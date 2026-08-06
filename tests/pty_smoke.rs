@@ -6,8 +6,9 @@
 //! gating the event loop, which cannot be observed without a terminal.
 //!
 //! Deliberately thin: one launch that proves the wiring, one that proves a
-//! remapped key. Behaviour worth asserting in detail belongs in the fast
-//! tests next to the code that implements it.
+//! remapped key, and one that proves two characters run at once with a rule
+//! crossing between them. Behaviour worth asserting in detail belongs in the
+//! fast tests next to the code that implements it.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -66,6 +67,61 @@ fn honours_a_remapped_quit_key() {
     app.expect_exit("the remapped quit key should quit");
 }
 
+/// M7's acceptance criterion, end to end through the real binary: two
+/// characters connected at once, and a tank trigger firing a heal in the
+/// cleric's session (docs/ARCHITECTURE.md §14 M7).
+#[test]
+fn plays_two_characters_and_routes_a_trigger_across_them() {
+    let tank_mud = FakeMud::start();
+    let cleric_mud = FakeMud::start();
+    let config = TempDir::new();
+    write_two_profiles(config.path(), tank_mud.port, cleric_mud.port);
+
+    let mut app = App::launch(&["tank", "cleric", "--config-dir", config.path_str()]);
+
+    app.wait_for(
+        BANNER,
+        "the focused session's banner should reach the screen",
+    );
+    app.wait_for("cleric", "the second session should appear in the tab bar");
+
+    // Only the tank's MUD says this; only the tank's rules react to it.
+    tank_mud.send_line("You are badly wounded!");
+    cleric_mud.wait_for_command(
+        "cast 'major heal' Grunk",
+        "the tank's trigger should drive the cleric's session",
+    );
+
+    // The heal must not also go to the character that raised it.
+    let tank_saw = String::from_utf8_lossy(&tank_mud.received.lock().unwrap()).into_owned();
+    assert!(
+        !tank_saw.contains("major heal"),
+        "a cross-session action must not reach its own server: {tank_saw:?}"
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// Two profiles on their own ports, the first with a cross-session rule.
+fn write_two_profiles(dir: &Path, tank_port: u16, cleric_port: u16) {
+    std::fs::create_dir_all(dir.join("profiles")).unwrap();
+    std::fs::write(
+        dir.join("profiles/tank.yaml"),
+        format!(
+            "name: tank\nhost: 127.0.0.1\nport: {tank_port}\n\
+             triggers:\n  - pattern: 'badly wounded'\n    send_to:\n      \
+             cleric: [\"cast 'major heal' Grunk\"]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("profiles/cleric.yaml"),
+        format!("name: cleric\nhost: 127.0.0.1\nport: {cleric_port}\n"),
+    )
+    .unwrap();
+}
+
 /// A config dir with a shared module the profile pulls in and overrides.
 fn write_config(dir: &Path, port: u16, quit: Option<&str>) {
     std::fs::create_dir_all(dir.join("profiles")).unwrap();
@@ -96,6 +152,8 @@ fn write_config(dir: &Path, port: u16, quit: Option<&str>) {
 struct FakeMud {
     port: u16,
     received: Arc<Mutex<Vec<u8>>>,
+    /// Lines to push at the client once it has connected.
+    outbound: std::sync::mpsc::Sender<String>,
 }
 
 impl FakeMud {
@@ -105,11 +163,19 @@ impl FakeMud {
         let received = Arc::new(Mutex::new(Vec::new()));
 
         let sink = Arc::clone(&received);
+        let (outbound, pending) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
             };
             let _ = sock.write_all(format!("{BANNER}\r\n").as_bytes());
+            if let Ok(mut writer) = sock.try_clone() {
+                std::thread::spawn(move || {
+                    while let Ok(line) = pending.recv() {
+                        let _ = writer.write_all(format!("{line}\r\n").as_bytes());
+                    }
+                });
+            }
             let mut buf = [0u8; 1024];
             while let Ok(n) = sock.read(&mut buf) {
                 if n == 0 {
@@ -121,7 +187,16 @@ impl FakeMud {
             }
         });
 
-        FakeMud { port, received }
+        FakeMud {
+            port,
+            received,
+            outbound,
+        }
+    }
+
+    /// Pushes a line to the connected client.
+    fn send_line(&self, line: &str) {
+        self.outbound.send(line.to_string()).unwrap();
     }
 
     fn wait_for_command(&self, expected: &str, why: &str) {

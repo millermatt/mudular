@@ -24,3 +24,16 @@ triggers:
     enabled: false      # this character does not loot corpses
   - id: greet-arrival
     send: ["say well met, ${who}"]
+
+# Cross-session automation: this character's rules can drive another open
+# session by name (`*` addresses every other session).
+  - id: call-for-heals
+    pattern: '^You are badly wounded'
+    send_to:
+      cleric: ["cast 'major heal' Kestrel"]
+
+# Let other characters use this one's aliases when they inject a command.
+# Only this profile can grant that — a sender can never force it.
+cross_session:
+  expand_aliases: true
+  max_hops: 1

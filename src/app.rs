@@ -1236,6 +1236,60 @@ mod tests {
         assert!(scrollback(&state.sessions[0]).contains("no session named"));
     }
 
+    // ---- keys (docs/ARCHITECTURE.md §11) ----
+
+    fn press(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        handle_key(state, &Keybinds::default(), code, modifiers)
+    }
+
+    #[test]
+    fn alt_n_jumps_straight_to_a_session() {
+        let (mut state, _rx) = app(&["tank", "cleric", "mage"]);
+
+        assert!(press(&mut state, KeyCode::Char('3'), KeyModifiers::ALT));
+        assert_eq!(state.focus, Focus::Session(2));
+
+        assert!(press(&mut state, KeyCode::Char('1'), KeyModifiers::ALT));
+        assert_eq!(state.focus, Focus::Session(0));
+    }
+
+    /// Alt+N past the last session must do nothing rather than focus a pane
+    /// that isn't there.
+    #[test]
+    fn alt_n_beyond_the_open_sessions_is_ignored() {
+        let (mut state, _rx) = app(&["tank"]);
+        assert!(!press(&mut state, KeyCode::Char('9'), KeyModifiers::ALT));
+        assert_eq!(state.focus, Focus::Session(0));
+    }
+
+    #[test]
+    fn the_layout_key_switches_between_tabs_and_splits() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+
+        assert!(press(&mut state, KeyCode::F(3), KeyModifiers::NONE));
+        assert_eq!(state.layout, LayoutMode::Splits);
+        assert!(press(&mut state, KeyCode::F(3), KeyModifiers::NONE));
+        assert_eq!(state.layout, LayoutMode::Tabs);
+    }
+
+    /// Hiding the channel column while a channel pane has focus must move
+    /// focus back to a pane that is still drawn.
+    #[test]
+    fn hiding_the_channels_takes_focus_off_them() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.channels.push(ChannelPane {
+            config: channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+        });
+        state.show_channels = true;
+        state.focus_pane(Focus::Channel(0));
+
+        assert!(press(&mut state, KeyCode::F(4), KeyModifiers::NONE));
+        assert!(!state.show_channels);
+        assert_eq!(state.focus, Focus::Session(0));
+    }
+
     // ---- /reload (docs/ARCHITECTURE.md §7.3) ----
 
     /// Writes a config dir with one module the profile pulls in.

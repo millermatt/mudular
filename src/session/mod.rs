@@ -80,8 +80,8 @@ pub enum SessionCommand {
     SetRules(Box<Engine>),
     /// Pane was resized; renegotiate NAWS.
     Resize { cols: u16, rows: u16 },
-    /// Handled here already; no UI affordance sends it until M7 adds
-    /// per-pane session control.
+    /// Handled here already; no UI affordance sends it yet — per-pane
+    /// connect/disconnect control is not part of any milestone so far.
     #[allow(dead_code)]
     Disconnect,
 }
@@ -1436,6 +1436,252 @@ mod tests {
         CommandReader::default().next(sock).await
     }
 
+    // ---- cross-session actions (docs/ARCHITECTURE.md §7.5) ----
+
+    /// A trigger's `send_to` leaves the session as an event for the hub —
+    /// one session never touches another's transport directly.
+    #[tokio::test]
+    async fn a_trigger_send_to_is_raised_for_the_hub_to_route() {
+        let (mut events, _commands) = serve_with_rules(
+            |mut sock| async move {
+                sock.write_all(b"HP: 30%\r\n").await.unwrap();
+                std::future::pending::<()>().await;
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: '^HP: (?P<hp>\d+)%'
+                    send_to:
+                      cleric: ["cast 'major heal' Grunk", "say healing ${hp}"]
+                "#,
+            ),
+        );
+
+        match next_matching(&mut events, |ev| matches!(ev, SessionEvent::SendTo { .. })).await {
+            SessionEvent::SendTo {
+                target,
+                lines,
+                hops,
+            } => {
+                assert_eq!(target, "cleric");
+                assert_eq!(lines, vec!["cast 'major heal' Grunk", "say healing 30"]);
+                assert_eq!(hops, 1, "a locally-raised action is the first hop");
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
+    }
+
+    /// An alias can address another session too, and its captures expand
+    /// the same way a `send` would.
+    #[tokio::test]
+    async fn an_alias_send_to_expands_captures() {
+        let (mut events, commands) = serve_with_rules(
+            |_sock| async { std::future::pending::<()>().await },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^heal (?P<who>\w+)$'
+                    send_to:
+                      cleric: ["cast heal ${who}"]
+                "#,
+            ),
+        );
+
+        commands
+            .send(SessionCommand::SendLine("heal Grunk".to_string()))
+            .await
+            .unwrap();
+
+        match next_matching(&mut events, |ev| matches!(ev, SessionEvent::SendTo { .. })).await {
+            SessionEvent::SendTo { target, lines, .. } => {
+                assert_eq!(target, "cleric");
+                assert_eq!(lines, vec!["cast heal Grunk"]);
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
+    }
+
+    /// The receiver decides: with expansion off, an injected command goes to
+    /// the server exactly as the sender wrote it — a sender can never make
+    /// this session's aliases run.
+    #[tokio::test]
+    async fn an_injected_command_is_sent_verbatim_by_default() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (mut events, commands) = serve_with(
+            move |mut sock| async move {
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^hh$'
+                    send: ["cast 'major heal' me"]
+                "#,
+            ),
+            false,
+        );
+
+        commands
+            .send(SessionCommand::Inject {
+                from: "tank".to_string(),
+                lines: vec!["hh".to_string()],
+                hops: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), sent.recv())
+                .await
+                .expect("timed out")
+                .unwrap(),
+            "hh",
+            "aliases must not run unless this session opted in"
+        );
+        // ...and it is echoed locally, so nothing happens invisibly.
+        assert_eq!(next_line(&mut events).await, "[from tank] hh");
+    }
+
+    /// With `expand_aliases: true` the receiver lets the sender use its own
+    /// shorthands.
+    #[tokio::test]
+    async fn an_injected_command_runs_through_aliases_when_the_receiver_opts_in() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, commands) = serve_with(
+            move |mut sock| async move {
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^hh$'
+                    send: ["cast 'major heal' me"]
+                "#,
+            ),
+            true,
+        );
+
+        commands
+            .send(SessionCommand::Inject {
+                from: "tank".to_string(),
+                lines: vec!["hh".to_string()],
+                hops: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), sent.recv())
+                .await
+                .expect("timed out")
+                .unwrap(),
+            "cast 'major heal' me"
+        );
+    }
+
+    /// Loop safety: an injected command whose expansion addresses a third
+    /// session carries a higher hop count, so a chain runs out (§7.5).
+    #[tokio::test]
+    async fn an_injection_that_bounces_onward_counts_a_hop() {
+        let (mut events, commands) = serve_with(
+            |_sock| async { std::future::pending::<()>().await },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^relay$'
+                    send_to:
+                      mage: ["shield tank"]
+                "#,
+            ),
+            true,
+        );
+
+        commands
+            .send(SessionCommand::Inject {
+                from: "tank".to_string(),
+                lines: vec!["relay".to_string()],
+                hops: 1,
+            })
+            .await
+            .unwrap();
+
+        match next_matching(&mut events, |ev| matches!(ev, SessionEvent::SendTo { .. })).await {
+            SessionEvent::SendTo { hops, target, .. } => {
+                assert_eq!(target, "mage");
+                assert_eq!(hops, 2, "one hop further than the injection that caused it");
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
+    }
+
+    // ---- channel routing (docs/ARCHITECTURE.md §11.1) ----
+
+    /// A routed line reaches the channel pane, and the gag that
+    /// `keep_in_main: false` compiles to keeps it out of the main scrollback.
+    #[tokio::test]
+    async fn a_routed_line_goes_to_its_channel_and_not_to_main() {
+        let (mut events, _commands) = serve_with_rules(
+            |mut sock| async move {
+                sock.write_all(b"Bob tells you hi\r\nYou see a rat.\r\n")
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'tells you'
+                    route: comms
+                    gag: true
+                "#,
+            ),
+        );
+
+        match next_matching(&mut events, |ev| matches!(ev, SessionEvent::Route { .. })).await {
+            SessionEvent::Route { channel, text } => {
+                assert_eq!(channel, "comms");
+                assert_eq!(text, "Bob tells you hi");
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+        // The next line the pane sees is the un-routed one: the tell was
+        // moved, not copied.
+        assert_eq!(next_line(&mut events).await, "You see a rat.");
+    }
+
+    /// `keep_in_main: true` compiles to a routed trigger with no gag, so the
+    /// line is mirrored to both panes.
+    #[tokio::test]
+    async fn a_copied_channel_line_also_stays_in_main() {
+        let (mut events, _commands) = serve_with_rules(
+            |mut sock| async move {
+                sock.write_all(b"Bob tells you hi\r\n").await.unwrap();
+                std::future::pending::<()>().await;
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'tells you'
+                    route: comms
+                    gag: false
+                "#,
+            ),
+        );
+
+        assert!(matches!(
+            next_matching(&mut events, |ev| matches!(ev, SessionEvent::Route { .. })).await,
+            SessionEvent::Route { .. }
+        ));
+        assert_eq!(next_line(&mut events).await, "Bob tells you hi");
+    }
+
     /// Runs `script` against one loopback connection and returns the
     /// session's channels.
     fn serve<F, Fut>(script: F) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
@@ -1450,6 +1696,20 @@ mod tests {
     fn serve_with_rules<F, Fut>(
         script: F,
         engine: Engine,
+    ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        serve_with(script, engine, false)
+    }
+
+    /// As `serve_with_rules`, but choosing whether injected commands run
+    /// through this session's aliases (§7.5).
+    fn serve_with<F, Fut>(
+        script: F,
+        engine: Engine,
+        expand_injected: bool,
     ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
     where
         F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
@@ -1472,7 +1732,7 @@ mod tests {
             None,
             Charset::Utf8,
             engine,
-            false,
+            expand_injected,
         )
     }
 

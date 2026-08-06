@@ -3,3 +3,30 @@
 # to ctrl+c.
 keybinds:
   quit: ctrl+q
+  # focus_next defaults to ctrl+tab. Terminals vary in whether they send
+  # it at all; remap to alt+tab if yours does not. Alt+1..9 always jumps
+  # straight to a session.
+  focus_next: ctrl+tab
+  cycle_layout: f3        # tabs <-> side-by-side splits
+  toggle_channels: f4     # show/hide the channel column
+
+# Channel panes: matching lines are pulled out of the main scrollback into
+# their own pane, so slow conversation stays readable under combat spam.
+# Each `match` compiles to an ordinary route trigger, so a rule anywhere
+# can also route a line explicitly with `route: comms`.
+channels:
+  - name: comms
+    match:
+      - '^\[gossip\]'
+      - '^\w+ tells you'
+    keep_in_main: false   # false (default) moves the line; true copies it
+    timestamps: true
+    # session: kestrel    # pin to one character instead of aggregating
+
+# What happens when another character's rules inject a command into a
+# session. This is the install-wide default; a profile can override it —
+# deliberately receiver-side, so only the character whose aliases would
+# run can opt into running them.
+cross_session:
+  expand_aliases: false   # injected commands are sent verbatim
+  max_hops: 1             # how far a chain of injections may travel

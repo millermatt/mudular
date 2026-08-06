@@ -1384,4 +1384,131 @@ mod tests {
         let err = Engine::compile(&[module("name: t\ntimers:\n  - send: [\"x\"]\n")]).unwrap_err();
         assert!(err.to_string().contains("every"), "{err}");
     }
+
+    // ---- cross-session actions (docs/ARCHITECTURE.md §7.5) ----
+
+    /// `send_to` is a separate output from `send`: the engine never mixes a
+    /// command meant for another character into this session's stream.
+    #[test]
+    fn send_to_is_kept_apart_from_this_sessions_sends() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: '^HP: (?P<hp>\d+)%'
+    send: ["quaff heal"]
+    send_to:
+      cleric: ["cast 'major heal' ${hp}"]
+"#,
+        )])
+        .unwrap();
+
+        let outcome = engine.process_line("HP: 30%");
+        assert_eq!(outcome.sends, vec!["quaff heal"]);
+        assert_eq!(
+            outcome.send_to,
+            vec![CrossSend {
+                target: "cleric".to_string(),
+                lines: vec!["cast 'major heal' 30".to_string()],
+            }]
+        );
+    }
+
+    /// A later scope layer can patch just the `send_to` of an inherited
+    /// rule, the same as any other field (§7.3).
+    #[test]
+    fn a_profile_can_override_an_inherited_send_to() {
+        let mut engine = Engine::compile(&[
+            module(
+                r#"
+name: global
+triggers:
+  - id: heal-me
+    pattern: 'low health'
+    send_to:
+      cleric: ["heal tank"]
+"#,
+            ),
+            module(
+                r#"
+name: profile
+triggers:
+  - id: heal-me
+    send_to:
+      mage: ["shield tank"]
+"#,
+            ),
+        ])
+        .unwrap();
+
+        let outcome = engine.process_line("you are at low health");
+        assert_eq!(outcome.send_to.len(), 1);
+        assert_eq!(outcome.send_to[0].target, "mage");
+    }
+
+    /// `${...}` in a cross-session command resolves against live server data
+    /// too, so a GMCP vital can drive another character's action.
+    #[test]
+    fn send_to_expands_server_data() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'wounded'
+    send_to:
+      cleric: ["heal ${Char.Base.name}"]
+"#,
+        )])
+        .unwrap();
+        engine.update_server_data_from_gmcp("Char.Base.name", "Grunk".to_string());
+
+        let outcome = engine.process_line("you are wounded");
+        assert_eq!(outcome.send_to[0].lines, vec!["heal Grunk"]);
+    }
+
+    // ---- channel routing (docs/ARCHITECTURE.md §11.1) ----
+
+    #[test]
+    fn a_routed_trigger_names_its_channel_and_can_gag_the_line() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'tells you'
+    route: comms
+    gag: true
+"#,
+        )])
+        .unwrap();
+
+        let outcome = engine.process_line("Bob tells you hi");
+        assert_eq!(outcome.route.as_deref(), Some("comms"));
+        assert!(outcome.gag);
+
+        let outcome = engine.process_line("You see a rat.");
+        assert_eq!(outcome.route, None);
+    }
+
+    /// A line belongs in one channel. Rules fire in scope order, so the
+    /// first match — the lowest layer that classified it — decides, and a
+    /// second matching rule cannot silently move it.
+    #[test]
+    fn the_first_matching_route_wins() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'tells you'
+    route: comms
+  - pattern: 'Bob'
+    route: spam
+"#,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            engine.process_line("Bob tells you hi").route.as_deref(),
+            Some("comms")
+        );
+    }
 }

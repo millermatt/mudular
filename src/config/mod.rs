@@ -713,7 +713,7 @@ triggers:
                 .matches(KeyCode::Char('q'), KeyModifiers::CONTROL)
         );
 
-        let layers = load_rules(&dir, Some("kestrel"), &[]).expect("example rules load");
+        let layers = load_rules(&dir, Some("kestrel"), &app.channels).expect("example rules load");
         let engine = crate::engine::Engine::compile(&layers).expect("example rules compile");
 
         // The profile disables the module's autoloot and overrides its
@@ -729,5 +729,171 @@ triggers:
         );
         // ...and overrides the module's `target` variable.
         assert_eq!(engine.expand_input("k").sends, vec!["kill dragon"]);
+
+        // The example channel classifies tells into the comms pane.
+        let outcome = engine.process_line("Bob tells you hello");
+        assert_eq!(outcome.route.as_deref(), Some("comms"));
+
+        // ...and the example's cross-session rule addresses the cleric.
+        let outcome = engine.process_line("You are badly wounded and bleeding");
+        assert_eq!(outcome.send_to.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.send_to[0].target, "cleric");
+    }
+
+    // ---- channel panes (docs/ARCHITECTURE.md §11.1) ----
+
+    fn channel(name: &str, patterns: &[&str], keep_in_main: bool) -> Channel {
+        Channel {
+            name: name.to_string(),
+            matches: patterns.iter().map(|s| s.to_string()).collect(),
+            keep_in_main,
+            timestamps: false,
+            session: None,
+        }
+    }
+
+    /// `match:` is sugar for route triggers, so classification gets the
+    /// engine's full regex machinery — and `keep_in_main: false` (the
+    /// default) becomes the gag that moves the line out of main.
+    #[test]
+    fn a_channel_match_compiles_to_a_gagging_route_trigger() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let channels = [channel("comms", &[r"^\w+ tells you"], false)];
+
+        let layers = load_rules(dir.path(), None, &channels).unwrap();
+        let mut engine = crate::engine::Engine::compile(&layers).unwrap();
+
+        let outcome = engine.process_line("Bob tells you hi");
+        assert_eq!(outcome.route.as_deref(), Some("comms"));
+        assert!(outcome.gag, "the default is to move, not copy");
+    }
+
+    #[test]
+    fn keep_in_main_copies_the_line_instead_of_moving_it() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let channels = [channel("comms", &[r"^\w+ tells you"], true)];
+
+        let layers = load_rules(dir.path(), None, &channels).unwrap();
+        let mut engine = crate::engine::Engine::compile(&layers).unwrap();
+
+        let outcome = engine.process_line("Bob tells you hi");
+        assert_eq!(outcome.route.as_deref(), Some("comms"));
+        assert!(!outcome.gag);
+    }
+
+    /// A trigger that routes explicitly inherits the channel's move-vs-copy
+    /// setting: that is a property of the channel, not of each rule.
+    #[test]
+    fn an_explicit_route_inherits_the_channels_move_setting() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        std::fs::write(
+            dir.path().join("global.yaml"),
+            "name: global\ntriggers:\n  - pattern: 'the guild announces'\n    route: comms\n",
+        )
+        .unwrap();
+
+        let channels = [channel("comms", &[], false)];
+        let layers = load_rules(dir.path(), None, &channels).unwrap();
+        let mut engine = crate::engine::Engine::compile(&layers).unwrap();
+
+        let outcome = engine.process_line("the guild announces a raid");
+        assert_eq!(outcome.route.as_deref(), Some("comms"));
+        assert!(outcome.gag, "keep_in_main: false applies to any route");
+    }
+
+    /// A channel pinned to one character must not classify — or gag —
+    /// anything in the other sessions.
+    #[test]
+    fn a_pinned_channel_only_compiles_into_its_own_session() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        for name in ["tank", "cleric"] {
+            std::fs::write(
+                dir.path().join(format!("profiles/{name}.yaml")),
+                format!("name: {name}\nhost: h\nport: 1\n"),
+            )
+            .unwrap();
+        }
+
+        let mut channels = [channel("tankchat", &["^chat:"], false)];
+        channels[0].session = Some("tank".to_string());
+
+        let engine = |profile: &str| {
+            let layers = load_rules(dir.path(), Some(profile), &channels).unwrap();
+            crate::engine::Engine::compile(&layers).unwrap()
+        };
+
+        assert_eq!(
+            engine("tank").process_line("chat: hello").route.as_deref(),
+            Some("tankchat")
+        );
+        let outcome = engine("cleric").process_line("chat: hello");
+        assert_eq!(outcome.route, None);
+        assert!(!outcome.gag, "a pinned channel must not gag other sessions");
+    }
+
+    /// A typo in `route:` would otherwise send lines to a pane that is never
+    /// drawn — they must fail loudly, like any other config typo.
+    #[test]
+    fn a_route_to_an_undeclared_channel_is_rejected() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        std::fs::write(
+            dir.path().join("global.yaml"),
+            "name: global\ntriggers:\n  - pattern: 'x'\n    route: coms\n",
+        )
+        .unwrap();
+
+        let err = load_rules(dir.path(), None, &[channel("comms", &[], false)]).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("coms"), "{message}");
+        assert!(message.contains("unknown channel"), "{message}");
+    }
+
+    #[test]
+    fn parses_a_channel_declaration() {
+        let config: AppConfig = serde_yaml::from_str(
+            r#"
+            channels:
+              - name: comms
+                match: ['^\[gossip\]']
+                keep_in_main: true
+                timestamps: true
+                session: tank
+            "#,
+        )
+        .unwrap();
+        let channel = &config.channels[0];
+        assert_eq!(channel.name, "comms");
+        assert_eq!(channel.matches, vec![r"^\[gossip\]"]);
+        assert!(channel.keep_in_main);
+        assert!(channel.timestamps);
+        assert_eq!(channel.session.as_deref(), Some("tank"));
+    }
+
+    // ---- cross-session settings (docs/ARCHITECTURE.md §7.5) ----
+
+    #[test]
+    fn cross_session_defaults_to_verbatim_injection_and_one_hop() {
+        let config = AppConfig::default();
+        assert!(!config.cross_session.expand_aliases);
+        assert_eq!(config.cross_session.max_hops, 1);
+    }
+
+    /// The profile is the receiver, so its block wins — field by field, so
+    /// setting one does not silently reset the other.
+    #[test]
+    fn a_profile_overrides_only_the_cross_session_fields_it_names() {
+        let install = CrossSession {
+            expand_aliases: false,
+            max_hops: 3,
+        };
+        let profile: Profile = serde_yaml::from_str(
+            "name: cleric\nhost: h\nport: 1\ncross_session:\n  expand_aliases: true\n",
+        )
+        .unwrap();
+
+        let merged = install.with_override(profile.cross_session);
+        assert!(merged.expand_aliases);
+        assert_eq!(merged.max_hops, 3, "unnamed fields keep the install value");
     }
 }
