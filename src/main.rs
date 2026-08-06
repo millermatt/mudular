@@ -88,12 +88,18 @@ async fn main() -> Result<()> {
                 .parse()
                 .map_err(|err: String| anyhow::anyhow!(err))
                 .with_context(|| format!("charset in {}", path.display()))?;
+            let layers = config::load_rules(&dir, Some(name))?;
             Some(app::ConnectTarget {
                 host: profile.host,
                 port: profile.port,
                 tls,
                 record: cli.record.clone(),
                 charset,
+                rules: app::Rules {
+                    engine: engine::Engine::compile(&layers)?,
+                    config_dir: dir.clone(),
+                    profile: Some(name.clone()),
+                },
             })
         }
         (None, Some(host)) => {
@@ -101,12 +107,19 @@ async fn main() -> Result<()> {
                 verify: cli.tls_verify,
                 pin_store: net::pins::PinStore::new(dir.join("known_certs")),
             });
+            // No profile, so only the global layer applies.
+            let layers = config::load_rules(&dir, None)?;
             Some(app::ConnectTarget {
                 host: host.clone(),
                 port: cli.port,
                 tls,
                 record: cli.record.clone(),
                 charset: cli.charset,
+                rules: app::Rules {
+                    engine: engine::Engine::compile(&layers)?,
+                    config_dir: dir.clone(),
+                    profile: None,
+                },
             })
         }
         (None, None) => None,

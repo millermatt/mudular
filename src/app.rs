@@ -16,6 +16,7 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::Keybinds;
+use crate::engine::Engine;
 use crate::proto::charset::Charset;
 use crate::session::{self, SessionCommand, SessionEvent};
 use crate::ui;
@@ -24,12 +25,48 @@ use crate::ui;
 /// (docs/ARCHITECTURE.md §8; a fuller ring buffer with disk logging is M9).
 const SCROLLBACK_LIMIT: usize = 10_000;
 
+/// The one client-side command M4 defines. Everything else starting with
+/// `/` is left alone, since plenty of MUDs use `/` for their own commands.
+const RELOAD_COMMAND: &str = "/reload";
+
+/// Recompile the rule set from disk and hand it to the running session.
+/// Returns the line to show the player either way — a broken rule file
+/// must report itself rather than silently leaving the old rules in place.
+async fn reload_rules(
+    rules: Option<&(PathBuf, Option<String>)>,
+    cmd_tx: Option<&tokio::sync::mpsc::Sender<SessionCommand>>,
+) -> String {
+    let (Some((config_dir, profile)), Some(tx)) = (rules, cmd_tx) else {
+        return "** /reload needs a connected session".to_string();
+    };
+
+    match crate::config::load_rules(config_dir, profile.as_deref())
+        .and_then(|layers| Ok(Engine::compile(&layers)?))
+    {
+        Ok(engine) => {
+            let _ = tx.send(SessionCommand::SetRules(Box::new(engine))).await;
+            "** rules reloaded".to_string()
+        }
+        Err(err) => format!("** reload failed, keeping the current rules: {err:#}"),
+    }
+}
+
 pub struct ConnectTarget {
     pub host: String,
     pub port: u16,
     pub tls: Option<crate::net::TlsConfig>,
     pub record: Option<PathBuf>,
     pub charset: Charset,
+    /// The compiled rule set, and how to rebuild it for `/reload`.
+    pub rules: Rules,
+}
+
+/// Where a session's rules came from, so `/reload` can recompile them from
+/// disk without reconnecting (docs/ARCHITECTURE.md §7.3).
+pub struct Rules {
+    pub engine: Engine,
+    pub config_dir: PathBuf,
+    pub profile: Option<String>,
 }
 
 /// Everything the UI needs to render a frame.
@@ -109,18 +146,30 @@ async fn event_loop(
     target: Option<ConnectTarget>,
     keybinds: Keybinds,
 ) -> Result<()> {
-    let (mut session_events, cmd_tx, status, connected_status) = match target {
+    let (mut session_events, cmd_tx, status, connected_status, rules) = match target {
         Some(t) => {
             let status = format!("connecting to {}:{}...", t.host, t.port);
             let connected_status = format!("connected to {}:{}", t.host, t.port);
-            let (rx, tx) = session::spawn(t.host, t.port, t.tls, t.record, t.charset);
-            (Some(rx), Some(tx), status, connected_status)
+            let Rules {
+                engine,
+                config_dir,
+                profile,
+            } = t.rules;
+            let (rx, tx) = session::spawn(t.host, t.port, t.tls, t.record, t.charset, engine);
+            (
+                Some(rx),
+                Some(tx),
+                status,
+                connected_status,
+                Some((config_dir, profile)),
+            )
         }
         None => (
             None,
             None,
             "no target — run with --host <mud> [--port N] [--tls]".to_string(),
             String::new(),
+            None,
         ),
     };
 
@@ -168,7 +217,10 @@ async fn event_loop(
                                 if !state.masked {
                                     state.push_line(format!("> {line}"));
                                 }
-                                if let Some(tx) = &cmd_tx {
+                                if line.trim() == RELOAD_COMMAND {
+                                    let notice = reload_rules(rules.as_ref(), cmd_tx.as_ref()).await;
+                                    state.push_line(notice);
+                                } else if let Some(tx) = &cmd_tx {
                                     let _ = tx.send(SessionCommand::SendLine(line)).await;
                                 }
                             }

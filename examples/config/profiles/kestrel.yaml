@@ -8,9 +8,19 @@ tls:
 charset: utf-8          # or a legacy fallback: latin1, cp437
 modules: [uw-combat]    # shared rule modules, applied in order
 
-# Profile-local overrides (highest scope layer)
+# Profile-local rules: the highest scope layer, so these win over
+# global.yaml and over anything the modules above define.
 variables:
-  target: rat
+  target: dragon        # overrides the module's default target
+
 triggers:
+  # A rule of this character's own.
   - pattern: '^You are hungry\.$'
     send: ["eat bread"]
+
+  # Override rules the shared module defined, by id. Only the fields
+  # named here change; the pattern and everything else is inherited.
+  - id: autoloot
+    enabled: false      # this character does not loot corpses
+  - id: greet-arrival
+    send: ["say well met, ${who}"]

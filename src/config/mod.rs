@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde::{Deserialize, Deserializer};
 
-use crate::engine::{Alias, RuleModule, Trigger};
+use crate::engine::{Alias, RuleModule, Timer, Trigger};
 use crate::net::VerifyMode;
 
 /// Where the config dir lives: `--config-dir`, or the platform default.
@@ -46,6 +46,8 @@ pub struct Profile {
     pub aliases: Vec<Alias>,
     #[serde(default)]
     pub triggers: Vec<Trigger>,
+    #[serde(default)]
+    pub timers: Vec<Timer>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -193,7 +195,50 @@ pub fn profile_path(dir: &Path, name: &str) -> PathBuf {
 pub fn load_module(path: &Path) -> Result<RuleModule> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading module {}", path.display()))?;
-    serde_yaml::from_str(&text).with_context(|| format!("parsing module {}", path.display()))
+    let mut module: RuleModule = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing module {}", path.display()))?;
+    // Error messages should name the file the rule actually came from.
+    if module.name.is_empty() {
+        module.name = path.display().to_string();
+    }
+    Ok(module)
+}
+
+/// The ordered scope layers for a session, lowest precedence first
+/// (docs/ARCHITECTURE.md §7.3): global defaults, then the shared modules
+/// the profile lists in order, then the profile's own inline rules.
+pub fn load_rules(dir: &Path, profile: Option<&str>) -> Result<Vec<RuleModule>> {
+    let mut layers = Vec::new();
+
+    let global = dir.join("global.yaml");
+    if global.exists() {
+        layers.push(load_module(&global)?);
+    }
+
+    let Some(name) = profile else {
+        return Ok(layers);
+    };
+    let path = profile_path(dir, name);
+    let profile = load_profile(&path)?;
+
+    for module in &profile.modules {
+        let module_path = dir.join("modules").join(format!("{module}.yaml"));
+        layers.push(
+            load_module(&module_path)
+                .with_context(|| format!("module `{module}` listed in profile `{name}`"))?,
+        );
+    }
+
+    layers.push(RuleModule {
+        name: format!("profile `{name}`"),
+        description: None,
+        variables: profile.variables,
+        aliases: profile.aliases,
+        triggers: profile.triggers,
+        timers: profile.timers,
+    });
+
+    Ok(layers)
 }
 
 #[cfg(test)]
@@ -324,5 +369,36 @@ mod tests {
     fn profile_path_lives_under_profiles_subdir() {
         let path = profile_path(Path::new("/cfg"), "kestrel");
         assert_eq!(path, Path::new("/cfg/profiles/kestrel.yaml"));
+    }
+
+    /// The shipped examples are documentation: if they stop loading, the
+    /// docs are wrong. Loading them here keeps that from going unnoticed.
+    #[test]
+    fn shipped_example_config_loads_and_compiles() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/config");
+
+        let app = load_app_config(&dir).expect("example mudular.yaml loads");
+        assert!(
+            app.keybinds
+                .quit
+                .matches(KeyCode::Char('q'), KeyModifiers::CONTROL)
+        );
+
+        let layers = load_rules(&dir, Some("kestrel")).expect("example rules load");
+        let engine = crate::engine::Engine::compile(&layers).expect("example rules compile");
+
+        // The profile disables the module's autoloot and overrides its
+        // greeting — the layering the comments in those files describe.
+        let mut engine = engine;
+        assert!(
+            engine.process_line("The kobold is DEAD!").sends.is_empty(),
+            "profile disables autoloot"
+        );
+        assert_eq!(
+            engine.process_line("Ærlend has arrived.").sends,
+            vec!["say well met, Ærlend"]
+        );
+        // ...and overrides the module's `target` variable.
+        assert_eq!(engine.expand_input("k"), vec!["kill dragon"]);
     }
 }

@@ -1,14 +1,32 @@
 # Example shared rule module. Real location: ~/.config/mudular/modules/
+#
+# Modules are listed by name in a profile's `modules:` and applied in that
+# order. Giving a rule an `id` lets a profile override or disable it later
+# without repeating the pattern — see profiles/kestrel.yaml.
 name: uw-combat
 description: Combat reactions shared by all Underworld characters
 variables:
-  heal_at: "40"
+  target: rat
 aliases:
-  - pattern: '^k (.+)$'
-    send: ["kill ${1}"]
+  - id: quickkill
+    pattern: '^k$'
+    send: ["kill ${target}"]
+  - id: getwear
+    pattern: '^gh (.+)$'
+    send: ["get ${1}", "wear ${1}"]
 triggers:
-  - pattern: '^(?P<who>\p{L}+) has arrived\.$'
+  - id: greet-arrival
+    pattern: '^(?P<who>\p{L}+) has arrived\.$'
     send: ["look ${who}"]
   - id: autoloot
     pattern: '(?P<victim>.+) is DEAD!'
     send: ["get all corpse"]
+  # Remember what we are fighting, so `k` targets it.
+  - id: track-target
+    pattern: '^You are now fighting (?P<foe>\w+)'
+    set:
+      target: "${foe}"
+timers:
+  - id: autosave
+    every: 5m
+    send: ["save"]

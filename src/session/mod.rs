@@ -11,15 +11,16 @@ mod line;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::engine::Engine;
 use crate::net::{self, TlsConfig};
 use crate::proto::charset::Charset;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, option};
-use line::LineAssembler;
+use line::{LineAssembler, strip_ansi};
 
 pub type SessionId = usize;
 
@@ -39,10 +40,15 @@ pub enum SessionEvent {
 }
 
 /// UI → session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum SessionCommand {
-    /// Send one line to the server (already alias-expanded).
+    /// One line as typed. The session splits it on `;` and expands
+    /// aliases: the engine owns the variable store that both aliases and
+    /// triggers read, so it lives in the session task where that state
+    /// needs no locking (docs/ARCHITECTURE.md §3).
     SendLine(String),
+    /// Replace the rule set without reconnecting (`/reload`).
+    SetRules(Box<Engine>),
     /// Pane was resized; renegotiate NAWS.
     Resize {
         cols: u16,
@@ -60,19 +66,24 @@ pub fn spawn(
     tls: Option<TlsConfig>,
     record: Option<PathBuf>,
     charset: Charset,
+    engine: Engine,
 ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>) {
     let (event_tx, event_rx) = mpsc::channel(256);
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
-    tokio::spawn(run(host, port, tls, record, charset, event_tx, cmd_rx));
+    tokio::spawn(run(
+        host, port, tls, record, charset, engine, event_tx, cmd_rx,
+    ));
     (event_rx, cmd_tx)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     host: String,
     port: u16,
     tls: Option<TlsConfig>,
     record: Option<PathBuf>,
     charset: Charset,
+    mut engine: Engine,
     events: mpsc::Sender<SessionEvent>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
@@ -121,8 +132,15 @@ async fn run(
             .await;
         return;
     }
+    engine.start_timers(Instant::now());
 
     let reason = loop {
+        // `select!` needs a future even when nothing is scheduled; park
+        // far out rather than busy-waiting when there are no timers.
+        let timer_deadline = engine
+            .next_timer_deadline()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+
         tokio::select! {
             result = reader.read(&mut sock_buf) => {
                 match result {
@@ -133,6 +151,7 @@ async fn run(
                             recorder.record(raw);
                         }
 
+                        let mut outbound: Vec<String> = Vec::new();
                         for event in telnet.feed(raw) {
                             let emitted = match event {
                                 TelnetEvent::Data(bytes) => {
@@ -153,13 +172,33 @@ async fn run(
                                 // engine in M6.
                                 _ => Vec::new(),
                             };
+
                             for event in emitted {
+                                // Triggers run between the line assembler
+                                // and the UI (§6.5), so a gagged line never
+                                // reaches the scrollback at all.
+                                let event = match event {
+                                    SessionEvent::Line(text) => {
+                                        let outcome = engine.process_line(&strip_ansi(&text));
+                                        outbound.extend(outcome.sends);
+                                        if outcome.gag {
+                                            continue;
+                                        }
+                                        SessionEvent::Line(text)
+                                    }
+                                    other => other,
+                                };
                                 if events.send(event).await.is_err() {
                                     return;
                                 }
                             }
                         }
 
+                        // Trigger output is sent verbatim: it is never fed
+                        // back through aliases, so rules cannot recurse.
+                        if send_lines(&mut writer, &outbound).await.is_err() {
+                            break "write failed".to_string();
+                        }
                         if flush_telnet(&mut telnet, &mut writer).await.is_err() {
                             break "write failed".to_string();
                         }
@@ -167,14 +206,23 @@ async fn run(
                     Err(err) => break format!("connection error: {err}"),
                 }
             }
+            _ = tokio::time::sleep_until(timer_deadline.into()) => {
+                let due = engine.fire_due_timers(Instant::now());
+                if send_lines(&mut writer, &due).await.is_err() {
+                    break "write failed".to_string();
+                }
+            }
             cmd = commands.recv() => {
                 match cmd {
                     Some(SessionCommand::SendLine(line)) => {
-                        if writer.write_all(line.as_bytes()).await.is_err()
-                            || writer.write_all(b"\r\n").await.is_err()
-                        {
+                        let expanded = engine.expand_input(&line);
+                        if send_lines(&mut writer, &expanded).await.is_err() {
                             break "write failed".to_string();
                         }
+                    }
+                    Some(SessionCommand::SetRules(rules)) => {
+                        engine = *rules;
+                        engine.start_timers(Instant::now());
                     }
                     Some(SessionCommand::Resize { cols, rows }) => {
                         telnet.set_window_size(cols, rows);
@@ -191,6 +239,18 @@ async fn run(
     };
 
     let _ = events.send(SessionEvent::Ended(reason)).await;
+}
+
+/// Write each command as its own CRLF-terminated line.
+async fn send_lines<W>(writer: &mut W, lines: &[String]) -> std::io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    for line in lines {
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\r\n").await?;
+    }
+    Ok(())
 }
 
 /// Write any negotiation replies the Telnet machine has queued.
@@ -454,6 +514,7 @@ mod tests {
             None,
             Some(path.clone()),
             Charset::Utf8,
+            Engine::default(),
         );
         assert_eq!(next_line(&mut events).await, "hi");
 
@@ -466,6 +527,211 @@ mod tests {
         assert_eq!(hex, "68690d0a", "raw bytes, before \\r is stripped");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn rules(yaml: &str) -> Engine {
+        let module = serde_yaml::from_str(yaml).expect("valid test YAML");
+        Engine::compile(&[module]).expect("compiles")
+    }
+
+    /// A trigger fires against real server output and its command reaches
+    /// the server — the whole point of the automation engine.
+    #[tokio::test]
+    async fn a_trigger_answers_the_server_automatically() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(b"The kobold is DEAD!\r\n").await.unwrap();
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'is DEAD!'
+                    send: ["get all corpse"]
+                "#,
+            ),
+        );
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), sent.recv())
+                .await
+                .expect("timed out")
+                .unwrap(),
+            "get all corpse"
+        );
+    }
+
+    /// Triggers match the ANSI-stripped projection (§7.1), so a pattern
+    /// does not have to know the server coloured the line.
+    #[tokio::test]
+    async fn a_trigger_matches_through_ansi_colour() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(b"\x1b[31mThe \x1b[1mkobold\x1b[0m is DEAD!\r\n")
+                    .await
+                    .unwrap();
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: '^The kobold is DEAD!$'
+                    send: ["cheer"]
+                "#,
+            ),
+        );
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), sent.recv())
+                .await
+                .expect("timed out")
+                .unwrap(),
+            "cheer"
+        );
+    }
+
+    /// A gagged line is dropped before the UI sees it, so it never reaches
+    /// the scrollback at all (§6.5).
+    #[tokio::test]
+    async fn a_gagged_line_never_reaches_the_ui() {
+        let (mut events, _commands) = serve_with_rules(
+            |mut sock| async move {
+                sock.write_all(b"channel spam here\r\nsomething real\r\n")
+                    .await
+                    .unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'spam'
+                    gag: true
+                "#,
+            ),
+        );
+
+        assert_eq!(
+            next_line(&mut events).await,
+            "something real",
+            "the gagged line must not be delivered"
+        );
+    }
+
+    /// Typed input is expanded by the session, not the UI: one line can
+    /// become several commands.
+    #[tokio::test]
+    async fn typed_input_is_alias_expanded_and_split_on_semicolons() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                let mut reader = CommandReader::default();
+                for _ in 0..3 {
+                    tx.send(reader.next(&mut sock).await).await.unwrap();
+                }
+            },
+            rules(
+                r#"
+                name: test
+                variables:
+                  target: rat
+                aliases:
+                  - pattern: '^k$'
+                    send: ["kill ${target}"]
+                "#,
+            ),
+        );
+
+        commands
+            .send(SessionCommand::SendLine("north; k".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(next_sent(&mut sent).await, "north");
+        assert_eq!(next_sent(&mut sent).await, "kill rat");
+
+        // A trigger's `set:` updates the variable the alias reads.
+        commands
+            .send(SessionCommand::SendLine("k".into()))
+            .await
+            .unwrap();
+        assert_eq!(next_sent(&mut sent).await, "kill rat");
+    }
+
+    /// `/reload` swaps the rule set on a live session (§7.3).
+    #[tokio::test]
+    async fn set_rules_replaces_the_rule_set_without_reconnecting() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                let mut reader = CommandReader::default();
+                for _ in 0..2 {
+                    tx.send(reader.next(&mut sock).await).await.unwrap();
+                }
+            },
+            rules(
+                r#"
+                name: before
+                aliases:
+                  - pattern: '^x$'
+                    send: ["old"]
+                "#,
+            ),
+        );
+
+        commands
+            .send(SessionCommand::SendLine("x".into()))
+            .await
+            .unwrap();
+        assert_eq!(next_sent(&mut sent).await, "old");
+
+        commands
+            .send(SessionCommand::SetRules(Box::new(rules(
+                r#"
+                name: after
+                aliases:
+                  - pattern: '^x$'
+                    send: ["new"]
+                "#,
+            ))))
+            .await
+            .unwrap();
+
+        commands
+            .send(SessionCommand::SendLine("x".into()))
+            .await
+            .unwrap();
+        assert_eq!(next_sent(&mut sent).await, "new");
+    }
+
+    #[tokio::test]
+    async fn timers_fire_on_their_own_without_server_traffic() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                timers:
+                  - every: 50ms
+                    send: ["save"]
+                "#,
+            ),
+        );
+
+        assert_eq!(next_sent(&mut sent).await, "save");
+    }
+
+    async fn next_sent(rx: &mut mpsc::Receiver<String>) -> String {
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for a sent command")
+            .expect("sender dropped")
     }
 
     /// Reads a fake MUD server's minimal login/echo/quit script against a
@@ -550,25 +816,52 @@ mod tests {
     }
 
     /// Reads until the client sends a complete line of actual input.
-    async fn read_command(sock: &mut tokio::net::TcpStream) -> String {
-        let mut buf = vec![0u8; 1024];
-        let mut acc = Vec::new();
-        loop {
-            let n = sock.read(&mut buf).await.unwrap();
-            if n == 0 {
-                return String::new();
-            }
-            acc.extend_from_slice(&buf[..n]);
-            let text = strip_telnet(&acc);
-            if let Some(idx) = text.iter().position(|&b| b == b'\n') {
-                return String::from_utf8_lossy(&text[..idx]).trim().to_string();
+    ///
+    /// Several commands can share one TCP segment (an alias expands to a
+    /// list, `;` splits a typed line), so leftover bytes are kept for the
+    /// next call rather than discarded.
+    #[derive(Default)]
+    struct CommandReader {
+        pending: Vec<u8>,
+    }
+
+    impl CommandReader {
+        async fn next(&mut self, sock: &mut tokio::net::TcpStream) -> String {
+            let mut buf = vec![0u8; 1024];
+            loop {
+                if let Some(idx) = self.pending.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = self.pending.drain(..=idx).collect();
+                    return String::from_utf8_lossy(&line).trim().to_string();
+                }
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return String::new();
+                }
+                self.pending.extend_from_slice(&strip_telnet(&buf[..n]));
             }
         }
+    }
+
+    /// One-shot read of a single command, for scripts that only need one.
+    async fn read_command(sock: &mut tokio::net::TcpStream) -> String {
+        CommandReader::default().next(sock).await
     }
 
     /// Runs `script` against one loopback connection and returns the
     /// session's channels.
     fn serve<F, Fut>(script: F) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        serve_with_rules(script, Engine::default())
+    }
+
+    /// As `serve`, but with a compiled rule set driving the session.
+    fn serve_with_rules<F, Fut>(
+        script: F,
+        engine: Engine,
+    ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
     where
         F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
@@ -583,7 +876,14 @@ mod tests {
             script(sock).await;
         });
 
-        spawn("127.0.0.1".to_string(), port, None, None, Charset::Utf8)
+        spawn(
+            "127.0.0.1".to_string(),
+            port,
+            None,
+            None,
+            Charset::Utf8,
+            engine,
+        )
     }
 
     async fn next_matching(

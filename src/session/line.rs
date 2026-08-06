@@ -58,6 +58,48 @@ impl LineAssembler {
     }
 }
 
+/// The plain-text projection of a line (docs/ARCHITECTURE.md §8): the text
+/// with ANSI escape sequences removed, which is what triggers match against
+/// (§7.1) so a pattern never has to account for colour codes.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters and intermediates, then one final byte.
+            Some('[') => {
+                for ch in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&ch) {
+                        break;
+                    }
+                }
+            }
+            // OSC: runs to BEL or the ST two-byte terminator.
+            Some(']') => {
+                while let Some(ch) = chars.next() {
+                    if ch == '\x07' {
+                        break;
+                    }
+                    if ch == '\x1b' {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Two-byte escapes (charset selection and friends): drop both.
+            Some(_) => {}
+            None => {}
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +192,45 @@ mod tests {
         let mut a = LineAssembler::default();
         let events = a.feed("\x1b[1;33mgold\x1b[0m\r\n");
         assert_eq!(lines(&events), vec!["\x1b[1;33mgold\x1b[0m"]);
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn removes_sgr_colour_codes() {
+        assert_eq!(strip_ansi("\x1b[1;33mgold\x1b[0m"), "gold");
+        assert_eq!(
+            strip_ansi("\x1b[38;2;255;0;0mtruecolor\x1b[0m"),
+            "truecolor"
+        );
+    }
+
+    #[test]
+    fn leaves_plain_text_untouched() {
+        assert_eq!(strip_ansi("Ærlend has arrived."), "Ærlend has arrived.");
+    }
+
+    /// A trigger must be able to match a line the server coloured, without
+    /// the pattern knowing anything about colour codes.
+    #[test]
+    fn a_coloured_line_matches_a_plain_pattern() {
+        let plain = strip_ansi("\x1b[31mThe \x1b[1mkobold\x1b[0m is DEAD!\x1b[0m");
+        assert_eq!(plain, "The kobold is DEAD!");
+    }
+
+    #[test]
+    fn removes_cursor_movement_and_osc_sequences() {
+        assert_eq!(strip_ansi("a\x1b[2Jb"), "ab");
+        assert_eq!(strip_ansi("a\x1b]0;title\x07b"), "ab");
+        assert_eq!(strip_ansi("a\x1b]0;title\x1b\\b"), "ab");
+    }
+
+    #[test]
+    fn tolerates_a_truncated_escape_at_the_end() {
+        assert_eq!(strip_ansi("text\x1b"), "text");
+        assert_eq!(strip_ansi("text\x1b["), "text");
     }
 }
