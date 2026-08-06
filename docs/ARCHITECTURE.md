@@ -644,7 +644,7 @@ exist from M0, even where a stage is a passthrough).
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | The same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
-| **M9** | Polish | Scrollback search, disk logging, reconnect/backoff, keyring passwords + auto-login, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalking, in-TUI new-profile form, self-update check | — |
+| **M9** | Polish | Scrollback search, disk logging, reconnect/backoff, keyring passwords + auto-login, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | — |
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
@@ -672,8 +672,9 @@ Target: a non-technical user installs Mudular on any OS in one step.
   implements `ScriptHost` (§7.4); WASM (`wasmtime`) is the designated
   universal target — one sandboxed ABI, plugins in any compiled language.
 - **Auto-mapper:** a map pane driven by GMCP `Room.*` data (falling back to
-  movement/exit-line inference), with speedwalk-to-room. Deliberately
-  post-1.0: it is a large feature and the GMCP plumbing it needs is M6.
+  movement/exit-line inference), with pathfinding speedwalk-to-room that
+  supersedes M9's macro speedwalks. Deliberately post-1.0: it is a large
+  feature and the GMCP plumbing it needs is M6.
 - **Module sharing:** install community YAML/script modules from a URL or
   registry; sandboxing (§7.4) is the prerequisite and lands first.
 - **More protocols:** MXP, MSP, NEW-ENVIRON slot in as `proto` modules +
