@@ -53,17 +53,17 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    let status = match (&cli.profile, &cli.host) {
-        (Some(profile), _) => format!("profile: {profile} (not wired yet — M3)"),
-        (None, Some(host)) => {
-            let scheme = if cli.tls { "stelnet" } else { "telnet" };
-            format!(
-                "target: {scheme}://{host}:{} (not wired yet — M0)",
-                cli.port
-            )
+    let target = match (&cli.profile, &cli.host) {
+        (Some(profile), _) => {
+            anyhow::bail!("profile `{profile}` not wired yet — M3; use --host instead")
         }
-        (None, None) => "no target — run with --host <mud> [--port N] [--tls]".to_string(),
+        (None, Some(host)) => Some(app::ConnectTarget {
+            host: host.clone(),
+            port: cli.port,
+            tls: cli.tls,
+        }),
+        (None, None) => None,
     };
 
-    app::run(status).await
+    app::run(target).await
 }
