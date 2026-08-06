@@ -59,6 +59,51 @@ By default, the platform config directory:
 Override it with `--config-dir <path>` (useful for testing, or running
 multiple isolated configs).
 
+## Playing several characters at once
+
+Name more than one profile and each gets its own session, with its own
+scrollback, prompt, input buffer, and rules:
+
+```sh
+mudular tank cleric
+```
+
+- **Layout:** tabs by default (one character full-screen, with a tab bar
+  naming the rest); `F3` switches to side-by-side panes.
+- **Focus:** `Alt+1`/`Alt+2` jump to a character by number, `Ctrl+Tab`
+  cycles. A background session shows `● 3` in its tab for the lines you
+  haven't seen yet, cleared when you focus it.
+- **Typing** always goes to the focused character, and the input box says
+  which one (`input → tank`). Nothing is shared between sessions — the
+  input buffers are separate, so switching mid-sentence keeps both.
+- Opening the same profile twice gives the second one a `-2` suffix
+  (`cleric-2`), which is how rules address it.
+
+### Channel panes
+
+Tells and chat can be pulled out of the main scrollback into their own
+pane, so they don't scroll away under combat spam. Declare them in
+`mudular.yaml`:
+
+```yaml
+channels:
+  - name: comms
+    match:
+      - '^\[gossip\]'
+      - '^\w+ tells you'
+    keep_in_main: false   # false (default) moves the line; true copies it
+    timestamps: true
+```
+
+The panes dock in a column beside the character panes; `F4` shows or hides
+them. With more than one character connected, lines are tagged with the
+one that received them (`[cleric] Bob tells you …`). Add `session: tank`
+to a channel to pin it to a single character instead.
+
+Focusing a channel pane does **not** change where your typing goes — it
+stays with the last character you focused, which is what the input box
+border is telling you.
+
 ## Automation: aliases, triggers, timers
 
 Rules can go directly in a profile, or in a shared module that several
@@ -174,20 +219,48 @@ if the server offers it — but most legacy MUDs never implemented that
 option at all, which is exactly why the profile setting exists as a
 fallback.
 
+## Keys
+
+| Key | Does | Remappable as |
+|---|---|---|
+| `Enter` | Send the input line. On an empty box it sends a bare return, for the "press return to continue" prompts many MUDs use at login. | — |
+| `Ctrl+C` | Quit | `quit` |
+| `Alt+1` … `Alt+9` | Jump straight to session 1–9 | — (built in) |
+| `Ctrl+Tab` | Cycle focus to the next pane, including channel panes | `focus_next` |
+| `F2` | Toggle the raw GMCP inspector for the focused session — the messages the server is sending behind the scenes | `gmcp_inspector` |
+| `F3` | Switch between the tabbed and side-by-side layouts | `cycle_layout` |
+| `F4` | Show or hide the channel panes | `toggle_channels` |
+
+There is no in-client help listing these yet — it's coming, and until then
+this table is the reference.
+
+`Ctrl+Tab` is the one to watch: terminals differ in whether they send it
+at all, and some swallow it for their own tab switching. If it does
+nothing in yours, remap it (`alt+tab` is the usual second choice).
+`Alt+1..9` works everywhere and is unaffected.
+
 ## App settings and keybinds
 
-Optional app-wide settings live at `<config dir>/mudular.yaml`. Today
-this covers the quit key:
+Optional app-wide settings live at `<config dir>/mudular.yaml`. Every key
+in the table above with a name in the last column can be remapped there:
 
 ```yaml
 # ~/.config/mudular/mudular.yaml
 keybinds:
   quit: ctrl+q
+  focus_next: alt+tab
+  gmcp_inspector: f2
+  cycle_layout: f3
+  toggle_channels: f4
 ```
 
-Keybindings are written as `modifier+modifier+key`, e.g. `ctrl+c`,
-`ctrl+shift+q`, `esc`. With no file (or no `keybinds` section), quit
-defaults to `ctrl+c`.
+Keybindings are written as `modifier+modifier+key` — modifiers are
+`ctrl`, `alt`, and `shift`; keys are a single character (`c`), a function
+key (`f2`), or one of `esc`, `enter`, `tab`, `backspace`. Every entry is
+optional: with no file, no `keybinds` section, or a section naming only
+some of them, the rest keep the defaults above. An unknown modifier or key
+name is rejected at startup with the offending string, rather than
+silently leaving you without the binding.
 
 ## Recording a session
 
@@ -202,10 +275,11 @@ mudular --host mud.example.org --port 4000 --record session.log
 ## All flags
 
 ```
-mudular [PROFILE] [OPTIONS]
+mudular [PROFILE]... [OPTIONS]
 
-  [PROFILE]              Profile name to connect with (loads
-                          <config dir>/profiles/<PROFILE>.yaml)
+  [PROFILE]...            Profile name(s) to connect with (each loads
+                          <config dir>/profiles/<PROFILE>.yaml). Naming
+                          several opens one session per character.
 
   --host <HOST>           Connect directly, bypassing profiles
   --port <PORT>           Port for --host (default: 23)

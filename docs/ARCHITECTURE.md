@@ -637,6 +637,8 @@ loudly at load time with file/line context.
   Input buffers are per-session — switching focus never mixes input.
 - **Status bar:** connection state, TLS lock icon, charset, MCCP badge,
   latency (M9).
+- **Discoverability:** every binding above is remappable, so no key may be
+  discovered only by reading the source or the config file — see §11.2.
 
 ### 11.1 Channel panes (M7)
 
@@ -676,6 +678,42 @@ spam — and conversely, so slow conversations stay visible.
 - Rendering is diff-based via ratatui; a full redraw of a 4-pane 200×60
   terminal is well under a millisecond, so we redraw on every event batch
   rather than tracking damage manually.
+
+### 11.2 In-client help (M9, built early)
+
+A keyboard-centric client whose keys are all remappable has a
+discoverability problem it must solve itself: a user who changed
+`focus_next` in `mudular.yaml` has no way to recall what it is now, and a
+user who changed nothing has no way to learn the defaults, without leaving
+the client and reading a file. Everything the UI offers beyond typing a
+command is behind a key.
+
+- **`F1` opens a help overlay** — a modal pane over the current layout,
+  dismissed by the same key or `Esc`. `F1` is chosen because it is the one
+  key a user will try unprompted, and it does not collide with the F2–F4
+  view toggles.
+- **Rendered from the live `Keybinds`, never a hardcoded list.** The
+  overlay reads the same struct the event loop matches against, so a
+  remapped key documents itself and the help cannot drift out of step with
+  what the client actually does. This is the constraint that makes the
+  feature worth having; a static list of defaults would be worse than
+  nothing for the user who remapped something.
+- **Contents:** the configurable bindings grouped by purpose (session
+  focus, layout, views, quit), the built-in `Alt+1..9`, and the
+  client-side commands (`/reload`, `/help`) — which are otherwise just as
+  invisible as the keys.
+- **`/help` prints the same content** into the focused pane, so the
+  overlay is reachable without already knowing a key. Client commands are
+  matched before the line is sent (§7.1), as `/reload` already is.
+- **Bindings not yet implemented render as such** rather than being
+  omitted, so the overlay doubles as an honest statement of what the
+  client can do.
+
+Scheduled in M9 with the rest of the user-facing polish, but built as soon
+as it is useful rather than in milestone order: it is small, and every
+milestone that adds a binding before it lands is a milestone whose
+features nobody can find. M7 alone took the client from one binding to
+five plus the `Alt` row.
 
 ---
 
@@ -733,7 +771,7 @@ exist from M0, even where a stage is a passthrough).
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
-| **M9** | Polish | Scrollback search, disk logging, reconnect/backoff, keyring passwords + auto-login, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | — |
+| **M9** | Polish | In-client help overlay + `/help` (§11.2 — built early, as soon as it is useful); scrollback search, disk logging, reconnect/backoff, keyring passwords + auto-login, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones |
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
