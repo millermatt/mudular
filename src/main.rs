@@ -17,8 +17,9 @@ use proto::charset::Charset;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Profile name to connect with.
-    profile: Option<String>,
+    /// Profile names to connect with. Naming several opens one session per
+    /// character, side by side (docs/ARCHITECTURE.md §14 M7).
+    profiles: Vec<String>,
 
     /// Connect directly to this host (bypasses profiles).
     #[arg(long)]
@@ -73,55 +74,76 @@ async fn main() -> Result<()> {
     let dir = config::config_dir(cli.config_dir.clone())?;
     let app_config = config::load_app_config(&dir)?;
 
-    let target = match (&cli.profile, &cli.host) {
-        (Some(name), _) => {
-            let path = config::profile_path(&dir, name);
-            let profile = config::load_profile(&path)?;
-            let tls = profile.tls.enabled.then(|| net::TlsConfig {
-                verify: profile.tls.verify,
-                pin_store: net::pins::PinStore::new(dir.join("known_certs")),
-            });
-            let charset: Charset = profile
-                .charset
-                .parse()
-                .map_err(|err: String| anyhow::anyhow!(err))
-                .with_context(|| format!("charset in {}", path.display()))?;
-            let layers = config::load_rules(&dir, Some(name))?;
-            Some(app::ConnectTarget {
-                host: profile.host,
-                port: profile.port,
-                tls,
-                record: cli.record.clone(),
-                charset,
-                rules: app::Rules {
-                    engine: engine::Engine::compile(&layers)?,
-                    config_dir: dir.clone(),
-                    profile: Some(name.clone()),
-                },
-            })
-        }
-        (None, Some(host)) => {
-            let tls = cli.tls.then(|| net::TlsConfig {
-                verify: cli.tls_verify,
-                pin_store: net::pins::PinStore::new(dir.join("known_certs")),
-            });
-            // No profile, so only the global layer applies.
-            let layers = config::load_rules(&dir, None)?;
-            Some(app::ConnectTarget {
-                host: host.clone(),
-                port: cli.port,
-                tls,
-                record: cli.record.clone(),
-                charset: cli.charset,
-                rules: app::Rules {
-                    engine: engine::Engine::compile(&layers)?,
-                    config_dir: dir.clone(),
-                    profile: None,
-                },
-            })
-        }
-        (None, None) => None,
-    };
+    let channels = app_config.channels.clone();
+    let mut targets = Vec::new();
+    let mut names: Vec<String> = Vec::new();
 
-    app::run(target, app_config.keybinds).await
+    for name in &cli.profiles {
+        let path = config::profile_path(&dir, name);
+        let profile = config::load_profile(&path)?;
+        let tls = profile.tls.enabled.then(|| net::TlsConfig {
+            verify: profile.tls.verify,
+            pin_store: net::pins::PinStore::new(dir.join("known_certs")),
+        });
+        let charset: Charset = profile
+            .charset
+            .parse()
+            .map_err(|err: String| anyhow::anyhow!(err))
+            .with_context(|| format!("charset in {}", path.display()))?;
+        let layers = config::load_rules(&dir, Some(name), &channels)?;
+        targets.push(app::ConnectTarget {
+            name: session_name(name, &mut names),
+            host: profile.host,
+            port: profile.port,
+            tls,
+            record: cli.record.clone(),
+            charset,
+            rules: app::Rules {
+                engine: engine::Engine::compile(&layers)?,
+                config_dir: dir.clone(),
+                profile: Some(name.clone()),
+            },
+            cross: app_config
+                .cross_session
+                .with_override(profile.cross_session),
+        });
+    }
+
+    if let Some(host) = &cli.host {
+        let tls = cli.tls.then(|| net::TlsConfig {
+            verify: cli.tls_verify,
+            pin_store: net::pins::PinStore::new(dir.join("known_certs")),
+        });
+        // No profile, so only the global layer applies.
+        let layers = config::load_rules(&dir, None, &channels)?;
+        targets.push(app::ConnectTarget {
+            name: session_name(host, &mut names),
+            host: host.clone(),
+            port: cli.port,
+            tls,
+            record: cli.record.clone(),
+            charset: cli.charset,
+            rules: app::Rules {
+                engine: engine::Engine::compile(&layers)?,
+                config_dir: dir.clone(),
+                profile: None,
+            },
+            cross: app_config.cross_session,
+        });
+    }
+
+    app::run(targets, app_config.keybinds, channels).await
+}
+
+/// Sessions are addressed by profile name; a second session on the same
+/// profile gets a numeric suffix (`cleric-2`, docs/ARCHITECTURE.md §7.5).
+fn session_name(base: &str, taken: &mut Vec<String>) -> String {
+    let mut name = base.to_string();
+    let mut suffix = 1;
+    while taken.contains(&name) {
+        suffix += 1;
+        name = format!("{base}-{suffix}");
+    }
+    taken.push(name.clone());
+    name
 }

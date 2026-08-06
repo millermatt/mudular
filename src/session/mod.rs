@@ -25,15 +25,24 @@ use crate::proto::msdp;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, encode_subnegotiation, option};
 use line::{LineAssembler, strip_ansi};
 
-/// Used by the M7 session manager; single-session builds never name one.
-#[allow(dead_code)]
-pub type SessionId = usize;
-
 /// Session → UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// A completed output line (ANSI styling preserved).
     Line(String),
+    /// A line a rule routed to a channel pane (docs/ARCHITECTURE.md §11.1).
+    /// Emitted alongside `Line` when the channel keeps lines in main.
+    Route { channel: String, text: String },
+    /// Commands this session's rules want another session to run. The hub
+    /// resolves `target` (a session name, or `*` for all others) and
+    /// delivers them as [`SessionCommand::Inject`] (§7.5).
+    SendTo {
+        target: String,
+        lines: Vec<String>,
+        /// Which hop this delivery would be; 1 for a locally-originated
+        /// action, one more for each further bounce.
+        hops: u8,
+    },
     /// The text that should sit above the input line. Empty means none.
     Prompt(String),
     /// Server asked us to mask/unmask local input (Telnet ECHO).
@@ -58,6 +67,15 @@ pub enum SessionCommand {
     /// triggers read, so it lives in the session task where that state
     /// needs no locking (docs/ARCHITECTURE.md §3).
     SendLine(String),
+    /// Commands another session's rules asked this one to run (§7.5).
+    /// Whether they run through this session's aliases is this session's
+    /// own `cross_session.expand_aliases` setting — a sender can never
+    /// force it.
+    Inject {
+        from: String,
+        lines: Vec<String>,
+        hops: u8,
+    },
     /// Replace the rule set without reconnecting (`/reload`).
     SetRules(Box<Engine>),
     /// Pane was resized; renegotiate NAWS.
@@ -71,6 +89,7 @@ pub enum SessionCommand {
 /// Connect and spawn the session task, returning its event stream and
 /// command sink. The task runs until the connection ends or `Disconnect`
 /// is received.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     host: String,
     port: u16,
@@ -78,11 +97,20 @@ pub fn spawn(
     record: Option<PathBuf>,
     charset: Charset,
     engine: Engine,
+    expand_injected: bool,
 ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>) {
     let (event_tx, event_rx) = mpsc::channel(256);
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
     tokio::spawn(run(
-        host, port, tls, record, charset, engine, event_tx, cmd_rx,
+        host,
+        port,
+        tls,
+        record,
+        charset,
+        engine,
+        expand_injected,
+        event_tx,
+        cmd_rx,
     ));
     (event_rx, cmd_tx)
 }
@@ -95,6 +123,7 @@ async fn run(
     record: Option<PathBuf>,
     charset: Charset,
     mut engine: Engine,
+    expand_injected: bool,
     events: mpsc::Sender<SessionEvent>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
@@ -166,6 +195,8 @@ async fn run(
                         }
 
                         let mut outbound: Vec<String> = Vec::new();
+                        // Cross-session actions the hub has to route (§7.5).
+                        let mut cross_out: Vec<crate::engine::CrossSend> = Vec::new();
                         // Negotiation replies triggered by inbound events
                         // (Core.Hello/Supports) rather than typed/trigger
                         // commands, so they bypass the CRLF line framing.
@@ -251,19 +282,28 @@ async fn run(
                                     // Triggers run between the line assembler
                                     // and the UI (§6.5), so a gagged line never
                                     // reaches the scrollback at all.
-                                    let event = match event {
+                                    let mut emit: Vec<SessionEvent> = Vec::new();
+                                    match event {
                                         SessionEvent::Line(text) => {
                                             let outcome = engine.process_line(&strip_ansi(&text));
                                             outbound.extend(outcome.sends);
-                                            if outcome.gag {
-                                                continue;
+                                            cross_out.extend(outcome.send_to);
+                                            if let Some(channel) = outcome.route {
+                                                emit.push(SessionEvent::Route {
+                                                    channel,
+                                                    text: text.clone(),
+                                                });
                                             }
-                                            SessionEvent::Line(text)
+                                            if !outcome.gag {
+                                                emit.push(SessionEvent::Line(text));
+                                            }
                                         }
-                                        other => other,
-                                    };
-                                    if events.send(event).await.is_err() {
-                                        return;
+                                        other => emit.push(other),
+                                    }
+                                    for event in emit {
+                                        if events.send(event).await.is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -276,6 +316,9 @@ async fn run(
                         // back through aliases, so rules cannot recurse.
                         if send_lines(&mut writer, &outbound).await.is_err() {
                             break "write failed".to_string();
+                        }
+                        if emit_cross_sends(&events, cross_out, FIRST_HOP).await.is_err() {
+                            return;
                         }
                         for bytes in &raw_out {
                             if writer.write_all(bytes).await.is_err() {
@@ -302,9 +345,42 @@ async fn run(
             cmd = commands.recv() => {
                 match cmd {
                     Some(SessionCommand::SendLine(line)) => {
-                        let expanded = engine.expand_input(&line);
-                        if send_lines(&mut writer, &expanded).await.is_err() {
+                        let outcome = engine.expand_input(&line);
+                        if send_lines(&mut writer, &outcome.sends).await.is_err() {
                             break "write failed".to_string();
+                        }
+                        if emit_cross_sends(&events, outcome.send_to, FIRST_HOP).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(SessionCommand::Inject { from, lines, hops }) => {
+                        // Echo locally first: nothing another session does to
+                        // this one may happen invisibly (§7.5).
+                        for line in &lines {
+                            let echo = SessionEvent::Line(format!("[from {from}] {line}"));
+                            if events.send(echo).await.is_err() {
+                                return;
+                            }
+                        }
+                        let (sends, cross) = if expand_injected {
+                            let mut sends = Vec::new();
+                            let mut cross = Vec::new();
+                            for line in &lines {
+                                let outcome = engine.expand_input(line);
+                                sends.extend(outcome.sends);
+                                cross.extend(outcome.send_to);
+                            }
+                            (sends, cross)
+                        } else {
+                            (lines, Vec::new())
+                        };
+                        if send_lines(&mut writer, &sends).await.is_err() {
+                            break "write failed".to_string();
+                        }
+                        // Anything this injection set off is one hop further
+                        // from where the chain started, so it runs out.
+                        if emit_cross_sends(&events, cross, hops.saturating_add(1)).await.is_err() {
+                            return;
                         }
                     }
                     Some(SessionCommand::SetRules(rules)) => {
@@ -326,6 +402,30 @@ async fn run(
     };
 
     let _ = events.send(SessionEvent::Ended(reason)).await;
+}
+
+/// A cross-session action a session raised itself is the first hop; the
+/// counter only grows when one injection sets off another (§7.5).
+const FIRST_HOP: u8 = 1;
+
+/// Hand the hub the cross-session actions a rule produced, tagged with the
+/// hop they would be. The hub owns addressing and the hop limit, since only
+/// it knows what other sessions exist.
+async fn emit_cross_sends(
+    events: &mpsc::Sender<SessionEvent>,
+    sends: Vec<crate::engine::CrossSend>,
+    hops: u8,
+) -> Result<(), mpsc::error::SendError<SessionEvent>> {
+    for send in sends {
+        events
+            .send(SessionEvent::SendTo {
+                target: send.target,
+                lines: send.lines,
+                hops,
+            })
+            .await?;
+    }
+    Ok(())
 }
 
 /// Write each command as its own CRLF-terminated line.
@@ -602,6 +702,7 @@ mod tests {
             Some(path.clone()),
             Charset::Utf8,
             Engine::default(),
+            false,
         );
         assert_eq!(next_line(&mut events).await, "hi");
 
@@ -1371,6 +1472,7 @@ mod tests {
             None,
             Charset::Utf8,
             engine,
+            false,
         )
     }
 

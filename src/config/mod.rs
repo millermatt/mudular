@@ -51,6 +51,78 @@ pub struct Profile {
     pub triggers: Vec<Trigger>,
     #[serde(default)]
     pub timers: Vec<Timer>,
+    /// Overrides the install-wide `cross_session` block for this character
+    /// (docs/ARCHITECTURE.md §7.5). Receiver-side by design: only the
+    /// profile whose aliases would run can opt into running them.
+    #[serde(default)]
+    pub cross_session: Option<CrossSessionOverride>,
+}
+
+/// How a session treats commands other sessions inject into it (§7.5).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossSession {
+    /// Run injected commands through this session's aliases.
+    #[serde(default)]
+    pub expand_aliases: bool,
+    /// How many times an injected command may bounce onward.
+    #[serde(default = "default_max_hops")]
+    pub max_hops: u8,
+}
+
+impl Default for CrossSession {
+    fn default() -> Self {
+        Self {
+            expand_aliases: false,
+            max_hops: default_max_hops(),
+        }
+    }
+}
+
+fn default_max_hops() -> u8 {
+    1
+}
+
+/// The same block with every field optional, for the per-profile override.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossSessionOverride {
+    #[serde(default)]
+    pub expand_aliases: Option<bool>,
+    #[serde(default)]
+    pub max_hops: Option<u8>,
+}
+
+impl CrossSession {
+    /// Applies a profile's overrides over the install-wide defaults.
+    pub fn with_override(self, over: Option<CrossSessionOverride>) -> Self {
+        let Some(over) = over else { return self };
+        Self {
+            expand_aliases: over.expand_aliases.unwrap_or(self.expand_aliases),
+            max_hops: over.max_hops.unwrap_or(self.max_hops),
+        }
+    }
+}
+
+/// A named pane that collects matching lines out of the main scrollback
+/// (docs/ARCHITECTURE.md §11.1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Channel {
+    pub name: String,
+    /// Sugar: each pattern compiles to an ordinary route trigger, so
+    /// classification gets the engine's full regex machinery.
+    #[serde(default, rename = "match")]
+    pub matches: Vec<String>,
+    /// `false` (the default) moves matching lines out of the main
+    /// scrollback; `true` mirrors them to both.
+    #[serde(default)]
+    pub keep_in_main: bool,
+    #[serde(default)]
+    pub timestamps: bool,
+    /// Pins the channel to one session instead of aggregating across all.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -80,6 +152,12 @@ pub fn load_profile(path: &Path) -> Result<Profile> {
 pub struct AppConfig {
     #[serde(default)]
     pub keybinds: Keybinds,
+    /// Channel panes shared by every session (docs/ARCHITECTURE.md §11.1).
+    #[serde(default)]
+    pub channels: Vec<Channel>,
+    /// Install-wide default for injected commands (§7.5).
+    #[serde(default)]
+    pub cross_session: CrossSession,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +168,17 @@ pub struct Keybinds {
     /// Toggles the raw GMCP inspector view (docs/ARCHITECTURE.md §14 M6).
     #[serde(default = "default_gmcp_inspector")]
     pub gmcp_inspector: KeyBinding,
+    /// Cycles focus to the next pane. Terminals vary in whether they
+    /// deliver Ctrl+Tab at all — remap to `alt+tab` if yours does not
+    /// (docs/ARCHITECTURE.md §11).
+    #[serde(default = "default_focus_next")]
+    pub focus_next: KeyBinding,
+    /// Switches between the tabbed and split layouts.
+    #[serde(default = "default_cycle_layout")]
+    pub cycle_layout: KeyBinding,
+    /// Shows or hides the channel panes (§11.1).
+    #[serde(default = "default_toggle_channels")]
+    pub toggle_channels: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -97,8 +186,23 @@ impl Default for Keybinds {
         Self {
             quit: default_quit(),
             gmcp_inspector: default_gmcp_inspector(),
+            focus_next: default_focus_next(),
+            cycle_layout: default_cycle_layout(),
+            toggle_channels: default_toggle_channels(),
         }
     }
+}
+
+fn default_focus_next() -> KeyBinding {
+    "ctrl+tab".parse().expect("built-in default keybinding")
+}
+
+fn default_cycle_layout() -> KeyBinding {
+    "f3".parse().expect("built-in default keybinding")
+}
+
+fn default_toggle_channels() -> KeyBinding {
+    "f4".parse().expect("built-in default keybinding")
 }
 
 fn default_quit() -> KeyBinding {
@@ -230,38 +334,97 @@ pub fn load_module(path: &Path) -> Result<RuleModule> {
 /// The ordered scope layers for a session, lowest precedence first
 /// (docs/ARCHITECTURE.md §7.3): global defaults, then the shared modules
 /// the profile lists in order, then the profile's own inline rules.
-pub fn load_rules(dir: &Path, profile: Option<&str>) -> Result<Vec<RuleModule>> {
-    let mut layers = Vec::new();
+/// `channels` are the install-wide channel panes: their `match:` patterns
+/// become the lowest-precedence layer (so a profile can disable one by id),
+/// and every `route:` a rule names must resolve to one of them.
+pub fn load_rules(
+    dir: &Path,
+    profile: Option<&str>,
+    channels: &[Channel],
+) -> Result<Vec<RuleModule>> {
+    let mut layers = vec![channel_module(channels, profile)];
 
     let global = dir.join("global.yaml");
     if global.exists() {
         layers.push(load_module(&global)?);
     }
 
-    let Some(name) = profile else {
-        return Ok(layers);
-    };
-    let path = profile_path(dir, name);
-    let profile = load_profile(&path)?;
+    if let Some(name) = profile {
+        let path = profile_path(dir, name);
+        let profile = load_profile(&path)?;
 
-    for module in &profile.modules {
-        let module_path = dir.join("modules").join(format!("{module}.yaml"));
-        layers.push(
-            load_module(&module_path)
-                .with_context(|| format!("module `{module}` listed in profile `{name}`"))?,
-        );
+        for module in &profile.modules {
+            let module_path = dir.join("modules").join(format!("{module}.yaml"));
+            layers.push(
+                load_module(&module_path)
+                    .with_context(|| format!("module `{module}` listed in profile `{name}`"))?,
+            );
+        }
+
+        layers.push(RuleModule {
+            name: format!("profile `{name}`"),
+            description: None,
+            variables: profile.variables,
+            aliases: profile.aliases,
+            triggers: profile.triggers,
+            timers: profile.timers,
+        });
     }
 
-    layers.push(RuleModule {
-        name: format!("profile `{name}`"),
-        description: None,
-        variables: profile.variables,
-        aliases: profile.aliases,
-        triggers: profile.triggers,
-        timers: profile.timers,
-    });
-
+    for layer in &mut layers {
+        apply_channel_defaults(layer, channels)?;
+    }
     Ok(layers)
+}
+
+/// Compiles the channels' `match:` sugar into ordinary route triggers
+/// (docs/ARCHITECTURE.md §11.1). A channel pinned to another session
+/// contributes nothing here, so its lines are never classified — and so
+/// never gagged — in sessions it does not belong to.
+fn channel_module(channels: &[Channel], profile: Option<&str>) -> RuleModule {
+    let mut triggers = Vec::new();
+    for channel in channels {
+        if let Some(pinned) = &channel.session
+            && Some(pinned.as_str()) != profile
+        {
+            continue;
+        }
+        for (index, pattern) in channel.matches.iter().enumerate() {
+            triggers.push(Trigger {
+                id: Some(format!("channel:{}:{index}", channel.name)),
+                pattern: Some(pattern.clone()),
+                route: Some(channel.name.clone()),
+                ..Trigger::default()
+            });
+        }
+    }
+    RuleModule {
+        name: "channels".to_string(),
+        triggers,
+        ..RuleModule::default()
+    }
+}
+
+/// Fills in what a routed trigger inherits from its channel: move-vs-copy
+/// is a property of the channel, so `keep_in_main: false` becomes the
+/// trigger's `gag` unless the rule sets one itself.
+fn apply_channel_defaults(layer: &mut RuleModule, channels: &[Channel]) -> Result<()> {
+    for trigger in &mut layer.triggers {
+        let Some(name) = trigger.route.clone() else {
+            continue;
+        };
+        let channel = channels
+            .iter()
+            .find(|channel| channel.name == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rule in `{}` routes to unknown channel `{name}`; declare it under `channels:` in mudular.yaml",
+                    layer.name
+                )
+            })?;
+        trigger.gag.get_or_insert(!channel.keep_in_main);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -485,7 +648,7 @@ triggers:
         .unwrap();
 
         let engine = |profile: &str| {
-            let layers = load_rules(dir, Some(profile)).expect("rules load");
+            let layers = load_rules(dir, Some(profile), &[]).expect("rules load");
             crate::engine::Engine::compile(&layers).expect("rules compile")
         };
 
@@ -493,8 +656,8 @@ triggers:
         let mut cleric = engine("cleric");
 
         // Module variable beats global; profile beats module.
-        assert_eq!(tank.expand_input("k"), vec!["kill kobold"]);
-        assert_eq!(cleric.expand_input("k"), vec!["kill dragon"]);
+        assert_eq!(tank.expand_input("k").sends, vec!["kill kobold"]);
+        assert_eq!(cleric.expand_input("k").sends, vec!["kill dragon"]);
 
         // The profile disables an inherited module rule by id alone.
         assert_eq!(
@@ -514,8 +677,8 @@ triggers:
         );
 
         // An untouched global rule survives in both.
-        assert_eq!(tank.expand_input("ll"), vec!["look"]);
-        assert_eq!(cleric.expand_input("ll"), vec!["look"]);
+        assert_eq!(tank.expand_input("ll").sends, vec!["look"]);
+        assert_eq!(cleric.expand_input("ll").sends, vec!["look"]);
     }
 
     /// A profile naming a module that isn't there must say which module and
@@ -531,7 +694,7 @@ triggers:
         )
         .unwrap();
 
-        let err = load_rules(dir, Some("tank")).unwrap_err();
+        let err = load_rules(dir, Some("tank"), &[]).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("nope"), "{message}");
         assert!(message.contains("tank"), "{message}");
@@ -550,7 +713,7 @@ triggers:
                 .matches(KeyCode::Char('q'), KeyModifiers::CONTROL)
         );
 
-        let layers = load_rules(&dir, Some("kestrel")).expect("example rules load");
+        let layers = load_rules(&dir, Some("kestrel"), &[]).expect("example rules load");
         let engine = crate::engine::Engine::compile(&layers).expect("example rules compile");
 
         // The profile disables the module's autoloot and overrides its
@@ -565,6 +728,6 @@ triggers:
             vec!["say well met, Ærlend"]
         );
         // ...and overrides the module's `target` variable.
-        assert_eq!(engine.expand_input("k"), vec!["kill dragon"]);
+        assert_eq!(engine.expand_input("k").sends, vec!["kill dragon"]);
     }
 }

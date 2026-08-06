@@ -52,6 +52,9 @@ pub struct Alias {
     pub pattern: Option<String>,
     #[serde(default)]
     pub send: Option<Vec<String>>,
+    /// Commands for *other* sessions, keyed by session name (§7.5).
+    #[serde(default)]
+    pub send_to: Option<BTreeMap<String, Vec<String>>>,
     #[serde(default)]
     pub set: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -68,10 +71,17 @@ pub struct Trigger {
     pub pattern: Option<String>,
     #[serde(default)]
     pub send: Option<Vec<String>>,
+    /// Commands for *other* sessions, keyed by session name (§7.5).
+    #[serde(default)]
+    pub send_to: Option<BTreeMap<String, Vec<String>>>,
     #[serde(default)]
     pub set: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub gag: Option<bool>,
+    /// Send the matched line to this channel pane instead of leaving it to
+    /// the main scrollback alone (§11.1).
+    #[serde(default)]
+    pub route: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
 }
@@ -118,6 +128,14 @@ pub enum EngineError {
     },
 }
 
+/// Commands a rule asks another session to run (docs/ARCHITECTURE.md §7.5).
+/// `target` is a session name, or `*` for every other session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossSend {
+    pub target: String,
+    pub lines: Vec<String>,
+}
+
 /// What a matched line asks the session to do.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LineOutcome {
@@ -125,14 +143,29 @@ pub struct LineOutcome {
     pub gag: bool,
     /// Commands to send to the server, in trigger order.
     pub sends: Vec<String>,
+    /// Commands for other sessions, for the hub to route (§7.5).
+    pub send_to: Vec<CrossSend>,
+    /// Channel pane this line also belongs in (§11.1).
+    pub route: Option<String>,
+}
+
+/// What a typed input line expands to.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct InputOutcome {
+    /// Commands to send to the server, in input order.
+    pub sends: Vec<String>,
+    /// Commands for other sessions, for the hub to route (§7.5).
+    pub send_to: Vec<CrossSend>,
 }
 
 #[derive(Debug)]
 struct CompiledRule {
     regex: Regex,
     sends: Vec<String>,
+    send_to: Vec<(String, Vec<String>)>,
     set: Vec<(String, String)>,
     gag: bool,
+    route: Option<String>,
 }
 
 #[derive(Debug)]
@@ -205,6 +238,17 @@ impl Engine {
                     &self.server_data,
                 ));
             }
+            for (target, templates) in &rule.send_to {
+                outcome.send_to.push(CrossSend {
+                    target: target.clone(),
+                    lines: templates
+                        .iter()
+                        .map(|template| {
+                            expand(template, Some(&caps), &self.variables, &self.server_data)
+                        })
+                        .collect(),
+                });
+            }
             for (name, template) in &rule.set {
                 updates.push((
                     name.clone(),
@@ -212,6 +256,11 @@ impl Engine {
                 ));
             }
             outcome.gag |= rule.gag;
+            // First route wins: a line belongs in one channel, and rules
+            // fire in scope order, so the most specific layer decides.
+            if outcome.route.is_none() {
+                outcome.route.clone_from(&rule.route);
+            }
         }
 
         self.variables.extend(updates);
@@ -240,8 +289,8 @@ impl Engine {
     /// Turn one typed input line into the commands to send: split on `;`,
     /// then expand each part through aliases. Alias output is never
     /// re-expanded, so aliases cannot recurse into each other.
-    pub fn expand_input(&mut self, input: &str) -> Vec<String> {
-        let mut out = Vec::new();
+    pub fn expand_input(&mut self, input: &str) -> InputOutcome {
+        let mut out = InputOutcome::default();
         let mut updates: Vec<(String, String)> = Vec::new();
 
         for part in input.split(';') {
@@ -256,12 +305,28 @@ impl Engine {
             {
                 Some((rule, caps)) => {
                     for template in &rule.sends {
-                        out.push(expand(
+                        out.sends.push(expand(
                             template,
                             Some(&caps),
                             &self.variables,
                             &self.server_data,
                         ));
+                    }
+                    for (target, templates) in &rule.send_to {
+                        out.send_to.push(CrossSend {
+                            target: target.clone(),
+                            lines: templates
+                                .iter()
+                                .map(|template| {
+                                    expand(
+                                        template,
+                                        Some(&caps),
+                                        &self.variables,
+                                        &self.server_data,
+                                    )
+                                })
+                                .collect(),
+                        });
                     }
                     for (name, template) in &rule.set {
                         updates.push((
@@ -270,7 +335,7 @@ impl Engine {
                         ));
                     }
                 }
-                None => out.push(part.to_string()),
+                None => out.sends.push(part.to_string()),
             }
         }
 
@@ -408,6 +473,7 @@ impl Layered for Alias {
         self.id = self.id.take().or_else(|| base.id.clone());
         self.pattern = self.pattern.take().or_else(|| base.pattern.clone());
         self.send = self.send.take().or_else(|| base.send.clone());
+        self.send_to = self.send_to.take().or_else(|| base.send_to.clone());
         self.set = self.set.take().or_else(|| base.set.clone());
         self.enabled = self.enabled.or(base.enabled);
     }
@@ -435,8 +501,10 @@ impl Layered for Trigger {
         self.id = self.id.take().or_else(|| base.id.clone());
         self.pattern = self.pattern.take().or_else(|| base.pattern.clone());
         self.send = self.send.take().or_else(|| base.send.clone());
+        self.send_to = self.send_to.take().or_else(|| base.send_to.clone());
         self.set = self.set.take().or_else(|| base.set.clone());
         self.gag = self.gag.or(base.gag);
+        self.route = self.route.take().or_else(|| base.route.clone());
         self.enabled = self.enabled.or(base.enabled);
     }
 }
@@ -477,8 +545,10 @@ trait CompilableRule {
     fn pattern_str(&self) -> Option<&str>;
     fn enabled(&self) -> bool;
     fn sends(&self) -> Vec<String>;
+    fn send_to(&self) -> Vec<(String, Vec<String>)>;
     fn sets(&self) -> Vec<(String, String)>;
     fn gag(&self) -> bool;
+    fn route(&self) -> Option<String>;
 }
 
 impl CompilableRule for Alias {
@@ -494,11 +564,21 @@ impl CompilableRule for Alias {
     fn sends(&self) -> Vec<String> {
         self.send.clone().unwrap_or_default()
     }
+    fn send_to(&self) -> Vec<(String, Vec<String>)> {
+        self.send_to
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
     fn sets(&self) -> Vec<(String, String)> {
         self.set.clone().unwrap_or_default().into_iter().collect()
     }
     fn gag(&self) -> bool {
         false
+    }
+    fn route(&self) -> Option<String> {
+        None
     }
 }
 
@@ -515,11 +595,21 @@ impl CompilableRule for Trigger {
     fn sends(&self) -> Vec<String> {
         self.send.clone().unwrap_or_default()
     }
+    fn send_to(&self) -> Vec<(String, Vec<String>)> {
+        self.send_to
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
     fn sets(&self) -> Vec<(String, String)> {
         self.set.clone().unwrap_or_default().into_iter().collect()
     }
     fn gag(&self) -> bool {
         self.gag.unwrap_or(false)
+    }
+    fn route(&self) -> Option<String> {
+        self.route.clone()
     }
 }
 
@@ -537,8 +627,10 @@ fn compile_rules<T: CompilableRule>(rules: &[T]) -> Result<Vec<CompiledRule>, En
                 source,
             })?,
             sends: rule.sends(),
+            send_to: rule.send_to(),
             set: rule.sets(),
             gag: rule.gag(),
+            route: rule.route(),
         });
     }
     Ok(out)
@@ -697,10 +789,10 @@ mod tests {
             "#,
         );
         assert_eq!(
-            engine.expand_input("gh 帽子"),
+            engine.expand_input("gh 帽子").sends,
             vec!["get 帽子", "wear 帽子"]
         );
-        assert_eq!(engine.expand_input("look"), vec!["look"]);
+        assert_eq!(engine.expand_input("look").sends, vec!["look"]);
     }
 
     /// The `${target}` in §7.2's own example is a *variable*, not a capture
@@ -717,7 +809,7 @@ mod tests {
                 send: ["cast heal ${target}"]
             "#,
         );
-        assert_eq!(engine.expand_input("hh"), vec!["cast heal rat"]);
+        assert_eq!(engine.expand_input("hh").sends, vec!["cast heal rat"]);
     }
 
     #[test]
@@ -730,7 +822,7 @@ mod tests {
                 send: ["kill ${nope}"]
             "#,
         );
-        assert_eq!(engine.expand_input("t"), vec!["kill ${nope}"]);
+        assert_eq!(engine.expand_input("t").sends, vec!["kill ${nope}"]);
     }
 
     #[test]
@@ -749,7 +841,7 @@ mod tests {
         );
         engine.process_line("You are fighting kobold");
         assert_eq!(engine.variable("target"), Some("kobold"));
-        assert_eq!(engine.expand_input("k"), vec!["kill kobold"]);
+        assert_eq!(engine.expand_input("k").sends, vec!["kill kobold"]);
     }
 
     #[test]
@@ -763,10 +855,10 @@ mod tests {
             "#,
         );
         assert_eq!(
-            engine.expand_input("n; gh sword ;n"),
+            engine.expand_input("n; gh sword ;n").sends,
             vec!["n", "get sword", "wear sword", "n"]
         );
-        assert_eq!(engine.expand_input(";;"), Vec::<String>::new());
+        assert_eq!(engine.expand_input(";;").sends, Vec::<String>::new());
     }
 
     /// Alias output is not re-expanded, so two aliases cannot bounce off
@@ -783,7 +875,7 @@ mod tests {
                 send: ["a"]
             "#,
         );
-        assert_eq!(engine.expand_input("a"), vec!["b"]);
+        assert_eq!(engine.expand_input("a").sends, vec!["b"]);
     }
 
     #[test]
@@ -828,7 +920,7 @@ mod tests {
             "#,
         );
         engine.update_server_data_from_gmcp("Char.Vitals.hp", "87".to_string());
-        assert_eq!(engine.expand_input("hp"), vec!["hp is 87"]);
+        assert_eq!(engine.expand_input("hp").sends, vec!["hp is 87"]);
     }
 
     #[test]
@@ -843,7 +935,7 @@ mod tests {
         );
         engine.update_server_data_from_gmcp("Char.Vitals.hp", "87".to_string());
         engine.update_server_data_from_gmcp("Char.Vitals.hp", "42".to_string());
-        assert_eq!(engine.expand_input("hp"), vec!["hp is 42"]);
+        assert_eq!(engine.expand_input("hp").sends, vec!["hp is 42"]);
     }
 
     /// A rule author's own variable of the same name wins over live server
@@ -861,7 +953,7 @@ mod tests {
             "#,
         );
         engine.update_server_data_from_gmcp("hp", "87".to_string());
-        assert_eq!(engine.expand_input("hp"), vec!["hp is unknown"]);
+        assert_eq!(engine.expand_input("hp").sends, vec!["hp is unknown"]);
     }
 
     /// The milestone's actual acceptance wording (§14 M6): a *trigger* — an
@@ -902,7 +994,7 @@ mod tests {
         );
         engine.update_server_data_from_gmcp("Char.Vitals.hp", "55".to_string());
         engine.process_line("snapshot");
-        assert_eq!(engine.expand_input("recall"), vec!["it was 55"]);
+        assert_eq!(engine.expand_input("recall").sends, vec!["it was 55"]);
     }
 
     /// §6.3: "where a server offers both, GMCP is preferred" — an MSDP
@@ -919,7 +1011,7 @@ mod tests {
         );
         engine.update_server_data_from_gmcp("hp", "87".to_string());
         engine.update_server_data_from_msdp("hp", "0".to_string());
-        assert_eq!(engine.expand_input("hp"), vec!["hp is 87"]);
+        assert_eq!(engine.expand_input("hp").sends, vec!["hp is 87"]);
     }
 
     /// The reverse is fine: GMCP data always overrides an earlier MSDP
@@ -936,7 +1028,7 @@ mod tests {
         );
         engine.update_server_data_from_msdp("hp", "0".to_string());
         engine.update_server_data_from_gmcp("hp", "87".to_string());
-        assert_eq!(engine.expand_input("hp"), vec!["hp is 87"]);
+        assert_eq!(engine.expand_input("hp").sends, vec!["hp is 87"]);
     }
 
     /// MSDP-only keys (no GMCP equivalent) still land normally.
@@ -951,7 +1043,10 @@ mod tests {
             "#,
         );
         engine.update_server_data_from_msdp("room_name", "The Bazaar".to_string());
-        assert_eq!(engine.expand_input("room"), vec!["you are in The Bazaar"]);
+        assert_eq!(
+            engine.expand_input("room").sends,
+            vec!["you are in The Bazaar"]
+        );
     }
 
     #[test]
@@ -1157,7 +1252,7 @@ mod tests {
                 pattern: 'x'
                 send: ["trigger fired"]
             "#]);
-        assert_eq!(engine.expand_input("x"), vec!["alias fired"]);
+        assert_eq!(engine.expand_input("x").sends, vec!["alias fired"]);
         assert_eq!(engine.process_line("x").sends, vec!["trigger fired"]);
     }
 
