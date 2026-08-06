@@ -1,0 +1,342 @@
+//! End-to-end smoke test: the real binary, driven through a real pty.
+//!
+//! Everything below `main` already has unit and integration coverage. What
+//! only this exercises is the assembly — CLI args → config dir → profile →
+//! compiled rules → session → terminal — plus the quit keybinding actually
+//! gating the event loop, which cannot be observed without a terminal.
+//!
+//! Deliberately thin: one launch that proves the wiring, one that proves a
+//! remapped key. Behaviour worth asserting in detail belongs in the fast
+//! tests next to the code that implements it.
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// ratatui writes cells in diff order, so a phrase with spaces can reach
+/// the terminal split by cursor moves. A single unspaced token always
+/// arrives contiguously, which makes it safe to search for.
+const BANNER: &str = "MUDULAR-SMOKE-BANNER";
+
+const CTRL_C: &[u8] = b"\x03";
+const CTRL_Q: &[u8] = b"\x11";
+
+#[test]
+fn plays_from_a_profile_with_its_rules_and_quits() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+
+    app.wait_for(BANNER, "the server banner should reach the screen");
+
+    // `k` is an alias defined in the shared module, using a variable the
+    // profile overrides — if main.rs did not compile and pass the rules,
+    // the server would see the raw "k" instead.
+    app.type_line("k");
+    mud.wait_for_command("kill dragon", "the profile's rules should apply");
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+#[test]
+fn honours_a_remapped_quit_key() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, Some("ctrl+q"));
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the screen");
+
+    app.send(CTRL_C);
+    assert!(
+        app.still_running(),
+        "ctrl+c must be inert once quit is remapped"
+    );
+
+    app.send(CTRL_Q);
+    app.expect_exit("the remapped quit key should quit");
+}
+
+/// A config dir with a shared module the profile pulls in and overrides.
+fn write_config(dir: &Path, port: u16, quit: Option<&str>) {
+    std::fs::create_dir_all(dir.join("profiles")).unwrap();
+    std::fs::create_dir_all(dir.join("modules")).unwrap();
+
+    if let Some(quit) = quit {
+        std::fs::write(
+            dir.join("mudular.yaml"),
+            format!("keybinds:\n  quit: {quit}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.join("modules/combat.yaml"),
+        "name: combat\nvariables:\n  target: kobold\naliases:\n  - id: kill\n    pattern: '^k$'\n    send: [\"kill ${target}\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("profiles/tank.yaml"),
+        format!(
+            "name: tank\nhost: 127.0.0.1\nport: {port}\nmodules: [combat]\nvariables:\n  target: dragon\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A minimal MUD: greets on connect, then records what the client sends.
+struct FakeMud {
+    port: u16,
+    received: Arc<Mutex<Vec<u8>>>,
+}
+
+impl FakeMud {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+
+        let sink = Arc::clone(&received);
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let _ = sock.write_all(format!("{BANNER}\r\n").as_bytes());
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .extend_from_slice(&strip_telnet(&buf[..n]));
+            }
+        });
+
+        FakeMud { port, received }
+    }
+
+    fn wait_for_command(&self, expected: &str, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let seen = String::from_utf8_lossy(&self.received.lock().unwrap()).into_owned();
+            if seen.lines().any(|line| line.trim() == expected) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let seen = String::from_utf8_lossy(&self.received.lock().unwrap()).into_owned();
+        panic!("{why}: never received {expected:?}; got {seen:?}");
+    }
+}
+
+/// Removes Telnet negotiation from client→server bytes, as a real server
+/// would before treating input as a command.
+fn strip_telnet(bytes: &[u8]) -> Vec<u8> {
+    const IAC: u8 = 255;
+    let mut out = Vec::new();
+    let mut iter = bytes.iter().copied().peekable();
+    while let Some(byte) = iter.next() {
+        if byte != IAC {
+            out.push(byte);
+            continue;
+        }
+        match iter.next() {
+            Some(IAC) => out.push(IAC),
+            // Subnegotiation: skip through the terminating IAC SE.
+            Some(250) => {
+                while let Some(b) = iter.next() {
+                    if b == IAC && iter.peek() == Some(&240) {
+                        iter.next();
+                        break;
+                    }
+                }
+            }
+            // WILL/WONT/DO/DONT carry one option byte.
+            Some(251..=254) => {
+                iter.next();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The binary under test, running on the slave side of a pty.
+struct App {
+    child: Child,
+    master: OwnedFd,
+    output: String,
+}
+
+impl App {
+    fn launch(args: &[&str]) -> Self {
+        let (master, slave) = open_pty();
+
+        // The child needs its own session with this pty as controlling
+        // terminal, or crossterm cannot open /dev/tty for key events.
+        let slave_fd = slave.as_raw_fd();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mudular"));
+        command
+            .args(args)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()));
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("the binary should start");
+        drop(slave);
+
+        // Non-blocking, so reads can poll instead of hanging on a child
+        // that has nothing to say.
+        unsafe {
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        App {
+            child,
+            master,
+            output: String::new(),
+        }
+    }
+
+    fn send(&mut self, bytes: &[u8]) {
+        let mut file = unsafe { std::fs::File::from_raw_fd(libc::dup(self.master.as_raw_fd())) };
+        file.write_all(bytes).expect("writing to the pty");
+        file.flush().ok();
+    }
+
+    fn type_line(&mut self, line: &str) {
+        self.send(line.as_bytes());
+        self.send(b"\r");
+    }
+
+    fn pump(&mut self) {
+        let mut file = unsafe { std::fs::File::from_raw_fd(libc::dup(self.master.as_raw_fd())) };
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = file.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            self.output.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+
+    fn wait_for(&mut self, needle: &str, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            self.pump();
+            if self.output.contains(needle) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("{why}: never saw {needle:?} in the terminal output");
+    }
+
+    fn still_running(&mut self) -> bool {
+        // Give a quit that should not happen time to happen anyway.
+        std::thread::sleep(Duration::from_millis(500));
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn expect_exit(&mut self, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                assert!(status.success(), "{why}: exited with {status}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("{why}: the process was still running");
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn open_pty() -> (OwnedFd, std::fs::File) {
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+
+    // A window large enough that the banner is not wrapped or truncated.
+    let size = libc::winsize {
+        ws_row: 30,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        libc::ioctl(slave, libc::TIOCSWINSZ, &size);
+    }
+
+    unsafe {
+        (
+            OwnedFd::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    }
+}
+
+/// Scratch directory that cleans up after itself.
+struct TempDir(PathBuf, String);
+
+impl TempDir {
+    fn new() -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("mudular-pty-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let display = path.to_string_lossy().into_owned();
+        TempDir(path, display)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn path_str(&self) -> &str {
+        &self.1
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}

@@ -792,6 +792,7 @@ dependencies = [
  "crossterm",
  "directories",
  "futures",
+ "libc",
  "ratatui",
  "rcgen",
  "regex",
