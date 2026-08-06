@@ -302,6 +302,9 @@ pinned by integration tests with synthetic compressed captures.
   line, echo a local note, play the terminal bell, call a script (§7.4),
   send commands to *another* session (§7.5), route the line to a channel
   pane (§11.1).
+- **Condition:** an optional `when:` guard on an alias or trigger. The
+  pattern decides what matched; the condition decides whether to act on it,
+  reading captures, variables, and live server data (§7.6).
 - **Variable:** string values in a per-session store; substituted into
   send/echo actions as `${name}`; captures bind `${1}`, `${name}` from
   named groups. All matching uses the `regex` crate: Unicode-aware classes,
@@ -326,7 +329,7 @@ triggers:
   - pattern: '^(?P<who>\p{L}+) has arrived\.$'
     send: ["look ${who}"]
   - pattern: '^Your health: (?P<hp>\d+)%'
-    when: '${hp} < ${heal_at}'      # numeric guard, later milestone
+    when: '${hp} < ${heal_at}'      # optional guard, §7.6 (M8)
     send: ["quaff heal"]
     gag: false
 ```
@@ -404,7 +407,7 @@ action alongside `send`:
 # tank profile — heal me when I drop below 40%
 triggers:
   - pattern: '^HP: (?P<hp>\d+)%'
-    when: '${hp} < 40'
+    when: '${hp} < 40'              # optional guard, §7.6 (M8)
     send_to:
       cleric: ["cast 'major heal' Grunk"]
 ```
@@ -439,8 +442,8 @@ a read-only snapshot — its exported variables plus its server-data map
 (GMCP/MSDP: vitals, affects, room) — over a `tokio::sync::watch` channel;
 every session holds receivers for all peers. Reads are local, lock-free,
 and eventually consistent (staleness is one channel hop, microseconds).
-YAML rules reference peer state as `${@tank.hp}`; a `when:` guard can
-combine local and peer values.
+YAML rules reference peer state as `${@tank.hp}`; a `when:` guard (§7.6)
+can combine local and peer values.
 
 **Scripting API (M8).** The `mud.*` API (§7.4) adds:
 
@@ -456,6 +459,80 @@ command the cleric) and observe (cleric's rules/scripts watch the tank).
 Prefer observe for reactions that are really the cleric's job — the rule
 lives with the character that acts, and it keeps working no matter which
 session detects the condition first.
+
+### 7.6 Rule conditions (`when:`, M8)
+
+A pattern says *what* matched; a condition says *whether to act on it*.
+`when:` is an optional guard on any alias or trigger — the rule fires only
+if its pattern matches **and** the condition evaluates true:
+
+```yaml
+triggers:
+  - pattern: '^Your health: (?P<hp>\d+)%'
+    when: '${hp} < ${heal_at}'
+    send: ["quaff heal"]
+```
+
+Without it, thresholds have to be smuggled into the regex, which is both
+unreadable and wrong for anything the pattern doesn't literally capture —
+a rule cannot otherwise consult a GMCP vital or a variable set by an
+earlier rule.
+
+**Not a script call.** The obvious alternative is to compile `when:` down
+to a `ScriptHost` invocation (§7.4), and it is rejected deliberately:
+script engines are feature-gated, so a plain YAML field would silently
+require one to be compiled in, and `${hp} < 40` would mean whatever the
+compiled engine's comparison semantics happen to be — Lua and QuickJS do
+not agree about string/number coercion. A declarative config field must
+mean one thing in every build. Conditions are also hot-path: the guard runs
+on every line the pattern matches, and §7.4 hooks run synchronously on the
+session task, so crossing a VM boundary to answer `30 < 40` is the wrong
+trade. Finally, `engine` is sans-IO and depends on nothing above it (§4);
+calling into a script host would invert that.
+
+**Grammar.** Deliberately small — a guard, not a language. Comparison
+(`< <= > >= == !=`), boolean `and`/`or`/`not`, parentheses, number and
+string literals, and `${...}` terms. Anything beyond that is a script's
+job (below).
+
+**Evaluation.**
+
+- **Compiled once,** at `Engine::compile`, alongside the rule's regex: a
+  malformed condition fails at load with module context, exactly like an
+  invalid pattern, rather than silently never firing at runtime. Matching
+  then costs one tree walk over the already-resolved variable stores.
+- **`${...}` is a term, never a textual substitution.** The name resolves
+  to a value *during* evaluation, using the same order as `send:`
+  expansion (§7.1): captures, then variables, then server data. Splicing
+  the text in before parsing would let untrusted server data (§13) inject
+  operators into the client's own predicate — a value of `0 or 1==1` would
+  rewrite the condition rather than be compared by it.
+- **Coercion:** compare numerically when both sides parse as numbers,
+  lexically otherwise. Everything in the variable and server-data stores is
+  a string, so `${hp} < 40` must not become a string comparison.
+- **Undefined names evaluate the condition false,** and the rule does not
+  fire. This departs from `send:` expansion, which leaves an unresolved
+  `${foo}` verbatim so a typo is visible on screen — a boolean has no
+  equivalent way to show itself, and "don't fire" is the safe failure for a
+  rule that would otherwise send commands.
+- **Peer values (M8):** `${@tank.hp}` resolves through the peer snapshot
+  (§7.5) with the same rules, so one character's guard can read another's
+  vitals.
+
+**First-party, per §2.1.** `evalexpr` and similar crates fit, but bring
+their own value model and error type to adapt for a grammar this size;
+`rhai` is excluded specifically because §7.4 lists it as a candidate
+*script* engine, and using it here would blur the boundary `ScriptHost`
+exists to draw. Roughly 200 lines of sans-IO code under byte-level tests,
+which is the same trade §2.1 already makes for the protocol core. Revisit
+if the grammar ever grows past the list above.
+
+**Where scripts take over.** `when:` covers stateless predicates over
+values already in the store. Anything with memory, arithmetic, or
+multi-step logic — "heal if HP is low *and* nobody healed in the last three
+seconds" — belongs in an `on_line` hook or a `script:` action (§7.4), which
+can simply return early. That split is the same one §7.4 already draws:
+YAML for the common cases, scripts for everything else.
 
 ---
 
@@ -646,13 +723,14 @@ exist from M0, even where a stage is a passthrough).
 | **M5** | MCCP | MCCP2 inflate with mid-buffer switchover (MCCP3 optional) | Compressed MUD session byte-identical to uncompressed fixture |
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
-| **M8** | Scripting | `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | The same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
+| **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
 | **M9** | Polish | Scrollback search, disk logging, reconnect/backoff, keyring passwords + auto-login, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | — |
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
 behind interfaces that already exist; M7 is almost entirely `ui`/`app`;
-M8 adds `engine::script` behind the existing `Action` enum.
+M8 adds a condition evaluator inside `engine`, then `engine::script` behind
+the existing `Action` enum.
 
 ## 15. Distribution & Installation
 

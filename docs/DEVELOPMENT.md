@@ -17,7 +17,7 @@ on evidence.
 | M5 MCCP | Mid-buffer compression switchover — subtle stream-state bugs | Opus |
 | M6 GMCP + MSDP | Well-specified codecs with byte fixtures | Sonnet |
 | M7 Multi-character | Concurrency, channel wiring, focus/layout, cross-session routing | Opus |
-| M8 Scripting | ScriptHost abstraction, FFI bindings, sandboxing | Opus |
+| M8 Scripting | `when:` parser/evaluator, ScriptHost abstraction, FFI bindings, sandboxing | Opus |
 | M9 Polish | Independent small features | Sonnet |
 
 Rules of thumb:
