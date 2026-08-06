@@ -619,6 +619,9 @@ spam — and conversely, so slow conversations stay visible.
 - Server data is untrusted: linear-time regex only; ANSI parser drops
   unknown escape sequences (terminal escape injection); paths from
   config are never taken from server data.
+- MCCP inflate is capped per read (§6.4): deflate reaches ~1032:1, so an
+  unbounded decoder turns one 4 KiB read into gigabytes of allocation.
+  Past the cap the session ends rather than buffering.
 - TLS: full verification by default; TOFU pinning for self-signed MUD
   certs; `insecure` requires explicit config and shows a UI warning.
 - Passwords: not stored in YAML; OS keyring integration planned (M9),

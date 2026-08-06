@@ -16,9 +16,24 @@ use flate2::{Decompress, FlushDecompress, Status};
 /// this usually empties the input in one pass.
 const CHUNK: usize = 16 * 1024;
 
+/// Ceiling on what a single inbound read may inflate to.
+///
+/// Inflate is an amplifier, and server data is untrusted
+/// (docs/ARCHITECTURE.md §13): deflate reaches roughly 1032:1, so an
+/// unbounded decoder turns one 4 KiB read into gigabytes of `Vec` growth.
+/// Exploiting it needs no MUD account — only a hostile address in a
+/// profile. Real MUD reads inflate to a few KiB, so this sits orders of
+/// magnitude above legitimate traffic and orders of magnitude below the
+/// point where a bomb costs the player anything.
+const MAX_INFLATED_PER_READ: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
-#[error("compressed stream is corrupt: {0}")]
-pub struct MccpError(#[from] flate2::DecompressError);
+pub enum MccpError {
+    #[error("compressed stream is corrupt: {0}")]
+    Corrupt(#[from] flate2::DecompressError),
+    #[error("compressed stream expanded past {MAX_INFLATED_PER_READ} bytes in one read")]
+    Bomb,
+}
 
 #[derive(Debug, Default)]
 pub struct MccpDecoder {
@@ -50,12 +65,19 @@ impl MccpDecoder {
 
         let mut buf = vec![0u8; CHUNK];
         let mut cursor = 0;
+        let mut produced = 0usize;
         loop {
             let (before_in, before_out) = (stream.total_in(), stream.total_out());
             let status = stream.decompress(&input[cursor..], &mut buf, FlushDecompress::None)?;
             let read = (stream.total_in() - before_in) as usize;
             let written = (stream.total_out() - before_out) as usize;
             cursor += read;
+            produced += written;
+            if produced > MAX_INFLATED_PER_READ {
+                // Refuse before buffering it: the point is to not grow
+                // `output` on a hostile server's say-so.
+                return Err(MccpError::Bomb);
+            }
             output.extend_from_slice(&buf[..written]);
 
             if status == Status::StreamEnd {
@@ -176,6 +198,54 @@ mod tests {
         let mut d = MccpDecoder::new();
         d.activate();
         assert_eq!(feed(&mut d, &deflate(plain.as_bytes())), plain.as_bytes());
+    }
+
+    /// A malformed server can send a second MCCP2 start subnegotiation
+    /// without ending the first stream. That means a new zlib stream, so
+    /// the previous decoder must be discarded rather than fed the new
+    /// stream's header as if it were more deflate data.
+    #[test]
+    fn restarting_compression_discards_the_previous_stream() {
+        let mut d = MccpDecoder::new();
+        d.activate();
+        assert_eq!(feed(&mut d, &deflate(b"first\r\n")), b"first\r\n");
+
+        d.activate();
+        assert_eq!(feed(&mut d, &deflate(b"second\r\n")), b"second\r\n");
+    }
+
+    /// Inflate is an amplifier and the server is untrusted (§13): a bomb
+    /// is refused rather than buffered.
+    #[test]
+    fn a_decompression_bomb_is_refused_rather_than_buffered() {
+        let payload = MAX_INFLATED_PER_READ + CHUNK;
+        let bomb = deflate(&vec![0u8; payload]);
+        assert!(
+            payload / bomb.len() > 1000,
+            "a bomb is cheap to send and expensive to hold: {} bytes in, \
+             {payload} out",
+            bomb.len()
+        );
+
+        let mut d = MccpDecoder::new();
+        d.activate();
+        let mut out = Vec::new();
+        assert!(matches!(d.feed(&bomb, &mut out), Err(MccpError::Bomb)));
+        assert!(
+            out.len() <= MAX_INFLATED_PER_READ,
+            "refused, but buffered {} bytes first",
+            out.len()
+        );
+    }
+
+    /// The cap sits far above real traffic: a large legitimate read still
+    /// goes through untouched.
+    #[test]
+    fn output_just_under_the_cap_is_still_delivered() {
+        let plain = vec![b'x'; MAX_INFLATED_PER_READ - 1];
+        let mut d = MccpDecoder::new();
+        d.activate();
+        assert_eq!(feed(&mut d, &deflate(&plain)).len(), plain.len());
     }
 
     #[test]

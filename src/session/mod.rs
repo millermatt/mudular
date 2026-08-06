@@ -958,6 +958,26 @@ mod tests {
         );
     }
 
+    /// A decompression bomb needs no MUD account to fire — just a hostile
+    /// address in a profile (§13). The session ends instead of growing its
+    /// buffer until the process dies.
+    #[tokio::test]
+    async fn a_decompression_bomb_ends_the_session() {
+        let (mut events, _commands) = serve(|mut sock| async move {
+            start_compression(&mut sock, &deflate(&vec![0u8; 8 * 1024 * 1024])).await;
+            idle(&mut sock).await;
+        });
+
+        let ended = next_matching(&mut events, |ev| matches!(ev, SessionEvent::Ended(_))).await;
+        let SessionEvent::Ended(reason) = ended else {
+            unreachable!()
+        };
+        assert!(
+            reason.contains("expanded past"),
+            "unexpected end reason: {reason}"
+        );
+    }
+
     /// zlib state has to survive socket read boundaries: half a block
     /// decodes to nothing on its own and must be held, not dropped.
     #[tokio::test]
