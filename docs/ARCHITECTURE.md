@@ -309,6 +309,15 @@ pinned by integration tests with synthetic compressed captures.
   send/echo actions as `${name}`; captures bind `${1}`, `${name}` from
   named groups. All matching uses the `regex` crate: Unicode-aware classes,
   linear-time guarantee (a hostile server line can't freeze the client).
+  Any rule can write one with `set:`, so a value parsed out of one line is
+  available to every later rule — `set: {target: '${foe}'}` on a trigger,
+  read back as `${target}` by an alias. **Writes land after the current
+  line (or typed input) is fully processed**, so rules never observe each
+  other's writes within it: two triggers matching the same line both read
+  the store as it was before the line, and `;`-separated input parts
+  likewise. That is deliberate — it keeps rule *order* semantically inert,
+  so a scope layer that shadows a rule (§7.3) and shifts what fires when
+  cannot change what any rule reads.
 - **Timer:** fires once after a delay or on an interval; defined in YAML
   (`timers: [{every: 60s, send: [...]}]`) or created at runtime by scripts.
 

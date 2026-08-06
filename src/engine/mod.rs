@@ -844,6 +844,59 @@ mod tests {
         assert_eq!(engine.expand_input("k").sends, vec!["kill kobold"]);
     }
 
+    /// `set:` is applied once the whole line has been processed, so two
+    /// triggers firing on one line never see each other's writes (§7.1).
+    /// That is what keeps rule order within a line semantically inert: a
+    /// layer that reorders rules cannot change what they read.
+    #[test]
+    fn a_variable_set_on_a_line_is_visible_from_the_next_line_on() {
+        let mut engine = engine(
+            r#"
+            name: test
+            triggers:
+              - pattern: 'fighting (?P<foe>\w+)'
+                set:
+                  target: "${foe}"
+              - pattern: 'fighting'
+                send: ["kill ${target}"]
+            "#,
+        );
+
+        // Same line: the second trigger reads the store as it was before
+        // the line, where `target` is unset — so the name stays verbatim,
+        // the same way any unresolved `${...}` does.
+        let first = engine.process_line("You are fighting kobold");
+        assert_eq!(first.sends, vec!["kill ${target}"]);
+        assert_eq!(engine.variable("target"), Some("kobold"));
+
+        // From the next line on, it reads back.
+        let second = engine.process_line("You are fighting kobold");
+        assert_eq!(second.sends, vec!["kill kobold"]);
+    }
+
+    /// The same batching on the input side: `;`-separated parts of one
+    /// typed line don't see each other's `set:` either.
+    #[test]
+    fn a_variable_set_by_an_alias_is_visible_from_the_next_input_on() {
+        let mut engine = engine(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^mark (?P<who>\w+)$'
+                set:
+                  target: "${who}"
+              - pattern: '^k$'
+                send: ["kill ${target}"]
+            "#,
+        );
+
+        assert_eq!(
+            engine.expand_input("mark rat; k").sends,
+            vec!["kill ${target}"]
+        );
+        assert_eq!(engine.expand_input("k").sends, vec!["kill rat"]);
+    }
+
     #[test]
     fn input_splits_on_semicolons_and_expands_each_part() {
         let mut engine = engine(
