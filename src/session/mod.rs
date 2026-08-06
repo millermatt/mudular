@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::net::{self, TlsConfig};
+use crate::proto::charset::Charset;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, option};
 use line::LineAssembler;
 
@@ -58,10 +59,11 @@ pub fn spawn(
     port: u16,
     tls: Option<TlsConfig>,
     record: Option<PathBuf>,
+    charset: Charset,
 ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>) {
     let (event_tx, event_rx) = mpsc::channel(256);
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
-    tokio::spawn(run(host, port, tls, record, event_tx, cmd_rx));
+    tokio::spawn(run(host, port, tls, record, charset, event_tx, cmd_rx));
     (event_rx, cmd_tx)
 }
 
@@ -70,6 +72,7 @@ async fn run(
     port: u16,
     tls: Option<TlsConfig>,
     record: Option<PathBuf>,
+    charset: Charset,
     events: mpsc::Sender<SessionEvent>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
@@ -106,7 +109,7 @@ async fn run(
 
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut telnet = TelnetMachine::new();
-    let mut decoder = Utf8Decoder::default();
+    let mut decoder = TextDecoder::new(charset);
     let mut assembler = LineAssembler::default();
     let mut sock_buf = [0u8; 4096];
 
@@ -244,6 +247,32 @@ impl Recorder {
         // a reason to drop the player's session.
         let _ = writeln!(self.writer, "{millis} {line}");
         let _ = self.writer.flush();
+    }
+}
+
+/// Decodes inbound bytes per the profile's configured charset (§9.2). UTF-8
+/// needs incremental byte-boundary state; the legacy charsets are
+/// single-byte, so every byte maps to exactly one `char` independently.
+enum TextDecoder {
+    Utf8(Utf8Decoder),
+    SingleByte(Charset),
+}
+
+impl TextDecoder {
+    fn new(charset: Charset) -> Self {
+        match charset {
+            Charset::Utf8 => TextDecoder::Utf8(Utf8Decoder::default()),
+            other => TextDecoder::SingleByte(other),
+        }
+    }
+
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        match self {
+            TextDecoder::Utf8(decoder) => decoder.decode(bytes),
+            TextDecoder::SingleByte(charset) => {
+                bytes.iter().map(|&b| charset.decode_byte(b)).collect()
+            }
+        }
     }
 }
 
@@ -419,8 +448,13 @@ mod tests {
             sock.write_all(b"hi\r\n").await.unwrap();
         });
 
-        let (mut events, _commands) =
-            spawn("127.0.0.1".to_string(), port, None, Some(path.clone()));
+        let (mut events, _commands) = spawn(
+            "127.0.0.1".to_string(),
+            port,
+            None,
+            Some(path.clone()),
+            Charset::Utf8,
+        );
         assert_eq!(next_line(&mut events).await, "hi");
 
         let captured = std::fs::read_to_string(&path).unwrap();
@@ -549,7 +583,7 @@ mod tests {
             script(sock).await;
         });
 
-        spawn("127.0.0.1".to_string(), port, None, None)
+        spawn("127.0.0.1".to_string(), port, None, None, Charset::Utf8)
     }
 
     async fn next_matching(

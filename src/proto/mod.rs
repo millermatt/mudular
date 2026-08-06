@@ -4,6 +4,7 @@
 //! transport; everything here is unit-testable with byte fixtures
 //! (docs/ARCHITECTURE.md §6).
 
+pub mod charset;
 pub mod gmcp;
 pub mod mccp;
 pub mod msdp;

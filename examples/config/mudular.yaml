@@ -1,0 +1,5 @@
+# Example app settings. Real location: ~/.config/mudular/mudular.yaml
+# Entirely optional — with no file, or no keybinds section, quit defaults
+# to ctrl+c.
+keybinds:
+  quit: ctrl+q

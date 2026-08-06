@@ -10,8 +10,10 @@ mod ui;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+
+use proto::charset::Charset;
 
 /// Mudular — a modern, keyboard-centric terminal MUD client.
 #[derive(Debug, Parser)]
@@ -35,6 +37,11 @@ struct Cli {
     /// How to verify the server certificate: full, pinned, or insecure.
     #[arg(long, default_value = "full")]
     tls_verify: net::VerifyMode,
+
+    /// Charset for --host, if CHARSET negotiation is absent or rejected:
+    /// utf-8, latin1, or cp437.
+    #[arg(long, default_value = "utf-8")]
+    charset: Charset,
 
     /// Configuration directory (default: the platform config directory).
     #[arg(long)]
@@ -65,36 +72,45 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    let tls = match cli.tls {
-        true => Some(net::TlsConfig {
-            verify: cli.tls_verify,
-            pin_store: net::pins::PinStore::new(config_dir(cli.config_dir)?.join("known_certs")),
-        }),
-        false => None,
-    };
+    let dir = config::config_dir(cli.config_dir.clone())?;
+    let app_config = config::load_app_config(&dir)?;
 
     let target = match (&cli.profile, &cli.host) {
-        (Some(profile), _) => {
-            anyhow::bail!("profile `{profile}` not wired yet — M3; use --host instead")
+        (Some(name), _) => {
+            let path = config::profile_path(&dir, name);
+            let profile = config::load_profile(&path)?;
+            let tls = profile.tls.enabled.then(|| net::TlsConfig {
+                verify: profile.tls.verify,
+                pin_store: net::pins::PinStore::new(dir.join("known_certs")),
+            });
+            let charset: Charset = profile
+                .charset
+                .parse()
+                .map_err(|err: String| anyhow::anyhow!(err))
+                .with_context(|| format!("charset in {}", path.display()))?;
+            Some(app::ConnectTarget {
+                host: profile.host,
+                port: profile.port,
+                tls,
+                record: cli.record.clone(),
+                charset,
+            })
         }
-        (None, Some(host)) => Some(app::ConnectTarget {
-            host: host.clone(),
-            port: cli.port,
-            tls,
-            record: cli.record.clone(),
-        }),
+        (None, Some(host)) => {
+            let tls = cli.tls.then(|| net::TlsConfig {
+                verify: cli.tls_verify,
+                pin_store: net::pins::PinStore::new(dir.join("known_certs")),
+            });
+            Some(app::ConnectTarget {
+                host: host.clone(),
+                port: cli.port,
+                tls,
+                record: cli.record.clone(),
+                charset: cli.charset,
+            })
+        }
         (None, None) => None,
     };
 
-    app::run(target).await
-}
-
-/// Where the pin store (and, from M3, the YAML config) lives.
-fn config_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(dir) = override_dir {
-        return Ok(dir);
-    }
-    let dirs = directories::ProjectDirs::from("", "", "mudular")
-        .ok_or_else(|| anyhow::anyhow!("cannot determine a config directory; use --config-dir"))?;
-    Ok(dirs.config_dir().to_path_buf())
+    app::run(target, app_config.keybinds).await
 }

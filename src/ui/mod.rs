@@ -88,9 +88,9 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         )
     };
     let title = if state.masked {
-        " input (hidden) "
+        " input (hidden) ".to_string()
     } else {
-        " input (Ctrl+C to quit) "
+        format!(" input ({} to quit) ", state.quit_hint)
     };
     let input_line = Paragraph::new(value).block(
         Block::bordered()
@@ -141,6 +141,7 @@ mod tests {
             masked: false,
             security: String::new(),
             connected: true,
+            quit_hint: "Ctrl+C".to_string(),
         }
     }
 

@@ -82,8 +82,13 @@ pub enum TelnetEvent {
     /// An option finished negotiating into the disabled state.
     OptionDisabled { option: u8, side: Side },
     /// A complete IAC SB <option> … IAC SE payload, IAC-unescaped.
-    /// TTYPE is answered internally and never surfaces here.
+    /// TTYPE and CHARSET are answered internally and never surface here.
     Subnegotiation { option: u8, data: Bytes },
+    /// The server's CHARSET REQUEST offered UTF-8 (or didn't); either way
+    /// we already answered ACCEPTED/REJECTED. Decoding falls back to the
+    /// profile-configured charset regardless (docs/ARCHITECTURE.md §9.2) —
+    /// this is informational, for the status bar.
+    CharsetResult { accepted: bool },
     /// Any other single-byte IAC command (NOP, AYT, …).
     Command(u8),
 }
@@ -123,12 +128,18 @@ struct OptionState {
 
 /// Options we let the server enable on its side (server WILL → we DO).
 fn accept_remote(option: u8) -> bool {
-    matches!(option, option::ECHO | option::SGA | option::EOR)
+    matches!(
+        option,
+        option::ECHO | option::SGA | option::EOR | option::CHARSET
+    )
 }
 
 /// Options we are willing to enable on our side (server DO → we WILL).
 fn accept_local(option: u8) -> bool {
-    matches!(option, option::SGA | option::TTYPE | option::NAWS)
+    matches!(
+        option,
+        option::SGA | option::TTYPE | option::NAWS | option::CHARSET
+    )
 }
 
 #[derive(Debug)]
@@ -229,6 +240,8 @@ impl TelnetMachine {
                         let data = self.sub_data.split().freeze();
                         if option == option::TTYPE {
                             self.answer_ttype(&data);
+                        } else if option == option::CHARSET {
+                            self.answer_charset(&data, &mut events);
                         } else {
                             events.push(TelnetEvent::Subnegotiation { option, data });
                         }
@@ -402,6 +415,39 @@ impl TelnetMachine {
         payload.extend_from_slice(value.as_bytes());
         let bytes = encode_subnegotiation(option::TTYPE, &payload);
         self.out.extend_from_slice(&bytes);
+    }
+
+    /// Reply to `IAC SB CHARSET REQUEST <sep><charset>...IAC SE` (RFC 2066):
+    /// ACCEPTED "UTF-8" if the server offered it, REJECTED otherwise. We
+    /// always decode with the profile-configured charset regardless of the
+    /// outcome (§9.2); this only tells the server what we picked.
+    fn answer_charset(&mut self, data: &[u8], events: &mut Vec<TelnetEvent>) {
+        const REQUEST: u8 = 1;
+        const ACCEPTED: u8 = 2;
+        const REJECTED: u8 = 3;
+
+        let Some((&REQUEST, rest)) = data.split_first() else {
+            // ACCEPTED/REJECTED/TTABLE-* replies to a REQUEST we never
+            // sent, or a malformed message: nothing to answer.
+            return;
+        };
+        let Some((&sep, list)) = rest.split_first() else {
+            return;
+        };
+        let offered = list
+            .split(|&b| b == sep)
+            .any(|name| name.eq_ignore_ascii_case(b"UTF-8"));
+
+        let reply = if offered {
+            let mut payload = vec![ACCEPTED];
+            payload.extend_from_slice(b"UTF-8");
+            payload
+        } else {
+            vec![REJECTED]
+        };
+        let bytes = encode_subnegotiation(option::CHARSET, &reply);
+        self.out.extend_from_slice(&bytes);
+        events.push(TelnetEvent::CharsetResult { accepted: offered });
     }
 
     fn send_naws(&mut self) {
@@ -617,6 +663,40 @@ mod tests {
         assert_eq!(reply(&mut m), "xterm-256color");
         assert_eq!(reply(&mut m), "MTTS 269");
         assert_eq!(reply(&mut m), "MTTS 269", "repeat signals end of cycle");
+    }
+
+    #[test]
+    fn accepts_charset_when_the_server_offers_utf8() {
+        let mut m = TelnetMachine::new();
+        m.feed(&[IAC, DO, option::CHARSET]);
+        assert_eq!(&m.take_output()[..], &[IAC, WILL, option::CHARSET]);
+
+        let mut request = vec![IAC, SB, option::CHARSET, 1, b';'];
+        request.extend_from_slice(b"US-ASCII;UTF-8;LATIN1");
+        request.extend_from_slice(&[IAC, SE]);
+
+        let events = m.feed(&request);
+        assert_eq!(events, vec![TelnetEvent::CharsetResult { accepted: true }]);
+
+        let mut expected = vec![IAC, SB, option::CHARSET, 2];
+        expected.extend_from_slice(b"UTF-8");
+        expected.extend_from_slice(&[IAC, SE]);
+        assert_eq!(&m.take_output()[..], &expected[..]);
+    }
+
+    #[test]
+    fn rejects_charset_when_utf8_is_not_offered() {
+        let mut m = TelnetMachine::new();
+        let mut request = vec![IAC, SB, option::CHARSET, 1, b';'];
+        request.extend_from_slice(b"US-ASCII;LATIN1");
+        request.extend_from_slice(&[IAC, SE]);
+
+        let events = m.feed(&request);
+        assert_eq!(events, vec![TelnetEvent::CharsetResult { accepted: false }]);
+        assert_eq!(
+            &m.take_output()[..],
+            &[IAC, SB, option::CHARSET, 3, IAC, SE]
+        );
     }
 
     #[test]

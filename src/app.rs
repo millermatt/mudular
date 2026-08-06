@@ -9,12 +9,14 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
+use crate::config::Keybinds;
+use crate::proto::charset::Charset;
 use crate::session::{self, SessionCommand, SessionEvent};
 use crate::ui;
 
@@ -27,6 +29,7 @@ pub struct ConnectTarget {
     pub port: u16,
     pub tls: Option<crate::net::TlsConfig>,
     pub record: Option<PathBuf>,
+    pub charset: Charset,
 }
 
 /// Everything the UI needs to render a frame.
@@ -44,6 +47,8 @@ pub struct AppState {
     /// the whole session keeps the layout — and so the NAWS pane size —
     /// stable as prompts come and go.
     pub connected: bool,
+    /// The configured quit binding, for the input box's hint text.
+    pub quit_hint: String,
 }
 
 impl AppState {
@@ -92,19 +97,23 @@ fn apply_session_event(state: &mut AppState, connected_status: &str, ev: Session
     }
 }
 
-pub async fn run(target: Option<ConnectTarget>) -> Result<()> {
+pub async fn run(target: Option<ConnectTarget>, keybinds: Keybinds) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, target).await;
+    let result = event_loop(&mut terminal, target, keybinds).await;
     ratatui::restore();
     result
 }
 
-async fn event_loop(terminal: &mut DefaultTerminal, target: Option<ConnectTarget>) -> Result<()> {
+async fn event_loop(
+    terminal: &mut DefaultTerminal,
+    target: Option<ConnectTarget>,
+    keybinds: Keybinds,
+) -> Result<()> {
     let (mut session_events, cmd_tx, status, connected_status) = match target {
         Some(t) => {
             let status = format!("connecting to {}:{}...", t.host, t.port);
             let connected_status = format!("connected to {}:{}", t.host, t.port);
-            let (rx, tx) = session::spawn(t.host, t.port, t.tls, t.record);
+            let (rx, tx) = session::spawn(t.host, t.port, t.tls, t.record, t.charset);
             (Some(rx), Some(tx), status, connected_status)
         }
         None => (
@@ -123,6 +132,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, target: Option<ConnectTarget
         masked: false,
         security: String::new(),
         connected: cmd_tx.is_some(),
+        quit_hint: keybinds.quit.to_string(),
     };
 
     // Tell the server our pane size up front; NAWS is sent once it agrees.
@@ -147,9 +157,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, target: Option<ConnectTarget
             ev = term_events.next() => {
                 match ev {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        let ctrl_c = key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_c {
+                        if keybinds.quit.matches(key.code, key.modifiers) {
                             return Ok(());
                         }
                         if key.code == KeyCode::Enter {
@@ -218,6 +226,7 @@ mod tests {
             masked: false,
             security: String::new(),
             connected: true,
+            quit_hint: "Ctrl+C".to_string(),
         }
     }
 
