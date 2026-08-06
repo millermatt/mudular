@@ -608,6 +608,22 @@ mod tests {
         assert!(m.take_deferred().is_empty(), "drained once");
     }
 
+    /// The subnegotiation itself can be split by a read boundary — here
+    /// between its `IAC` and `SE` — so the compressed tail is whatever
+    /// follows the `SE` in the *second* read (§6.4).
+    #[test]
+    fn hands_back_the_tail_when_the_subnegotiation_is_split_across_reads() {
+        let mut m = TelnetMachine::new();
+        assert!(m.feed(&[IAC, SB, option::MCCP2, IAC]).is_empty());
+        assert!(m.take_deferred().is_empty(), "nothing to defer yet");
+
+        assert_eq!(
+            m.feed(&[SE, 0x78, 0x9c, 0x01]),
+            vec![TelnetEvent::CompressionStart]
+        );
+        assert_eq!(&m.take_deferred()[..], &[0x78, 0x9c, 0x01]);
+    }
+
     #[test]
     fn compression_start_with_nothing_after_it_defers_nothing() {
         let mut m = TelnetMachine::new();

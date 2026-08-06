@@ -874,6 +874,108 @@ mod tests {
         );
     }
 
+    /// Starts MCCP2 the way a real server does — offer, wait for our `DO`,
+    /// then the subnegotiation with `payload` sharing the same write.
+    async fn start_compression(sock: &mut tokio::net::TcpStream, payload: &[u8]) {
+        sock.write_all(&[IAC, WILL, option::MCCP2]).await.unwrap();
+        await_agreement(sock, option::MCCP2).await;
+        let mut first = vec![IAC, SB, option::MCCP2, IAC, SE];
+        first.extend_from_slice(payload);
+        sock.write_all(&first).await.unwrap();
+    }
+
+    /// Writes `bytes` far enough after the previous write that the client
+    /// sees them as their own socket read. Without the pause TCP is free to
+    /// coalesce the two, and the read boundary under test never happens.
+    async fn separate_read(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sock.write_all(bytes).await.unwrap();
+    }
+
+    /// `Z_STREAM_END` mid-read: the server ended compression cleanly and
+    /// the rest of that same read is plain Telnet again (§6.4).
+    #[tokio::test]
+    async fn a_finished_stream_returns_the_session_to_plain_text() {
+        let (mut events, _commands) = serve(|mut sock| async move {
+            let mut payload = deflate_finished(b"compressed line\r\n");
+            payload.extend_from_slice(b"plain in the same read\r\n");
+            start_compression(&mut sock, &payload).await;
+            // A later read must still be plain: the decoder is gone, not
+            // merely bypassed for the remainder of the ending read.
+            separate_read(&mut sock, b"plain in a later read\r\n").await;
+            idle(&mut sock).await;
+        });
+
+        assert_eq!(next_line(&mut events).await, "compressed line");
+        assert_eq!(
+            next_line(&mut events).await,
+            "plain in the same read",
+            "bytes past Z_STREAM_END are plain Telnet, not zlib"
+        );
+        assert_eq!(next_line(&mut events).await, "plain in a later read");
+    }
+
+    /// A server may end one zlib stream and start another. The second
+    /// subnegotiation arrives *inside* the plain tail of the first, so the
+    /// session has to re-enter the inflate stage with a fresh decoder.
+    #[tokio::test]
+    async fn a_second_compressed_stream_starts_after_the_first_one_ends() {
+        let (mut events, _commands) = serve(|mut sock| async move {
+            start_compression(&mut sock, &deflate_finished(b"first stream\r\n")).await;
+
+            let mut restart = b"between streams\r\n".to_vec();
+            restart.extend_from_slice(&[IAC, SB, option::MCCP2, IAC, SE]);
+            restart.extend_from_slice(&deflate(b"second stream\r\n"));
+            separate_read(&mut sock, &restart).await;
+            idle(&mut sock).await;
+        });
+
+        assert_eq!(next_line(&mut events).await, "first stream");
+        assert_eq!(next_line(&mut events).await, "between streams");
+        assert_eq!(
+            next_line(&mut events).await,
+            "second stream",
+            "the restarted stream must decode against a fresh decoder"
+        );
+    }
+
+    /// A corrupt stream cannot be recovered from — the session ends with
+    /// the inflate error as its reason rather than emitting garbage.
+    #[tokio::test]
+    async fn a_corrupt_compressed_stream_ends_the_session() {
+        let (mut events, _commands) = serve(|mut sock| async move {
+            start_compression(&mut sock, b"\x78\x9c not a deflate block at all").await;
+            idle(&mut sock).await;
+        });
+
+        let ended = next_matching(&mut events, |ev| matches!(ev, SessionEvent::Ended(_))).await;
+        let SessionEvent::Ended(reason) = ended else {
+            unreachable!()
+        };
+        assert!(
+            reason.contains("compressed stream is corrupt"),
+            "unexpected end reason: {reason}"
+        );
+    }
+
+    /// zlib state has to survive socket read boundaries: half a block
+    /// decodes to nothing on its own and must be held, not dropped.
+    #[tokio::test]
+    async fn a_compressed_block_split_across_two_reads_is_reassembled() {
+        let (mut events, _commands) = serve(|mut sock| async move {
+            let deflated = deflate(b"a line long enough to be split in half\r\n");
+            let (head, tail) = deflated.split_at(deflated.len() / 2);
+            start_compression(&mut sock, head).await;
+            separate_read(&mut sock, tail).await;
+            idle(&mut sock).await;
+        });
+
+        assert_eq!(
+            next_line(&mut events).await,
+            "a line long enough to be split in half"
+        );
+    }
+
     /// What the pane ends up showing: completed lines, echo state, and the
     /// pinned prompt. Provisional prompt updates are dropped — how many of
     /// them appear depends on where TCP splits the reads, which is an
@@ -919,10 +1021,19 @@ mod tests {
 
     /// zlib-compress as one flushed block, the way an MCCP2 server does.
     fn deflate(plain: &[u8]) -> Vec<u8> {
+        compress_with(plain, flate2::FlushCompress::Sync)
+    }
+
+    /// As `deflate`, but ending the zlib stream (`Z_STREAM_END`) — how a
+    /// server turns compression back off.
+    fn deflate_finished(plain: &[u8]) -> Vec<u8> {
+        compress_with(plain, flate2::FlushCompress::Finish)
+    }
+
+    fn compress_with(plain: &[u8], flush: flate2::FlushCompress) -> Vec<u8> {
         let mut c = flate2::Compress::new(flate2::Compression::default(), true);
         let mut out = vec![0u8; plain.len() + 128];
-        c.compress(plain, &mut out, flate2::FlushCompress::Sync)
-            .unwrap();
+        c.compress(plain, &mut out, flush).unwrap();
         out.truncate(c.total_out() as usize);
         out
     }
