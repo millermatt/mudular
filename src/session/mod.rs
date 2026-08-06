@@ -2,10 +2,9 @@
 //!
 //! One tokio task per session owns its transport, decompressor, Telnet
 //! machine, charset decoder, automation engine, and scrollback — nothing is
-//! shared between sessions (docs/ARCHITECTURE.md §3). M1 wires:
-//! TCP → Telnet FSM (with RFC 1143 negotiation) → UTF-8 decode → line
-//! assembler. MCCP inflation and charset fallback slot in ahead of the
-//! decoder in M5/M3.
+//! shared between sessions (docs/ARCHITECTURE.md §3). The inbound pipeline
+//! is §6.5: TCP → MCCP inflate → Telnet FSM (with RFC 1143 negotiation) →
+//! charset decode → line assembler → trigger engine → UI events.
 
 mod line;
 
@@ -13,12 +12,14 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::engine::Engine;
 use crate::net::{self, TlsConfig};
 use crate::proto::charset::Charset;
+use crate::proto::mccp::MccpDecoder;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, option};
 use line::{LineAssembler, strip_ansi};
 
@@ -120,9 +121,12 @@ async fn run(
 
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut telnet = TelnetMachine::new();
+    let mut mccp = MccpDecoder::new();
     let mut decoder = TextDecoder::new(charset);
     let mut assembler = LineAssembler::default();
     let mut sock_buf = [0u8; 4096];
+    // Inflate output, reused across reads.
+    let mut plain: Vec<u8> = Vec::new();
 
     // Offer NAWS up front; the size follows once the server agrees (§6.2).
     telnet.request_local_enable(option::NAWS);
@@ -152,46 +156,68 @@ async fn run(
                         }
 
                         let mut outbound: Vec<String> = Vec::new();
-                        for event in telnet.feed(raw) {
-                            let emitted = match event {
-                                TelnetEvent::Data(bytes) => {
-                                    let text = strip_unsafe_controls(&decoder.decode(&bytes));
-                                    assembler.feed(&text)
-                                }
-                                TelnetEvent::PromptBoundary => {
-                                    vec![assembler.prompt_boundary()]
-                                }
-                                TelnetEvent::OptionEnabled { option: option::ECHO, side: Side::Remote } => {
-                                    vec![SessionEvent::EchoMask(true)]
-                                }
-                                TelnetEvent::OptionDisabled { option: option::ECHO, side: Side::Remote } => {
-                                    vec![SessionEvent::EchoMask(false)]
-                                }
-                                // Other options are handled inside the
-                                // Telnet machine; subnegotiations reach the
-                                // engine in M6.
-                                _ => Vec::new(),
-                            };
+                        let mut break_reason: Option<String> = None;
+                        // Inflate, then parse. Turning compression on ends
+                        // the parse mid-buffer: the rest of the read is
+                        // zlib, so it goes back through `mccp` (§6.4/§6.5).
+                        let mut pending = Bytes::copy_from_slice(raw);
+                        while !pending.is_empty() {
+                            plain.clear();
+                            if let Err(err) = mccp.feed(&pending, &mut plain) {
+                                break_reason = Some(err.to_string());
+                                break;
+                            }
+                            pending = Bytes::new();
 
-                            for event in emitted {
-                                // Triggers run between the line assembler
-                                // and the UI (§6.5), so a gagged line never
-                                // reaches the scrollback at all.
-                                let event = match event {
-                                    SessionEvent::Line(text) => {
-                                        let outcome = engine.process_line(&strip_ansi(&text));
-                                        outbound.extend(outcome.sends);
-                                        if outcome.gag {
-                                            continue;
-                                        }
-                                        SessionEvent::Line(text)
+                            for event in telnet.feed(&plain) {
+                                let emitted = match event {
+                                    TelnetEvent::Data(bytes) => {
+                                        let text = strip_unsafe_controls(&decoder.decode(&bytes));
+                                        assembler.feed(&text)
                                     }
-                                    other => other,
+                                    TelnetEvent::PromptBoundary => {
+                                        vec![assembler.prompt_boundary()]
+                                    }
+                                    TelnetEvent::OptionEnabled { option: option::ECHO, side: Side::Remote } => {
+                                        vec![SessionEvent::EchoMask(true)]
+                                    }
+                                    TelnetEvent::OptionDisabled { option: option::ECHO, side: Side::Remote } => {
+                                        vec![SessionEvent::EchoMask(false)]
+                                    }
+                                    TelnetEvent::CompressionStart => {
+                                        mccp.activate();
+                                        pending = telnet.take_deferred();
+                                        Vec::new()
+                                    }
+                                    // Other options are handled inside the
+                                    // Telnet machine; subnegotiations reach
+                                    // the engine in M6.
+                                    _ => Vec::new(),
                                 };
-                                if events.send(event).await.is_err() {
-                                    return;
+
+                                for event in emitted {
+                                    // Triggers run between the line assembler
+                                    // and the UI (§6.5), so a gagged line never
+                                    // reaches the scrollback at all.
+                                    let event = match event {
+                                        SessionEvent::Line(text) => {
+                                            let outcome = engine.process_line(&strip_ansi(&text));
+                                            outbound.extend(outcome.sends);
+                                            if outcome.gag {
+                                                continue;
+                                            }
+                                            SessionEvent::Line(text)
+                                        }
+                                        other => other,
+                                    };
+                                    if events.send(event).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
+                        }
+                        if let Some(reason) = break_reason {
+                            break reason;
                         }
 
                         // Trigger output is sent verbatim: it is never fed
@@ -781,6 +807,138 @@ mod tests {
             next_matching(&mut events, |ev| matches!(ev, SessionEvent::Ended(_))).await,
             SessionEvent::Ended(_)
         ));
+    }
+
+    /// M5's acceptance criterion (§14): the same scripted session played
+    /// twice — once in clear Telnet, once MCCP2-compressed with the
+    /// switchover happening mid-read — must reach the UI identically.
+    #[tokio::test]
+    async fn a_compressed_session_is_identical_to_the_uncompressed_one() {
+        // Telnet framing inside the compressed stream — an option
+        // negotiation and a GA prompt boundary — proves the stages stay
+        // ordered: compression wraps Telnet, not the reverse (§6.5).
+        let body: Vec<u8> = [
+            b"\x1b[1;33mThe Grand Bazaar\x1b[0m\r\nA merchant waves.\r\n".as_slice(),
+            &[IAC, WILL, option::ECHO],
+            b"Password: ",
+            &[IAC, GA],
+        ]
+        .concat();
+
+        let plain = drain(serve({
+            let body = body.clone();
+            move |mut sock| async move {
+                sock.write_all(b"Welcome\r\n").await.unwrap();
+                sock.write_all(&body).await.unwrap();
+                idle(&mut sock).await;
+            }
+        }))
+        .await;
+
+        let compressed = drain(serve({
+            let body = body.clone();
+            move |mut sock| async move {
+                sock.write_all(b"Welcome\r\n").await.unwrap();
+                sock.write_all(&[IAC, WILL, option::MCCP2]).await.unwrap();
+                await_agreement(&mut sock, option::MCCP2).await;
+
+                // The subnegotiation and the first compressed bytes share
+                // one write: this is the mid-buffer switchover (§6.4).
+                let deflated = deflate(&body);
+                let (head, tail) = deflated.split_at(deflated.len() / 2);
+                let mut first = vec![IAC, SB, option::MCCP2, IAC, SE];
+                first.extend_from_slice(head);
+                sock.write_all(&first).await.unwrap();
+                sock.write_all(tail).await.unwrap();
+                idle(&mut sock).await;
+            }
+        }))
+        .await;
+
+        let plain = transcript(&plain);
+        assert_eq!(
+            transcript(&compressed),
+            plain,
+            "compressed session diverged from the fixture"
+        );
+        assert_eq!(
+            plain,
+            vec![
+                SessionEvent::Line("Welcome".into()),
+                SessionEvent::Line("\x1b[1;33mThe Grand Bazaar\x1b[0m".into()),
+                SessionEvent::Line("A merchant waves.".into()),
+                SessionEvent::EchoMask(true),
+                SessionEvent::Prompt("Password: ".into()),
+            ],
+            "the fixture itself must carry lines, a negotiation and a prompt"
+        );
+    }
+
+    /// What the pane ends up showing: completed lines, echo state, and the
+    /// pinned prompt. Provisional prompt updates are dropped — how many of
+    /// them appear depends on where TCP splits the reads, which is an
+    /// arrival artifact rather than a difference in the decoded stream.
+    fn transcript(events: &[SessionEvent]) -> Vec<SessionEvent> {
+        let mut out: Vec<SessionEvent> = events
+            .iter()
+            .filter(|ev| matches!(ev, SessionEvent::Line(_) | SessionEvent::EchoMask(_)))
+            .cloned()
+            .collect();
+        if let Some(prompt) = events
+            .iter()
+            .rev()
+            .find(|ev| matches!(ev, SessionEvent::Prompt(text) if !text.is_empty()))
+        {
+            out.push(prompt.clone());
+        }
+        out
+    }
+
+    /// Reads until the client agrees to `option`, so the server only
+    /// starts compressing once the handshake is complete.
+    async fn await_agreement(sock: &mut tokio::net::TcpStream, option: u8) {
+        let mut seen = Vec::new();
+        let mut buf = vec![0u8; 64];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "client closed before agreeing to option {option}");
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(3).any(|w| w == [IAC, DO, option]) {
+                return;
+            }
+        }
+    }
+
+    /// Holds the connection open and drains the client's replies: dropping
+    /// a socket with unread data pending sends an RST, which discards
+    /// output the client has not read yet and makes the fixture flaky.
+    async fn idle(sock: &mut tokio::net::TcpStream) {
+        let mut sink = vec![0u8; 256];
+        while sock.read(&mut sink).await.unwrap_or(0) > 0 {}
+    }
+
+    /// zlib-compress as one flushed block, the way an MCCP2 server does.
+    fn deflate(plain: &[u8]) -> Vec<u8> {
+        let mut c = flate2::Compress::new(flate2::Compression::default(), true);
+        let mut out = vec![0u8; plain.len() + 128];
+        c.compress(plain, &mut out, flate2::FlushCompress::Sync)
+            .unwrap();
+        out.truncate(c.total_out() as usize);
+        out
+    }
+
+    /// Collects a session's events until the server goes quiet. The two
+    /// scripts stay connected afterwards, so `Ended` is not the terminator
+    /// here — and its reason would differ between them anyway.
+    async fn drain(
+        channels: (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>),
+    ) -> Vec<SessionEvent> {
+        let (mut events, _commands) = channels;
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) = timeout(Duration::from_millis(250), events.recv()).await {
+            seen.push(event);
+        }
+        seen
     }
 
     /// Strips Telnet framing from client→server bytes, the way any real

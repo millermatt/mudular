@@ -84,6 +84,10 @@ pub enum TelnetEvent {
     /// A complete IAC SB <option> … IAC SE payload, IAC-unescaped.
     /// TTYPE and CHARSET are answered internally and never surface here.
     Subnegotiation { option: u8, data: Bytes },
+    /// The server's MCCP2 subnegotiation: every inbound byte after it is
+    /// zlib-compressed (§6.4). The machine stops consuming at this point;
+    /// the rest of the read is held for [`TelnetMachine::take_deferred`].
+    CompressionStart,
     /// The server's CHARSET REQUEST offered UTF-8 (or didn't); either way
     /// we already answered ACCEPTED/REJECTED. Decoding falls back to the
     /// profile-configured charset regardless (docs/ARCHITECTURE.md §9.2) —
@@ -130,7 +134,7 @@ struct OptionState {
 fn accept_remote(option: u8) -> bool {
     matches!(
         option,
-        option::ECHO | option::SGA | option::EOR | option::CHARSET
+        option::ECHO | option::SGA | option::EOR | option::CHARSET | option::MCCP2
     )
 }
 
@@ -150,6 +154,9 @@ pub struct TelnetMachine {
     sub_data: BytesMut,
     options: [OptionState; 256],
     out: BytesMut,
+    /// Bytes of the current read that follow an MCCP2 subnegotiation and
+    /// are therefore compressed rather than Telnet-framed.
+    deferred: BytesMut,
     /// Position in the TTYPE/MTTS reply cycle.
     ttype_index: usize,
     window: Option<(u16, u16)>,
@@ -164,6 +171,7 @@ impl Default for TelnetMachine {
             sub_data: BytesMut::new(),
             options: [OptionState::default(); 256],
             out: BytesMut::new(),
+            deferred: BytesMut::new(),
             ttype_index: 0,
             window: None,
         }
@@ -180,7 +188,7 @@ impl TelnetMachine {
     /// are queued for [`Self::take_output`].
     pub fn feed(&mut self, input: &[u8]) -> Vec<TelnetEvent> {
         let mut events = Vec::new();
-        for &byte in input {
+        for (index, &byte) in input.iter().enumerate() {
             match self.state {
                 State::Data => {
                     if byte == IAC {
@@ -238,14 +246,20 @@ impl TelnetMachine {
                     SE => {
                         let option = self.sub_option;
                         let data = self.sub_data.split().freeze();
+                        self.state = State::Data;
                         if option == option::TTYPE {
                             self.answer_ttype(&data);
                         } else if option == option::CHARSET {
                             self.answer_charset(&data, &mut events);
+                        } else if option == option::MCCP2 {
+                            // Everything past this byte is zlib, so it is
+                            // not ours to parse: hand it back (§6.4).
+                            events.push(TelnetEvent::CompressionStart);
+                            self.deferred.extend_from_slice(&input[index + 1..]);
+                            return events;
                         } else {
                             events.push(TelnetEvent::Subnegotiation { option, data });
                         }
-                        self.state = State::Data;
                     }
                     // Malformed: keep both bytes as subnegotiation payload
                     // rather than corrupting the outer stream.
@@ -263,6 +277,13 @@ impl TelnetMachine {
     /// Drain queued outbound bytes (negotiation replies, subnegotiations).
     pub fn take_output(&mut self) -> Bytes {
         self.out.split().freeze()
+    }
+
+    /// Drain the still-compressed tail of the read that turned compression
+    /// on. The caller pushes it back through the inflate stage and feeds
+    /// the result here again (§6.4).
+    pub fn take_deferred(&mut self) -> Bytes {
+        self.deferred.split().freeze()
     }
 
     /// Offer an option on our side (RFC 1143 "ask to enable local").
@@ -547,14 +568,54 @@ mod tests {
     #[test]
     fn refuses_options_we_do_not_implement_yet() {
         let mut m = TelnetMachine::new();
-        // GMCP and MCCP2 land in M6/M5; until then we must decline rather
-        // than leave the server waiting.
-        let events = m.feed(&[IAC, WILL, option::GMCP, IAC, WILL, option::MCCP2]);
+        // GMCP lands in M6; until then we must decline rather than leave
+        // the server waiting.
+        let events = m.feed(&[IAC, WILL, option::GMCP]);
         assert!(events.is_empty());
+        assert_eq!(&m.take_output()[..], &[IAC, DONT, option::GMCP]);
+    }
+
+    #[test]
+    fn accepts_mccp2_when_the_server_offers_it() {
+        let mut m = TelnetMachine::new();
         assert_eq!(
-            &m.take_output()[..],
-            &[IAC, DONT, option::GMCP, IAC, DONT, option::MCCP2]
+            m.feed(&[IAC, WILL, option::MCCP2]),
+            vec![TelnetEvent::OptionEnabled {
+                option: option::MCCP2,
+                side: Side::Remote,
+            }]
         );
+        assert_eq!(&m.take_output()[..], &[IAC, DO, option::MCCP2]);
+    }
+
+    /// The switchover the whole stage exists for: bytes after the MCCP2
+    /// `IAC SE` are zlib, not Telnet, even inside the same read (§6.4).
+    #[test]
+    fn hands_back_the_compressed_tail_of_the_starting_read() {
+        let mut m = TelnetMachine::new();
+        let mut input = vec![b'h', b'i', IAC, SB, option::MCCP2, IAC, SE];
+        input.extend_from_slice(&[0x78, 0x9c, IAC, IAC, b'\r']);
+
+        assert_eq!(
+            m.feed(&input),
+            vec![
+                TelnetEvent::Data(Bytes::from_static(b"hi")),
+                TelnetEvent::CompressionStart,
+            ],
+            "no bytes past the SE may be parsed as Telnet"
+        );
+        assert_eq!(&m.take_deferred()[..], &[0x78, 0x9c, IAC, IAC, b'\r']);
+        assert!(m.take_deferred().is_empty(), "drained once");
+    }
+
+    #[test]
+    fn compression_start_with_nothing_after_it_defers_nothing() {
+        let mut m = TelnetMachine::new();
+        assert_eq!(
+            m.feed(&[IAC, SB, option::MCCP2, IAC, SE]),
+            vec![TelnetEvent::CompressionStart]
+        );
+        assert!(m.take_deferred().is_empty());
     }
 
     /// The whole point of RFC 1143: a peer repeating an offer we already

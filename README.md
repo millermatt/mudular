@@ -4,15 +4,15 @@ A modern, keyboard-centric terminal MUD client: a lightweight, high-performance
 alternative to desktop clients like Mudlet, with multi-character sessions in
 split panes or tabs — strictly in the terminal.
 
-**Status:** M0–M4 done. You can log in and play over plain Telnet or TLS,
+**Status:** M0–M5 done. You can log in and play over plain Telnet or TLS,
 with full option negotiation (NAWS, TTYPE/MTTS, CHARSET, ECHO password
-masking, EOR/GA prompts), TLS with pinning for self-signed certs,
-config-file profiles with legacy charset fallback (Latin-1, CP437), and
-automation: aliases, triggers, variables, and timers in shareable YAML
-modules with global → module → profile scoping and `/reload`. See the
-roadmap in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (§14) for what's
-next — MCCP, GMCP/MSDP, scripting, and multi-character play are not
-implemented yet.
+masking, EOR/GA prompts), MCCP2 stream compression, TLS with pinning for
+self-signed certs, config-file profiles with legacy charset fallback
+(Latin-1, CP437), and automation: aliases, triggers, variables, and timers
+in shareable YAML modules with global → module → profile scoping and
+`/reload`. See the roadmap in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+(§14) for what's next — GMCP/MSDP, scripting, and multi-character play are
+not implemented yet.
 
 ## Highlights
 
@@ -20,6 +20,7 @@ Done:
 
 - Plain Telnet and TLS ("STelnet") connections, fully async
 - Full Telnet negotiation (NAWS, TTYPE/MTTS, CHARSET, ECHO, EOR/GA prompts)
+- MCCP2 compression, including the mid-stream switchover
 - TLS with full/pinned/insecure verification modes; TOFU pinning for the
   self-signed certificates many MUDs run
 - Config-file profiles, remappable keybinds
@@ -30,7 +31,7 @@ Done:
 
 Planned:
 
-- GMCP + MSDP out-of-band data, MCCP2/3 compression
+- GMCP + MSDP out-of-band data
 - Multi-engine scripting behind one API: Lua first, JavaScript next,
   more embeddable engines pluggable
 - True multi-character play: split panes/tabs, instant hotkey focus
