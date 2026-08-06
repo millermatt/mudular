@@ -25,6 +25,9 @@ use crate::ui;
 /// (docs/ARCHITECTURE.md §8; a fuller ring buffer with disk logging is M9).
 const SCROLLBACK_LIMIT: usize = 10_000;
 
+/// Same rationale as `SCROLLBACK_LIMIT`, for the raw GMCP inspector log.
+const GMCP_LOG_LIMIT: usize = 1_000;
+
 /// The one client-side command M4 defines. Everything else starting with
 /// `/` is left alone, since plenty of MUDs use `/` for their own commands.
 const RELOAD_COMMAND: &str = "/reload";
@@ -86,6 +89,12 @@ pub struct AppState {
     pub connected: bool,
     /// The configured quit binding, for the input box's hint text.
     pub quit_hint: String,
+    /// Raw `Package payload` lines, newest last — the GMCP inspector view
+    /// (docs/ARCHITECTURE.md §14 M6).
+    pub gmcp_log: VecDeque<String>,
+    /// Whether the output pane is currently showing `gmcp_log` instead of
+    /// the scrollback.
+    pub show_gmcp: bool,
 }
 
 impl AppState {
@@ -93,6 +102,17 @@ impl AppState {
         self.scrollback.push_back(line);
         if self.scrollback.len() > SCROLLBACK_LIMIT {
             self.scrollback.pop_front();
+        }
+    }
+
+    fn push_gmcp(&mut self, package: String, payload: Option<String>) {
+        let line = match payload {
+            Some(payload) => format!("{package} {payload}"),
+            None => package,
+        };
+        self.gmcp_log.push_back(line);
+        if self.gmcp_log.len() > GMCP_LOG_LIMIT {
+            self.gmcp_log.pop_front();
         }
     }
 }
@@ -114,6 +134,10 @@ fn apply_session_event(state: &mut AppState, connected_status: &str, ev: Session
         }
         SessionEvent::EchoMask(masked) => {
             state.masked = masked;
+            false
+        }
+        SessionEvent::Gmcp { package, payload } => {
+            state.push_gmcp(package, payload);
             false
         }
         SessionEvent::Security(security) => {
@@ -182,6 +206,8 @@ async fn event_loop(
         security: String::new(),
         connected: cmd_tx.is_some(),
         quit_hint: keybinds.quit.to_string(),
+        gmcp_log: VecDeque::new(),
+        show_gmcp: false,
     };
 
     // Tell the server our pane size up front; NAWS is sent once it agrees.
@@ -209,7 +235,9 @@ async fn event_loop(
                         if keybinds.quit.matches(key.code, key.modifiers) {
                             return Ok(());
                         }
-                        if key.code == KeyCode::Enter {
+                        if keybinds.gmcp_inspector.matches(key.code, key.modifiers) {
+                            state.show_gmcp = !state.show_gmcp;
+                        } else if key.code == KeyCode::Enter {
                             let line = state.input.value().to_string();
                             state.input.reset();
                             if !line.is_empty() {
@@ -279,6 +307,8 @@ mod tests {
             security: String::new(),
             connected: true,
             quit_hint: "Ctrl+C".to_string(),
+            gmcp_log: VecDeque::new(),
+            show_gmcp: false,
         }
     }
 
@@ -345,6 +375,27 @@ mod tests {
         state.masked = false;
         state.push_line("> look".to_string());
         assert_eq!(scrollback(&state), "> look");
+    }
+
+    /// The inspector view's data source (§14 M6): raw GMCP messages land in
+    /// their own log, not the scrollback.
+    #[test]
+    fn a_gmcp_message_is_logged_for_the_inspector_view() {
+        let mut state = state();
+        apply_session_event(
+            &mut state,
+            "connected",
+            SessionEvent::Gmcp {
+                package: "Char.Vitals".to_string(),
+                payload: Some(r#"{"hp":100}"#.to_string()),
+            },
+        );
+        assert_eq!(state.gmcp_log.len(), 1);
+        assert_eq!(state.gmcp_log[0], r#"Char.Vitals {"hp":100}"#);
+        assert!(
+            state.scrollback.is_empty(),
+            "GMCP must not reach scrollback"
+        );
     }
 
     #[test]

@@ -87,18 +87,26 @@ pub struct AppConfig {
 pub struct Keybinds {
     #[serde(default = "default_quit")]
     pub quit: KeyBinding,
+    /// Toggles the raw GMCP inspector view (docs/ARCHITECTURE.md §14 M6).
+    #[serde(default = "default_gmcp_inspector")]
+    pub gmcp_inspector: KeyBinding,
 }
 
 impl Default for Keybinds {
     fn default() -> Self {
         Self {
             quit: default_quit(),
+            gmcp_inspector: default_gmcp_inspector(),
         }
     }
 }
 
 fn default_quit() -> KeyBinding {
     "ctrl+c".parse().expect("built-in default keybinding")
+}
+
+fn default_gmcp_inspector() -> KeyBinding {
+    "f2".parse().expect("built-in default keybinding")
 }
 
 /// A single key combination, parsed from strings like `ctrl+c` or `f1`.
@@ -127,6 +135,7 @@ impl std::fmt::Display for KeyBinding {
         }
         match self.code {
             KeyCode::Char(c) => write!(f, "{}", c.to_ascii_uppercase()),
+            KeyCode::F(n) => write!(f, "F{n}"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -151,11 +160,22 @@ impl std::str::FromStr for KeyBinding {
             }
         }
 
-        let code = match key.to_ascii_lowercase().as_str() {
+        let lower = key.to_ascii_lowercase();
+        let code = match lower.as_str() {
             "esc" | "escape" => KeyCode::Esc,
             "enter" | "return" => KeyCode::Enter,
             "tab" => KeyCode::Tab,
             "backspace" => KeyCode::Backspace,
+            other
+                if other.len() > 1
+                    && other.starts_with('f')
+                    && other[1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                let n: u8 = other[1..]
+                    .parse()
+                    .map_err(|_| format!("unknown key `{other}` in keybinding `{s}`"))?;
+                KeyCode::F(n)
+            }
             other if other.chars().count() == 1 => {
                 KeyCode::Char(other.chars().next().expect("checked non-empty"))
             }
@@ -313,6 +333,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_function_keys() {
+        let binding: KeyBinding = "f2".parse().unwrap();
+        assert!(binding.matches(KeyCode::F(2), KeyModifiers::NONE));
+
+        let binding: KeyBinding = "F12".parse().unwrap();
+        assert!(binding.matches(KeyCode::F(12), KeyModifiers::NONE));
+    }
+
+    #[test]
     fn rejects_unknown_modifiers_and_keys() {
         assert!("hyper+c".parse::<KeyBinding>().is_err());
         assert!("ctrl+".parse::<KeyBinding>().is_err());
@@ -348,6 +377,12 @@ mod tests {
                 .keybinds
                 .quit
                 .matches(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        );
+        assert!(
+            config
+                .keybinds
+                .gmcp_inspector
+                .matches(KeyCode::F(2), KeyModifiers::NONE)
         );
     }
 

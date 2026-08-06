@@ -18,15 +18,11 @@ pub mod option {
     pub const EOR: u8 = 25;
     pub const NAWS: u8 = 31;
     pub const CHARSET: u8 = 42;
-    /// Negotiated in M6.
-    #[allow(dead_code)]
     pub const MSDP: u8 = 69;
     pub const MCCP2: u8 = 86;
     /// Deliberately never offered: outbound volume does not justify it.
     #[allow(dead_code)]
     pub const MCCP3: u8 = 87;
-    /// Negotiated in M6.
-    #[allow(dead_code)]
     pub const GMCP: u8 = 201;
 }
 
@@ -145,7 +141,13 @@ struct OptionState {
 fn accept_remote(option: u8) -> bool {
     matches!(
         option,
-        option::ECHO | option::SGA | option::EOR | option::CHARSET | option::MCCP2
+        option::ECHO
+            | option::SGA
+            | option::EOR
+            | option::CHARSET
+            | option::MCCP2
+            | option::MSDP
+            | option::GMCP
     )
 }
 
@@ -579,11 +581,34 @@ mod tests {
     #[test]
     fn refuses_options_we_do_not_implement_yet() {
         let mut m = TelnetMachine::new();
-        // GMCP lands in M6; until then we must decline rather than leave
-        // the server waiting.
-        let events = m.feed(&[IAC, WILL, option::GMCP]);
+        // An option with no handler: we must decline rather than leave the
+        // server waiting.
+        const UNIMPLEMENTED: u8 = 199;
+        let events = m.feed(&[IAC, WILL, UNIMPLEMENTED]);
         assert!(events.is_empty());
-        assert_eq!(&m.take_output()[..], &[IAC, DONT, option::GMCP]);
+        assert_eq!(&m.take_output()[..], &[IAC, DONT, UNIMPLEMENTED]);
+    }
+
+    #[test]
+    fn accepts_gmcp_and_msdp_when_the_server_offers_them() {
+        let mut m = TelnetMachine::new();
+        assert_eq!(
+            m.feed(&[IAC, WILL, option::GMCP]),
+            vec![TelnetEvent::OptionEnabled {
+                option: option::GMCP,
+                side: Side::Remote,
+            }]
+        );
+        assert_eq!(&m.take_output()[..], &[IAC, DO, option::GMCP]);
+
+        assert_eq!(
+            m.feed(&[IAC, WILL, option::MSDP]),
+            vec![TelnetEvent::OptionEnabled {
+                option: option::MSDP,
+                side: Side::Remote,
+            }]
+        );
+        assert_eq!(&m.take_output()[..], &[IAC, DO, option::MSDP]);
     }
 
     #[test]

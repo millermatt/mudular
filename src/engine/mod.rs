@@ -14,7 +14,7 @@
 //! Sans-IO: no files, no sockets, no async. Timers report when they are
 //! next due; the session task owns the actual sleeping.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use regex::{Captures, Regex};
@@ -150,6 +150,14 @@ pub struct Engine {
     triggers: Vec<CompiledRule>,
     timers: Vec<CompiledTimer>,
     variables: HashMap<String, String>,
+    /// GMCP/MSDP values, keyed by dotted path (`Char.Vitals.hp`). Kept apart
+    /// from `variables` so live server data can't collide with a rule
+    /// author's own names; `${...}` templates fall back to it after
+    /// captures and variables (docs/ARCHITECTURE.md §6.3/§14 M6).
+    server_data: HashMap<String, String>,
+    /// Keys currently sourced from GMCP. MSDP updates to one of these keys
+    /// are dropped, since §6.3 says GMCP wins when a server offers both.
+    gmcp_keys: HashSet<String>,
 }
 
 impl Engine {
@@ -173,6 +181,8 @@ impl Engine {
             triggers: compile_rules(&triggers)?,
             timers: compile_timers(&timers)?,
             variables,
+            server_data: HashMap::new(),
+            gmcp_keys: HashSet::new(),
         })
     }
 
@@ -188,18 +198,43 @@ impl Engine {
                 continue;
             };
             for template in &rule.sends {
-                outcome
-                    .sends
-                    .push(expand(template, Some(&caps), &self.variables));
+                outcome.sends.push(expand(
+                    template,
+                    Some(&caps),
+                    &self.variables,
+                    &self.server_data,
+                ));
             }
             for (name, template) in &rule.set {
-                updates.push((name.clone(), expand(template, Some(&caps), &self.variables)));
+                updates.push((
+                    name.clone(),
+                    expand(template, Some(&caps), &self.variables, &self.server_data),
+                ));
             }
             outcome.gag |= rule.gag;
         }
 
         self.variables.extend(updates);
         outcome
+    }
+
+    /// Records one GMCP value under its dotted path, making it available to
+    /// `${...}` templates in aliases, triggers, and timers
+    /// (docs/ARCHITECTURE.md §14 M6 — "triggers can react to server data").
+    /// GMCP always wins over MSDP for the same key (§6.3).
+    pub fn update_server_data_from_gmcp(&mut self, key: &str, value: String) {
+        self.gmcp_keys.insert(key.to_string());
+        self.server_data.insert(key.to_string(), value);
+    }
+
+    /// As [`Self::update_server_data_from_gmcp`], but for MSDP: a no-op if
+    /// GMCP already owns this key, since a server offering both protocols
+    /// has GMCP preferred (§6.3).
+    pub fn update_server_data_from_msdp(&mut self, key: &str, value: String) {
+        if self.gmcp_keys.contains(key) {
+            return;
+        }
+        self.server_data.insert(key.to_string(), value);
     }
 
     /// Turn one typed input line into the commands to send: split on `;`,
@@ -221,11 +256,18 @@ impl Engine {
             {
                 Some((rule, caps)) => {
                     for template in &rule.sends {
-                        out.push(expand(template, Some(&caps), &self.variables));
+                        out.push(expand(
+                            template,
+                            Some(&caps),
+                            &self.variables,
+                            &self.server_data,
+                        ));
                     }
                     for (name, template) in &rule.set {
-                        updates
-                            .push((name.clone(), expand(template, Some(&caps), &self.variables)));
+                        updates.push((
+                            name.clone(),
+                            expand(template, Some(&caps), &self.variables, &self.server_data),
+                        ));
                     }
                 }
                 None => out.push(part.to_string()),
@@ -262,10 +304,13 @@ impl Engine {
                 continue;
             }
             for template in &timer.sends {
-                sends.push(expand(template, None, &self.variables));
+                sends.push(expand(template, None, &self.variables, &self.server_data));
             }
             for (name, template) in &timer.set {
-                updates.push((name.clone(), expand(template, None, &self.variables)));
+                updates.push((
+                    name.clone(),
+                    expand(template, None, &self.variables, &self.server_data),
+                ));
             }
             timer.next = timer.repeat.then(|| now + timer.interval);
         }
@@ -557,7 +602,12 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
 /// Substitutes `${...}` in a send/set template: numbered and named regex
 /// captures first, then the variable store (§7.1). An unresolved name is
 /// left verbatim so a typo is visible rather than silently blank.
-fn expand(template: &str, caps: Option<&Captures>, vars: &HashMap<String, String>) -> String {
+fn expand(
+    template: &str,
+    caps: Option<&Captures>,
+    vars: &HashMap<String, String>,
+    server_data: &HashMap<String, String>,
+) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
 
@@ -570,7 +620,7 @@ fn expand(template: &str, caps: Option<&Captures>, vars: &HashMap<String, String
             return out;
         };
         let name = &after[..end];
-        match lookup(name, caps, vars) {
+        match lookup(name, caps, vars, server_data) {
             Some(value) => out.push_str(&value),
             None => {
                 out.push_str("${");
@@ -585,7 +635,15 @@ fn expand(template: &str, caps: Option<&Captures>, vars: &HashMap<String, String
     out
 }
 
-fn lookup(name: &str, caps: Option<&Captures>, vars: &HashMap<String, String>) -> Option<String> {
+/// Resolution order: regex captures, then rule-defined variables, then live
+/// server data — a variable a rule author names can always shadow a GMCP/
+/// MSDP key of the same name.
+fn lookup(
+    name: &str,
+    caps: Option<&Captures>,
+    vars: &HashMap<String, String>,
+    server_data: &HashMap<String, String>,
+) -> Option<String> {
     if let Some(caps) = caps {
         if let Ok(index) = name.parse::<usize>() {
             return caps.get(index).map(|m| m.as_str().to_string());
@@ -594,7 +652,9 @@ fn lookup(name: &str, caps: Option<&Captures>, vars: &HashMap<String, String>) -
             return Some(m.as_str().to_string());
         }
     }
-    vars.get(name).cloned()
+    vars.get(name)
+        .cloned()
+        .or_else(|| server_data.get(name).cloned())
 }
 
 #[cfg(test)]
@@ -753,6 +813,145 @@ mod tests {
             "#,
         );
         assert!(engine.process_line("x").sends.is_empty());
+    }
+
+    // ---- server data (§6.3/§14 M6) ----
+
+    #[test]
+    fn templates_read_live_server_data() {
+        let mut engine = engine(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^hp$'
+                send: ["hp is ${Char.Vitals.hp}"]
+            "#,
+        );
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "87".to_string());
+        assert_eq!(engine.expand_input("hp"), vec!["hp is 87"]);
+    }
+
+    #[test]
+    fn a_later_server_data_update_overwrites_the_earlier_value() {
+        let mut engine = engine(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^hp$'
+                send: ["hp is ${Char.Vitals.hp}"]
+            "#,
+        );
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "87".to_string());
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "42".to_string());
+        assert_eq!(engine.expand_input("hp"), vec!["hp is 42"]);
+    }
+
+    /// A rule author's own variable of the same name wins over live server
+    /// data, so server data can never silently shadow a name a rule set.
+    #[test]
+    fn a_rule_defined_variable_shadows_server_data_of_the_same_name() {
+        let mut engine = engine(
+            r#"
+            name: test
+            variables:
+              hp: unknown
+            aliases:
+              - pattern: '^hp$'
+                send: ["hp is ${hp}"]
+            "#,
+        );
+        engine.update_server_data_from_gmcp("hp", "87".to_string());
+        assert_eq!(engine.expand_input("hp"), vec!["hp is unknown"]);
+    }
+
+    /// The milestone's actual acceptance wording (§14 M6): a *trigger* — an
+    /// inbound-line match via `process_line`, not an alias via
+    /// `expand_input` — reacts to live server data in its `send`.
+    #[test]
+    fn a_trigger_reacts_to_live_server_data() {
+        let mut engine = engine(
+            r#"
+            name: test
+            triggers:
+              - pattern: '^low hp$'
+                send: ["quaff heal, currently ${Char.Vitals.hp}"]
+            "#,
+        );
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "12".to_string());
+        assert_eq!(
+            engine.process_line("low hp").sends,
+            vec!["quaff heal, currently 12"]
+        );
+    }
+
+    /// A trigger's `set:` can also capture server data into a plain
+    /// variable for later rules to read.
+    #[test]
+    fn a_trigger_can_copy_server_data_into_a_variable() {
+        let mut engine = engine(
+            r#"
+            name: test
+            triggers:
+              - pattern: '^snapshot$'
+                set:
+                  last_hp: "${Char.Vitals.hp}"
+            aliases:
+              - pattern: '^recall$'
+                send: ["it was ${last_hp}"]
+            "#,
+        );
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "55".to_string());
+        engine.process_line("snapshot");
+        assert_eq!(engine.expand_input("recall"), vec!["it was 55"]);
+    }
+
+    /// §6.3: "where a server offers both, GMCP is preferred" — an MSDP
+    /// update must not clobber a key GMCP already set.
+    #[test]
+    fn gmcp_data_is_not_overwritten_by_a_later_msdp_update_of_the_same_key() {
+        let mut engine = engine(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^hp$'
+                send: ["hp is ${hp}"]
+            "#,
+        );
+        engine.update_server_data_from_gmcp("hp", "87".to_string());
+        engine.update_server_data_from_msdp("hp", "0".to_string());
+        assert_eq!(engine.expand_input("hp"), vec!["hp is 87"]);
+    }
+
+    /// The reverse is fine: GMCP data always overrides an earlier MSDP
+    /// value for the same key.
+    #[test]
+    fn gmcp_data_overwrites_an_earlier_msdp_value_for_the_same_key() {
+        let mut engine = engine(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^hp$'
+                send: ["hp is ${hp}"]
+            "#,
+        );
+        engine.update_server_data_from_msdp("hp", "0".to_string());
+        engine.update_server_data_from_gmcp("hp", "87".to_string());
+        assert_eq!(engine.expand_input("hp"), vec!["hp is 87"]);
+    }
+
+    /// MSDP-only keys (no GMCP equivalent) still land normally.
+    #[test]
+    fn msdp_data_populates_keys_gmcp_never_touched() {
+        let mut engine = engine(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^room$'
+                send: ["you are in ${room_name}"]
+            "#,
+        );
+        engine.update_server_data_from_msdp("room_name", "The Bazaar".to_string());
+        assert_eq!(engine.expand_input("room"), vec!["you are in The Bazaar"]);
     }
 
     #[test]

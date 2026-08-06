@@ -40,8 +40,14 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     let [main, prompt_area, input_area] = layout(frame.area(), state.connected);
 
     let mut lines: Vec<Line> = Vec::new();
-    for raw in &state.scrollback {
-        lines.extend(ansi_lines(raw));
+    if state.show_gmcp {
+        for raw in &state.gmcp_log {
+            lines.push(Line::raw(raw.clone()));
+        }
+    } else {
+        for raw in &state.scrollback {
+            lines.extend(ansi_lines(raw));
+        }
     }
 
     // Content width matches the Paragraph's own wrapping width (area minus
@@ -53,7 +59,9 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         .wrap(Wrap { trim: false })
         .line_count(content_width) as u16;
 
-    let title = if state.security.is_empty() {
+    let title = if state.show_gmcp {
+        " Mudular — GMCP inspector ".to_string()
+    } else if state.security.is_empty() {
         format!(" Mudular — {} ", state.status)
     } else {
         format!(" Mudular — {} [{}] ", state.status, state.security)
@@ -142,6 +150,8 @@ mod tests {
             security: String::new(),
             connected: true,
             quit_hint: "Ctrl+C".to_string(),
+            gmcp_log: VecDeque::new(),
+            show_gmcp: false,
         }
     }
 
@@ -189,6 +199,24 @@ mod tests {
             "scrollback stays in the pane: {:?}",
             row(&buffer, 1)
         );
+    }
+
+    /// The inspector view (§14 M6) replaces the scrollback with the raw
+    /// GMCP log while toggled on.
+    #[test]
+    fn shows_the_gmcp_log_instead_of_scrollback_when_toggled() {
+        let mut state = state();
+        state
+            .scrollback
+            .push_back("You are in a forest.".to_string());
+        state
+            .gmcp_log
+            .push_back(r#"Char.Vitals {"hp":100}"#.to_string());
+        state.show_gmcp = true;
+
+        let buffer = render(&state);
+        assert!(row(&buffer, 1).contains("Char.Vitals"));
+        assert!(!row(&buffer, 1).contains("forest"));
     }
 
     #[test]

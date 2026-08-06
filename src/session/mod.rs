@@ -19,8 +19,10 @@ use tokio::sync::mpsc;
 use crate::engine::Engine;
 use crate::net::{self, TlsConfig};
 use crate::proto::charset::Charset;
+use crate::proto::gmcp;
 use crate::proto::mccp::MccpDecoder;
-use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, option};
+use crate::proto::msdp;
+use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, encode_subnegotiation, option};
 use line::{LineAssembler, strip_ansi};
 
 /// Used by the M7 session manager; single-session builds never name one.
@@ -38,6 +40,12 @@ pub enum SessionEvent {
     EchoMask(bool),
     /// What the transport is trusting, once connected.
     Security(net::Security),
+    /// A raw GMCP message, for the inspector view (§14 M6). MSDP data feeds
+    /// the same server-data store silently, with no raw view of its own.
+    Gmcp {
+        package: String,
+        payload: Option<String>,
+    },
     /// The session terminated; the pane stays up showing the reason.
     Ended(String),
 }
@@ -158,6 +166,10 @@ async fn run(
                         }
 
                         let mut outbound: Vec<String> = Vec::new();
+                        // Negotiation replies triggered by inbound events
+                        // (Core.Hello/Supports) rather than typed/trigger
+                        // commands, so they bypass the CRLF line framing.
+                        let mut raw_out: Vec<Bytes> = Vec::new();
                         let mut break_reason: Option<String> = None;
                         // Inflate, then parse. Turning compression on ends
                         // the parse mid-buffer: the rest of the read is
@@ -191,9 +203,47 @@ async fn run(
                                         pending = telnet.take_deferred();
                                         Vec::new()
                                     }
+                                    // The server just agreed to send GMCP;
+                                    // announce ourselves (§6.3).
+                                    TelnetEvent::OptionEnabled { option: option::GMCP, side: Side::Remote } => {
+                                        raw_out.push(encode_subnegotiation(
+                                            option::GMCP,
+                                            &gmcp::encode(&gmcp::hello_message()),
+                                        ));
+                                        raw_out.push(encode_subnegotiation(
+                                            option::GMCP,
+                                            &gmcp::encode(&gmcp::supports_message()),
+                                        ));
+                                        Vec::new()
+                                    }
+                                    TelnetEvent::Subnegotiation { option: option::GMCP, data } => {
+                                        match gmcp::parse(&data) {
+                                            Ok(message) => {
+                                                for (key, value) in gmcp::flatten(&message) {
+                                                    engine.update_server_data_from_gmcp(&key, value);
+                                                }
+                                                vec![SessionEvent::Gmcp {
+                                                    package: message.package,
+                                                    payload: message.payload,
+                                                }]
+                                            }
+                                            Err(_) => Vec::new(),
+                                        }
+                                    }
+                                    TelnetEvent::Subnegotiation { option: option::MSDP, data } => {
+                                        if let Ok(pairs) = msdp::parse(&data) {
+                                            let mut flat = Vec::new();
+                                            for (name, value) in &pairs {
+                                                msdp::flatten(name, value, &mut flat);
+                                            }
+                                            for (key, value) in flat {
+                                                engine.update_server_data_from_msdp(&key, value);
+                                            }
+                                        }
+                                        Vec::new()
+                                    }
                                     // Other options are handled inside the
-                                    // Telnet machine; subnegotiations reach
-                                    // the engine in M6.
+                                    // Telnet machine.
                                     _ => Vec::new(),
                                 };
 
@@ -226,6 +276,15 @@ async fn run(
                         // back through aliases, so rules cannot recurse.
                         if send_lines(&mut writer, &outbound).await.is_err() {
                             break "write failed".to_string();
+                        }
+                        for bytes in &raw_out {
+                            if writer.write_all(bytes).await.is_err() {
+                                break_reason = Some("write failed".to_string());
+                                break;
+                            }
+                        }
+                        if let Some(reason) = break_reason {
+                            break reason;
                         }
                         if flush_telnet(&mut telnet, &mut writer).await.is_err() {
                             break "write failed".to_string();
@@ -753,6 +812,144 @@ mod tests {
         );
 
         assert_eq!(next_sent(&mut sent).await, "save");
+    }
+
+    /// The M6 acceptance criterion (§14): GMCP negotiation announces the
+    /// client, a vitals message reaches the UI as a raw event, and its
+    /// value is live in the engine's server-data store for a trigger's
+    /// `${...}` template to read straight away.
+    #[tokio::test]
+    async fn gmcp_negotiates_surfaces_vitals_and_feeds_the_engine() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (mut events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::GMCP]).await.unwrap();
+
+                let mut subnegs = SubnegReader::default();
+                let hello = subnegs.next(&mut sock, option::GMCP).await;
+                assert!(
+                    String::from_utf8_lossy(&hello).starts_with("Core.Hello"),
+                    "client must announce itself first: {hello:?}"
+                );
+                let supports = subnegs.next(&mut sock, option::GMCP).await;
+                assert!(
+                    String::from_utf8_lossy(&supports).starts_with("Core.Supports.Set"),
+                    "client must advertise supported packages: {supports:?}"
+                );
+
+                let vitals = encode_subnegotiation(option::GMCP, br#"Char.Vitals {"hp":87}"#);
+                sock.write_all(&vitals).await.unwrap();
+
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^hp$'
+                    send: ["tell hp ${Char.Vitals.hp}"]
+                "#,
+            ),
+        );
+
+        assert_eq!(
+            next_matching(&mut events, |ev| matches!(ev, SessionEvent::Gmcp { .. })).await,
+            SessionEvent::Gmcp {
+                package: "Char.Vitals".to_string(),
+                payload: Some(r#"{"hp":87}"#.to_string()),
+            }
+        );
+
+        commands
+            .send(SessionCommand::SendLine("hp".into()))
+            .await
+            .unwrap();
+        assert_eq!(next_sent(&mut sent).await, "tell hp 87");
+    }
+
+    /// MSDP has no negotiation handshake of its own (unlike GMCP's
+    /// Core.Hello/Supports) — a server can push data as soon as the option
+    /// is enabled. This exercises that path end to end: negotiation, an
+    /// MSDP VAR/VAL pair, and an alias's `${...}` template reading it
+    /// straight from the server-data store.
+    #[tokio::test]
+    async fn msdp_negotiates_and_feeds_the_engine() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (mut events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::MSDP]).await.unwrap();
+                await_agreement(&mut sock, option::MSDP).await;
+
+                let mut payload = vec![msdp::VAR];
+                payload.extend_from_slice(b"ROOM_NAME");
+                payload.push(msdp::VAL);
+                payload.extend_from_slice(b"The Bazaar");
+                let msg = encode_subnegotiation(option::MSDP, &payload);
+                // MSDP raises no SessionEvent of its own to synchronize on
+                // (unlike GMCP's inspector event): a plain line right after
+                // it does the job instead, since the session processes
+                // events in stream order — by the time this line reaches
+                // the test, the MSDP update has already landed.
+                let mut combined = msg.to_vec();
+                combined.extend_from_slice(b"msdp applied\r\n");
+                sock.write_all(&combined).await.unwrap();
+
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^look$'
+                    send: ["you see ${ROOM_NAME}"]
+                "#,
+            ),
+        );
+
+        assert_eq!(next_line(&mut events).await, "msdp applied");
+
+        commands
+            .send(SessionCommand::SendLine("look".into()))
+            .await
+            .unwrap();
+        assert_eq!(next_sent(&mut sent).await, "you see The Bazaar");
+    }
+
+    /// Reads complete `IAC SB <option> … IAC SE` subnegotiations,
+    /// IAC-unescaped, ignoring any other Telnet framing (like our own NAWS
+    /// offer) mixed in with them. Keeps leftover bytes across calls, since
+    /// two subnegotiations written back-to-back can arrive in one read.
+    #[derive(Default)]
+    struct SubnegReader {
+        pending: Vec<u8>,
+    }
+
+    impl SubnegReader {
+        async fn next(&mut self, sock: &mut tokio::net::TcpStream, option: u8) -> Vec<u8> {
+            let mut buf = vec![0u8; 256];
+            loop {
+                if let Some(pos) = self.pending.windows(3).position(|w| w == [IAC, SB, option]) {
+                    let mut data = Vec::new();
+                    let mut i = pos + 3;
+                    while i + 1 < self.pending.len() {
+                        if self.pending[i] == IAC && self.pending[i + 1] == SE {
+                            self.pending.drain(..i + 2);
+                            return data;
+                        }
+                        if self.pending[i] == IAC && self.pending[i + 1] == IAC {
+                            data.push(IAC);
+                            i += 2;
+                            continue;
+                        }
+                        data.push(self.pending[i]);
+                        i += 1;
+                    }
+                }
+                let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0, "client closed before sending the subnegotiation");
+                self.pending.extend_from_slice(&buf[..n]);
+            }
+        }
     }
 
     async fn next_sent(rx: &mut mpsc::Receiver<String>) -> String {
