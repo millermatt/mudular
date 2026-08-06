@@ -362,4 +362,80 @@ mod tests {
         assert!(!state.connected);
         assert!(state.status.contains("connection closed"));
     }
+
+    // ---- /reload (docs/ARCHITECTURE.md §7.3) ----
+
+    /// Writes a config dir with one module the profile pulls in.
+    fn config_with_alias(send: &str) -> crate::net::pins::tests::tempdir::TempDir {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        std::fs::create_dir_all(dir.path().join("modules")).unwrap();
+        std::fs::write(
+            dir.path().join("profiles/tank.yaml"),
+            "name: tank\nhost: h\nport: 1\nmodules: [combat]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("modules/combat.yaml"),
+            format!("name: combat\naliases:\n  - pattern: '^x$'\n    send: [\"{send}\"]\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn reload_picks_up_edited_rules() {
+        let dir = config_with_alias("old");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+
+        // Edit the module on disk, exactly as a player would.
+        std::fs::write(
+            dir.path().join("modules/combat.yaml"),
+            "name: combat\naliases:\n  - pattern: '^x$'\n    send: [\"new\"]\n",
+        )
+        .unwrap();
+
+        let notice = reload_rules(Some(&rules), Some(&tx)).await;
+        assert!(notice.contains("reloaded"), "{notice}");
+
+        match rx.try_recv().expect("a new rule set was sent") {
+            SessionCommand::SetRules(mut engine) => {
+                assert_eq!(engine.expand_input("x"), vec!["new"]);
+            }
+            other => panic!("expected SetRules, got {other:?}"),
+        }
+    }
+
+    /// A broken rule file must report itself and leave the running session
+    /// on the rules it already had, rather than dropping to no rules.
+    #[tokio::test]
+    async fn reload_reports_a_broken_file_and_sends_nothing() {
+        let dir = config_with_alias("old");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+
+        std::fs::write(
+            dir.path().join("modules/combat.yaml"),
+            "name: combat\naliases:\n  - pattern: '('\n",
+        )
+        .unwrap();
+
+        let notice = reload_rules(Some(&rules), Some(&tx)).await;
+        assert!(notice.contains("reload failed"), "{notice}");
+        assert!(
+            notice.contains("keeping the current rules"),
+            "the player must be told the old rules still apply: {notice}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a failed reload must not replace the session's rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_without_a_session_explains_itself() {
+        let notice = reload_rules(None, None).await;
+        assert!(notice.contains("needs a connected session"), "{notice}");
+    }
 }

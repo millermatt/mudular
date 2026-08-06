@@ -371,6 +371,134 @@ mod tests {
         assert_eq!(path, Path::new("/cfg/profiles/kestrel.yaml"));
     }
 
+    /// M4's acceptance criterion (docs/ARCHITECTURE.md §14): one shared
+    /// module, two profiles, each behaving per the scope rules. The engine
+    /// tests cover merging in memory; this covers the part only real files
+    /// exercise — global.yaml, `modules:` resolution, and the profile's
+    /// own layer actually reaching the merge in the right order.
+    #[test]
+    fn two_profiles_share_a_module_and_layer_it_differently() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::create_dir_all(dir.join("modules")).unwrap();
+
+        std::fs::write(
+            dir.join("global.yaml"),
+            r#"
+name: global
+variables:
+  target: rat
+aliases:
+  - id: quicklook
+    pattern: '^ll$'
+    send: ["look"]
+triggers:
+  - id: greet
+    pattern: '^(?P<who>\w+) has arrived\.$'
+    send: ["say welcome ${who}"]
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("modules/combat.yaml"),
+            r#"
+name: combat
+variables:
+  target: kobold
+aliases:
+  - id: kill
+    pattern: '^k$'
+    send: ["kill ${target}"]
+triggers:
+  - id: autoloot
+    pattern: 'is DEAD'
+    send: ["get all corpse"]
+"#,
+        )
+        .unwrap();
+
+        // Takes the shared module as-is.
+        std::fs::write(
+            dir.join("profiles/tank.yaml"),
+            "name: tank\nhost: h\nport: 1\nmodules: [combat]\n",
+        )
+        .unwrap();
+
+        // Same module, but overrides the variable, disables one of its
+        // rules, and patches a *global* rule without restating its pattern.
+        std::fs::write(
+            dir.join("profiles/cleric.yaml"),
+            r#"
+name: cleric
+host: h
+port: 1
+modules: [combat]
+variables:
+  target: dragon
+triggers:
+  - id: autoloot
+    enabled: false
+  - id: greet
+    send: ["say blessings ${who}"]
+"#,
+        )
+        .unwrap();
+
+        let engine = |profile: &str| {
+            let layers = load_rules(dir, Some(profile)).expect("rules load");
+            crate::engine::Engine::compile(&layers).expect("rules compile")
+        };
+
+        let mut tank = engine("tank");
+        let mut cleric = engine("cleric");
+
+        // Module variable beats global; profile beats module.
+        assert_eq!(tank.expand_input("k"), vec!["kill kobold"]);
+        assert_eq!(cleric.expand_input("k"), vec!["kill dragon"]);
+
+        // The profile disables an inherited module rule by id alone.
+        assert_eq!(
+            tank.process_line("The kobold is DEAD!").sends,
+            vec!["get all corpse"]
+        );
+        assert!(cleric.process_line("The kobold is DEAD!").sends.is_empty());
+
+        // ...and patches a global rule's command, inheriting its pattern.
+        assert_eq!(
+            tank.process_line("Bob has arrived.").sends,
+            vec!["say welcome Bob"]
+        );
+        assert_eq!(
+            cleric.process_line("Bob has arrived.").sends,
+            vec!["say blessings Bob"]
+        );
+
+        // An untouched global rule survives in both.
+        assert_eq!(tank.expand_input("ll"), vec!["look"]);
+        assert_eq!(cleric.expand_input("ll"), vec!["look"]);
+    }
+
+    /// A profile naming a module that isn't there must say which module and
+    /// which profile, not just "file not found".
+    #[test]
+    fn a_missing_module_names_the_profile_that_wanted_it() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("profiles/tank.yaml"),
+            "name: tank\nhost: h\nport: 1\nmodules: [nope]\n",
+        )
+        .unwrap();
+
+        let err = load_rules(dir, Some("tank")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("nope"), "{message}");
+        assert!(message.contains("tank"), "{message}");
+    }
+
     /// The shipped examples are documentation: if they stop loading, the
     /// docs are wrong. Loading them here keeps that from going unnoticed.
     #[test]
