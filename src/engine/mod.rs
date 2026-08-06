@@ -27,7 +27,10 @@ pub struct RuleModule {
     /// Label used in error messages; loaders set it from the file name.
     #[serde(default)]
     pub name: String,
+    /// Part of the on-disk schema: `deny_unknown_fields` means dropping it
+    /// would reject modules that set it. Read by the user, not the code.
     #[serde(default)]
+    #[allow(dead_code)]
     pub description: Option<String>,
     #[serde(default)]
     pub variables: HashMap<String, String>,

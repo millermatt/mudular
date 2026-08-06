@@ -47,6 +47,9 @@ impl MccpDecoder {
         Self::default()
     }
 
+    /// For the §11 status-bar MCCP badge, which lands with the status bar
+    /// rather than with the protocol.
+    #[allow(dead_code)]
     pub fn is_active(&self) -> bool {
         self.stream.is_some()
     }

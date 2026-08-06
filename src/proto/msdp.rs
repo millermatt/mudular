@@ -4,6 +4,11 @@
 //! (docs/ARCHITECTURE.md §6.3). MSDP values are normalized into the same
 //! server-data namespace as GMCP.
 
+// Every item here is an M6 seam with no caller yet. The allowance is
+// module-scoped so that it lapses with the module: once M6 wires the
+// codec up, anything still unused is genuinely unused.
+#![allow(dead_code)]
+
 pub const VAR: u8 = 1;
 pub const VAL: u8 = 2;
 pub const TABLE_OPEN: u8 = 3;

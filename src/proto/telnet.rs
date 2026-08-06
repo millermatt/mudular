@@ -18,9 +18,15 @@ pub mod option {
     pub const EOR: u8 = 25;
     pub const NAWS: u8 = 31;
     pub const CHARSET: u8 = 42;
+    /// Negotiated in M6.
+    #[allow(dead_code)]
     pub const MSDP: u8 = 69;
     pub const MCCP2: u8 = 86;
+    /// Deliberately never offered: outbound volume does not justify it.
+    #[allow(dead_code)]
     pub const MCCP3: u8 = 87;
+    /// Negotiated in M6.
+    #[allow(dead_code)]
     pub const GMCP: u8 = 201;
 }
 
@@ -119,6 +125,11 @@ enum Q {
     WantNo,
     WantNoOpposite,
     WantYes,
+    /// Only reachable by withdrawing an offer we have already sent, which
+    /// needs a "request local disable" entry point this client has no use
+    /// for yet. The arms that read it are kept so the table stays a
+    /// complete transcription of RFC 1143.
+    #[allow(dead_code)]
     WantYesOpposite,
 }
 

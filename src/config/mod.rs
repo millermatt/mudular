@@ -29,6 +29,9 @@ pub fn config_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    /// Part of the on-disk schema: `deny_unknown_fields` means dropping it
+    /// would reject configs that set it. Read by the user, not the code.
+    #[allow(dead_code)]
     pub name: String,
     pub host: String,
     pub port: u16,

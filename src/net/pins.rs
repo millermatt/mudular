@@ -23,6 +23,10 @@ impl PinStore {
         Self { path }
     }
 
+    // Unlike the other allowances in this crate this one marks no seam:
+    // nothing has ever called it. Left rather than removed as an unrelated
+    // change — a removal candidate.
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -3,6 +3,10 @@
 //! Subnegotiation payload is `Package.SubPackage [<json>]`. The JSON payload
 //! is kept as text here; consumers parse it lazily (M6).
 
+// The parser is exercised by its own tests but has no production caller
+// until M6 routes GMCP subnegotiations here.
+#![allow(dead_code)]
+
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

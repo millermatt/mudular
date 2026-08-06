@@ -23,6 +23,8 @@ use crate::proto::mccp::MccpDecoder;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, option};
 use line::{LineAssembler, strip_ansi};
 
+/// Used by the M7 session manager; single-session builds never name one.
+#[allow(dead_code)]
 pub type SessionId = usize;
 
 /// Session → UI.
@@ -51,10 +53,10 @@ pub enum SessionCommand {
     /// Replace the rule set without reconnecting (`/reload`).
     SetRules(Box<Engine>),
     /// Pane was resized; renegotiate NAWS.
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
+    Resize { cols: u16, rows: u16 },
+    /// Handled here already; no UI affordance sends it until M7 adds
+    /// per-pane session control.
+    #[allow(dead_code)]
     Disconnect,
 }
 
