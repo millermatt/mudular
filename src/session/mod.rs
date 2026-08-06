@@ -16,7 +16,7 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::net;
+use crate::net::{self, TlsConfig};
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, option};
 use line::LineAssembler;
 
@@ -31,6 +31,8 @@ pub enum SessionEvent {
     Prompt(String),
     /// Server asked us to mask/unmask local input (Telnet ECHO).
     EchoMask(bool),
+    /// What the transport is trusting, once connected.
+    Security(net::Security),
     /// The session terminated; the pane stays up showing the reason.
     Ended(String),
 }
@@ -54,7 +56,7 @@ pub enum SessionCommand {
 pub fn spawn(
     host: String,
     port: u16,
-    tls: bool,
+    tls: Option<TlsConfig>,
     record: Option<PathBuf>,
 ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>) {
     let (event_tx, event_rx) = mpsc::channel(256);
@@ -66,18 +68,25 @@ pub fn spawn(
 async fn run(
     host: String,
     port: u16,
-    tls: bool,
+    tls: Option<TlsConfig>,
     record: Option<PathBuf>,
     events: mpsc::Sender<SessionEvent>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
-    let transport = match net::connect(&host, port, tls).await {
-        Ok(t) => t,
+    let connection = match net::connect(&host, port, tls.as_ref()).await {
+        Ok(connection) => connection,
         Err(err) => {
             let _ = events.send(SessionEvent::Ended(format!("{err:#}"))).await;
             return;
         }
     };
+    let net::Connection {
+        transport,
+        security,
+    } = connection;
+    if events.send(SessionEvent::Security(security)).await.is_err() {
+        return;
+    }
 
     let mut recorder = match record {
         Some(path) => match Recorder::create(&path, &host, port) {
@@ -411,7 +420,7 @@ mod tests {
         });
 
         let (mut events, _commands) =
-            spawn("127.0.0.1".to_string(), port, false, Some(path.clone()));
+            spawn("127.0.0.1".to_string(), port, None, Some(path.clone()));
         assert_eq!(next_line(&mut events).await, "hi");
 
         let captured = std::fs::read_to_string(&path).unwrap();
@@ -540,7 +549,7 @@ mod tests {
             script(sock).await;
         });
 
-        spawn("127.0.0.1".to_string(), port, false, None)
+        spawn("127.0.0.1".to_string(), port, None, None)
     }
 
     async fn next_matching(

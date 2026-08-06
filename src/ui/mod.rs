@@ -53,7 +53,11 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         .wrap(Wrap { trim: false })
         .line_count(content_width) as u16;
 
-    let title = format!(" Mudular — {} ", state.status);
+    let title = if state.security.is_empty() {
+        format!(" Mudular — {} ", state.status)
+    } else {
+        format!(" Mudular — {} [{}] ", state.status, state.security)
+    };
     let body = Paragraph::new(text)
         .block(Block::bordered().title(title.bold()))
         .wrap(Wrap { trim: false })
@@ -135,6 +139,7 @@ mod tests {
             input: tui_input::Input::default(),
             status: "connected".to_string(),
             masked: false,
+            security: String::new(),
             connected: true,
         }
     }

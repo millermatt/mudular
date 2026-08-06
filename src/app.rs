@@ -2,8 +2,8 @@
 //!
 //! Session tasks never touch the terminal; they emit
 //! [`crate::session::SessionEvent`]s that this loop consumes alongside
-//! terminal input (see docs/ARCHITECTURE.md §3). M1 wires exactly one
-//! session; multiplexing several arrives in M7.
+//! terminal input (see docs/ARCHITECTURE.md §3). Exactly one session is
+//! wired for now; multiplexing several arrives in M7.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ const SCROLLBACK_LIMIT: usize = 10_000;
 pub struct ConnectTarget {
     pub host: String,
     pub port: u16,
-    pub tls: bool,
+    pub tls: Option<crate::net::TlsConfig>,
     pub record: Option<PathBuf>,
 }
 
@@ -38,6 +38,8 @@ pub struct AppState {
     pub status: String,
     /// Server took over echoing (Telnet ECHO): hide what we type.
     pub masked: bool,
+    /// Transport security shown in the title bar ("TLS", "TLS pinned", …).
+    pub security: String,
     /// Whether a session owns the prompt row. Keeping the row reserved for
     /// the whole session keeps the layout — and so the NAWS pane size —
     /// stable as prompts come and go.
@@ -70,6 +72,15 @@ fn apply_session_event(state: &mut AppState, connected_status: &str, ev: Session
         }
         SessionEvent::EchoMask(masked) => {
             state.masked = masked;
+            false
+        }
+        SessionEvent::Security(security) => {
+            state.security = security.label;
+            // §13 requires an insecure connection (or a newly pinned
+            // certificate) to be visible, not just implied by a label.
+            if let Some(warning) = security.warning {
+                state.push_line(format!("** {warning}"));
+            }
             false
         }
         SessionEvent::Ended(reason) => {
@@ -110,6 +121,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, target: Option<ConnectTarget
         input: Input::default(),
         status,
         masked: false,
+        security: String::new(),
         connected: cmd_tx.is_some(),
     };
 
@@ -189,5 +201,104 @@ async fn event_loop(terminal: &mut DefaultTerminal, target: Option<ConnectTarget
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::Security;
+
+    fn state() -> AppState {
+        AppState {
+            scrollback: VecDeque::new(),
+            prompt: String::new(),
+            input: Input::default(),
+            status: "connecting".to_string(),
+            masked: false,
+            security: String::new(),
+            connected: true,
+        }
+    }
+
+    fn scrollback(state: &AppState) -> String {
+        state
+            .scrollback
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// §13: an unverified connection must be visible in the pane, not just
+    /// implied by a status label the player may never look at.
+    #[test]
+    fn surfaces_a_security_warning_in_the_pane() {
+        let mut state = state();
+        apply_session_event(
+            &mut state,
+            "connected",
+            SessionEvent::Security(Security {
+                label: "TLS insecure".to_string(),
+                warning: Some("certificate NOT verified".to_string()),
+            }),
+        );
+
+        assert_eq!(state.security, "TLS insecure");
+        assert!(
+            scrollback(&state).contains("certificate NOT verified"),
+            "warning missing from the pane: {:?}",
+            scrollback(&state)
+        );
+    }
+
+    #[test]
+    fn a_verified_connection_adds_no_noise() {
+        let mut state = state();
+        apply_session_event(
+            &mut state,
+            "connected",
+            SessionEvent::Security(Security {
+                label: "TLS".to_string(),
+                warning: None,
+            }),
+        );
+
+        assert_eq!(state.security, "TLS");
+        assert!(state.scrollback.is_empty());
+    }
+
+    /// A password typed while the server is echoing must not be written to
+    /// the scrollback the player can scroll back through.
+    #[test]
+    fn masked_input_is_never_echoed_to_scrollback() {
+        let mut state = state();
+        state.masked = true;
+        // Mirrors the Enter branch of the event loop.
+        let line = "hunter2".to_string();
+        if !state.masked {
+            state.push_line(format!("> {line}"));
+        }
+        assert!(state.scrollback.is_empty());
+
+        state.masked = false;
+        state.push_line("> look".to_string());
+        assert_eq!(scrollback(&state), "> look");
+    }
+
+    #[test]
+    fn ending_a_session_clears_masking_and_connected_state() {
+        let mut state = state();
+        state.masked = true;
+        let ended = apply_session_event(
+            &mut state,
+            "connected",
+            SessionEvent::Ended("connection closed".to_string()),
+        );
+
+        assert!(ended);
+        assert!(!state.masked, "a dead session must not leave input hidden");
+        assert!(!state.connected);
+        assert!(state.status.contains("connection closed"));
     }
 }

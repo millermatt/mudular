@@ -32,6 +32,14 @@ struct Cli {
     #[arg(long)]
     tls: bool,
 
+    /// How to verify the server certificate: full, pinned, or insecure.
+    #[arg(long, default_value = "full")]
+    tls_verify: net::VerifyMode,
+
+    /// Configuration directory (default: the platform config directory).
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+
     /// Write diagnostic logs to this file (filtered via RUST_LOG).
     #[arg(long)]
     log: Option<PathBuf>,
@@ -57,6 +65,14 @@ async fn main() -> Result<()> {
             .init();
     }
 
+    let tls = match cli.tls {
+        true => Some(net::TlsConfig {
+            verify: cli.tls_verify,
+            pin_store: net::pins::PinStore::new(config_dir(cli.config_dir)?.join("known_certs")),
+        }),
+        false => None,
+    };
+
     let target = match (&cli.profile, &cli.host) {
         (Some(profile), _) => {
             anyhow::bail!("profile `{profile}` not wired yet — M3; use --host instead")
@@ -64,11 +80,21 @@ async fn main() -> Result<()> {
         (None, Some(host)) => Some(app::ConnectTarget {
             host: host.clone(),
             port: cli.port,
-            tls: cli.tls,
+            tls,
             record: cli.record.clone(),
         }),
         (None, None) => None,
     };
 
     app::run(target).await
+}
+
+/// Where the pin store (and, from M3, the YAML config) lives.
+fn config_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(dir) = override_dir {
+        return Ok(dir);
+    }
+    let dirs = directories::ProjectDirs::from("", "", "mudular")
+        .ok_or_else(|| anyhow::anyhow!("cannot determine a config directory; use --config-dir"))?;
+    Ok(dirs.config_dir().to_path_buf())
 }

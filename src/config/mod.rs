@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::engine::{Alias, RuleModule, Trigger};
+use crate::net::VerifyMode;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,15 +44,6 @@ pub struct TlsSettings {
     pub enabled: bool,
     #[serde(default)]
     pub verify: VerifyMode,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VerifyMode {
-    #[default]
-    Full,
-    Pinned,
-    Insecure,
 }
 
 fn default_charset() -> String {
