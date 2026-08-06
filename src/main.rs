@@ -35,6 +35,10 @@ struct Cli {
     /// Write diagnostic logs to this file (filtered via RUST_LOG).
     #[arg(long)]
     log: Option<PathBuf>,
+
+    /// Record raw inbound bytes to this file for replay as a test fixture.
+    #[arg(long)]
+    record: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -61,6 +65,7 @@ async fn main() -> Result<()> {
             host: host.clone(),
             port: cli.port,
             tls: cli.tls,
+            record: cli.record.clone(),
         }),
         (None, None) => None,
     };

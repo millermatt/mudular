@@ -2,10 +2,11 @@
 //!
 //! Session tasks never touch the terminal; they emit
 //! [`crate::session::SessionEvent`]s that this loop consumes alongside
-//! terminal input (see docs/ARCHITECTURE.md §3). M0 wires exactly one
+//! terminal input (see docs/ARCHITECTURE.md §3). M1 wires exactly one
 //! session; multiplexing several arrives in M7.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -25,15 +26,22 @@ pub struct ConnectTarget {
     pub host: String,
     pub port: u16,
     pub tls: bool,
+    pub record: Option<PathBuf>,
 }
 
 /// Everything the UI needs to render a frame.
 pub struct AppState {
     pub scrollback: VecDeque<String>,
-    /// The current unterminated line (e.g. a login prompt with no `\n`).
+    /// Text pinned above the input line; empty means no prompt.
     pub prompt: String,
     pub input: Input,
     pub status: String,
+    /// Server took over echoing (Telnet ECHO): hide what we type.
+    pub masked: bool,
+    /// Whether a session owns the prompt row. Keeping the row reserved for
+    /// the whole session keeps the layout — and so the NAWS pane size —
+    /// stable as prompts come and go.
+    pub connected: bool,
 }
 
 impl AppState {
@@ -53,7 +61,6 @@ fn apply_session_event(state: &mut AppState, connected_status: &str, ev: Session
     }
     match ev {
         SessionEvent::Line(line) => {
-            state.prompt.clear();
             state.push_line(line);
             false
         }
@@ -61,12 +68,14 @@ fn apply_session_event(state: &mut AppState, connected_status: &str, ev: Session
             state.prompt = text;
             false
         }
-        SessionEvent::EchoMask(_) => {
-            // Password masking lands in M1.
+        SessionEvent::EchoMask(masked) => {
+            state.masked = masked;
             false
         }
         SessionEvent::Ended(reason) => {
             state.status = format!("disconnected: {reason}");
+            state.masked = false;
+            state.connected = false;
             true
         }
     }
@@ -84,7 +93,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, target: Option<ConnectTarget
         Some(t) => {
             let status = format!("connecting to {}:{}...", t.host, t.port);
             let connected_status = format!("connected to {}:{}", t.host, t.port);
-            let (rx, tx) = session::spawn(t.host, t.port, t.tls);
+            let (rx, tx) = session::spawn(t.host, t.port, t.tls, t.record);
             (Some(rx), Some(tx), status, connected_status)
         }
         None => (
@@ -100,7 +109,15 @@ async fn event_loop(terminal: &mut DefaultTerminal, target: Option<ConnectTarget
         prompt: String::new(),
         input: Input::default(),
         status,
+        masked: false,
+        connected: cmd_tx.is_some(),
     };
+
+    // Tell the server our pane size up front; NAWS is sent once it agrees.
+    if let Some(tx) = &cmd_tx {
+        let (cols, rows) = ui::output_pane_size(terminal.get_frame().area(), state.connected);
+        let _ = tx.send(SessionCommand::Resize { cols, rows }).await;
+    }
 
     let mut term_events = EventStream::new();
 
@@ -127,13 +144,23 @@ async fn event_loop(terminal: &mut DefaultTerminal, target: Option<ConnectTarget
                             let line = state.input.value().to_string();
                             state.input.reset();
                             if !line.is_empty() {
-                                state.push_line(format!("> {line}"));
+                                // Never echo what the server is masking.
+                                if !state.masked {
+                                    state.push_line(format!("> {line}"));
+                                }
                                 if let Some(tx) = &cmd_tx {
                                     let _ = tx.send(SessionCommand::SendLine(line)).await;
                                 }
                             }
                         } else {
                             state.input.handle_event(&Event::Key(key));
+                        }
+                    }
+                    Some(Ok(Event::Resize(cols, rows))) => {
+                        if let Some(tx) = &cmd_tx {
+                            let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+                            let (cols, rows) = ui::output_pane_size(area, state.connected);
+                            let _ = tx.send(SessionCommand::Resize { cols, rows }).await;
                         }
                     }
                     Some(Ok(_)) => {}
