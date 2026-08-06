@@ -1,0 +1,14 @@
+# Example shared rule module. Real location: ~/.config/mudular/modules/
+name: uw-combat
+description: Combat reactions shared by all Underworld characters
+variables:
+  heal_at: "40"
+aliases:
+  - pattern: '^k (.+)$'
+    send: ["kill ${1}"]
+triggers:
+  - pattern: '^(?P<who>\p{L}+) has arrived\.$'
+    send: ["look ${who}"]
+  - id: autoloot
+    pattern: '(?P<victim>.+) is DEAD!'
+    send: ["get all corpse"]

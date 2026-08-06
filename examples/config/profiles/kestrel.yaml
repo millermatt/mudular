@@ -1,0 +1,16 @@
+# Example character profile. Real location: ~/.config/mudular/profiles/
+name: kestrel
+host: underworld.example.org
+port: 4443
+tls:
+  enabled: true
+  verify: pinned        # full | pinned | insecure
+charset: utf-8          # or a legacy fallback: latin1, cp437
+modules: [uw-combat]    # shared rule modules, applied in order
+
+# Profile-local overrides (highest scope layer)
+variables:
+  target: rat
+triggers:
+  - pattern: '^You are hungry\.$'
+    send: ["eat bread"]
