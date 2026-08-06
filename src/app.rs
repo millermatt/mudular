@@ -690,11 +690,13 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     };
     let line = session.input.value().to_string();
     session.input.reset();
-    if line.is_empty() {
-        return;
-    }
-    // Never echo what the server is masking.
-    if !session.masked {
+    // A bare Enter is a keystroke in its own right — MUD login flows and
+    // pagers ask for one ("press return to continue") — so it goes to the
+    // server rather than being swallowed as "nothing typed". It is not
+    // echoed: a lone `>` in the scrollback would be noise, and the server's
+    // own response is the feedback that matters.
+    if !line.is_empty() && !session.masked {
+        // Never echo what the server is masking.
         session.push_line(format!("> {line}"));
     }
     if line.trim() == RELOAD_COMMAND {
@@ -1234,6 +1236,39 @@ mod tests {
 
         assert!(injections.is_empty());
         assert!(scrollback(&state.sessions[0]).contains("no session named"));
+    }
+
+    // ---- input submission ----
+
+    /// Pressing Enter on an empty box must still send: MUD login flows ask
+    /// for a bare return. It is not echoed, though — a lone `>` line would
+    /// be noise in the scrollback.
+    #[tokio::test]
+    async fn a_bare_enter_is_sent_but_not_echoed() {
+        let (mut state, mut receivers) = app(&["tank"]);
+
+        submit_input(&mut state, &[]).await;
+
+        match receivers[0].try_recv().expect("a bare Enter is dispatched") {
+            SessionCommand::SendLine(line) => assert_eq!(line, ""),
+            other => panic!("expected SendLine, got {other:?}"),
+        }
+        assert!(
+            state.sessions[0].scrollback.is_empty(),
+            "a bare Enter must not leave a stray prompt line: {:?}",
+            state.sessions[0].scrollback
+        );
+    }
+
+    #[tokio::test]
+    async fn a_typed_line_is_still_echoed() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].input = Input::default().with_value("look".into());
+
+        submit_input(&mut state, &[]).await;
+
+        assert_eq!(scrollback(&state.sessions[0]), "> look");
+        assert_eq!(state.sessions[0].input.value(), "", "input is cleared");
     }
 
     // ---- keys (docs/ARCHITECTURE.md §11) ----

@@ -344,6 +344,15 @@ async fn run(
             }
             cmd = commands.recv() => {
                 match cmd {
+                    // A bare Enter carries meaning of its own, so it goes
+                    // out as a plain CRLF instead of through the alias
+                    // splitter — which drops empty parts, so that `a;;b`
+                    // sends two commands rather than three.
+                    Some(SessionCommand::SendLine(line)) if line.is_empty() => {
+                        if send_lines(&mut writer, &[String::new()]).await.is_err() {
+                            break "write failed".to_string();
+                        }
+                    }
                     Some(SessionCommand::SendLine(line)) => {
                         let outcome = engine.expand_input(&line);
                         if send_lines(&mut writer, &outcome.sends).await.is_err() {
@@ -1434,6 +1443,73 @@ mod tests {
     /// One-shot read of a single command, for scripts that only need one.
     async fn read_command(sock: &mut tokio::net::TcpStream) -> String {
         CommandReader::default().next(sock).await
+    }
+
+    /// "Press return to continue" is a real step in plenty of MUD login
+    /// flows, so a bare Enter has to reach the server as an empty line
+    /// rather than being treated as nothing typed.
+    #[tokio::test]
+    async fn a_bare_enter_reaches_the_server_as_an_empty_line() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, commands) = serve(move |mut sock| async move {
+            let mut reader = CommandReader::default();
+            tx.send(reader.next(&mut sock).await).await.unwrap();
+            tx.send(reader.next(&mut sock).await).await.unwrap();
+        });
+
+        commands
+            .send(SessionCommand::SendLine(String::new()))
+            .await
+            .unwrap();
+        commands
+            .send(SessionCommand::SendLine("look".to_string()))
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            received.push(
+                timeout(Duration::from_secs(2), sent.recv())
+                    .await
+                    .expect("timed out")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(received, vec!["", "look"]);
+    }
+
+    /// The empty line bypasses the alias splitter, which drops empty parts
+    /// so that `a;;b` sends two commands — that must not swallow the bare
+    /// Enter as well.
+    #[tokio::test]
+    async fn a_bare_enter_is_sent_even_with_aliases_loaded() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^k$'
+                    send: ["kill rat"]
+                "#,
+            ),
+        );
+
+        commands
+            .send(SessionCommand::SendLine(String::new()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), sent.recv())
+                .await
+                .expect("timed out")
+                .unwrap(),
+            ""
+        );
     }
 
     // ---- cross-session actions (docs/ARCHITECTURE.md §7.5) ----
