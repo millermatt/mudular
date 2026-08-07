@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::style::Color;
 use serde::{Deserialize, Deserializer};
 
 use crate::engine::{Alias, RuleModule, Timer, Trigger};
@@ -39,6 +40,12 @@ pub struct Profile {
     pub tls: TlsSettings,
     #[serde(default = "default_charset")]
     pub charset: String,
+    /// Tints this character's pane border and tab entry, so panes are
+    /// told apart at a glance rather than by reading their titles
+    /// (docs/ARCHITECTURE.md §11). A colour name (`cyan`, `light blue`),
+    /// `#rrggbb`, or a 0-255 terminal palette index.
+    #[serde(default, deserialize_with = "parse_color")]
+    pub color: Option<Color>,
     /// Shared rule modules, applied in order (scope layer 2).
     #[serde(default)]
     pub modules: Vec<String>,
@@ -132,6 +139,24 @@ pub struct TlsSettings {
     pub enabled: bool,
     #[serde(default)]
     pub verify: VerifyMode,
+}
+
+/// Fails at load with the offending string, like every other schema typo —
+/// a silently ignored colour is a setting the user thinks they applied.
+fn parse_color<'de, D>(deserializer: D) -> std::result::Result<Option<Color>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use std::str::FromStr;
+
+    let Some(name) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Color::from_str(&name).map(Some).map_err(|_| {
+        serde::de::Error::custom(format!(
+            "unknown color {name:?}: use a name (cyan, light blue), #rrggbb, or 0-255"
+        ))
+    })
 }
 
 fn default_charset() -> String {
@@ -613,6 +638,29 @@ mod tests {
         assert_eq!(load_app_config(&dir).unwrap().history_size, 20);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A colour the terminal can't name is a typo, and a typo the loader
+    /// swallowed is a setting the user believes they applied (§10).
+    #[test]
+    fn a_profile_color_parses_every_accepted_form_and_rejects_the_rest() {
+        let base = "name: t\nhost: h\nport: 1\n";
+        for (yaml, expected) in [
+            ("color: cyan\n", Color::Cyan),
+            ("color: light blue\n", Color::LightBlue),
+            ("color: '#ff8800'\n", Color::Rgb(255, 136, 0)),
+            ("color: '12'\n", Color::Indexed(12)),
+        ] {
+            let profile: Profile = serde_yaml::from_str(&format!("{base}{yaml}")).unwrap();
+            assert_eq!(profile.color, Some(expected), "{yaml}");
+        }
+
+        let profile: Profile = serde_yaml::from_str(base).unwrap();
+        assert_eq!(profile.color, None, "no color: is not an error");
+
+        let err = serde_yaml::from_str::<Profile>(&format!("{base}color: puce\n"))
+            .expect_err("an unknown color is rejected");
+        assert!(err.to_string().contains("puce"), "{err}");
     }
 
     #[test]

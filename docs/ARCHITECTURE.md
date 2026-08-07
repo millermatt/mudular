@@ -636,6 +636,14 @@ loudly at load time with file/line context.
   prompt line pinned above a per-session input line with its own history
   (`Up`/`Down`, §11.3). Input buffers are per-session — switching focus
   never mixes input.
+- **Per-character colour:** a profile's `color:` (a name, `#rrggbb`, or a
+  0-255 index) tints that character's pane border and its tab entry, so
+  panes are told apart peripherally instead of by reading titles. Colour
+  identifies the *character*; brightness stays reserved for focus, so an
+  unfocused coloured pane is dimmed in its own colour rather than losing
+  it. Scrollback text is never recoloured — that space belongs to the
+  server's own ANSI. Channel panes take no colour: they aggregate across
+  characters, so no one profile's colour could stand for the pane.
 - **Status bar:** connection state, TLS lock icon, charset, MCCP badge,
   latency (M9).
 - **Discoverability:** every binding above is remappable, so no key may be

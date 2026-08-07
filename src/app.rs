@@ -20,6 +20,8 @@ use tokio::sync::mpsc;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
+use ratatui::style::Color;
+
 use crate::config::{Channel, CrossSession, Keybinds};
 use crate::engine::Engine;
 use crate::proto::charset::Charset;
@@ -56,6 +58,8 @@ pub struct ConnectTarget {
     pub rules: Rules,
     /// How this session treats commands injected into it (§7.5).
     pub cross: CrossSession,
+    /// Tints this character's border and tab entry (§11).
+    pub color: Option<Color>,
 }
 
 /// Where a session's rules came from, so `/reload` can recompile them from
@@ -88,6 +92,9 @@ pub struct SessionPane {
     pub gmcp_log: VecDeque<String>,
     /// Lines that arrived while the pane was not focused (§11).
     pub unread: usize,
+    /// The profile's `color:`, if it set one — the pane border and this
+    /// session's tab entry are drawn in it (§11).
+    pub color: Option<Color>,
     /// Commands typed here, oldest first, exactly as typed — before alias
     /// expansion and `;` splitting, because the alias is what the player is
     /// choosing to repeat (docs/ARCHITECTURE.md §11.3).
@@ -553,6 +560,7 @@ fn connect(target: ConnectTarget, history_limit: usize) -> SessionPane {
         connected: true,
         gmcp_log: VecDeque::new(),
         unread: 0,
+        color: target.color,
         history: VecDeque::new(),
         history_pos: None,
         history_draft: String::new(),
@@ -844,6 +852,7 @@ pub(crate) mod test_support {
                 connected: true,
                 gmcp_log: VecDeque::new(),
                 unread: 0,
+                color: None,
                 history: VecDeque::new(),
                 history_pos: None,
                 history_draft: String::new(),

@@ -11,7 +11,7 @@
 use ansi_to_tui::IntoText;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
@@ -272,7 +272,7 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         )
     };
 
-    render_scrollback(frame, area, lines, title, focused);
+    render_scrollback(frame, area, lines, title, focused, session.color);
 }
 
 fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: bool) {
@@ -282,7 +282,9 @@ fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: b
         .flat_map(|raw| ansi_lines(raw))
         .collect();
     let title = format!("{} ", pane_title(&channel.config.name, channel.unread));
-    render_scrollback(frame, area, lines, title, focused);
+    // Channels aggregate across characters, so no one profile's colour
+    // could stand for the pane.
+    render_scrollback(frame, area, lines, title, focused, None);
 }
 
 /// Renders a bordered, bottom-tailed pane. Scrollback navigation (PgUp/PgDn)
@@ -294,6 +296,7 @@ fn render_scrollback(
     lines: Vec<Line>,
     title: String,
     focused: bool,
+    color: Option<Color>,
 ) {
     // Content width matches the Paragraph's own wrapping width (area minus
     // borders). `line_count` runs ratatui's real wrap algorithm rather than
@@ -304,13 +307,19 @@ fn render_scrollback(
         .wrap(Wrap { trim: false })
         .line_count(content_width) as u16;
 
+    // A profile's colour tints the border; dimming still marks the pane as
+    // unfocused, so colour identifies the character and brightness
+    // identifies focus — two signals that don't compete (§11).
+    let mut border = match color {
+        Some(color) => Style::new().fg(color),
+        None => Style::new(),
+    };
+    if !focused {
+        border = border.dim();
+    }
     let block = Block::bordered()
         .title(if focused { title.bold() } else { title.into() })
-        .border_style(if focused {
-            Style::new()
-        } else {
-            Style::new().dim()
-        });
+        .border_style(border);
     let body = Paragraph::new(text)
         .block(block)
         .wrap(Wrap { trim: false })
@@ -380,11 +389,16 @@ fn tab_line(state: &AppState) -> Line<'static> {
             index + 1,
             pane_title(&session.name, session.unread)
         );
-        spans.push(if state.is_focused_session(index) {
-            Span::styled(label, Style::new().bold().reversed())
+        let mut style = match session.color {
+            Some(color) => Style::new().fg(color),
+            None => Style::new(),
+        };
+        style = if state.is_focused_session(index) {
+            style.bold().reversed()
         } else {
-            Span::styled(label, Style::new().dim())
-        });
+            style.dim()
+        };
+        spans.push(Span::styled(label, style));
     }
     Line::from(spans)
 }
@@ -496,6 +510,39 @@ mod tests {
         let buffer = render(&state);
         assert!(row(&buffer, 1).contains("Char.Vitals"));
         assert!(!row(&buffer, 1).contains("forest"));
+    }
+
+    /// A profile's colour has to reach both places a character is named,
+    /// or the pane and its tab look like different characters (§11).
+    #[test]
+    fn a_profiles_color_tints_its_border_and_its_tab() {
+        let mut state = test_support::app(&["tank", "cleric"]);
+        state.sessions[0].color = Some(Color::Magenta);
+
+        let buffer = render_sized(&state, 40, 12);
+        // Row 0 is the tab bar; row 1 is the focused pane's top border.
+        let tab = buffer
+            .content()
+            .iter()
+            .take(40)
+            .find(|cell| cell.symbol() == "t")
+            .expect("the tab bar names the session");
+        assert_eq!(tab.fg, Color::Magenta);
+        assert_eq!(buffer.cell((0, 1)).unwrap().fg, Color::Magenta);
+    }
+
+    /// Focus is shown by brightness and colour by profile, so an unfocused
+    /// coloured pane must keep both signals rather than losing one.
+    #[test]
+    fn an_unfocused_colored_pane_stays_colored() {
+        let mut state = test_support::app(&["tank", "cleric"]);
+        state.sessions[1].color = Some(Color::Green);
+        state.layout = LayoutMode::Splits;
+
+        let buffer = render_sized(&state, 60, 12);
+        let border = buffer.cell((59, 1)).unwrap();
+        assert_eq!(border.fg, Color::Green);
+        assert!(border.modifier.contains(ratatui::style::Modifier::DIM));
     }
 
     /// The overlay covers what is under it — a listing rendered over live

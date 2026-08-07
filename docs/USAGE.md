@@ -37,6 +37,7 @@ tls:
   enabled: true
   verify: pinned   # full | pinned | insecure — see below
 charset: utf-8     # or a legacy fallback: latin1, cp437
+color: cyan        # tints this character's pane border and tab
 ```
 
 Then just:
@@ -76,6 +77,12 @@ mudular tank cleric
 - **Typing** always goes to the focused character, and the input box says
   which one (`input → tank`). Nothing is shared between sessions — the
   input buffers are separate, so switching mid-sentence keeps both.
+- **Colour:** give a profile `color: cyan` and that character's pane
+  border and tab entry are drawn in it, so you can tell panes apart
+  without reading the titles. Any colour name (`cyan`, `light blue`), a
+  `#rrggbb` value, or a 0-255 palette index works; an unrecognised one is
+  rejected at startup rather than ignored. Focus is still shown by
+  brightness, so an unfocused pane is dimmed in its own colour.
 - Opening the same profile twice gives the second one a `-2` suffix
   (`cleric-2`), which is how rules address it.
 

@@ -106,6 +106,7 @@ async fn main() -> Result<()> {
             cross: app_config
                 .cross_session
                 .with_override(profile.cross_session),
+            color: profile.color,
         });
     }
 
@@ -129,6 +130,8 @@ async fn main() -> Result<()> {
                 profile: None,
             },
             cross: app_config.cross_session,
+            // A --host connection has no profile to carry a colour.
+            color: None,
         });
     }
 

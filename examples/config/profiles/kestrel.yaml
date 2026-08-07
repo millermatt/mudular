@@ -5,6 +5,7 @@ port: 4443
 tls:
   enabled: true
   verify: pinned        # full | pinned | insecure
+color: cyan             # pane border + tab colour for this character
 charset: utf-8          # or a legacy fallback: latin1, cp437
 modules: [uw-combat]    # shared rule modules, applied in order
 
