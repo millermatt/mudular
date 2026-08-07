@@ -593,7 +593,7 @@ Location: platform config dir (`~/.config/mudular/`), overridable with
 
 ```
 ~/.config/mudular/
-  mudular.yaml        # app settings: keybinds, theme, scrollback size
+  mudular.yaml        # app settings: keybinds, theme, scrollback/history size
   global.yaml         # global default rules (scope layer 1)
   modules/*.yaml      # shared rule modules (scope layer 2)
   profiles/*.yaml     # one file per character (scope layer 3)
@@ -633,8 +633,9 @@ loudly at load time with file/line context.
   focus. Trigger-flagged "important" lines can escalate the indicator
   color (M8).
 - **Per-pane content:** scrollback viewport (PgUp/PgDn, `End` to tail),
-  prompt line pinned above a per-session input line with its own history.
-  Input buffers are per-session — switching focus never mixes input.
+  prompt line pinned above a per-session input line with its own history
+  (`Up`/`Down`, §11.3). Input buffers are per-session — switching focus
+  never mixes input.
 - **Status bar:** connection state, TLS lock icon, charset, MCCP badge,
   latency (M9).
 - **Discoverability:** every binding above is remappable, so no key may be
@@ -699,9 +700,10 @@ command is behind a key.
   feature worth having; a static list of defaults would be worse than
   nothing for the user who remapped something.
 - **Contents:** the configurable bindings grouped by purpose (session
-  focus, layout, views, quit), the built-in `Alt+1..9`, and the
-  client-side commands (`/reload`, `/help`) — which are otherwise just as
-  invisible as the keys.
+  focus, layout, views, quit), the built-in ones (`Alt+1..9`, `Up`/`Down`
+  history, `PgUp`/`PgDn` scrollback), and the client-side commands
+  (`/reload`, `/help`) — which are otherwise just as invisible as the
+  keys.
 - **`/help` prints the same content** into the focused pane, so the
   overlay is reachable without already knowing a key. Client commands are
   matched before the line is sent (§7.1), as `/reload` already is.
@@ -714,6 +716,60 @@ as it is useful rather than in milestone order: it is small, and every
 milestone that adds a binding before it lands is a milestone whose
 features nobody can find. M7 alone took the client from one binding to
 five plus the `Alt` row.
+
+### 11.3 Command history (M9, built early)
+
+Recalling the last command is the single most-used affordance of any
+line-oriented client, and a MUD is the worst case for retyping: combat is
+a burst of short repeated commands, and the alternative to history is the
+player mashing the same six characters all evening.
+
+- **`Up`/`Down` walk the focused session's history**, replacing the input
+  line. Built-in and not remappable, like `Alt+1..9` — the arrows have no
+  other meaning on a single-line input, and a client that made them
+  configurable would be inviting users to break the one binding everyone
+  arrives already knowing. Scrollback keeps `PgUp`/`PgDn`, so there is no
+  collision.
+- **Per session, like the input buffer.** History belongs to the character,
+  not the app: `kill rat` recalled into the cleric's input is a mistake the
+  client should be structurally incapable of making. Focusing a channel
+  pane leaves history bound to the last focused session, exactly as input
+  routing is (§11.1).
+- **What is stored is what was typed** — before alias expansion and before
+  `;` splitting. `k` recalls as `k`, not as the four commands it expanded
+  to, because the alias is the thing the player is choosing to repeat. It
+  follows that a history entry replayed after a `/reload` picks up the new
+  rules, which is the intent.
+- **The in-progress line survives a walk.** Pressing `Up` stashes whatever
+  is currently typed; walking back `Down` past the newest entry restores
+  it. Losing a half-typed line to a stray arrow key is the failure mode
+  that makes people distrust history and stop using it.
+- **Editing a recalled entry never rewrites the stored one.** A recalled
+  line is a copy; the history is append-only, and submitting an edited
+  recall appends a new entry.
+- **Consecutive duplicates collapse** to one entry, so a spammed `look`
+  costs one slot and `Up` twice reaches the command before it, not the
+  same one again. Non-adjacent repeats are kept — position in the sequence
+  is information.
+- **Masked input is never recorded** (§13). Under server `ECHO`
+  negotiation the line is already kept out of scrollback; history is the
+  same class of leak and takes the same rule. This is not a preference,
+  and there is no setting to turn it off.
+- **In memory only, not persisted across restarts.** A history file is a
+  plaintext record of everything typed at every prompt, including the
+  password typed at the prompt the server forgot to mask — the failure is
+  silent and permanent. If persistence is added later it is opt-in per
+  profile and never the default.
+- **Bounded** by `history_size` in `mudular.yaml` (default 500 entries per
+  session), discarding oldest-first — the same reasoning as scrollback
+  bounds, applied to a buffer that a stuck key can fill.
+- Prefix search (`Ctrl+R`, or `Up` filtering on what is already typed) is a
+  deliberate later addition, alongside scrollback search in M9. Plain
+  recall must land first and stand alone.
+
+Built early for the same reason as §11.2: it is small, it is table stakes,
+and the client is already usable enough that its absence is felt every
+session.
 
 ---
 
@@ -749,7 +805,9 @@ five plus the `Alt` row.
 - TLS: full verification by default; TOFU pinning for self-signed MUD
   certs; `insecure` requires explicit config and shows a UI warning.
 - Passwords: not stored in YAML; OS keyring integration planned (M9),
-  masked input under server ECHO negotiation from M1.
+  masked input under server ECHO negotiation from M1. Masked lines never
+  enter command history, and history is not persisted to disk (§11.3) — a
+  recall buffer leaks credentials exactly as scrollback would.
 
 ---
 
@@ -771,7 +829,7 @@ exist from M0, even where a stage is a passthrough).
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
-| **M9** | Polish | In-client help overlay + `/help` (§11.2 — built early, as soon as it is useful); scrollback search, disk logging, reconnect/backoff, keyring passwords + auto-login, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones |
+| **M9** | Polish | In-client help overlay + `/help` (§11.2) and `Up`/`Down` command history (§11.3) — both built early, as soon as they are useful; scrollback search, disk logging, reconnect/backoff, keyring passwords + auto-login, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either |
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
