@@ -9,6 +9,12 @@ keybinds:
   focus_next: ctrl+tab
   cycle_layout: f3        # tabs <-> side-by-side splits
   toggle_channels: f4     # show/hide the channel column
+  help: f1                # the in-client key/command listing
+
+# How many commands each character remembers for Up/Down recall. Kept in
+# memory only — a history file would be a plaintext record of everything
+# typed at every prompt, passwords included.
+history_size: 500
 
 # Channel panes: matching lines are pulled out of the main scrollback into
 # their own pane, so slow conversation stays readable under combat spam.

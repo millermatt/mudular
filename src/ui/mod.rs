@@ -16,11 +16,55 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::app::{AppState, ChannelPane, Focus, LayoutMode};
+use crate::config::Keybinds;
 
 /// Width of the docked channel column, and the smallest main area worth
 /// keeping beside it — below that the channels are simply not drawn.
 const CHANNEL_WIDTH: u16 = 28;
 const MIN_MAIN_WIDTH: u16 = 30;
+
+/// Column the descriptions start at in the help listing.
+const HELP_KEY_WIDTH: usize = 14;
+
+/// Every binding and client command, built from the bindings the event loop
+/// actually matches against (docs/ARCHITECTURE.md §11.2). Nothing here is a
+/// hardcoded key name: a remapped binding documents itself, and the help
+/// cannot drift out of step with what the client does.
+pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
+    fn row(key: impl std::fmt::Display, what: &str) -> String {
+        format!("  {:HELP_KEY_WIDTH$}{what}", key.to_string())
+    }
+
+    vec![
+        "Typing".to_string(),
+        row("Enter", "send the line — on an empty box a bare"),
+        row("", "return, for \"press return to continue\""),
+        row("Up / Down", "walk this character's history"),
+        // Listed even though it does nothing yet, so the overlay is an
+        // honest account of the client rather than an aspirational one.
+        row("PgUp / PgDn", "scroll back — not implemented yet"),
+        String::new(),
+        "Characters".to_string(),
+        row("Alt+1 … Alt+9", "jump to character 1-9"),
+        row(keybinds.focus_next, "cycle focus, channels included"),
+        String::new(),
+        "Views".to_string(),
+        row(keybinds.cycle_layout, "tabs / side-by-side layout"),
+        row(keybinds.toggle_channels, "show or hide channel panes"),
+        row(keybinds.gmcp_inspector, "raw GMCP inspector"),
+        row(keybinds.help, "this help"),
+        String::new(),
+        "Commands you can type".to_string(),
+        row("/help", "print this help into the pane"),
+        row("/reload", "recompile rules from disk"),
+        String::new(),
+        "Leaving".to_string(),
+        row(keybinds.quit, "quit"),
+        String::new(),
+        "Keys other than Alt+N, Enter and the arrows are".to_string(),
+        "remappable under `keybinds:` in mudular.yaml.".to_string(),
+    ]
+}
 
 /// Where every pane lands this frame.
 pub struct Panes {
@@ -166,6 +210,33 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     }
 
     draw_input(frame, panes.input, state);
+
+    if state.show_help {
+        draw_help(frame, frame.area(), &state.keybinds);
+    }
+}
+
+/// The help overlay: a box centred over the layout, sized to its content and
+/// clipped to the terminal (docs/ARCHITECTURE.md §11.2).
+fn draw_help(frame: &mut Frame, area: Rect, keybinds: &Keybinds) {
+    let lines = help_lines(keybinds);
+    let content_width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    // +2 for the border on each axis.
+    let width = (content_width as u16 + 4).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let overlay = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let text = Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>());
+    let block =
+        Block::bordered().title(format!(" Help — {} or Esc to close ", keybinds.help).bold());
+    // Clear first: the overlay sits on top of panes that already drew here.
+    frame.render_widget(ratatui::widgets::Clear, overlay);
+    frame.render_widget(Paragraph::new(text).block(block), overlay);
 }
 
 fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
@@ -251,7 +322,7 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     let Some(session) = state.bound() else {
         let empty = Paragraph::new("").block(
             Block::bordered()
-                .title(format!(" input ({} to quit) ", state.quit_hint))
+                .title(format!(" input ({} to quit) ", state.keybinds.quit))
                 .border_style(Style::new().dim()),
         );
         frame.render_widget(empty, area);
@@ -274,7 +345,10 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     let title = if session.masked {
         format!(" input → {} (hidden) ", session.name)
     } else {
-        format!(" input → {} ({} to quit) ", session.name, state.quit_hint)
+        format!(
+            " input → {} ({} to quit) ",
+            session.name, state.keybinds.quit
+        )
     };
     let input_line = Paragraph::new(value).block(
         Block::bordered()
@@ -357,6 +431,14 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// The whole buffer as text, for assertions that don't care which row.
+    fn rows(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| row(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
         let width = buffer.area.width;
         (0..width)
@@ -414,6 +496,47 @@ mod tests {
         let buffer = render(&state);
         assert!(row(&buffer, 1).contains("Char.Vitals"));
         assert!(!row(&buffer, 1).contains("forest"));
+    }
+
+    /// The overlay covers what is under it — a listing rendered over live
+    /// scrollback would be unreadable (docs/ARCHITECTURE.md §11.2).
+    #[test]
+    fn the_help_overlay_draws_over_the_panes() {
+        let mut state = state();
+        for _ in 0..40 {
+            state.sessions[0]
+                .scrollback
+                .push_back("You are in a forest.".to_string());
+        }
+
+        let without = render_sized(&state, 70, 40);
+        assert!(rows(&without).contains("forest"));
+
+        state.show_help = true;
+        let with = render_sized(&state, 70, 40);
+        let listing = rows(&with);
+        assert!(listing.contains("Help"), "{listing}");
+        assert!(listing.contains("Ctrl+C"), "{listing}");
+
+        let covered = (0..with.area.height)
+            .map(|y| row(&with, y))
+            .find(|line| line.contains("Alt+1"))
+            .expect("the listing is on screen");
+        assert!(
+            !covered.contains("forest"),
+            "the overlay must clear the cells it covers: {covered}"
+        );
+    }
+
+    /// Small terminals are the ones most likely to have the overlay, and a
+    /// box larger than the screen would panic in ratatui rather than clip.
+    #[test]
+    fn the_help_overlay_fits_a_terminal_smaller_than_itself() {
+        let mut state = state();
+        state.show_help = true;
+
+        let buffer = render_sized(&state, 20, 6);
+        assert_eq!(buffer.area.width, 20);
     }
 
     #[test]

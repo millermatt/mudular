@@ -201,6 +201,9 @@ pub struct Keybinds {
     /// Shows or hides the channel panes (§11.1).
     #[serde(default = "default_toggle_channels")]
     pub toggle_channels: KeyBinding,
+    /// Opens the help overlay listing every binding (§11.2).
+    #[serde(default = "default_help")]
+    pub help: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -211,6 +214,7 @@ impl Default for Keybinds {
             focus_next: default_focus_next(),
             cycle_layout: default_cycle_layout(),
             toggle_channels: default_toggle_channels(),
+            help: default_help(),
         }
     }
 }
@@ -225,6 +229,11 @@ fn default_cycle_layout() -> KeyBinding {
 
 fn default_toggle_channels() -> KeyBinding {
     "f4".parse().expect("built-in default keybinding")
+}
+
+fn default_help() -> KeyBinding {
+    // The one key a user tries unprompted, and clear of the F2-F4 toggles.
+    "f1".parse().expect("built-in default keybinding")
 }
 
 fn default_quit() -> KeyBinding {

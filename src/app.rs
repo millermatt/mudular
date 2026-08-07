@@ -33,9 +33,12 @@ const SCROLLBACK_LIMIT: usize = 10_000;
 /// Same rationale as `SCROLLBACK_LIMIT`, for the raw GMCP inspector log.
 const GMCP_LOG_LIMIT: usize = 1_000;
 
-/// The one client-side command M4 defines. Everything else starting with
-/// `/` is left alone, since plenty of MUDs use `/` for their own commands.
+/// The client-side commands. Everything else starting with `/` is left
+/// alone, since plenty of MUDs use `/` for their own commands.
 const RELOAD_COMMAND: &str = "/reload";
+/// The same listing as the overlay, for players who never find the key
+/// (docs/ARCHITECTURE.md §11.2).
+const HELP_COMMAND: &str = "/help";
 
 /// `send_to` address meaning "every other session" (§7.5).
 const ALL_SESSIONS: &str = "*";
@@ -231,8 +234,12 @@ pub struct AppState {
     /// Whether the focused session's pane shows `gmcp_log` instead of its
     /// scrollback.
     pub show_gmcp: bool,
-    /// The configured quit binding, for the input box's hint text.
-    pub quit_hint: String,
+    /// Whether the help overlay is up (§11.2).
+    pub show_help: bool,
+    /// The live bindings, so the input hint and the help overlay both read
+    /// what the event loop actually matches against — never a second copy
+    /// that can drift (§11.2).
+    pub keybinds: Keybinds,
 }
 
 impl AppState {
@@ -632,7 +639,8 @@ async fn event_loop(
         layout: LayoutMode::Tabs,
         show_channels: !channels.is_empty(),
         show_gmcp: false,
-        quit_hint: keybinds.quit.to_string(),
+        show_help: false,
+        keybinds: keybinds.clone(),
     };
 
     if !has_sessions {
@@ -731,6 +739,17 @@ fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
+    // While the overlay is up it owns the keyboard: any key dismisses it and
+    // goes no further. Typing blind into an input line hidden behind the
+    // help is worse than the extra keystroke to reopen it (§11.2).
+    if state.show_help {
+        state.show_help = false;
+        return true;
+    }
+    if keybinds.help.matches(code, modifiers) {
+        state.show_help = true;
+        return true;
+    }
     if keybinds.gmcp_inspector.matches(code, modifiers) {
         state.show_gmcp = !state.show_gmcp;
         return true;
@@ -785,6 +804,15 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     if !line.is_empty() && !session.masked {
         // Never echo what the server is masking.
         session.push_line(format!("> {line}"));
+    }
+    if line.trim() == HELP_COMMAND {
+        let lines = ui::help_lines(&state.keybinds);
+        if let Some(session) = state.bound_mut() {
+            for line in lines {
+                session.push_line(line);
+            }
+        }
+        return;
     }
     if line.trim() == RELOAD_COMMAND {
         let notice = reload_rules(state, channels).await;
@@ -850,7 +878,8 @@ pub(crate) mod test_support {
                 layout: LayoutMode::Tabs,
                 show_channels: false,
                 show_gmcp: false,
-                quit_hint: "Ctrl+C".to_string(),
+                show_help: false,
+                keybinds: Keybinds::default(),
             },
             receivers,
         )
@@ -1360,6 +1389,90 @@ mod tests {
 
         assert_eq!(scrollback(&state.sessions[0]), "> look");
         assert_eq!(state.sessions[0].input.value(), "", "input is cleared");
+    }
+
+    // ---- help (docs/ARCHITECTURE.md §11.2) ----
+
+    #[test]
+    fn the_help_key_opens_the_overlay_and_any_key_closes_it() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        assert!(press(&mut state, KeyCode::F(1), KeyModifiers::NONE));
+        assert!(state.show_help);
+
+        assert!(press(&mut state, KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!state.show_help);
+
+        press(&mut state, KeyCode::F(1), KeyModifiers::NONE);
+        // A key with no other meaning still dismisses, rather than being
+        // typed into an input line hidden behind the overlay.
+        assert!(press(&mut state, KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(!state.show_help);
+    }
+
+    /// The overlay must never become a second, stale copy of the bindings
+    /// (§11.2) — the listing is generated from the ones in force.
+    #[test]
+    fn help_shows_remapped_keys_not_the_defaults() {
+        let keybinds = Keybinds {
+            toggle_channels: "alt+t".parse().unwrap(),
+            ..Keybinds::default()
+        };
+        let listing = ui::help_lines(&keybinds).join("\n");
+
+        assert!(listing.contains("Alt+T"), "{listing}");
+        assert!(
+            !listing.contains("F4"),
+            "the default it replaced must be gone: {listing}"
+        );
+    }
+
+    #[test]
+    fn help_lists_every_configurable_binding() {
+        let keybinds = Keybinds::default();
+        let listing = ui::help_lines(&keybinds).join("\n");
+
+        for binding in [
+            &keybinds.quit,
+            &keybinds.gmcp_inspector,
+            &keybinds.focus_next,
+            &keybinds.cycle_layout,
+            &keybinds.toggle_channels,
+            &keybinds.help,
+        ] {
+            assert!(
+                listing.contains(&binding.to_string()),
+                "{binding} missing from:\n{listing}"
+            );
+        }
+        // The built-ins and client commands are just as invisible otherwise.
+        for text in ["Alt+1", "Up / Down", "/reload", "/help"] {
+            assert!(listing.contains(text), "{text} missing from:\n{listing}");
+        }
+        // An unimplemented binding is shown as such rather than omitted.
+        assert!(listing.contains("not implemented yet"), "{listing}");
+    }
+
+    #[tokio::test]
+    async fn the_help_command_prints_the_same_listing_into_the_pane() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        state.sessions[0].input = Input::default().with_value("/help".into());
+
+        submit_input(&mut state, &[]).await;
+
+        let printed = state.sessions[0]
+            .scrollback
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        for line in ui::help_lines(&state.keybinds) {
+            assert!(printed.contains(&line), "{line:?} missing from:\n{printed}");
+        }
+        assert!(
+            receivers[0].try_recv().is_err(),
+            "/help is a client command and must not reach the server"
+        );
     }
 
     // ---- command history (docs/ARCHITECTURE.md §11.3) ----

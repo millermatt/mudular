@@ -225,6 +225,7 @@ fallback.
 |---|---|---|
 | `Enter` | Send the input line. On an empty box it sends a bare return, for the "press return to continue" prompts many MUDs use at login. | — |
 | `Up` / `Down` | Walk back and forward through the commands you've sent to the focused character. What you were part-way through typing comes back when you walk forward past the newest one. | — (built in) |
+| `F1` | Show the help overlay: every key and client command, including any you've remapped. Any key closes it. | `help` |
 | `Ctrl+C` | Quit | `quit` |
 | `Alt+1` … `Alt+9` | Jump straight to session 1–9 | — (built in) |
 | `Ctrl+Tab` | Cycle focus to the next pane, including channel panes | `focus_next` |
@@ -232,8 +233,9 @@ fallback.
 | `F3` | Switch between the tabbed and side-by-side layouts | `cycle_layout` |
 | `F4` | Show or hide the channel panes | `toggle_channels` |
 
-There is no in-client help listing these yet — it's coming, and until then
-this table is the reference.
+`F1` shows this same list inside the client, built from your actual
+config — so it stays right even if you remap something. `/help` prints it
+into the pane if you'd rather not reach for a key.
 
 `Ctrl+Tab` is the one to watch: terminals differ in whether they send it
 at all, and some swallow it for their own tab switching. If it does
@@ -253,6 +255,7 @@ keybinds:
   gmcp_inspector: f2
   cycle_layout: f3
   toggle_channels: f4
+  help: f1
 ```
 
 `history_size:` (default 500) sets how many commands each character
