@@ -85,6 +85,19 @@ pub struct SessionPane {
     pub gmcp_log: VecDeque<String>,
     /// Lines that arrived while the pane was not focused (§11).
     pub unread: usize,
+    /// Commands typed here, oldest first, exactly as typed — before alias
+    /// expansion and `;` splitting, because the alias is what the player is
+    /// choosing to repeat (docs/ARCHITECTURE.md §11.3).
+    history: VecDeque<String>,
+    /// How far back through `history` the recall walk has gone. `None` means
+    /// the input line is the player's own, not a recalled copy.
+    history_pos: Option<usize>,
+    /// What was typed when the walk began, restored on walking back past the
+    /// newest entry. Losing a half-written line to a stray arrow key is what
+    /// teaches people to distrust history.
+    history_draft: String,
+    /// How many entries `history` keeps (`history_size`, §11.3).
+    history_limit: usize,
     /// The status line shown once the connection is up.
     connected_status: String,
     /// `None` once the session has ended, so its receiver stops being polled.
@@ -104,6 +117,60 @@ impl SessionPane {
         if self.scrollback.len() > SCROLLBACK_LIMIT {
             self.scrollback.pop_front();
         }
+    }
+
+    /// Records a submitted command for recall, and ends any walk in progress
+    /// so the next `Up` starts from the newest entry again (§11.3).
+    fn push_history(&mut self, line: &str) {
+        self.history_pos = None;
+        self.history_draft.clear();
+        // Nothing to recall from an empty line, and a masked line is a
+        // password: it stays out of history for the same reason it stays out
+        // of scrollback (§13).
+        if line.is_empty() || self.masked || self.history_limit == 0 {
+            return;
+        }
+        // Only *consecutive* duplicates collapse: a spammed `look` costs one
+        // slot, but a repeat further back keeps its place, since where a
+        // command sits in the sequence is information.
+        if self.history.back().is_some_and(|last| last == line) {
+            return;
+        }
+        self.history.push_back(line.to_string());
+        while self.history.len() > self.history_limit {
+            self.history.pop_front();
+        }
+    }
+
+    /// Walks the recall list, `back` towards older entries. Returns whether
+    /// anything moved, so the caller can leave the key to the input widget.
+    fn walk_history(&mut self, back: bool) -> bool {
+        // Recall into a masked prompt would send an old command as the
+        // password, in the clear, to whatever is listening.
+        if self.masked || self.history.is_empty() {
+            return false;
+        }
+        let next = match (self.history_pos, back) {
+            // Starting a walk: stash the live line before it is overwritten.
+            (None, true) => {
+                self.history_draft = self.input.value().to_string();
+                Some(self.history.len() - 1)
+            }
+            (None, false) => return false,
+            (Some(0), true) => return false,
+            (Some(pos), true) => Some(pos - 1),
+            (Some(pos), false) if pos + 1 < self.history.len() => Some(pos + 1),
+            // Past the newest entry: back to what the player was typing.
+            (Some(_), false) => None,
+        };
+        let line = match next {
+            Some(pos) => self.history[pos].clone(),
+            None => std::mem::take(&mut self.history_draft),
+        };
+        self.history_pos = next;
+        // A recalled entry is a copy — editing it must never rewrite history.
+        self.input = Input::new(line);
+        true
     }
 
     fn push_gmcp(&mut self, package: String, payload: Option<String>) {
@@ -443,14 +510,15 @@ pub async fn run(
     targets: Vec<ConnectTarget>,
     keybinds: Keybinds,
     channels: Vec<Channel>,
+    history_size: usize,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, targets, keybinds, channels).await;
+    let result = event_loop(&mut terminal, targets, keybinds, channels, history_size).await;
     ratatui::restore();
     result
 }
 
-fn connect(target: ConnectTarget) -> SessionPane {
+fn connect(target: ConnectTarget, history_limit: usize) -> SessionPane {
     let status = format!("connecting to {}:{}...", target.host, target.port);
     let connected_status = format!("connected to {}:{}", target.host, target.port);
     let Rules {
@@ -478,6 +546,10 @@ fn connect(target: ConnectTarget) -> SessionPane {
         connected: true,
         gmcp_log: VecDeque::new(),
         unread: 0,
+        history: VecDeque::new(),
+        history_pos: None,
+        history_draft: String::new(),
+        history_limit,
         connected_status,
         events: Some(events),
         commands,
@@ -537,8 +609,12 @@ async fn event_loop(
     targets: Vec<ConnectTarget>,
     keybinds: Keybinds,
     channels: Vec<Channel>,
+    history_size: usize,
 ) -> Result<()> {
-    let sessions: Vec<SessionPane> = targets.into_iter().map(connect).collect();
+    let sessions: Vec<SessionPane> = targets
+        .into_iter()
+        .map(|target| connect(target, history_size))
+        .collect();
     let has_sessions = !sessions.is_empty();
 
     let mut state = AppState {
@@ -587,7 +663,17 @@ async fn event_loop(
                 } else if key.code == KeyCode::Enter {
                     submit_input(&mut state, &channels).await;
                 } else if let Some(session) = state.bound_mut() {
-                    session.input.handle_event(&Event::Key(key));
+                    // Up/Down are built-in and unremappable (§11.3): on a
+                    // single-line input they have no other meaning, and
+                    // they are the one binding every user arrives knowing.
+                    let walked = match key.code {
+                        KeyCode::Up if key.modifiers.is_empty() => session.walk_history(true),
+                        KeyCode::Down if key.modifiers.is_empty() => session.walk_history(false),
+                        _ => false,
+                    };
+                    if !walked {
+                        session.input.handle_event(&Event::Key(key));
+                    }
                 }
             }
             Wake::Terminal(Some(Ok(Event::Resize(cols, rows)))) => {
@@ -690,6 +776,7 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     };
     let line = session.input.value().to_string();
     session.input.reset();
+    session.push_history(&line);
     // A bare Enter is a keystroke in its own right — MUD login flows and
     // pagers ask for one ("press return to continue") — so it goes to the
     // server rather than being swallowed as "nothing typed". It is not
@@ -729,6 +816,10 @@ pub(crate) mod test_support {
                 connected: true,
                 gmcp_log: VecDeque::new(),
                 unread: 0,
+                history: VecDeque::new(),
+                history_pos: None,
+                history_draft: String::new(),
+                history_limit: 500,
                 connected_status: "connected".to_string(),
                 events: None,
                 commands: tx,
@@ -1269,6 +1360,168 @@ mod tests {
 
         assert_eq!(scrollback(&state.sessions[0]), "> look");
         assert_eq!(state.sessions[0].input.value(), "", "input is cleared");
+    }
+
+    // ---- command history (docs/ARCHITECTURE.md §11.3) ----
+
+    /// Submits `line` as if typed into the bound session.
+    async fn submit(state: &mut AppState, line: &str) {
+        if let Some(session) = state.bound_mut() {
+            session.input = Input::default().with_value(line.into());
+        }
+        submit_input(state, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn up_recalls_the_last_command_and_down_returns_to_the_draft() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "kill rat").await;
+        submit(&mut state, "look").await;
+
+        let session = &mut state.sessions[0];
+        session.input = Input::default().with_value("half typ".into());
+
+        assert!(session.walk_history(true));
+        assert_eq!(session.input.value(), "look");
+        assert!(session.walk_history(true));
+        assert_eq!(session.input.value(), "kill rat");
+        // Nothing older to reach; the oldest entry stays put.
+        assert!(!session.walk_history(true));
+        assert_eq!(session.input.value(), "kill rat");
+
+        assert!(session.walk_history(false));
+        assert_eq!(session.input.value(), "look");
+        assert!(session.walk_history(false));
+        assert_eq!(
+            session.input.value(),
+            "half typ",
+            "walking back past the newest entry restores what was being typed"
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_a_recalled_line_leaves_the_stored_one_alone() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "kill rat").await;
+
+        let session = &mut state.sessions[0];
+        session.walk_history(true);
+        session.input = Input::default().with_value("kill wolf".into());
+        submit(&mut state, "kill wolf").await;
+
+        let session = &mut state.sessions[0];
+        assert!(session.walk_history(true));
+        assert_eq!(session.input.value(), "kill wolf");
+        assert!(session.walk_history(true));
+        assert_eq!(
+            session.input.value(),
+            "kill rat",
+            "the edited recall was appended, not written over its source"
+        );
+    }
+
+    #[tokio::test]
+    async fn consecutive_duplicates_collapse_but_earlier_repeats_stay() {
+        let (mut state, _rx) = app(&["tank"]);
+        for line in ["look", "look", "north", "look"] {
+            submit(&mut state, line).await;
+        }
+
+        let session = &mut state.sessions[0];
+        assert_eq!(
+            session.history.iter().collect::<Vec<_>>(),
+            ["look", "north", "look"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_enter_is_not_worth_recalling() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "look").await;
+        submit(&mut state, "").await;
+
+        let session = &mut state.sessions[0];
+        assert!(session.walk_history(true));
+        assert_eq!(session.input.value(), "look");
+    }
+
+    /// A password typed under server ECHO stays out of history for the same
+    /// reason it stays out of scrollback (§13).
+    #[tokio::test]
+    async fn a_masked_line_is_never_recorded_or_recalled() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "look").await;
+
+        state.sessions[0].masked = true;
+        submit(&mut state, "hunter2").await;
+
+        let session = &mut state.sessions[0];
+        assert!(
+            !session.history.contains(&"hunter2".to_string()),
+            "history: {:?}",
+            session.history
+        );
+        assert!(
+            !session.walk_history(true),
+            "recall into a masked prompt would send an old command as the password"
+        );
+        assert_eq!(session.input.value(), "");
+
+        // Unmasking restores ordinary recall, minus the password.
+        state.sessions[0].masked = false;
+        let session = &mut state.sessions[0];
+        assert!(session.walk_history(true));
+        assert_eq!(session.input.value(), "look");
+    }
+
+    #[tokio::test]
+    async fn history_is_per_session() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        submit(&mut state, "kill rat").await;
+
+        state.input_session = 1;
+        state.focus_pane(Focus::Session(1));
+        let cleric = &mut state.sessions[1];
+
+        assert!(
+            !cleric.walk_history(true),
+            "the tank's commands must not be recallable in the cleric's input"
+        );
+        assert_eq!(cleric.input.value(), "");
+    }
+
+    #[tokio::test]
+    async fn history_is_bounded_and_discards_oldest_first() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].history_limit = 2;
+        for line in ["one", "two", "three"] {
+            submit(&mut state, line).await;
+        }
+
+        assert_eq!(
+            state.sessions[0].history.iter().collect::<Vec<_>>(),
+            ["two", "three"]
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_restarts_the_walk_from_the_newest_entry() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "one").await;
+        submit(&mut state, "two").await;
+
+        state.sessions[0].walk_history(true);
+        state.sessions[0].walk_history(true);
+        assert_eq!(state.sessions[0].input.value(), "one");
+        submit(&mut state, "one").await;
+
+        let session = &mut state.sessions[0];
+        assert!(session.walk_history(true));
+        assert_eq!(
+            session.input.value(),
+            "one",
+            "a fresh walk starts at the newest entry, not where the last one stopped"
+        );
     }
 
     // ---- keys (docs/ARCHITECTURE.md §11) ----

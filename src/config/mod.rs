@@ -147,7 +147,7 @@ pub fn load_profile(path: &Path) -> Result<Profile> {
 /// App-wide settings (`mudular.yaml`): keybinds today; theme and
 /// scrollback size are later milestones. Absent entirely is fine — a
 /// fresh install has sensible defaults and no config dir yet (§15).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
@@ -158,6 +158,28 @@ pub struct AppConfig {
     /// Install-wide default for injected commands (§7.5).
     #[serde(default)]
     pub cross_session: CrossSession,
+    /// Commands each session remembers for `Up`/`Down` recall
+    /// (docs/ARCHITECTURE.md §11.3).
+    #[serde(default = "default_history_size")]
+    pub history_size: usize,
+}
+
+/// Hand-written rather than derived: a derived `Default` would give a
+/// config-less install a zero-length history, so the one case with no file
+/// to fix it would be the one case with the feature switched off.
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            keybinds: Keybinds::default(),
+            channels: Vec::new(),
+            cross_session: CrossSession::default(),
+            history_size: default_history_size(),
+        }
+    }
+}
+
+fn default_history_size() -> usize {
+    500
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -562,6 +584,24 @@ mod tests {
                 .quit
                 .matches(KeyCode::Char('q'), KeyModifiers::CONTROL)
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The no-file path is the one that cannot be corrected by editing a
+    /// file, so it must not be the one that ships history switched off
+    /// (docs/ARCHITECTURE.md §11.3).
+    #[test]
+    fn history_size_defaults_with_and_without_a_config_file() {
+        let dir = std::env::temp_dir().join(format!("mudular-cfg3-{}", std::process::id()));
+        assert_eq!(load_app_config(&dir).unwrap().history_size, 500);
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mudular.yaml"), "keybinds:\n  quit: ctrl+q\n").unwrap();
+        assert_eq!(load_app_config(&dir).unwrap().history_size, 500);
+
+        std::fs::write(dir.join("mudular.yaml"), "history_size: 20\n").unwrap();
+        assert_eq!(load_app_config(&dir).unwrap().history_size, 20);
 
         std::fs::remove_dir_all(&dir).ok();
     }

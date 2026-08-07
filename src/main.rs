@@ -132,7 +132,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    app::run(targets, app_config.keybinds, channels).await
+    app::run(
+        targets,
+        app_config.keybinds,
+        channels,
+        app_config.history_size,
+    )
+    .await
 }
 
 /// Sessions are addressed by profile name; a second session on the same

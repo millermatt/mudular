@@ -224,6 +224,7 @@ fallback.
 | Key | Does | Remappable as |
 |---|---|---|
 | `Enter` | Send the input line. On an empty box it sends a bare return, for the "press return to continue" prompts many MUDs use at login. | — |
+| `Up` / `Down` | Walk back and forward through the commands you've sent to the focused character. What you were part-way through typing comes back when you walk forward past the newest one. | — (built in) |
 | `Ctrl+C` | Quit | `quit` |
 | `Alt+1` … `Alt+9` | Jump straight to session 1–9 | — (built in) |
 | `Ctrl+Tab` | Cycle focus to the next pane, including channel panes | `focus_next` |
@@ -253,6 +254,20 @@ keybinds:
   cycle_layout: f3
   toggle_channels: f4
 ```
+
+`history_size:` (default 500) sets how many commands each character
+remembers for `Up`/`Down`:
+
+```yaml
+history_size: 500
+```
+
+History is per character — the tank's commands never appear in the
+cleric's input — and it records what you typed, before aliases expand, so
+`k` recalls as `k`. Passwords are never recorded: while the server has
+input masked, nothing is stored and `Up` does nothing, so an old command
+can't be sent as your password. History is kept in memory only and is
+gone when you quit; nothing is written to disk.
 
 Keybindings are written as `modifier+modifier+key` — modifiers are
 `ctrl`, `alt`, and `shift`; keys are a single character (`c`), a function
