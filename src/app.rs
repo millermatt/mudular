@@ -60,6 +60,8 @@ pub struct ConnectTarget {
     pub cross: CrossSession,
     /// Tints this character's border and tab entry (§11).
     pub color: Option<Color>,
+    /// Answers the server's opening prompts, if the profile asked for it.
+    pub login: Option<session::login::Autologin>,
 }
 
 /// Where a session's rules came from, so `/reload` can recompile them from
@@ -548,6 +550,7 @@ fn connect(target: ConnectTarget, history_limit: usize) -> SessionPane {
         target.charset,
         engine,
         target.cross.expand_aliases,
+        target.login,
     );
     SessionPane {
         name: target.name,

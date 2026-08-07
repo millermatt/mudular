@@ -7,6 +7,7 @@
 //! charset decode → line assembler → trigger engine → UI events.
 
 mod line;
+pub mod login;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ use crate::proto::mccp::MccpDecoder;
 use crate::proto::msdp;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, encode_subnegotiation, option};
 use line::{LineAssembler, strip_ansi};
+use login::{Autologin, LoginAction};
 
 /// Session → UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +100,7 @@ pub fn spawn(
     charset: Charset,
     engine: Engine,
     expand_injected: bool,
+    login: Option<Autologin>,
 ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>) {
     let (event_tx, event_rx) = mpsc::channel(256);
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -109,6 +112,7 @@ pub fn spawn(
         charset,
         engine,
         expand_injected,
+        login,
         event_tx,
         cmd_rx,
     ));
@@ -124,6 +128,7 @@ async fn run(
     charset: Charset,
     mut engine: Engine,
     expand_injected: bool,
+    mut login: Option<Autologin>,
     events: mpsc::Sender<SessionEvent>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
@@ -195,6 +200,8 @@ async fn run(
                         }
 
                         let mut outbound: Vec<String> = Vec::new();
+                        // Why auto-login didn't finish, shown in the pane.
+                        let mut login_notices: Vec<String> = Vec::new();
                         // Cross-session actions the hub has to route (§7.5).
                         let mut cross_out: Vec<crate::engine::CrossSend> = Vec::new();
                         // Negotiation replies triggered by inbound events
@@ -279,6 +286,30 @@ async fn run(
                                 };
 
                                 for event in emitted {
+                                    // Auto-login sees the exchange before the
+                                    // rules do, and is disarmed for good the
+                                    // moment the player types (§10).
+                                    if let Some(machine) = login.as_mut() {
+                                        let action = match &event {
+                                            SessionEvent::Line(text) => {
+                                                machine.on_line(&strip_ansi(text))
+                                            }
+                                            SessionEvent::Prompt(text) => {
+                                                machine.on_line(&strip_ansi(text))
+                                            }
+                                            SessionEvent::EchoMask(masked) => {
+                                                machine.on_echo_mask(*masked)
+                                            }
+                                            _ => None,
+                                        };
+                                        match action {
+                                            Some(LoginAction::Send(line)) => outbound.push(line),
+                                            Some(LoginAction::Notice(text)) => {
+                                                login_notices.push(text)
+                                            }
+                                            None => {}
+                                        }
+                                    }
                                     // Triggers run between the line assembler
                                     // and the UI (§6.5), so a gagged line never
                                     // reaches the scrollback at all.
@@ -312,6 +343,11 @@ async fn run(
                             break reason;
                         }
 
+                        for notice in login_notices.drain(..) {
+                            if events.send(SessionEvent::Line(notice)).await.is_err() {
+                                return;
+                            }
+                        }
                         // Trigger output is sent verbatim: it is never fed
                         // back through aliases, so rules cannot recurse.
                         if send_lines(&mut writer, &outbound).await.is_err() {
@@ -343,6 +379,12 @@ async fn run(
                 }
             }
             cmd = commands.recv() => {
+                // The player is driving now: auto-login must never fire
+                // again on this connection (§10).
+                if matches!(cmd, Some(SessionCommand::SendLine(_)))
+                    && let Some(machine) = login.as_mut() {
+                        machine.disarm();
+                    }
                 match cmd {
                     // A bare Enter carries meaning of its own, so it goes
                     // out as a plain CRLF instead of through the alias
@@ -712,6 +754,7 @@ mod tests {
             Charset::Utf8,
             Engine::default(),
             false,
+            None,
         );
         assert_eq!(next_line(&mut events).await, "hi");
 
@@ -1478,6 +1521,40 @@ mod tests {
         assert_eq!(received, vec!["", "look"]);
     }
 
+    /// The whole point, through a real socket: the server asks, the client
+    /// answers, and the player never types either (docs/ARCHITECTURE.md §10).
+    #[tokio::test]
+    async fn auto_login_answers_the_opening_prompts_over_the_wire() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let login = Autologin::new("Kestrel".into(), Some("hunter2".into()), None, None).unwrap();
+
+        let (_events, _commands) = serve_with_login(
+            move |mut sock| async move {
+                let mut reader = CommandReader::default();
+                sock.write_all(b"By what name are you known?\r\n")
+                    .await
+                    .unwrap();
+                tx.send(reader.next(&mut sock).await).await.unwrap();
+                sock.write_all(b"Password:\r\n").await.unwrap();
+                tx.send(reader.next(&mut sock).await).await.unwrap();
+            },
+            Engine::default(),
+            false,
+            Some(login),
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            received.push(
+                timeout(Duration::from_secs(2), sent.recv())
+                    .await
+                    .expect("timed out")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(received, vec!["Kestrel", "hunter2"]);
+    }
+
     /// The empty line bypasses the alias splitter, which drops empty parts
     /// so that `a;;b` sends two commands — that must not swallow the bare
     /// Enter as well.
@@ -1791,6 +1868,21 @@ mod tests {
         F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
+        serve_with_login(script, engine, expand_injected, None)
+    }
+
+    /// As `serve_with`, with an auto-login machine driving the opening
+    /// exchange (docs/ARCHITECTURE.md §10).
+    fn serve_with_login<F, Fut>(
+        script: F,
+        engine: Engine,
+        expand_injected: bool,
+        login: Option<Autologin>,
+    ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1809,6 +1901,7 @@ mod tests {
             Charset::Utf8,
             engine,
             expand_injected,
+            login,
         )
     }
 

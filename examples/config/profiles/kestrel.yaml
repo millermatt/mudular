@@ -6,6 +6,13 @@ tls:
   enabled: true
   verify: pinned        # full | pinned | insecure
 color: cyan             # pane border + tab colour for this character
+
+# Optional auto-login. The password is NOT stored here — there is no field
+# for it. Run `mudular --set-password kestrel` to put it in the OS keyring.
+login:
+  name: Kestrel
+  # name_prompt: '^Who goes there\?'      # only if the defaults miss
+  # password_prompt: '^Speak the word'
 charset: utf-8          # or a legacy fallback: latin1, cp437
 modules: [uw-combat]    # shared rule modules, applied in order
 

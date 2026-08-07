@@ -46,6 +46,12 @@ pub struct Profile {
     /// `#rrggbb`, or a 0-255 terminal palette index.
     #[serde(default, deserialize_with = "parse_color")]
     pub color: Option<Color>,
+    /// Answers the server's opening name/password prompts (§10). There is
+    /// deliberately no `password:` field: `deny_unknown_fields` turns an
+    /// attempt to put one here into a load error naming it, which is a
+    /// better answer than quietly accepting a secret into a plaintext file.
+    #[serde(default)]
+    pub login: Option<Login>,
     /// Shared rule modules, applied in order (scope layer 2).
     #[serde(default)]
     pub modules: Vec<String>,
@@ -63,6 +69,44 @@ pub struct Profile {
     /// profile whose aliases would run can opt into running them.
     #[serde(default)]
     pub cross_session: Option<CrossSessionOverride>,
+}
+
+/// Auto-login settings. The password lives in the OS keyring, not here
+/// (docs/ARCHITECTURE.md §13); store it with `mudular --set-password`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Login {
+    /// The character name to send at the name prompt.
+    pub name: String,
+    /// Overrides for MUDs whose prompts the defaults don't recognise.
+    #[serde(default)]
+    pub name_prompt: Option<String>,
+    #[serde(default)]
+    pub password_prompt: Option<String>,
+}
+
+/// The keyring service every profile's password is filed under. The account
+/// is the profile name, so two characters on one MUD keep separate secrets.
+const KEYRING_SERVICE: &str = "mudular";
+
+/// Reads a profile's stored password. A missing entry is `Ok(None)` — an
+/// unconfigured keyring is a normal state, not a failure to connect.
+pub fn stored_password(profile: &str) -> Result<Option<String>> {
+    match keyring::Entry::new(KEYRING_SERVICE, profile)?.get_password() {
+        Ok(password) => Ok(Some(password)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => {
+            Err(anyhow::Error::new(err)
+                .context(format!("reading the keyring password for {profile}")))
+        }
+    }
+}
+
+/// Stores (or replaces) a profile's password in the OS keyring.
+pub fn store_password(profile: &str, password: &str) -> Result<()> {
+    keyring::Entry::new(KEYRING_SERVICE, profile)?
+        .set_password(password)
+        .with_context(|| format!("storing the keyring password for {profile}"))
 }
 
 /// How a session treats commands other sessions inject into it (§7.5).
@@ -661,6 +705,26 @@ mod tests {
         let err = serde_yaml::from_str::<Profile>(&format!("{base}color: puce\n"))
             .expect_err("an unknown color is rejected");
         assert!(err.to_string().contains("puce"), "{err}");
+    }
+
+    /// §13's rule made mechanical: there is no field to put a password in,
+    /// so trying names the mistake at load instead of silently keeping a
+    /// secret in a plaintext file.
+    #[test]
+    fn a_login_block_takes_a_name_but_refuses_a_password() {
+        let base = "name: t\nhost: h\nport: 1\n";
+
+        let profile: Profile =
+            serde_yaml::from_str(&format!("{base}login:\n  name: Kestrel\n")).unwrap();
+        let login = profile.login.expect("the block parsed");
+        assert_eq!(login.name, "Kestrel");
+        assert_eq!(login.name_prompt, None, "prompts are optional overrides");
+
+        let err = serde_yaml::from_str::<Profile>(&format!(
+            "{base}login:\n  name: Kestrel\n  password: hunter2\n"
+        ))
+        .expect_err("a password in YAML is rejected");
+        assert!(err.to_string().contains("password"), "{err}");
     }
 
     #[test]

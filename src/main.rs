@@ -53,6 +53,11 @@ struct Cli {
     /// Record raw inbound bytes to this file for replay as a test fixture.
     #[arg(long)]
     record: Option<PathBuf>,
+
+    /// Store this profile's auto-login password in the OS keyring, then
+    /// exit. Prompts for the password; it is never echoed or logged.
+    #[arg(long, value_name = "PROFILE")]
+    set_password: Option<String>,
 }
 
 #[tokio::main]
@@ -69,6 +74,10 @@ async fn main() -> Result<()> {
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
             .init();
+    }
+
+    if let Some(profile) = &cli.set_password {
+        return set_password(profile);
     }
 
     let dir = config::config_dir(cli.config_dir.clone())?;
@@ -107,6 +116,7 @@ async fn main() -> Result<()> {
                 .cross_session
                 .with_override(profile.cross_session),
             color: profile.color,
+            login: autologin(profile.login.as_ref(), name)?,
         });
     }
 
@@ -130,8 +140,10 @@ async fn main() -> Result<()> {
                 profile: None,
             },
             cross: app_config.cross_session,
-            // A --host connection has no profile to carry a colour.
+            // A --host connection has no profile to carry a colour, and
+            // nothing to key a stored password on.
             color: None,
+            login: None,
         });
     }
 
@@ -142,6 +154,78 @@ async fn main() -> Result<()> {
         app_config.history_size,
     )
     .await
+}
+
+/// Builds the auto-login machine for a profile, reading its password from
+/// the OS keyring (docs/ARCHITECTURE.md §10). A profile with no `login:`
+/// block gets `None` and the ordinary hand-typed login.
+fn autologin(
+    login: Option<&config::Login>,
+    profile: &str,
+) -> Result<Option<session::login::Autologin>> {
+    let Some(login) = login else {
+        return Ok(None);
+    };
+    // Read once, at startup: the keyring may prompt, and doing that from
+    // inside the session task would block the pipeline mid-connection.
+    let password = config::stored_password(profile)?;
+    session::login::Autologin::new(
+        login.name.clone(),
+        password,
+        login.name_prompt.as_deref(),
+        login.password_prompt.as_deref(),
+    )
+    .map(Some)
+    .with_context(|| format!("auto-login for {profile}"))
+}
+
+/// Stores a profile's password in the OS keyring. Reads it with the
+/// terminal's echo off, so it is not left on screen or in shell history —
+/// the reason this is a prompt rather than a `--password` argument.
+fn set_password(profile: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    print!("Password for {profile}: ");
+    std::io::stdout().flush()?;
+
+    crossterm::terminal::enable_raw_mode().context("reading the password without echo")?;
+    let entered = read_hidden_line();
+    crossterm::terminal::disable_raw_mode()?;
+    println!();
+
+    let password = entered?;
+    if password.is_empty() {
+        anyhow::bail!("no password entered; nothing stored");
+    }
+    config::store_password(profile, &password)?;
+    println!("Stored in the keyring for profile {profile}.");
+    Ok(())
+}
+
+/// Reads a line of typed characters in raw mode without echoing them.
+fn read_hidden_line() -> Result<String> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+
+    let mut password = String::new();
+    loop {
+        let Event::Key(key) = read()? else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Enter => return Ok(password),
+            KeyCode::Backspace => {
+                password.pop();
+            }
+            // Ctrl+C has to work here too, and must not store a partial
+            // password on the way out.
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                anyhow::bail!("cancelled");
+            }
+            KeyCode::Char(c) => password.push(c),
+            _ => {}
+        }
+    }
 }
 
 /// Sessions are addressed by profile name; a second session on the same

@@ -91,7 +91,7 @@ Supporting crates:
 | ANSI parsing | `ansi-to-tui` (or `vte` if we outgrow it) | inbound SGR/escape → ratatui spans (§8) |
 | Input editing | `tui-input` | grapheme-aware line editor widget |
 | Config paths | `directories` | platform config dir discovery |
-| Secrets | `keyring` | OS keychain for passwords (M8) |
+| Secrets | `keyring` | OS keychain for auto-login passwords (§10.1) |
 
 ### 2.1 Dependency policy
 
@@ -608,7 +608,8 @@ tls:
   enabled: true
   verify: pinned
 charset: utf-8
-login:                     # optional auto-login (password via keyring, M9)
+color: cyan                # tints this character's border and tab (§11)
+login:                     # optional auto-login; password via keyring
   name: Kestrel
 modules: [uw-common, uw-combat]
 triggers: []               # profile-local overrides (scope layer 3)
@@ -616,6 +617,39 @@ triggers: []               # profile-local overrides (scope layer 3)
 
 Schema structs are `serde` types with `deny_unknown_fields` so typos fail
 loudly at load time with file/line context.
+
+### 10.1 Auto-login
+
+The opening exchange is the same every session and is worth automating,
+but it is also the one exchange that handles a credential, so the design
+is shaped by what must never happen rather than by convenience.
+
+- **`login: { name }`** in a profile, with optional `name_prompt` and
+  `password_prompt` regex overrides for MUDs whose wording the defaults
+  miss. There is no `password:` field, and `deny_unknown_fields` turns an
+  attempt to add one into a load error naming it — a better answer than
+  quietly accepting a secret into a world-readable file.
+- **The password comes from the OS keyring** (`keyring`, §2.1), filed
+  under service `mudular` and the profile name, so two characters on one
+  MUD keep separate secrets. Stored with `mudular --set-password
+  <profile>`, which prompts with terminal echo off: a `--password` flag
+  would put the secret in shell history. A missing entry is not an error
+  — the name is still sent and the pane says why the rest didn't happen.
+- **A small forward-only state machine** (name → password → done) drives
+  it, sans-IO in `session::login` and fed the lines, prompts, and ECHO
+  events the pipeline already produces. Each step fires at most once, and
+  anything the player types disarms it permanently.
+- That last property is the security argument. Matching `Password:`
+  against arbitrary server text is otherwise an injection hole: another
+  player says `Password:` in chat, and a naive client sends the secret as
+  a public command. With one-shot steps that disarm on first input, there
+  is no armed step left by the time anyone can talk to you.
+- **A masked prompt is a password prompt**, whatever it says: the server
+  negotiating ECHO is a protocol fact rather than a guess about wording,
+  so it fires the password step alongside the regex.
+- Auto-login runs ahead of the rule engine and its sends never appear in
+  the pane — the server echoes the name itself, and the password must not
+  be echoed anywhere (§13).
 
 ---
 
@@ -812,8 +846,11 @@ session.
   Past the cap the session ends rather than buffering.
 - TLS: full verification by default; TOFU pinning for self-signed MUD
   certs; `insecure` requires explicit config and shows a UI warning.
-- Passwords: not stored in YAML; OS keyring integration planned (M9),
-  masked input under server ECHO negotiation from M1. Masked lines never
+- Passwords: never in YAML — the schema has no field for one (§10.1); the
+  OS keyring holds them, and masked input under server ECHO negotiation
+  has applied since M1. Auto-login's steps are one-shot and disarm on
+  first input, so a `Password:` printed by another player has nothing to
+  fire. Masked lines never
   enter command history, and history is not persisted to disk (§11.3) — a
   recall buffer leaks credentials exactly as scrollback would.
 
@@ -837,7 +874,7 @@ exist from M0, even where a stage is a passthrough).
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
-| **M9** | Polish | In-client help overlay + `/help` (§11.2) and `Up`/`Down` command history (§11.3) — both built early, as soon as they are useful; scrollback search, disk logging, reconnect/backoff, keyring passwords + auto-login, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either |
+| **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), and keyring-backed auto-login (§10.1) — all built early, as soon as they were useful; scrollback search, disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either |
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module

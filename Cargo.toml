@@ -28,6 +28,26 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tui-input = { version = "0.11", default-features = false, features = ["crossterm"] }
 webpki-roots = "0.26"
 
+# One native credential store per platform, so no OS pulls in another's
+# backend and the static-binary promise of §15 survives (TAD §2.1).
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "4", default-features = false, features = [
+  "v1",
+  "zbus-secret-service-keyring-store",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "4", default-features = false, features = [
+  "v1",
+  "apple-native-keyring-store",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "4", default-features = false, features = [
+  "v1",
+  "windows-native-keyring-store",
+] }
+
 [dev-dependencies]
 libc = "0.2.189"
 rcgen = "0.14"

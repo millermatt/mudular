@@ -49,6 +49,48 @@ mudular kestrel
 See [`examples/config/profiles/kestrel.yaml`](../examples/config/profiles/kestrel.yaml)
 for a fuller example.
 
+### Logging in automatically
+
+Add a `login:` block naming your character, and Mudular answers the
+server's opening prompts for you:
+
+```yaml
+login:
+  name: Kestrel
+```
+
+The password does **not** go in the file — there is no field for it, and
+putting one there is a startup error rather than a silently stored
+secret. Store it in your OS keyring instead (GNOME Keyring, macOS
+Keychain, Windows Credential Manager):
+
+```sh
+mudular --set-password kestrel
+```
+
+It prompts without echoing, so the password never reaches your shell
+history or your screen. Re-run it any time to change the stored one.
+
+If your MUD's prompts aren't recognised, override them with regexes:
+
+```yaml
+login:
+  name: Kestrel
+  name_prompt: '^Who goes there\?'
+  password_prompt: '^Speak the word'
+```
+
+The password step also fires whenever the server hides your typing, so on
+MUDs that mask the password prompt the wording doesn't matter.
+
+With no password stored, the name is still sent and the pane tells you
+what's missing — you type the password as usual.
+
+**How it stays safe:** each step fires at most once per connection, and
+anything you type shuts the whole thing off for the rest of the session.
+So a `Password:` that another player says in chat an hour later has
+nothing left to trigger.
+
 ### Where the config directory is
 
 By default, the platform config directory:
@@ -312,6 +354,9 @@ mudular [PROFILE]... [OPTIONS]
   --tls-verify <MODE>     full | pinned | insecure (default: full)
   --charset <CHARSET>     utf-8 | latin1 | cp437 for --host (default: utf-8)
   --config-dir <PATH>     Override the config directory
+  --set-password <PROFILE>
+                          Store that profile's auto-login password in the
+                          OS keyring (prompts; no echo), then exit
   --record <PATH>         Record raw inbound bytes to a file
   --log <PATH>            Write diagnostic logs to a file (filtered via RUST_LOG)
 ```
