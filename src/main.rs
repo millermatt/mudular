@@ -58,6 +58,11 @@ struct Cli {
     /// exit. Prompts for the password; it is never echoed or logged.
     #[arg(long, value_name = "PROFILE")]
     set_password: Option<String>,
+
+    /// Delete this profile's stored auto-login password from the OS
+    /// keyring, then exit.
+    #[arg(long, value_name = "PROFILE")]
+    forget_password: Option<String>,
 }
 
 #[tokio::main]
@@ -78,6 +83,10 @@ async fn main() -> Result<()> {
 
     if let Some(profile) = &cli.set_password {
         return set_password(profile);
+    }
+
+    if let Some(profile) = &cli.forget_password {
+        return forget_password(profile);
     }
 
     let dir = config::config_dir(cli.config_dir.clone())?;
@@ -199,6 +208,17 @@ fn set_password(profile: &str) -> Result<()> {
     }
     config::store_password(profile, &password)?;
     println!("Stored in the keyring for profile {profile}.");
+    Ok(())
+}
+
+/// Deletes a profile's stored password. Having none is reported, not an
+/// error: the caller wanted the keyring empty for this profile, and it is.
+fn forget_password(profile: &str) -> Result<()> {
+    if config::forget_password(profile)? {
+        println!("Removed from the keyring for profile {profile}.");
+    } else {
+        println!("No keyring password stored for profile {profile}.");
+    }
     Ok(())
 }
 

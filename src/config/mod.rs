@@ -109,6 +109,19 @@ pub fn store_password(profile: &str, password: &str) -> Result<()> {
         .with_context(|| format!("storing the keyring password for {profile}"))
 }
 
+/// Deletes a profile's stored password. `Ok(false)` when there was none:
+/// the end state the caller asked for already holds.
+pub fn forget_password(profile: &str) -> Result<bool> {
+    match keyring::Entry::new(KEYRING_SERVICE, profile)?.delete_credential() {
+        Ok(()) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(err) => {
+            Err(anyhow::Error::new(err)
+                .context(format!("deleting the keyring password for {profile}")))
+        }
+    }
+}
+
 /// How a session treats commands other sessions inject into it (§7.5).
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]

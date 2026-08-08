@@ -69,7 +69,12 @@ mudular --set-password kestrel
 ```
 
 It prompts without echoing, so the password never reaches your shell
-history or your screen. Re-run it any time to change the stored one.
+history or your screen. Re-run it any time to change the stored one, or
+drop it again with:
+
+```sh
+mudular --forget-password kestrel
+```
 
 If your MUD's prompts aren't recognised, override them with regexes:
 
@@ -357,6 +362,9 @@ mudular [PROFILE]... [OPTIONS]
   --set-password <PROFILE>
                           Store that profile's auto-login password in the
                           OS keyring (prompts; no echo), then exit
+  --forget-password <PROFILE>
+                          Delete that profile's stored password from the
+                          OS keyring, then exit
   --record <PATH>         Record raw inbound bytes to a file
   --log <PATH>            Write diagnostic logs to a file (filtered via RUST_LOG)
 ```

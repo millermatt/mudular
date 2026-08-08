@@ -704,7 +704,8 @@ is shaped by what must never happen rather than by convenience.
   under service `mudular` and the profile name, so two characters on one
   MUD keep separate secrets. Stored with `mudular --set-password
   <profile>`, which prompts with terminal echo off: a `--password` flag
-  would put the secret in shell history. A missing entry is not an error
+  would put the secret in shell history; `--forget-password <profile>`
+  deletes it again. A missing entry is not an error
   — the name is still sent and the pane says why the rest didn't happen.
 - **A small forward-only state machine** (name → password → done) drives
   it, sans-IO in `session::login` and fed the lines, prompts, and ECHO
