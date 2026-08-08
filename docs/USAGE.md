@@ -6,7 +6,25 @@ command-line flags. For how it's built, see
 
 ## Quick connect
 
-Connect straight to a MUD without any config file:
+The first time you run `mudular` with no profile name and no `--host`, and
+you have no profiles saved yet, it shows a short form right in the
+terminal — name, host, port, TLS — instead of an empty screen:
+
+```sh
+mudular
+```
+
+Answer each field and press Enter; `Esc` at any point backs out without
+saving or connecting. Finishing it writes a profile to
+`<config dir>/profiles/<name>.yaml` — the same file you'd get from the
+[Profiles](#profiles) section below — and connects with it immediately, so
+there's nothing to hand-edit just to get started. Once you have at least
+one profile, `mudular` with no arguments goes back to showing nothing to
+connect to, and the form only asks what it needs to connect; add a
+`login:`, `color:`, or rules to the saved file afterward same as any
+profile.
+
+Or connect straight to a MUD without any config file at all:
 
 ```sh
 mudular --host mud.example.org --port 4000
