@@ -522,6 +522,65 @@ pub fn profile_path(dir: &Path, name: &str) -> PathBuf {
     dir.join("profiles").join(format!("{name}.yaml"))
 }
 
+/// Whether any profile is already configured — the trigger for the
+/// first-run wizard (docs/ARCHITECTURE.md §15): a missing `profiles/` dir
+/// reads the same as an empty one, since neither has anything to connect
+/// with.
+pub fn has_profiles(dir: &Path) -> bool {
+    std::fs::read_dir(dir.join("profiles"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "yaml"))
+}
+
+/// What the in-TUI new-profile wizard collects (§15) — just enough to
+/// connect; everything else a profile can do (`login:`, `modules:`,
+/// `color:`, …) is left to hand-editing the file afterward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewProfile {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+}
+
+/// Writes a wizard-built profile to disk, creating `profiles/` if this is
+/// the first one. A small purpose-built shape rather than reusing
+/// `Profile` (which only derives `Deserialize` — nothing in the schema
+/// needs to round-trip) serialized through `serde_yaml`, so a host or name
+/// with YAML-special characters comes out correctly quoted rather than
+/// hand-formatted and hoping.
+pub fn save_new_profile(dir: &Path, profile: &NewProfile) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct Tls {
+        enabled: bool,
+    }
+    #[derive(serde::Serialize)]
+    struct OnDisk<'a> {
+        name: &'a str,
+        host: &'a str,
+        port: u16,
+        tls: Tls,
+    }
+
+    let path = profile_path(dir, &profile.name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let yaml = serde_yaml::to_string(&OnDisk {
+        name: &profile.name,
+        host: &profile.host,
+        port: profile.port,
+        tls: Tls {
+            enabled: profile.tls,
+        },
+    })
+    .context("serializing the new profile")?;
+    std::fs::write(&path, yaml).with_context(|| format!("writing {}", path.display()))
+}
+
 pub fn load_module(path: &Path) -> Result<RuleModule> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading module {}", path.display()))?;
@@ -896,6 +955,63 @@ mod tests {
     fn profile_path_lives_under_profiles_subdir() {
         let path = profile_path(Path::new("/cfg"), "kestrel");
         assert_eq!(path, Path::new("/cfg/profiles/kestrel.yaml"));
+    }
+
+    // ---- first-run wizard (§15) ----
+
+    #[test]
+    fn has_profiles_is_false_until_the_profiles_dir_has_one() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        assert!(!has_profiles(dir), "neither the dir nor a profile exists");
+
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        assert!(!has_profiles(dir), "an empty profiles dir is still none");
+
+        std::fs::write(dir.join("profiles/kestrel.yaml"), "name: kestrel").unwrap();
+        assert!(has_profiles(dir));
+    }
+
+    /// What the wizard writes must be exactly what `load_profile` reads —
+    /// otherwise the form's whole point (no hand-editing YAML) is undone
+    /// the moment a saved profile fails to load back.
+    #[test]
+    fn a_wizard_profile_round_trips_through_load_profile() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        let new_profile = NewProfile {
+            name: "kestrel".to_string(),
+            host: "underworld.example.org".to_string(),
+            port: 4443,
+            tls: true,
+        };
+
+        save_new_profile(dir, &new_profile).unwrap();
+        let loaded = load_profile(&profile_path(dir, "kestrel")).unwrap();
+
+        assert_eq!(loaded.host, "underworld.example.org");
+        assert_eq!(loaded.port, 4443);
+        assert!(loaded.tls.enabled);
+    }
+
+    /// A host with YAML-special characters must still come out as the
+    /// literal string typed, not be reinterpreted as YAML syntax — the
+    /// reason this is serialized rather than hand-formatted.
+    #[test]
+    fn a_host_with_yaml_special_characters_survives_the_round_trip() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        let new_profile = NewProfile {
+            name: "weird".to_string(),
+            host: "mud.example.org: # not a comment".to_string(),
+            port: 23,
+            tls: false,
+        };
+
+        save_new_profile(dir, &new_profile).unwrap();
+        let loaded = load_profile(&profile_path(dir, "weird")).unwrap();
+
+        assert_eq!(loaded.host, "mud.example.org: # not a comment");
     }
 
     /// M4's acceptance criterion (docs/ARCHITECTURE.md §14): one shared

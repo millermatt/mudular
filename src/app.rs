@@ -700,6 +700,125 @@ async fn reload_rules(state: &AppState, channels: &[Channel]) -> String {
     }
 }
 
+/// Which field the new-profile wizard is currently collecting, in the
+/// order it asks them (docs/ARCHITECTURE.md §15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardStep {
+    Name,
+    Host,
+    Port,
+    Tls,
+}
+
+impl WizardStep {
+    fn prompt(self) -> &'static str {
+        match self {
+            WizardStep::Name => "Character/profile name",
+            WizardStep::Host => "Host",
+            WizardStep::Port => "Port (blank for 23)",
+            WizardStep::Tls => "Use TLS? (y/N)",
+        }
+    }
+}
+
+/// The first-run "create a profile" form (docs/ARCHITECTURE.md §15): shown
+/// when nothing was given on the command line and no profile exists yet,
+/// so a first connection needs no hand-edited YAML. Runs its own terminal
+/// session before any of `event_loop`'s — there is no session to drive it
+/// yet, and threading a would-be session through a loop built to manage
+/// live ones would be the tail wagging the dog. `Ok(None)` means the
+/// player cancelled with Esc.
+pub async fn run_new_profile_wizard() -> Result<Option<config::NewProfile>> {
+    let mut terminal = ratatui::init();
+    let result = new_profile_event_loop(&mut terminal).await;
+    ratatui::restore();
+    result
+}
+
+async fn new_profile_event_loop(
+    terminal: &mut DefaultTerminal,
+) -> Result<Option<config::NewProfile>> {
+    let mut step = WizardStep::Name;
+    let mut name = String::new();
+    let mut host = String::new();
+    let mut port: u16 = 23;
+    let mut answered: Vec<(&str, String)> = Vec::new();
+    let mut input = Input::default();
+    let mut error: Option<String> = None;
+    let mut term_events = EventStream::new();
+
+    loop {
+        terminal.draw(|frame| {
+            ui::draw_new_profile_wizard(
+                frame,
+                &answered,
+                step.prompt(),
+                input.value(),
+                input.visual_cursor(),
+                error.as_deref(),
+            )
+        })?;
+
+        let Some(Ok(Event::Key(key))) = term_events.next().await else {
+            return Ok(None);
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if key.code == KeyCode::Esc {
+            return Ok(None);
+        }
+        if key.code != KeyCode::Enter {
+            input.handle_event(&Event::Key(key));
+            continue;
+        }
+
+        let value = input.value().trim().to_string();
+        error = match step {
+            WizardStep::Name if value.is_empty() || value.contains(['/', '\\']) => {
+                Some("a profile name can't be empty or contain a slash".to_string())
+            }
+            WizardStep::Name => {
+                name = value.clone();
+                answered.push(("Name", value));
+                step = WizardStep::Host;
+                None
+            }
+            WizardStep::Host if value.is_empty() => Some("a host is required".to_string()),
+            WizardStep::Host => {
+                host = value.clone();
+                answered.push(("Host", value));
+                step = WizardStep::Port;
+                None
+            }
+            WizardStep::Port if value.is_empty() => {
+                answered.push(("Port", "23".to_string()));
+                step = WizardStep::Tls;
+                None
+            }
+            WizardStep::Port => match value.parse() {
+                Ok(parsed) => {
+                    port = parsed;
+                    answered.push(("Port", value));
+                    step = WizardStep::Tls;
+                    None
+                }
+                Err(_) => Some("port must be a number from 1-65535".to_string()),
+            },
+            WizardStep::Tls => {
+                let tls = matches!(value.to_ascii_lowercase().as_str(), "y" | "yes");
+                return Ok(Some(config::NewProfile {
+                    name,
+                    host,
+                    port,
+                    tls,
+                }));
+            }
+        };
+        input = Input::default();
+    }
+}
+
 pub async fn run(
     targets: Vec<ConnectTarget>,
     keybinds: Keybinds,

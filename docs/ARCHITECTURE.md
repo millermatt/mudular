@@ -1291,9 +1291,21 @@ Target: a non-technical user installs Mudular on any OS in one step.
   (macOS/Linux), MSI + `winget`/Scoop (Windows), plus plain tarballs.
   Effort is one config file, so this lands early (M3, first "someone else
   could install this" milestone) rather than last.
-- **First run:** if no config exists, Mudular creates the config dir and a
-  commented sample profile, and offers an in-TUI "new profile" form —
-  no hand-editing YAML required to get connected (form lands M9).
+- **First run (M9):** launched with no profile, no `--host`, and no
+  profile already saved (`config::has_profiles`), Mudular shows an in-TUI
+  "new profile" form instead of an empty shell — no hand-editing YAML
+  required to get connected. One field at a time (name, host, port,
+  TLS), with what's already been answered shown above the current one;
+  Esc cancels back to an empty shell. The form only asks what's needed to
+  connect — `login:`, `modules:`, `color:`, and the rest of a profile's
+  fields are left to hand-editing the file afterward, same as any profile.
+  Runs its own terminal session before `event_loop`'s: there is no session
+  yet for a mid-loop form to belong to, so the wizard is a self-contained
+  screen that hands back a profile (or nothing, on cancel) rather than a
+  state grafted onto the session-management loop. On success it's saved
+  to `profiles/<name>.yaml` via `serde_yaml` (quoting whatever the player
+  typed correctly, rather than hand-formatting the file and hoping) and
+  connected immediately, in the same launch.
 
 ## 16. Designed-For Extensions
 - **More scripting engines:** anything embeddable and statically linkable

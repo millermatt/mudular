@@ -258,6 +258,62 @@ fn draw_help(frame: &mut Frame, area: Rect, keybinds: &Keybinds) {
     frame.render_widget(Paragraph::new(text).block(block), overlay);
 }
 
+/// The first-run "new profile" wizard (docs/ARCHITECTURE.md §15): one field
+/// at a time, with what's already been answered shown above it, so filling
+/// it in never risks fat-fingering a form whose other fields are out of
+/// sight. Runs before any session exists, so it draws over an empty
+/// terminal rather than over panes.
+pub fn draw_new_profile_wizard(
+    frame: &mut Frame,
+    answered: &[(&str, String)],
+    prompt: &str,
+    value: &str,
+    cursor: usize,
+    error: Option<&str>,
+) {
+    let area = frame.area();
+    let mut lines = vec![
+        "Let's connect to a MUD — no YAML required.".to_string(),
+        String::new(),
+    ];
+    for (label, value) in answered {
+        lines.push(format!("{label}: {value}"));
+    }
+    if let Some(error) = error {
+        lines.push(String::new());
+        lines.push(format!("** {error}"));
+    }
+    lines.push(String::new());
+    // The input line is always last, so the cursor row is just its index —
+    // no separate bookkeeping to keep in step with what's above it.
+    let input_row = lines.len() as u16;
+    lines.push(format!("{prompt}: {value}"));
+
+    let content_width = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(44);
+    let width = (content_width as u16 + 4).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let overlay = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let text = Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>());
+    let block = Block::bordered().title(" New profile — Esc to cancel ".bold());
+    frame.render_widget(ratatui::widgets::Clear, overlay);
+    frame.render_widget(Paragraph::new(text).block(block), overlay);
+
+    let max_x = overlay.x + overlay.width.saturating_sub(1);
+    let cursor_x = overlay.x + 1 + prompt.chars().count() as u16 + 2 + cursor as u16;
+    frame.set_cursor_position((cursor_x.min(max_x), overlay.y + 1 + input_row));
+}
+
 fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     let session = &state.sessions[index];
     let focused = state.is_focused_session(index);
@@ -673,6 +729,37 @@ mod tests {
 
         let buffer = render_sized(&state, 20, 6);
         assert_eq!(buffer.area.width, 20);
+    }
+
+    // ---- new-profile wizard (§15) ----
+
+    fn render_wizard(
+        answered: &[(&str, String)],
+        prompt: &str,
+        value: &str,
+        cursor: usize,
+        error: Option<&str>,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| draw_new_profile_wizard(frame, answered, prompt, value, cursor, error))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_wizard_shows_prior_answers_above_the_current_prompt() {
+        let answered = vec![("Name", "kestrel".to_string())];
+        let buffer = render_wizard(&answered, "Host", "underworld", 10, None);
+        let listing = rows(&buffer);
+        assert!(listing.contains("Name: kestrel"), "{listing}");
+        assert!(listing.contains("Host: underworld"), "{listing}");
+    }
+
+    #[test]
+    fn the_wizard_shows_a_rejected_answer_as_an_error() {
+        let buffer = render_wizard(&[], "Host", "", 0, Some("a host is required"));
+        assert!(rows(&buffer).contains("a host is required"));
     }
 
     #[test]

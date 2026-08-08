@@ -67,7 +67,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     if let Some(path) = &cli.log {
         let file = std::fs::File::create(path)?;
@@ -90,6 +90,20 @@ async fn main() -> Result<()> {
     }
 
     let dir = config::config_dir(cli.config_dir.clone())?;
+
+    // First run (docs/ARCHITECTURE.md §15): nothing named on the command
+    // line and no profile saved yet, so there is nothing this launch could
+    // possibly connect to without either a form or a text editor.
+    if cli.profiles.is_empty() && cli.host.is_none() && !config::has_profiles(&dir) {
+        match app::run_new_profile_wizard().await? {
+            Some(new_profile) => {
+                config::save_new_profile(&dir, &new_profile)?;
+                cli.profiles = vec![new_profile.name];
+            }
+            None => return Ok(()),
+        }
+    }
+
     let app_config = config::load_app_config(&dir)?;
 
     let channels = app_config.channels.clone();

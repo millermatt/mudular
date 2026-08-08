@@ -67,6 +67,36 @@ fn honours_a_remapped_quit_key() {
     app.expect_exit("the remapped quit key should quit");
 }
 
+/// First run, §15's acceptance bar: launched with no profile, no `--host`,
+/// and an empty config dir, the wizard should appear, and answering it
+/// should both write a loadable profile and connect with it — no
+/// hand-edited YAML anywhere in the path.
+#[test]
+fn creates_a_profile_from_the_wizard_and_connects() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+
+    let mut app = App::launch(&["--config-dir", config.path_str()]);
+    // A single unspaced token: ratatui writes cells in diff order, so a
+    // multi-word phrase can reach the terminal split across writes (see
+    // the module doc comment on `BANNER`).
+    app.wait_for("YAML", "the wizard should appear on first run");
+
+    app.type_line("tank");
+    app.type_line("127.0.0.1");
+    app.type_line(&mud.port.to_string());
+    app.type_line("n");
+
+    app.wait_for(BANNER, "the wizard-built profile should connect");
+
+    let saved = std::fs::read_to_string(config.path().join("profiles/tank.yaml"))
+        .expect("the wizard should have saved a loadable profile");
+    assert!(saved.contains("127.0.0.1"), "{saved}");
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
 /// M7's acceptance criterion, end to end through the real binary: two
 /// characters connected at once, and a tank trigger firing a heal in the
 /// cleric's session (docs/ARCHITECTURE.md §14 M7).
