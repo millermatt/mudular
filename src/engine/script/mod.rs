@@ -22,6 +22,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use super::{PeerSnapshot, Peers};
+
 #[cfg(test)]
 mod conformance;
 
@@ -60,6 +62,14 @@ pub enum Hook {
         package: String,
         json: String,
     },
+    /// One key of a peer's published server data changed (§7.5). Delivered
+    /// to `mud.on_peer` subscriptions whose session matches and whose event
+    /// is a prefix of `key`.
+    Peer {
+        session: String,
+        key: String,
+        value: String,
+    },
     /// A function a YAML rule named in its `script:` action, called with
     /// the text that matched and the rule's captures.
     Function {
@@ -87,6 +97,7 @@ impl Hook {
             Hook::Line(_) => "line",
             Hook::Prompt(_) => "prompt",
             Hook::Gmcp { .. } => "gmcp",
+            Hook::Peer { .. } => "peer",
             Hook::Function { .. } => "script action",
         }
     }
@@ -104,6 +115,9 @@ pub struct ScriptOutcome {
     /// Replace the triggering line's text. Last writer wins: a later hook
     /// substitutes over an earlier one rather than both appearing.
     pub substitute: Option<String>,
+    /// Commands for other sessions, by the name that addresses them
+    /// (§7.5). Routed by the hub exactly like a rule's `send_to:`.
+    pub send_to: Vec<(String, Vec<String>)>,
 }
 
 /// The state a hook reads and writes, lent to the host for one call.
@@ -119,7 +133,20 @@ pub struct ScriptCtx {
     /// owns them, and a script that wants its own name should use a
     /// variable.
     pub server_data: HashMap<String, String>,
+    /// The other sessions' published snapshots (§7.5). Held as receivers
+    /// rather than copies: a script that never asks about a peer pays
+    /// nothing, and one that does reads the latest value without a copy.
+    pub peers: Peers,
     pub out: ScriptOutcome,
+}
+
+impl ScriptCtx {
+    /// One peer's published state, or `None` if no session answers to that
+    /// name. Scripts see a copy: a snapshot handed to a VM must not change
+    /// underneath the script reading it.
+    pub fn peer(&self, name: &str) -> Option<PeerSnapshot> {
+        self.peers.get(name).map(|rx| rx.borrow().clone())
+    }
 }
 
 #[derive(Debug, Error)]

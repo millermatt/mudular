@@ -145,6 +145,13 @@ async fn run(
     events: mpsc::Sender<SessionEvent>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
+    // The engine reads peers on demand; the loop watches the same channels
+    // so a peer's change can wake this session's `on_peer` scripts (§7.5).
+    let mut watching: Vec<(String, watch::Receiver<PeerSnapshot>)> = peers
+        .others
+        .iter()
+        .map(|(name, rx)| (name.clone(), rx.clone()))
+        .collect();
     engine.set_peers(peers.others);
     let publish_to = peers.publish;
     let connection = match net::connect(&host, port, tls.as_ref()).await {
@@ -441,6 +448,25 @@ async fn run(
                     Err(err) => break format!("connection error: {err}"),
                 }
             }
+            Some(peer) = next_peer_change(&mut watching) => {
+                let outcome = engine.poll_peer(&peer);
+                if send_lines(&mut writer, &outcome.sends).await.is_err() {
+                    break "write failed".to_string();
+                }
+                for text in outcome.echoes {
+                    if events.send(SessionEvent::Line(text)).await.is_err() {
+                        return;
+                    }
+                }
+                let cross = outcome
+                    .send_to
+                    .into_iter()
+                    .map(|(target, lines)| crate::engine::CrossSend { target, lines })
+                    .collect();
+                if emit_cross_sends(&events, cross, FIRST_HOP).await.is_err() {
+                    return;
+                }
+            }
             _ = tokio::time::sleep_until(timer_deadline.into()) => {
                 let due = engine.fire_due_timers(Instant::now());
                 publish(&mut engine, &publish_to);
@@ -559,6 +585,21 @@ async fn run(
         }
     }
     let _ = events.send(SessionEvent::Ended(reason)).await;
+}
+
+/// Waits for any peer to publish something new, and says which. Parks
+/// forever for a lone character, so `select!` has a branch that simply
+/// never fires rather than a special case (§7.5).
+async fn next_peer_change(
+    watching: &mut [(String, watch::Receiver<PeerSnapshot>)],
+) -> Option<String> {
+    if watching.is_empty() {
+        std::future::pending::<()>().await;
+    }
+    let changes = watching
+        .iter_mut()
+        .map(|(name, rx)| Box::pin(async move { rx.changed().await.ok().map(|()| name.clone()) }));
+    futures::future::select_all(changes).await.0
 }
 
 /// Publishes this session's state for its peers to read, if it has moved

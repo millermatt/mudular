@@ -98,7 +98,7 @@ impl LuaHost {
         let mud = lua.create_table()?;
 
         let hooks = lua.create_table()?;
-        for name in ["connect", "disconnect", "line", "prompt", "gmcp"] {
+        for name in ["connect", "disconnect", "line", "prompt", "gmcp", "peer"] {
             hooks.set(name, lua.create_table()?)?;
         }
         lua.set_named_registry_value(HOOKS_KEY, hooks)?;
@@ -160,6 +160,55 @@ impl LuaHost {
             lua.create_function(move |_, key: String| {
                 Ok(lock(&ctx).server_data.get(&key).cloned())
             })?,
+        )?;
+
+        // `mud.session("cleric")` — a handle onto one peer (§7.5). It is
+        // built from the snapshot as it stands now, so a script reading
+        // `.data` twice in one hook sees one consistent picture rather than
+        // two moments of the peer's life.
+        let ctx = Arc::clone(&self.shared);
+        mud.set(
+            "session",
+            lua.create_function(move |lua, name: String| {
+                let Some(snapshot) = lock(&ctx).peer(&name) else {
+                    return Ok(mlua::Value::Nil);
+                };
+                let handle = lua.create_table()?;
+                handle.set("name", name.clone())?;
+                handle.set("vars", lua.create_table_from(snapshot.vars)?)?;
+                handle.set("data", lua.create_table_from(snapshot.data)?)?;
+
+                let sends = Arc::clone(&ctx);
+                let target = name.clone();
+                handle.set(
+                    "send",
+                    lua.create_function(move |_, (_, command): (mlua::Table, String)| {
+                        lock(&sends)
+                            .out
+                            .send_to
+                            .push((target.clone(), vec![command]));
+                        Ok(())
+                    })?,
+                )?;
+                Ok(mlua::Value::Table(handle))
+            })?,
+        )?;
+
+        // `mud.on_peer(session, event, fn)` — subscribe to one peer's
+        // server data (§7.5). Registrations live in the same registry as
+        // the event hooks, as a list of {session, event, fn} triples.
+        mud.set(
+            "on_peer",
+            lua.create_function(
+                |lua, (session, event, callback): (String, String, Function)| {
+                    let entry = lua.create_table()?;
+                    entry.set("session", session)?;
+                    entry.set("event", event)?;
+                    entry.set("fn", callback)?;
+                    let hooks: Table = lua.named_registry_value(HOOKS_KEY)?;
+                    hooks.get::<Table>("peer")?.push(entry)
+                },
+            )?,
         )?;
 
         for (api, hook) in [
@@ -256,6 +305,15 @@ impl ScriptHost for LuaHost {
             return self.call_function(name, line, captures, ctx);
         }
 
+        if let Hook::Peer {
+            session,
+            key,
+            value,
+        } = hook
+        {
+            return self.call_peer(session, key, value, ctx);
+        }
+
         let name = hook.name();
         let callbacks = self.callbacks(name)?;
         if callbacks.is_empty() {
@@ -271,9 +329,10 @@ impl ScriptHost for LuaHost {
                     Hook::Gmcp { package, json } => {
                         callback.call::<()>((package.clone(), json.clone()))?
                     }
-                    // Handled above: a rule's `script:` action names its
-                    // function rather than going through a registry.
-                    Hook::Function { .. } => unreachable!(),
+                    // Both handled above: a rule's `script:` action names
+                    // its function, and a peer update is filtered per
+                    // subscription rather than broadcast.
+                    Hook::Function { .. } | Hook::Peer { .. } => unreachable!(),
                 }
             }
             Ok(())
@@ -317,6 +376,46 @@ impl LuaHost {
                 .globals()
                 .get::<Function>(name)?
                 .call::<()>((line, table))
+        });
+        self.swap_ctx(ctx);
+        result
+    }
+
+    /// Calls the `mud.on_peer` subscriptions that match: same session, and
+    /// an event that is a prefix of the changed key — so `Char.Affects`
+    /// catches `Char.Affects.blessed` without naming it.
+    fn call_peer(
+        &mut self,
+        session: &str,
+        key: &str,
+        value: &str,
+        ctx: &mut ScriptCtx,
+    ) -> Result<(), ScriptError> {
+        let entries: Vec<Table> = self
+            .lua
+            .named_registry_value::<Table>(HOOKS_KEY)
+            .and_then(|hooks| hooks.get::<Table>("peer"))
+            .and_then(|list| list.sequence_values::<Table>().collect())
+            .map_err(|err| ScriptError::Runtime {
+                hook: "peer".to_string(),
+                reason: err.to_string(),
+            })?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        self.swap_ctx(ctx);
+        let result = self.with_budget("peer", || {
+            for entry in &entries {
+                if entry.get::<String>("session")? != session {
+                    continue;
+                }
+                if !key.starts_with(&entry.get::<String>("event")?) {
+                    continue;
+                }
+                entry.get::<Function>("fn")?.call::<()>((key, value))?;
+            }
+            Ok(())
         });
         self.swap_ctx(ctx);
         result
@@ -424,7 +523,26 @@ mod tests {
                       error("boom")
                     end)
                 "#,
+                peers: r#"
+                    mud.on_line(function()
+                      local tank = mud.session("tank")
+                      if tank == nil then
+                        mud.echo("no tank")
+                      else
+                        mud.echo(tank.vars.hp .. "/" .. tank.data["Char.Vitals.hp"])
+                        tank:send("stand")
+                      end
+                    end)
+                "#,
                 runaway: "mud.on_line(function() while true do end end)",
+                peer_hook: r#"
+                    mud.on_peer("tank", "Char.Affects", function(key, value)
+                      mud.echo(key .. "=" .. value)
+                    end)
+                    mud.on_peer("healer", "Char.Affects", function(key)
+                      mud.echo("healer " .. key)
+                    end)
+                "#,
                 broken: "this is not lua",
             },
         );

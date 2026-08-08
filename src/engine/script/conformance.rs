@@ -8,10 +8,13 @@
 //! A host that passes this suite is a host the rule engine can dispatch to
 //! without knowing which language it speaks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
-use super::{Captures, Hook, ScriptCtx, ScriptError, ScriptHost, ScriptSource, TIME_BUDGET};
+use super::{
+    Captures, Hook, PeerSnapshot, Peers, ScriptCtx, ScriptError, ScriptHost, ScriptSource,
+    TIME_BUDGET,
+};
 
 /// The suite's scripts, ported to one language. Each field is the whole
 /// script for one scenario; the assertions live in [`run`].
@@ -41,6 +44,13 @@ pub struct Ported {
     pub failing: &'static str,
     /// Registers a line hook that never returns.
     pub runaway: &'static str,
+    /// Registers a line hook that reads the peer `tank`'s `hp` variable
+    /// and `Char.Vitals.hp` data, echoes them as `<hp>/<data>`, sends the
+    /// tank `stand`, and echoes `no tank` when there is no such peer.
+    pub peers: &'static str,
+    /// Subscribes to peer `tank`'s `Char.Affects`, echoing `<key>=<value>`
+    /// for each update, and to peer `healer`'s, echoing `healer <key>`.
+    pub peer_hook: &'static str,
     /// Not a valid program in this language.
     pub broken: &'static str,
 }
@@ -201,6 +211,76 @@ pub fn run(new_host: impl Fn() -> Box<dyn ScriptHost>, ported: &Ported) {
         let mut ctx = ScriptCtx::default();
         call(&mut host, line("You are hungry."), &mut ctx);
         assert_eq!(ctx.out.sends, vec!["eat bread"]);
+    }
+
+    // Peer state (§7.5): readable by name, and addressable by name.
+    {
+        let mut host = load(ported.peers);
+        let (tx, rx) = tokio::sync::watch::channel(PeerSnapshot {
+            vars: HashMap::from([("hp".to_string(), "30".to_string())]),
+            data: HashMap::from([("Char.Vitals.hp".to_string(), "31".to_string())]),
+        });
+
+        let mut ctx = ScriptCtx {
+            peers: Peers::from([("tank".to_string(), rx)]),
+            ..ScriptCtx::default()
+        };
+        call(&mut host, line("x"), &mut ctx);
+        assert_eq!(ctx.out.echoes, vec!["30/31"]);
+        assert_eq!(
+            ctx.out.send_to,
+            vec![("tank".to_string(), vec!["stand".to_string()])]
+        );
+
+        // A peer that is not there is absent, not an error: sessions come
+        // and go, and a script must be able to ask.
+        let mut ctx = ScriptCtx::default();
+        call(&mut host, line("x"), &mut ctx);
+        assert_eq!(ctx.out.echoes, vec!["no tank"]);
+        assert!(ctx.out.send_to.is_empty());
+
+        drop(tx);
+    }
+
+    // `mud.on_peer` filters by session and by key prefix, so a
+    // subscription hears its own peer's affects and nothing else (§7.5).
+    {
+        let mut host = load(ported.peer_hook);
+        let mut ctx = ScriptCtx::default();
+        call(
+            &mut host,
+            Hook::Peer {
+                session: "tank".to_string(),
+                key: "Char.Affects.blessed".to_string(),
+                value: "0".to_string(),
+            },
+            &mut ctx,
+        );
+        call(
+            &mut host,
+            Hook::Peer {
+                session: "tank".to_string(),
+                key: "Char.Vitals.hp".to_string(),
+                value: "30".to_string(),
+            },
+            &mut ctx,
+        );
+        call(
+            &mut host,
+            Hook::Peer {
+                session: "healer".to_string(),
+                key: "Char.Affects.blessed".to_string(),
+                value: "0".to_string(),
+            },
+            &mut ctx,
+        );
+        // The tank's affects reached its own subscription; its vitals
+        // reached neither (wrong prefix); and the healer's affects reached
+        // the healer's subscription alone (wrong session).
+        assert_eq!(
+            ctx.out.echoes,
+            vec!["Char.Affects.blessed=0", "healer Char.Affects.blessed"]
+        );
     }
 
     // A script that will not compile names the file it came from.

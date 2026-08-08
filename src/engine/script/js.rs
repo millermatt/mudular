@@ -35,9 +35,38 @@ const DISPATCH: &str = "__mudular_dispatch";
 /// closure is the only container QuickJS has that a script cannot reach.
 const BOOTSTRAP: &str = r#"
 (function () {
+  const peerVars = mud.__peer_vars;
+  const peerData = mud.__peer_data;
+  const sendTo = mud.__send_to;
+  delete mud.__peer_vars;
+  delete mud.__peer_data;
+  delete mud.__send_to;
+
+  // One handle onto one peer (§7.5), built from the snapshot as it stands
+  // now, so a script reading `.data` twice in one hook sees one consistent
+  // picture rather than two moments of the peer's life.
+  mud.session = function (name) {
+    const vars = peerVars(name);
+    if (vars === null || vars === undefined) { return null; }
+    return {
+      name: name,
+      vars: vars,
+      data: peerData(name),
+      send: function (command) { sendTo(name, command); },
+    };
+  };
+
   const hooks = { connect: [], disconnect: [], line: [], prompt: [], gmcp: [] };
   const register = function (name) {
     return function (fn) { hooks[name].push(fn); };
+  };
+
+  // `mud.on_peer(session, event, fn)` — one peer's server data (§7.5).
+  // Filtered per subscription rather than broadcast, so `Char.Affects`
+  // catches `Char.Affects.blessed` without naming it.
+  const peerHooks = [];
+  mud.on_peer = function (session, event, fn) {
+    peerHooks.push({ session: session, event: event, fn: fn });
   };
   mud.on_connect = register("connect");
   mud.on_disconnect = register("disconnect");
@@ -46,6 +75,16 @@ const BOOTSTRAP: &str = r#"
   mud.on_gmcp = register("gmcp");
   Object.defineProperty(globalThis, "__mudular_dispatch", {
     value: function (name, args) {
+      if (name === "peer") {
+        const session = args[0], key = args[1], value = args[2];
+        for (let i = 0; i < peerHooks.length; i++) {
+          const hook = peerHooks[i];
+          if (hook.session === session && key.indexOf(hook.event) === 0) {
+            hook.fn(key, value);
+          }
+        }
+        return;
+      }
       const list = hooks[name];
       for (let i = 0; i < list.length; i++) { list[i].apply(null, args); }
     },
@@ -171,6 +210,29 @@ impl JsHost {
             Func::from(move |key: String| lock(&shared).server_data.get(&key).cloned()),
         )?;
 
+        // The peer bridge (§7.5). These return plain maps rather than
+        // built objects: a Rust closure cannot name the VM's lifetime, so
+        // the handle itself is assembled in the bootstrap, which can.
+        let shared = Arc::clone(&self.shared);
+        mud.set(
+            "__peer_vars",
+            Func::from(move |name: String| lock(&shared).peer(&name).map(|peer| peer.vars)),
+        )?;
+
+        let shared = Arc::clone(&self.shared);
+        mud.set(
+            "__peer_data",
+            Func::from(move |name: String| lock(&shared).peer(&name).map(|peer| peer.data)),
+        )?;
+
+        let shared = Arc::clone(&self.shared);
+        mud.set(
+            "__send_to",
+            Func::from(move |target: String, command: String| {
+                lock(&shared).out.send_to.push((target, vec![command]));
+            }),
+        )?;
+
         ctx.globals().set("mud", mud)?;
         ctx.eval::<(), _>(BOOTSTRAP.as_bytes())
     }
@@ -290,6 +352,15 @@ fn call_hooks(ctx: &Ctx<'_>, hook: &Hook) -> rquickjs::Result<()> {
             args.set(0, package.as_str())?;
             args.set(1, json.as_str())?;
         }
+        Hook::Peer {
+            session,
+            key,
+            value,
+        } => {
+            args.set(0, session.as_str())?;
+            args.set(1, key.as_str())?;
+            args.set(2, value.as_str())?;
+        }
         // Handled by the caller: a rule's `script:` action names its
         // function rather than going through the dispatcher.
         Hook::Function { .. } => unreachable!(),
@@ -392,7 +463,26 @@ mod tests {
                       throw new Error("boom");
                     });
                 "#,
+                peers: r#"
+                    mud.on_line(function () {
+                      const tank = mud.session("tank");
+                      if (tank === null) {
+                        mud.echo("no tank");
+                      } else {
+                        mud.echo(tank.vars.hp + "/" + tank.data["Char.Vitals.hp"]);
+                        tank.send("stand");
+                      }
+                    });
+                "#,
                 runaway: "mud.on_line(function () { for (;;) {} });",
+                peer_hook: r#"
+                    mud.on_peer("tank", "Char.Affects", function (key, value) {
+                      mud.echo(key + "=" + value);
+                    });
+                    mud.on_peer("healer", "Char.Affects", function (key) {
+                      mud.echo("healer " + key);
+                    });
+                "#,
                 broken: "function (",
             },
         );

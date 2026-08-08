@@ -321,6 +321,9 @@ pub struct Engine {
     hosts: Vec<HostEntry>,
     /// The other sessions' published state, for `${@name.key}` (§7.5).
     peers: Peers,
+    /// The last snapshot each peer was seen at, so a change can be
+    /// reported as the keys that moved rather than as "something did".
+    peers_seen: HashMap<String, PeerSnapshot>,
     /// Whether this session's own state has moved since it last published.
     /// Snapshots are values, so publishing copies the stores; doing it only
     /// on change keeps a quiet session free.
@@ -357,6 +360,7 @@ impl Engine {
             gmcp_keys: HashSet::new(),
             hosts,
             peers: Peers::new(),
+            peers_seen: HashMap::new(),
             changed: false,
         })
     }
@@ -402,6 +406,7 @@ impl Engine {
         let mut ctx = ScriptCtx {
             vars: std::mem::take(&mut self.variables),
             server_data: std::mem::take(&mut self.server_data),
+            peers: std::mem::take(&mut self.peers),
             out: ScriptOutcome::default(),
         };
         for (index, entry) in self.hosts.iter_mut().enumerate() {
@@ -414,10 +419,54 @@ impl Engine {
         }
         self.variables = ctx.vars;
         self.server_data = ctx.server_data;
+        self.peers = ctx.peers;
         // A hook may have called `mud.set`; asking which is not worth the
         // bookkeeping when the answer only costs one snapshot.
         self.changed = true;
         ctx.out
+    }
+
+    /// Reports one peer's changed server-data keys to the scripts watching
+    /// it (§7.5). The session calls this when that peer's snapshot channel
+    /// wakes it; keys go in sorted order, so two runs of the same change
+    /// dispatch the same way.
+    ///
+    /// This is the "observe" half of cross-session automation: the reaction
+    /// lives with the character that acts, and runs in its own session,
+    /// where the commands it sends belong.
+    pub fn poll_peer(&mut self, name: &str) -> ScriptOutcome {
+        let Some(current) = self.peers.get(name).map(|rx| rx.borrow().clone()) else {
+            return ScriptOutcome::default();
+        };
+        let previous = self.peers_seen.insert(name.to_string(), current.clone());
+
+        let mut out = ScriptOutcome::default();
+        if self.hosts.is_empty() {
+            return out;
+        }
+        let previous = previous.unwrap_or_default();
+        let mut changed: Vec<(&String, &String)> = current
+            .data
+            .iter()
+            .filter(|(key, value)| previous.data.get(*key) != Some(*value))
+            .collect();
+        changed.sort();
+
+        for (key, value) in changed
+            .into_iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>()
+        {
+            merge(
+                &mut out,
+                self.run_hook(&Hook::Peer {
+                    session: name.to_string(),
+                    key,
+                    value,
+                }),
+            );
+        }
+        out
     }
 
     /// Session lifecycle hooks (§7.4). `on_connect` runs once the
@@ -524,6 +573,7 @@ impl Engine {
         }
         merge(&mut scripted, self.run_hook(&Hook::Line(line.to_string())));
         outcome.sends.extend(scripted.sends);
+        outcome.send_to.extend(cross_sends(scripted.send_to));
         outcome.echoes = scripted.echoes;
         outcome.gag |= scripted.gag;
         outcome.substitute = scripted.substitute;
@@ -625,6 +675,7 @@ impl Engine {
             );
             out.sends.extend(scripted.sends);
             out.echoes.extend(scripted.echoes);
+            out.send_to.extend(cross_sends(scripted.send_to));
         }
         out
     }
@@ -1075,10 +1126,19 @@ fn captured(regex: &Regex, caps: &Captures) -> script::Captures {
 
 /// Folds one script call's results into the line's running total. `gag` is
 /// sticky and a later `substitute` wins, matching how the rules combine.
+/// A script's cross-session sends, in the shape the hub routes (§7.5).
+fn cross_sends(sends: Vec<(String, Vec<String>)>) -> Vec<CrossSend> {
+    sends
+        .into_iter()
+        .map(|(target, lines)| CrossSend { target, lines })
+        .collect()
+}
+
 fn merge(into: &mut ScriptOutcome, from: ScriptOutcome) {
     into.sends.extend(from.sends);
     into.echoes.extend(from.echoes);
     into.gag |= from.gag;
+    into.send_to.extend(from.send_to);
     if from.substitute.is_some() {
         into.substitute = from.substitute;
     }
@@ -2630,6 +2690,53 @@ triggers:
                 engine.process_line("You are now fighting kobold").sends,
                 vec!["consider kobold"]
             );
+        }
+
+        /// The M8 acceptance case for §7.5: the cleric's own script watches
+        /// the tank's GMCP affects and rebuffs when one drops — the
+        /// reaction lives with the character that acts, in the session
+        /// whose commands they are.
+        #[test]
+        fn a_cleric_script_rebuffs_off_the_tanks_affects() {
+            let mut layer = module("name: cleric");
+            layer.script_sources.push(ScriptSource {
+                name: "cleric.lua".to_string(),
+                code: r#"
+                mud.on_peer("tank", "Char.Affects", function(key, value)
+                  if value == "0" then
+                    local spell = key:match("([^.]+)$")
+                    mud.session("tank"):send("cast " .. spell .. " Grunk")
+                  end
+                end)
+                "#
+                .to_string(),
+            });
+            let mut engine = Engine::compile(&[layer]).expect("compiles");
+
+            let (tank, rx) = watch::channel(snapshot(
+                &[],
+                &[("Char.Affects.bless", "1"), ("Char.Vitals.hp", "90")],
+            ));
+            engine.set_peers(Peers::from([("tank".to_string(), rx)]));
+
+            // First poll: everything is new, but nothing has worn off.
+            assert!(engine.poll_peer("tank").send_to.is_empty());
+
+            // The blessing drops — and only that key is reported, so the
+            // unchanged vitals do not wake the subscription.
+            tank.send(snapshot(
+                &[],
+                &[("Char.Affects.bless", "0"), ("Char.Vitals.hp", "90")],
+            ))
+            .expect("the engine holds a receiver");
+            let outcome = engine.poll_peer("tank");
+            assert_eq!(
+                outcome.send_to,
+                vec![("tank".to_string(), vec!["cast bless Grunk".to_string()])]
+            );
+
+            // Nothing new: nothing fires.
+            assert!(engine.poll_peer("tank").send_to.is_empty());
         }
 
         /// A guard governs the script action like any other: no match, no

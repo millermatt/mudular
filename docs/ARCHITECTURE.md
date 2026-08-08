@@ -513,11 +513,21 @@ as an unknown local name does.
 **Scripting API (M8).** The `mud.*` API (§7.4) adds:
 
 - `mud.session("cleric"):send(cmd)` / `:echo(text)` — routed as above.
-- `mud.session("tank").data` / `.vars` — the peer snapshot (read-only).
-- `mud.on_peer("tank", "gmcp:Char.Affects", fn)` — subscribe to a peer's
-  server-data updates; this is the clean solution for "rebuff when a buff
-  wears off": the cleric's script watches the tank's affect list and reacts
-  from the cleric's own session, where the response commands belong.
+  `mud.session` answers `nil` for a name no session holds, so a script can
+  ask rather than assume.
+- `mud.session("tank").data` / `.vars` — the peer snapshot (read-only), as
+  it stood when the handle was made, so a hook reading two keys sees one
+  moment of that character's life rather than two.
+- `mud.on_peer("tank", "Char.Affects", fn)` — subscribe to a peer's
+  server-data updates, by session and by key prefix, called as
+  `fn(key, value)` for each key that changed. This is the clean solution
+  for "rebuff when a buff wears off": the cleric's script watches the
+  tank's affect list and reacts from the cleric's own session, where the
+  response commands belong. The event names a dotted key prefix and not a
+  protocol (`gmcp:`): the snapshot is source-agnostic by the time it is
+  published — GMCP already won over MSDP at the store (§6.3) — so a
+  subscription that named the source would break on a server that switched
+  protocols without the data changing at all.
 
 Both directions are therefore supported and equivalent: push (tank's rules
 command the cleric) and observe (cleric's rules/scripts watch the tank).
