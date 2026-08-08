@@ -699,21 +699,32 @@ not an implementation detail.
 
 ## 8. Line Assembly & Scrollback
 
-- The assembler consumes decoded text + prompt boundaries and produces
-  `Line` values: styled spans (parsed SGR state carried across chunks) +
-  plain-text projection (for triggers/search) + kind (`Output | Prompt |
-  Local | Gagged`).
-- Rule highlights (§7.7) are spliced into the line's escape sequences
-  before this point, so a highlighted line is an ordinary styled line by
-  the time it reaches the renderer — nothing downstream knows the
+- The assembler (`session::line::LineAssembler`) consumes decoded text +
+  prompt boundaries and emits one `SessionEvent::Line`/`Prompt` per
+  completed line, still carrying the server's raw ANSI. Triggers match
+  against a stripped projection computed separately (`strip_ansi`, §7.1)
+  rather than a second stored copy — stripping is cheap enough to redo
+  than to cache, and it leaves one string per line to keep in sync, not
+  two.
+- Rule highlights (§7.7) are spliced into that raw text before it reaches
+  scrollback, so a highlighted line is an ordinary ANSI line by the time
+  it's stored — nothing downstream (rendering, channel routing) knows the
   difference.
 - ANSI parsing uses `ansi-to-tui` to turn SGR (16/256/TrueColor) into
-  ratatui spans; unknown/unsafe escape sequences are dropped, not rendered
-  raw. If MUD-specific quirks outgrow it, the fallback is a thin parser on
-  `vte` (Alacritty's escape parser).
-- Scrollback is a bounded ring buffer (`VecDeque<Line>`, default 10k lines,
-  configurable) per session. Optional disk logging (M9) writes plain text
-  or raw-with-ANSI per profile.
+  ratatui spans at render time, not at assembly time — one parse pass, run
+  when a frame actually needs it, rather than a stored structured
+  representation that has to be kept in step with every mutation between
+  assembly and render (the highlight splice, `mud.substitute`). If
+  MUD-specific quirks outgrow it, the fallback is a thin parser on `vte`
+  (Alacritty's escape parser).
+- Scrollback is a bounded `VecDeque<String>` per pane — session panes and
+  channel panes alike (§11.1) — plain raw text, discarded oldest-first, at
+  a fixed 10,000 lines today. **Planned (M9, §11.5): making that bound a
+  `scrollback_size` setting in `mudular.yaml`**, the same shape as
+  `history_size` (§11.3) — a `usize`, same 10,000 default so nothing
+  changes for a config that doesn't set it, no file persistence. Disk
+  logging is a separate, unspec'd M9 item; it would read from this buffer
+  rather than keep a second one.
 
 ---
 
@@ -841,8 +852,8 @@ is shaped by what must never happen rather than by convenience.
   for non-focused sessions with new output since last focus; cleared on
   focus. Trigger-flagged "important" lines can escalate the indicator
   color (M8).
-- **Per-pane content:** scrollback viewport (PgUp/PgDn, `End` to tail),
-  prompt line pinned above a per-session input line with its own history
+- **Per-pane content:** scrollback viewport (`PgUp`/`PgDn`, `Home`/`End`,
+  §11.5), prompt line pinned above a per-session input line with its own history
   (`Up`/`Down`, §11.3). Input buffers are per-session — switching focus
   never mixes input.
 - **Per-character colour:** a profile's `color:` (a name, `#rrggbb`, or a
@@ -920,7 +931,7 @@ command is behind a key.
   nothing for the user who remapped something.
 - **Contents:** the configurable bindings grouped by purpose (session
   focus, layout, views, quit), the built-in ones (`Alt+1..9`, `Up`/`Down`
-  history, `PgUp`/`PgDn` scrollback), and the client-side commands
+  history, `PgUp`/`PgDn`/`Home`/`End` scrollback, §11.5), and the client-side commands
   (`/reload`, `/help`) — which are otherwise just as invisible as the
   keys.
 - **`/help` prints the same content** into the focused pane, so the
@@ -947,8 +958,8 @@ player mashing the same six characters all evening.
   line. Built-in and not remappable, like `Alt+1..9` — the arrows have no
   other meaning on a single-line input, and a client that made them
   configurable would be inviting users to break the one binding everyone
-  arrives already knowing. Scrollback keeps `PgUp`/`PgDn`, so there is no
-  collision.
+  arrives already knowing. Scrollback keeps `PgUp`/`PgDn`/`Home`/`End`
+  (§11.5), so there is no collision.
 - **Per session, like the input buffer.** History belongs to the character,
   not the app: `kill rat` recalled into the cleric's input is a mistake the
   client should be structurally incapable of making. Focusing a channel
@@ -983,8 +994,9 @@ player mashing the same six characters all evening.
   session), discarding oldest-first — the same reasoning as scrollback
   bounds, applied to a buffer that a stuck key can fill.
 - Prefix search (`Ctrl+R`, or `Up` filtering on what is already typed) is a
-  deliberate later addition, alongside scrollback search in M9. Plain
-  recall must land first and stand alone.
+  deliberate later addition, alongside scrollback search (§11.5) — both
+  wait on their respective plain feature landing and proving itself
+  first.
 
 Built early for the same reason as §11.2: it is small, it is table stakes,
 and the client is already usable enough that its absence is felt every
@@ -1031,6 +1043,61 @@ anything else:
 Per-channel heights within the column stay evenly split. Splitting three
 comms panes unevenly is a want nobody has voiced; the column's width
 against the game text is the ratio that actually bites.
+
+### 11.5 Scrollback navigation (M9)
+
+Every pane above (§11's own bullets, §11.1, §11.3) already talks about a
+scrollback viewport as if it existed — "`PgUp`/`PgDn`, `End` to tail",
+"scrollable like any other pane." It doesn't yet: `render_scrollback`
+always pins to the newest content, there is no stored notion of "how far
+up" a pane is, and neither key has a handler. This is the gap "scrollback
+search" quietly assumed was already closed; it wasn't, and search can't
+be specced on top of a viewport that can't move yet. Navigation ships in
+M9; search (scrollback and the `Up` prefix search §11.3 already defers)
+stays a later addition on top of it.
+
+- **Per-pane scroll offset, in `AppState`.** Not per rendered widget —
+  the same "state, not layout" split §11.4 already uses for the channel
+  column: the offset is a number the event loop changes, and
+  `render_scrollback` computes the viewport from it every frame. Every
+  pane with a scrollback gets one, session panes and channel panes alike
+  — §11.1's "scrollable like any other pane" is this section.
+- **Measured in wrapped rows, not logical lines, and clamped to
+  `[0, wrapped_rows.saturating_sub(viewport)]`** — the same
+  `wrapped_rows` `render_scrollback` already computes by running
+  ratatui's real wrap algorithm rather than a second estimate. A resize
+  changes the wrap and therefore the clamp; the offset re-clamps on
+  every `Resize` event, the same as the channel column's width does
+  (§11.4).
+- **Keys: `PgUp`/`PgDn` move one viewport height; `Home`/`End` jump to
+  the oldest and newest line.** Built-in and unremappable, like
+  `Alt+1..9` and `Up`/`Down` (§11.3) — none of them have a competing
+  meaning on a scrollback pane, and making them configurable would
+  invite someone to break the one behaviour every pager and terminal has
+  already taught them to expect.
+- **New output never moves a reader who has scrolled away from the
+  tail.** A line arriving while the offset is nonzero is appended to the
+  buffer and left there — not auto-followed, not dropped. Auto-follow
+  (the offset staying at the tail) applies only while the pane is
+  already there when the line arrives: the ordinary "sticky bottom" a
+  pane should default to. Yanking a reader back to the tail mid-read is
+  the failure mode that makes people stop trusting a client's
+  scrollback — the same reasoning §11.3 gives for not losing a
+  half-typed line to a history walk.
+- **A scrolled pane says so**, with an indicator distinct from the
+  unread badge (§11's own bullet): unread means "you haven't looked",
+  scrolled means "you're looking at something old right now", and they
+  need to be tellable apart at a glance — including on the pane that's
+  currently focused, which the unread badge deliberately never marks.
+- **Not scrollback storage.** Making its bound a `scrollback_size` setting
+  (§8) is bundled into this milestone but is not something navigation
+  itself touches — navigation makes what's kept reachable, it doesn't
+  decide how much to keep.
+- **Not search.** §11.3 already earmarks scrollback search as a later
+  addition once plain history recall proved itself; the same logic
+  applies here — navigation has to exist before a search can jump you
+  somewhere in it, and building both at once is two features wearing one
+  milestone entry.
 
 #### Dragging borders with the mouse: possible, deliberately not scheduled
 
@@ -1133,7 +1200,7 @@ exist from M0, even where a stage is a passthrough).
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
-| **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), keyring-backed auto-login (§10.1), and rule highlights (§7.7) — all built early, as soon as they were useful; scrollback search, disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), resizable channel column (§11.4), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either; the channel column can be widened from the keyboard and the sessions beside it are told their new size |
+| **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), keyring-backed auto-login (§10.1), and rule highlights (§7.7) — all built early, as soon as they were useful; scrollback navigation with a configurable buffer size (§8, §11.5), disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), resizable channel column (§11.4), in-TUI new-profile form, self-update check; scrollback search and `Up` prefix search are deliberately deferred past M9 (§11.3, §11.5) | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either; the channel column can be widened from the keyboard and the sessions beside it are told their new size; `PgUp`/`PgDn`/`Home`/`End` move a pane's scrollback without losing new output that arrives while scrolled up, and a scrolled pane is visibly distinguishable from a live one |
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
