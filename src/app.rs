@@ -74,6 +74,9 @@ pub struct ConnectTarget {
     /// (docs/ARCHITECTURE.md §13), so a stored password does not have to be
     /// set up ahead of time.
     pub offer_password_save: bool,
+    /// Where to append this session's transcript, if the profile's `log:`
+    /// is set (§8, §12). `None` means disk logging is off.
+    pub log_path: Option<PathBuf>,
 }
 
 /// Where a session's rules came from, so `/reload` can recompile them from
@@ -147,6 +150,11 @@ pub struct SessionPane {
     last_size: Option<(u16, u16)>,
     /// How many lines `scrollback` keeps (`scrollback_size`, §8).
     scrollback_limit: usize,
+    /// The open transcript file, if the profile's `log:` is set (§8, §12).
+    /// Every line that reaches `push_line` is appended here too — the same
+    /// choke point that already keeps masked lines out of scrollback keeps
+    /// them out of the transcript, for free (§13).
+    log: Option<std::io::BufWriter<std::fs::File>>,
     /// Distance back from the tail, in wrapped rows: 0 is pinned to the
     /// newest content, larger is further back in history. Storing distance
     /// rather than an absolute position means a new line arriving needs no
@@ -157,6 +165,15 @@ pub struct SessionPane {
 
 impl SessionPane {
     fn push_line(&mut self, line: String) {
+        if let Some(log) = &mut self.log {
+            use std::io::Write as _;
+            // Best-effort: a full disk or a yanked log file must not take
+            // the session down. Silently stop trying rather than repeat a
+            // failing write every line.
+            if writeln!(log, "{line}").and_then(|()| log.flush()).is_err() {
+                self.log = None;
+            }
+        }
         self.scrollback.push_back(line);
         if self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
@@ -736,7 +753,31 @@ fn connect(
         cross: target.cross,
         last_size: None,
         scrollback_limit,
+        log: target.log_path.as_deref().and_then(open_log),
         back_offset: 0,
+    }
+}
+
+/// Opens a session's transcript file for append, creating its directory if
+/// needed. `None` on any failure — a session that can't log still connects
+/// (docs/ARCHITECTURE.md §3: one session's trouble stays local to it).
+fn open_log(path: &std::path::Path) -> Option<std::io::BufWriter<std::fs::File>> {
+    if let Some(dir) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(dir)
+    {
+        tracing::warn!("could not create log directory {}: {err}", dir.display());
+        return None;
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => Some(std::io::BufWriter::new(file)),
+        Err(err) => {
+            tracing::warn!("could not open log file {}: {err}", path.display());
+            None
+        }
     }
 }
 
@@ -1167,6 +1208,7 @@ pub(crate) mod test_support {
                 cross: CrossSession::default(),
                 last_size: None,
                 scrollback_limit: 10_000,
+                log: None,
                 back_offset: 0,
             },
             rx,
@@ -1306,6 +1348,61 @@ mod tests {
         session.masked = false;
         session.push_line("> look".to_string());
         assert_eq!(scrollback(session), "> look");
+    }
+
+    /// The same guard that keeps a password out of scrollback must keep it
+    /// out of the transcript file — disk logging must never be the one
+    /// place a masked line survives.
+    #[test]
+    fn masked_input_is_never_written_to_the_log_file() {
+        let (mut session, _rx) = test_support::pane("tank");
+        let path = std::env::temp_dir().join(format!(
+            "mudular-test-masked-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        session.log = open_log(&path);
+        assert!(session.log.is_some(), "log file failed to open");
+
+        session.masked = true;
+        let line = "hunter2".to_string();
+        // Mirrors the Enter branch of the event loop: a masked line never
+        // reaches push_line at all.
+        if !session.masked {
+            session.push_line(format!("> {line}"));
+        }
+
+        session.masked = false;
+        session.push_line("> look".to_string());
+        drop(session);
+
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(logged, "> look\n");
+        assert!(!logged.contains("hunter2"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Disk logging (§8, §12) writes through the same choke point as
+    /// scrollback, so anything that reaches the pane reaches the transcript
+    /// too — and, by the same token, a masked line reaches neither.
+    #[test]
+    fn push_line_appends_to_the_open_log_file() {
+        let (mut session, _rx) = test_support::pane("tank");
+        let path = std::env::temp_dir().join(format!(
+            "mudular-test-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        session.log = open_log(&path);
+        assert!(session.log.is_some(), "log file failed to open");
+
+        session.push_line("You see a rat.".to_string());
+        session.push_line("You swing your sword.".to_string());
+        drop(session); // flushes the BufWriter
+
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(logged, "You see a rat.\nYou swing your sword.\n");
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The inspector view's data source (§14 M6): raw GMCP messages land in

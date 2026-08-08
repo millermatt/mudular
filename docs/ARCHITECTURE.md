@@ -722,9 +722,14 @@ not an implementation detail.
   a fixed 10,000 lines today. **Planned (M9, §11.5): making that bound a
   `scrollback_size` setting in `mudular.yaml`**, the same shape as
   `history_size` (§11.3) — a `usize`, same 10,000 default so nothing
-  changes for a config that doesn't set it, no file persistence. Disk
-  logging is a separate, unspec'd M9 item; it would read from this buffer
-  rather than keep a second one.
+  changes for a config that doesn't set it, no file persistence.
+- **Disk logging** (M9): a profile's `log: true` appends every line that
+  reaches `push_line` — the same choke point scrollback fills from — to
+  `<config dir>/logs/<session name>.log`, opened once at connect and kept
+  open for append. No second buffer: the transcript is exactly what the
+  pane shows, so a masked line is excluded from the log for the same
+  reason it never reaches scrollback (§13). A write or open failure
+  disables logging for that session rather than ending it.
 
 ---
 
@@ -780,6 +785,7 @@ login:                     # optional auto-login; password via keyring
   name: Kestrel
 modules: [uw-common, uw-combat]
 triggers: []               # profile-local overrides (scope layer 3)
+log: true                  # append scrollback to <config dir>/logs/kestrel.log (§8)
 ```
 
 Schema structs are `serde` types with `deny_unknown_fields` so typos fail

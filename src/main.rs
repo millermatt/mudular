@@ -110,8 +110,12 @@ async fn main() -> Result<()> {
             .with_context(|| format!("charset in {}", path.display()))?;
         let layers = config::load_rules(&dir, Some(name), &channels)?;
         let (login, offer_password_save) = autologin(profile.login.as_ref(), name, &dir)?;
+        let session_name = session_name(name, &mut names);
+        let log_path = profile
+            .log
+            .then(|| config::log_dir(&dir).join(format!("{session_name}.log")));
         targets.push(app::ConnectTarget {
-            name: session_name(name, &mut names),
+            name: session_name,
             host: profile.host,
             port: profile.port,
             tls,
@@ -128,6 +132,7 @@ async fn main() -> Result<()> {
             color: profile.color,
             login,
             offer_password_save,
+            log_path,
         });
     }
 
@@ -156,6 +161,7 @@ async fn main() -> Result<()> {
             color: None,
             login: None,
             offer_password_save: false,
+            log_path: None,
         });
     }
 

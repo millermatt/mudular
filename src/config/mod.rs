@@ -28,6 +28,13 @@ pub fn config_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(dirs.config_dir().to_path_buf())
 }
 
+/// Where session transcripts are written when a profile sets `log: true`
+/// (§8, §12) — a subdirectory of the config dir, so `--config-dir` moves
+/// logs along with everything else.
+pub fn log_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("logs")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -73,6 +80,11 @@ pub struct Profile {
     /// profile whose aliases would run can opt into running them.
     #[serde(default)]
     pub cross_session: Option<CrossSessionOverride>,
+    /// Appends this character's scrollback to `<config dir>/logs/<name>.log`
+    /// (§8, §12). Off by default: a transcript is something a player opts
+    /// into per character, not a standing side effect of connecting.
+    #[serde(default)]
+    pub log: bool,
 }
 
 /// Auto-login settings. The password lives in the OS keyring, not here
