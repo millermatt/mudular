@@ -1238,3 +1238,10 @@ Target: a non-technical user installs Mudular on any OS in one step.
   Telnet option registrations.
 - **Workspace split:** modules are dependency-clean for promotion to crates
   (`mudular-proto` would make a fine standalone library).
+- **Import from TinTin++/Mudlet:** a `--import-tintin`/`--import-mudlet`
+  CLI step that reads a TinTin++ script or Mudlet package and emits
+  profile-scope YAML (§7.2) for the aliases/triggers/timers it can
+  translate, warning on constructs (TinTin `#class`, Mudlet GUI
+  elements) with no Mudular equivalent. Post-1.0: real fidelity needs
+  each source format's quirks worked out against real scripts, not
+  guessed at.
