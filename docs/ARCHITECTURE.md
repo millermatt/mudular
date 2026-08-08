@@ -730,6 +730,36 @@ sends or gags, with no parallel list to keep in step.
   together so a fired trigger reaches whichever the player's terminal
   understands, and is silently ignored by the rest.
 
+### 7.9 Speedwalk paths (M9)
+
+`.3n2e` — a leading `.` followed by count+direction pairs — is the
+TinTin++/zMUD convention for a string of moves without spelling each one
+out. Deliberately no room graph: that's the post-1.0 auto-mapper's
+pathfinding, which supersedes this (§16). This is pure text expansion.
+
+```
+.3n2e       → n, n, n, e, e
+.2ne1d      → ne, ne, d          (two-letter diagonals are one move, not two)
+home; .2s1w → whatever `home` sends, then s, s, w
+```
+
+- **Directions:** `n s e w u d ne nw se sw`, matched longest-first so a
+  diagonal isn't misread as its two components — `.ne` is one move, not
+  `n` then `e`. A count defaults to 1 when omitted.
+- **Expands wherever a send is queued from typed input** — a line typed
+  directly, or an alias's `send:` template — so a stored alias *is* a
+  speedwalk macro (`send: [".2s1w"]` behind a memorable name) with no
+  separate macro schema to add. Trigger and script sends are untouched:
+  those react to the server, not the player choosing to walk somewhere.
+- **A pattern that doesn't parse — no leading `.`, a token that isn't a
+  digit run followed by a known direction, or a count/total past a sanity
+  bound (999 either way, so a typo can't queue a send storm, §13) — is
+  sent unchanged.** `.` stays an ordinary character in anything that isn't
+  a valid path, so a channel command like `.who` or a typed `.` is never
+  mistaken for one.
+- One command per step, matching how a MUD reads movement: a path is a
+  list of separate sends, not one line the server has to parse itself.
+
 ---
 
 ## 8. Line Assembly & Scrollback

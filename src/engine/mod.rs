@@ -744,7 +744,7 @@ impl Engine {
                         peers: &self.peers,
                     };
                     for template in &rule.sends {
-                        out.sends.push(expand(template, &scope));
+                        push_send(&mut out.sends, expand(template, &scope));
                     }
                     for (target, templates) in &rule.send_to {
                         out.send_to.push(CrossSend {
@@ -767,7 +767,7 @@ impl Engine {
                         ));
                     }
                 }
-                None => out.sends.push(part.to_string()),
+                None => push_send(&mut out.sends, part.to_string()),
             }
         }
 
@@ -1475,6 +1475,63 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_millis(millis))
 }
 
+/// Speedwalk direction tokens, longest first so a two-letter diagonal is
+/// preferred over the two one-letter moves it could also parse as — `ne`
+/// is one move, not `n` then `e` (§7, §16).
+const SPEEDWALK_DIRECTIONS: &[&str] = &["ne", "nw", "se", "sw", "n", "s", "e", "w", "u", "d"];
+
+/// A single count run's upper bound, and the whole path's — a typo like
+/// `.99999999n` should fall back to being sent as literal text, not queue
+/// up a send storm (§13: bound anything that can multiply input).
+const MAX_SPEEDWALK_COUNT: usize = 999;
+const MAX_SPEEDWALK_STEPS: usize = 999;
+
+/// Queues a send, first checking whether it's a `.3n2e`-style speedwalk
+/// path (§7.8's sibling for movement rather than attention) — the classic
+/// TinTin++/zMUD notation, with no room graph behind it (§16). A path that
+/// doesn't parse as one is queued as typed, so `.` remains an ordinary
+/// character everywhere else in a command.
+fn push_send(sends: &mut Vec<String>, text: String) {
+    match expand_speedwalk(&text) {
+        Some(steps) => sends.extend(steps),
+        None => sends.push(text),
+    }
+}
+
+/// Expands a leading-dot speedwalk path into its individual movement
+/// commands, each sent as its own line (a MUD reads one direction per
+/// command). `None` for anything that isn't one — no leading `.`, an empty
+/// path, a token that isn't a digit run followed by a known direction, or
+/// a count/total past the sanity bound — so the caller falls back to
+/// sending the text unchanged.
+fn expand_speedwalk(path: &str) -> Option<Vec<String>> {
+    let mut rest = path.strip_prefix('.')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let mut steps = Vec::new();
+    while !rest.is_empty() {
+        let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let (digits, after_digits) = rest.split_at(digits_len);
+        let count: usize = match digits {
+            "" => 1,
+            digits => digits
+                .parse()
+                .ok()
+                .filter(|&n| n > 0 && n <= MAX_SPEEDWALK_COUNT)?,
+        };
+        let dir = SPEEDWALK_DIRECTIONS
+            .iter()
+            .find(|dir| after_digits.starts_with(*dir))?;
+        if steps.len() + count > MAX_SPEEDWALK_STEPS {
+            return None;
+        }
+        steps.extend(std::iter::repeat_n(dir.to_string(), count));
+        rest = &after_digits[dir.len()..];
+    }
+    Some(steps)
+}
+
 /// Substitutes `${...}` in a send/set template: numbered and named regex
 /// captures first, then the variable store (§7.1). An unresolved name is
 /// left verbatim so a typo is visible rather than silently blank.
@@ -1700,6 +1757,58 @@ mod tests {
             vec!["n", "get sword", "wear sword", "n"]
         );
         assert_eq!(engine.expand_input(";;").sends, Vec::<String>::new());
+    }
+
+    // ---- speedwalk (§7.8, §16) ----
+
+    #[test]
+    fn a_speedwalk_path_expands_to_one_move_per_step() {
+        let mut engine = engine("name: test");
+        assert_eq!(
+            engine.expand_input(".3n2e").sends,
+            vec!["n", "n", "n", "e", "e"]
+        );
+    }
+
+    /// Two-letter diagonals are greedy: `ne` is one move, not `n` then `e`.
+    #[test]
+    fn a_speedwalk_diagonal_is_not_split_into_two_moves() {
+        let mut engine = engine("name: test");
+        assert_eq!(engine.expand_input(".2ne1d").sends, vec!["ne", "ne", "d"]);
+    }
+
+    /// Text that merely starts with `.` but isn't a valid path — no
+    /// direction after a digit run, or no leading digits at all that
+    /// resolve to a direction — is sent exactly as typed.
+    #[test]
+    fn text_that_only_looks_like_a_speedwalk_is_sent_unchanged() {
+        let mut engine = engine("name: test");
+        assert_eq!(engine.expand_input(".hello").sends, vec![".hello"]);
+        assert_eq!(engine.expand_input(".").sends, vec!["."]);
+        assert_eq!(engine.expand_input("3n2e").sends, vec!["3n2e"]);
+    }
+
+    /// A stored alias is a speedwalk macro for free: its `send:` output
+    /// goes through the same expansion as anything typed directly.
+    #[test]
+    fn an_alias_can_store_a_speedwalk_macro() {
+        let mut engine = engine(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^home$'
+                send: [".2s1w"]
+            "#,
+        );
+        assert_eq!(engine.expand_input("home").sends, vec!["s", "s", "w"]);
+    }
+
+    /// A count or a total past the sanity bound falls back to the literal
+    /// text rather than queuing a send storm (§13).
+    #[test]
+    fn an_oversized_speedwalk_count_is_not_expanded() {
+        let mut engine = engine("name: test");
+        assert_eq!(engine.expand_input(".99999999n").sends, vec![".99999999n"]);
     }
 
     /// Alias output is not re-expanded, so two aliases cannot bounce off
