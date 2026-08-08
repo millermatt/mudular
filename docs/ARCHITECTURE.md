@@ -695,6 +695,41 @@ not an implementation detail.
 - Gagged lines are never highlighted, for the obvious reason. A rule that
   sets both is not an error — `gag` simply wins.
 
+### 7.8 Desktop notifications (`bell:`, M9)
+
+The one alert a highlight can't give: something happened in a pane you
+aren't looking at right now.
+
+```yaml
+triggers:
+  - pattern: 'You have been slain'
+    bell: true
+```
+
+**Also a trigger action, for the same reason `highlight:` is (§7.7)** — it
+inherits shadowing, `when:` guards, and composes with a rule that also
+sends or gags, with no parallel list to keep in step.
+
+- **Independent of `gag:`**, unlike `highlight:`: a line worth hiding from
+  scrollback (an OOC channel spammed by a bot, say) can still be worth an
+  alert, so both may be set on the same rule without one cancelling the
+  other.
+- **The engine only reports the request.** `process_line` has no notion of
+  which pane is focused — that state lives in the hub (`app`), one layer
+  up, and `session` (which does know a `Bell` fired) has no terminal to
+  ring it on either (§4: neither is allowed to touch the terminal). So a
+  fired `bell:` becomes `SessionEvent::Bell`, and the hub — which already
+  tracks focus for unread counts (§11) — decides whether to actually ring
+  it: only for a session that isn't the focused pane, since a focused
+  session's own alert is just noise.
+- **Rung as a terminal `BEL` plus an OSC 9 notification** (`ESC ] 9 ;
+  text BEL`) naming the session. `BEL` alone reaches terminal multiplexers
+  watching for activity (tmux's `visual-activity`) and terminals that beep
+  or flash; OSC 9 additionally reaches desktop notification centers on
+  terminals that forward it (iTerm2, kitty, foot, and others) — sent
+  together so a fired trigger reaches whichever the player's terminal
+  understands, and is silently ignored by the rest.
+
 ---
 
 ## 8. Line Assembly & Scrollback

@@ -53,6 +53,10 @@ pub enum SessionEvent {
     Prompt(String),
     /// Server asked us to mask/unmask local input (Telnet ECHO).
     EchoMask(bool),
+    /// A trigger's `bell:` fired on this line (§14 M9). The hub rings the
+    /// terminal bell / desktop notification only if the pane isn't
+    /// focused — the session has no notion of focus to decide that itself.
+    Bell,
     /// What the transport is trusting, once connected.
     Security(net::Security),
     /// A raw GMCP message, for the inspector view (§14 M6). MSDP data feeds
@@ -538,6 +542,12 @@ async fn run_connection(
                                             }
                                             if !outcome.gag {
                                                 emit.push(SessionEvent::Line(text));
+                                            }
+                                            // Independent of gag: a line
+                                            // worth hiding can still be
+                                            // worth an alert.
+                                            if outcome.bell {
+                                                emit.push(SessionEvent::Bell);
                                             }
                                             // Echoes follow the line that
                                             // provoked them.
@@ -1424,6 +1434,33 @@ mod tests {
             "something real",
             "the gagged line must not be delivered"
         );
+    }
+
+    /// A `bell:` trigger emits its own event, separate from the line it
+    /// fired on — the hub decides whether it actually rings (§14 M9).
+    #[tokio::test]
+    async fn a_bell_trigger_emits_a_bell_event() {
+        let (mut events, _commands) = serve_with_rules(
+            |mut sock| async move {
+                sock.write_all(b"You have been slain by a rat.\r\n")
+                    .await
+                    .unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'slain'
+                    bell: true
+                "#,
+            ),
+        );
+
+        assert_eq!(
+            next_line(&mut events).await,
+            "You have been slain by a rat."
+        );
+        next_matching(&mut events, |ev| matches!(ev, SessionEvent::Bell)).await;
     }
 
     /// Typed input is expanded by the session, not the UI: one line can

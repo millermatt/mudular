@@ -126,6 +126,11 @@ pub struct Trigger {
     /// Recolour the matched text, or the whole line (§7.7).
     #[serde(default)]
     pub highlight: Option<HighlightSpec>,
+    /// Rings the terminal bell / desktop notification when this fires in a
+    /// session that isn't focused (§14 M9). Independent of `gag:` — a line
+    /// worth hiding can still be worth an alert.
+    #[serde(default)]
+    pub bell: Option<bool>,
     #[serde(default)]
     pub enabled: Option<bool>,
 }
@@ -259,6 +264,10 @@ pub struct LineOutcome {
     /// (§7.7). The engine never sees the original ANSI, so it returns
     /// ranges rather than styled text and the session splices them.
     pub highlights: Vec<(std::ops::Range<usize>, String)>,
+    /// A trigger asked for a bell / desktop notification on this line
+    /// (§14 M9). The session doesn't know its own focus state, so it only
+    /// reports the request; the hub decides whether to ring it.
+    pub bell: bool,
 }
 
 /// What a typed input line expands to.
@@ -314,6 +323,7 @@ struct CompiledRule {
     gag: bool,
     route: Option<String>,
     highlight: Option<CompiledHighlight>,
+    bell: bool,
 }
 
 /// A `highlight:` block reduced to what the hot path needs: the SGR
@@ -648,6 +658,7 @@ impl Engine {
                     outcome.highlights.push((span, highlight.sgr.clone()));
                 }
             }
+            outcome.bell |= rule.bell;
         }
 
         self.changed |= !updates.is_empty();
@@ -989,6 +1000,7 @@ impl Layered for Trigger {
         self.gag = self.gag.or(base.gag);
         self.route = self.route.take().or_else(|| base.route.clone());
         self.highlight = self.highlight.take().or_else(|| base.highlight.clone());
+        self.bell = self.bell.or(base.bell);
         self.enabled = self.enabled.or(base.enabled);
     }
 }
@@ -1036,6 +1048,7 @@ trait CompilableRule {
     fn gag(&self) -> bool;
     fn route(&self) -> Option<String>;
     fn highlight(&self) -> Option<HighlightSpec>;
+    fn bell(&self) -> bool;
 }
 
 impl CompilableRule for Alias {
@@ -1077,6 +1090,11 @@ impl CompilableRule for Alias {
     fn highlight(&self) -> Option<HighlightSpec> {
         None
     }
+    /// Aliases fire on outbound input, not inbound lines, so there is
+    /// nothing here for the player to be alerted to.
+    fn bell(&self) -> bool {
+        false
+    }
 }
 
 impl CompilableRule for Trigger {
@@ -1116,6 +1134,9 @@ impl CompilableRule for Trigger {
     }
     fn highlight(&self) -> Option<HighlightSpec> {
         self.highlight.clone()
+    }
+    fn bell(&self) -> bool {
+        self.bell.unwrap_or(false)
     }
 }
 
@@ -1169,6 +1190,7 @@ fn compile_rules<T: CompilableRule>(
                     })
                 })
                 .transpose()?,
+            bell: rule.bell(),
         });
     }
     Ok(out)
@@ -2434,6 +2456,45 @@ triggers:
         let outcome = engine.process_line("spam here");
         assert!(outcome.gag);
         assert_eq!(outcome.highlights, vec![(0..4, "1".to_string())]);
+    }
+
+    // ---- bell (§14 M9) ----
+
+    #[test]
+    fn a_bell_trigger_flags_the_outcome() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'You have been slain'
+    bell: true
+"#,
+        )])
+        .unwrap();
+
+        assert!(engine.process_line("You have been slain by a rat.").bell);
+        assert!(!engine.process_line("You see a rat.").bell);
+    }
+
+    /// A gagged line can still be worth an alert — `bell:` and `gag:` are
+    /// independent, unlike `highlight:` which only matters if the line is
+    /// shown at all.
+    #[test]
+    fn a_bell_trigger_still_rings_when_the_line_is_gagged() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'tick'
+    gag: true
+    bell: true
+"#,
+        )])
+        .unwrap();
+
+        let outcome = engine.process_line("tick");
+        assert!(outcome.gag);
+        assert!(outcome.bell);
     }
 
     #[test]

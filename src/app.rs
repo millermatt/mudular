@@ -556,6 +556,23 @@ fn timestamp() -> String {
 /// Applies one session event to `state`. Returns the injections the hub
 /// should deliver, and whether the session ended (so the caller can stop
 /// polling its receiver).
+/// Whether a `SessionEvent::Bell` from this session should actually ring
+/// (§14 M9): only when its pane isn't the one the player is looking at — a
+/// focused session's own bell would just be noise.
+fn wants_bell(state: &AppState, index: usize, ev: &SessionEvent) -> bool {
+    matches!(ev, SessionEvent::Bell) && !state.is_focused(index)
+}
+
+/// Rings the terminal bell and, on terminals that turn it into one (iTerm2,
+/// kitty, foot, …), an OSC 9 desktop notification. Best-effort: a write
+/// failure here is not worth ending the session over.
+fn notify_unfocused(session_name: &str) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x07\x1b]9;{session_name} has new output\x07");
+    let _ = stdout.flush();
+}
+
 fn apply_session_event(
     state: &mut AppState,
     index: usize,
@@ -612,6 +629,9 @@ fn apply_session_event(
             }
             (false, Vec::new())
         }
+        // The hub decides whether to actually ring it, from the caller's
+        // own focus check — this function stays a pure state update.
+        SessionEvent::Bell => (false, Vec::new()),
         SessionEvent::Gmcp { package, payload } => {
             state.sessions[index].push_gmcp(package, payload);
             (false, Vec::new())
@@ -965,8 +985,10 @@ async fn event_loop(
             Wake::Terminal(None) => return Ok(()),
             Wake::Session(index, ev) => {
                 let mut injections = Vec::new();
+                let mut ring_bell = false;
                 match ev {
                     Some(ev) => {
+                        ring_bell |= wants_bell(&state, index, &ev);
                         let (ended, out) = apply_session_event(&mut state, index, ev);
                         injections.extend(out);
                         if ended {
@@ -977,6 +999,7 @@ async fn event_loop(
                             // arriving across many small reads) triggers one
                             // redraw instead of one per event.
                             while let Some(ev) = try_recv(&mut state, index) {
+                                ring_bell |= wants_bell(&state, index, &ev);
                                 let (ended, out) = apply_session_event(&mut state, index, ev);
                                 injections.extend(out);
                                 if ended {
@@ -987,6 +1010,9 @@ async fn event_loop(
                         }
                     }
                     None => state.sessions[index].events = None,
+                }
+                if ring_bell {
+                    notify_unfocused(&state.sessions[index].name);
                 }
                 for (target, command) in injections {
                     let _ = state.sessions[target].commands.send(command).await;
@@ -1329,6 +1355,22 @@ mod tests {
 
         apply_session_event(&mut state, 0, SessionEvent::Ended("closed".to_string()));
         assert!(state.sessions[0].latency.is_empty());
+    }
+
+    /// A focused session's own bell is not worth ringing — the player is
+    /// already looking at it. An unfocused one is exactly the case the
+    /// notification exists for (§14 M9).
+    #[test]
+    fn a_bell_rings_only_for_an_unfocused_session() {
+        let (state, _rx) = app(&["tank", "cleric"]);
+        assert!(state.is_focused(0));
+        assert!(!wants_bell(&state, 0, &SessionEvent::Bell));
+        assert!(wants_bell(&state, 1, &SessionEvent::Bell));
+        assert!(!wants_bell(
+            &state,
+            1,
+            &SessionEvent::Line("hi".to_string())
+        ));
     }
 
     /// A password typed while the server is echoing must not be written to
