@@ -40,9 +40,8 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("Enter", "send the line — on an empty box a bare"),
         row("", "return, for \"press return to continue\""),
         row("Up / Down", "walk this character's history"),
-        // Listed even though it does nothing yet, so the overlay is an
-        // honest account of the client rather than an aspirational one.
-        row("PgUp / PgDn", "scroll back — not implemented yet"),
+        row("PgUp / PgDn", "scroll the focused pane back / forward"),
+        row("Home / End", "jump to the oldest / newest line"),
         String::new(),
         "Characters".to_string(),
         row("Alt+1 … Alt+9", "jump to character 1-9"),
@@ -259,20 +258,37 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         format!(" {} — GMCP inspector ", session.name)
     } else if session.security.is_empty() {
         format!(
-            "{} — {} ",
+            "{} — {}{} ",
             pane_title(&session.name, session.unread),
-            session.status
+            session.status,
+            scroll_indicator(session.back_offset)
         )
     } else {
         format!(
-            "{} — {} [{}] ",
+            "{} — {} [{}]{} ",
             pane_title(&session.name, session.unread),
             session.status,
-            session.security
+            session.security,
+            scroll_indicator(session.back_offset)
         )
     };
 
-    render_scrollback(frame, area, lines, title, focused, session.color);
+    // The inspector is a different buffer (`gmcp_log`, not `scrollback`) —
+    // a scroll position set for one has nothing to say about the other, so
+    // toggling into it always shows its own tail rather than silently
+    // inheriting an offset that would land somewhere unrelated with no
+    // indicator to explain why (§11.5 scopes navigation to scrollback).
+    let back_offset = if showing_gmcp { 0 } else { session.back_offset };
+
+    render_scrollback(
+        frame,
+        area,
+        lines,
+        title,
+        focused,
+        session.color,
+        back_offset,
+    );
 }
 
 fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: bool) {
@@ -281,15 +297,42 @@ fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: b
         .iter()
         .flat_map(|raw| ansi_lines(raw))
         .collect();
-    let title = format!("{} ", pane_title(&channel.config.name, channel.unread));
+    let title = format!(
+        "{}{} ",
+        pane_title(&channel.config.name, channel.unread),
+        scroll_indicator(channel.back_offset)
+    );
     // Channels aggregate across characters, so no one profile's colour
     // could stand for the pane.
-    render_scrollback(frame, area, lines, title, focused, None);
+    render_scrollback(
+        frame,
+        area,
+        lines,
+        title,
+        focused,
+        None,
+        channel.back_offset,
+    );
 }
 
-/// Renders a bordered, bottom-tailed pane. Scrollback navigation (PgUp/PgDn)
-/// is a later milestone; panes stay tailed to the newest line like a
-/// terminal.
+/// `↑ scrolled` when a pane isn't pinned to the tail — distinct from the
+/// unread badge (`●N`), and shown even on a focused pane, which the unread
+/// badge deliberately never marks: unread means "you haven't looked",
+/// scrolled means "you're looking at something old right now"
+/// (docs/ARCHITECTURE.md §11.5).
+fn scroll_indicator(back_offset: usize) -> &'static str {
+    if back_offset == 0 {
+        ""
+    } else {
+        " ↑ scrolled"
+    }
+}
+
+/// Renders a bordered pane, tailed to the newest content unless `back_offset`
+/// says otherwise. Clamping happens here, not at key-press time: this is
+/// where `wrapped_rows` — ratatui's real wrap algorithm, not an estimate —
+/// and the viewport height are both already known (docs/ARCHITECTURE.md
+/// §11.5).
 fn render_scrollback(
     frame: &mut Frame,
     area: Rect,
@@ -297,6 +340,7 @@ fn render_scrollback(
     title: String,
     focused: bool,
     color: Option<Color>,
+    back_offset: usize,
 ) {
     // Content width matches the Paragraph's own wrapping width (area minus
     // borders). `line_count` runs ratatui's real wrap algorithm rather than
@@ -323,7 +367,7 @@ fn render_scrollback(
     let body = Paragraph::new(text)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((scroll_offset(area.height, wrapped_rows), 0));
+        .scroll((scroll_offset(area.height, wrapped_rows, back_offset), 0));
     frame.render_widget(body, area);
 }
 
@@ -403,9 +447,15 @@ fn tab_line(state: &AppState) -> Line<'static> {
     Line::from(spans)
 }
 
-fn scroll_offset(area_height: u16, content_lines: u16) -> u16 {
+/// Turns a pane's `back_offset` (distance from the tail) into the ratatui
+/// scroll row, clamped to `[0, max_scroll]` here — the one place both the
+/// real wrapped-row count and the viewport height are known
+/// (docs/ARCHITECTURE.md §11.5).
+fn scroll_offset(area_height: u16, content_lines: u16, back_offset: usize) -> u16 {
     let viewport = area_height.saturating_sub(2); // borders
-    content_lines.saturating_sub(viewport)
+    let max_scroll = content_lines.saturating_sub(viewport);
+    let back = back_offset.min(max_scroll as usize) as u16;
+    max_scroll - back
 }
 
 fn ansi_lines(raw: &str) -> Vec<Line<'static>> {
@@ -704,6 +754,8 @@ mod tests {
             config: test_support::channel("comms"),
             lines: VecDeque::new(),
             unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
         });
         state.show_channels = true;
         state.focus_pane(Focus::Session(1));
@@ -723,6 +775,8 @@ mod tests {
             config: test_support::channel("comms"),
             lines: VecDeque::new(),
             unread: 2,
+            scrollback_limit: 10_000,
+            back_offset: 0,
         };
         channel.lines.push_back("Bob tells you hi".to_string());
         state.channels.push(channel);
@@ -788,5 +842,76 @@ mod tests {
             terminal.draw(|frame| draw(frame, &state)).unwrap();
             assert_left_border_intact(terminal.backend().buffer());
         }
+    }
+
+    // ---- scrollback navigation (§11.5) ----
+
+    /// The scrolled indicator is distinct from the unread badge and shows
+    /// only when the pane isn't pinned to the tail — including on a
+    /// focused pane, which the unread badge deliberately never marks.
+    #[test]
+    fn a_scrolled_pane_shows_an_indicator_the_tail_does_not() {
+        let mut state = state();
+        for i in 0..20 {
+            state.sessions[0].scrollback.push_back(format!("line {i}"));
+        }
+
+        let at_tail = rows(&render_sized(&state, 40, 12));
+        assert!(
+            !at_tail.contains("scrolled"),
+            "a tailed pane must show no indicator: {at_tail}"
+        );
+
+        state.sessions[0].back_offset = 5;
+        let scrolled = rows(&render_sized(&state, 40, 12));
+        assert!(
+            scrolled.contains("scrolled"),
+            "a scrolled pane must show an indicator: {scrolled}"
+        );
+    }
+
+    /// `back_offset` is clamped at render time to `[0, max_scroll]`: an
+    /// offset far past the top must not panic and must land on the oldest
+    /// line, not scroll past it into blank space.
+    #[test]
+    fn an_oversized_back_offset_clamps_to_the_true_top() {
+        let mut state = state();
+        for i in 0..20 {
+            state.sessions[0].scrollback.push_back(format!("line {i}"));
+        }
+        state.sessions[0].back_offset = usize::MAX;
+
+        let buffer = render_sized(&state, 40, 12);
+        assert!(
+            rows(&buffer).contains("line 0"),
+            "the oldest line must be reachable, not scrolled past: {}",
+            rows(&buffer)
+        );
+    }
+
+    /// The GMCP inspector (§14 M6) is a different buffer from the
+    /// scrollback a `back_offset` was set against — toggling into it must
+    /// always show its own tail, not silently inherit an offset that
+    /// belongs to unrelated content with no indicator to explain why.
+    #[test]
+    fn toggling_the_gmcp_inspector_ignores_the_scrollbacks_scroll_position() {
+        let mut state = state();
+        // More entries than the 4 content rows `render` gives (see
+        // `CONTENT_ROWS`), so a wrongly-applied offset would visibly hide
+        // the tail rather than just failing to matter.
+        for i in 0..8 {
+            state.sessions[0].gmcp_log.push_back(format!("gmcp-{i}"));
+        }
+        // A large offset set while looking at the scrollback, carried
+        // along when the player then hits F2.
+        state.sessions[0].back_offset = usize::MAX;
+        state.show_gmcp = true;
+
+        let buffer = render(&state);
+        assert!(
+            rows(&buffer).contains("gmcp-7"),
+            "the inspector must show its own tail: {}",
+            rows(&buffer)
+        );
     }
 }

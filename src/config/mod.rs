@@ -262,9 +262,9 @@ pub fn load_profile(path: &Path) -> Result<Profile> {
     serde_yaml::from_str(&text).with_context(|| format!("parsing profile {}", path.display()))
 }
 
-/// App-wide settings (`mudular.yaml`): keybinds today; theme and
-/// scrollback size are later milestones. Absent entirely is fine — a
-/// fresh install has sensible defaults and no config dir yet (§15).
+/// App-wide settings (`mudular.yaml`): keybinds, history, and scrollback
+/// size. Absent entirely is fine — a fresh install has sensible defaults
+/// and no config dir yet (§15).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -280,6 +280,9 @@ pub struct AppConfig {
     /// (docs/ARCHITECTURE.md §11.3).
     #[serde(default = "default_history_size")]
     pub history_size: usize,
+    /// Lines kept per pane's scrollback buffer (docs/ARCHITECTURE.md §8).
+    #[serde(default = "default_scrollback_size")]
+    pub scrollback_size: usize,
 }
 
 /// Hand-written rather than derived: a derived `Default` would give a
@@ -292,12 +295,17 @@ impl Default for AppConfig {
             channels: Vec::new(),
             cross_session: CrossSession::default(),
             history_size: default_history_size(),
+            scrollback_size: default_scrollback_size(),
         }
     }
 }
 
 fn default_history_size() -> usize {
     500
+}
+
+fn default_scrollback_size() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -756,6 +764,23 @@ mod tests {
 
         std::fs::write(dir.join("mudular.yaml"), "history_size: 20\n").unwrap();
         assert_eq!(load_app_config(&dir).unwrap().history_size, 20);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mirrors `history_size_defaults_with_and_without_a_config_file`: the
+    /// no-file path must not ship scrollback switched off either.
+    #[test]
+    fn scrollback_size_defaults_with_and_without_a_config_file() {
+        let dir = std::env::temp_dir().join(format!("mudular-cfg4-{}", std::process::id()));
+        assert_eq!(load_app_config(&dir).unwrap().scrollback_size, 10_000);
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mudular.yaml"), "keybinds:\n  quit: ctrl+q\n").unwrap();
+        assert_eq!(load_app_config(&dir).unwrap().scrollback_size, 10_000);
+
+        std::fs::write(dir.join("mudular.yaml"), "scrollback_size: 20\n").unwrap();
+        assert_eq!(load_app_config(&dir).unwrap().scrollback_size, 20);
 
         std::fs::remove_dir_all(&dir).ok();
     }

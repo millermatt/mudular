@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
         app_config.keybinds,
         channels,
         app_config.history_size,
+        app_config.scrollback_size,
     )
     .await
 }

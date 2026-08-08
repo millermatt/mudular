@@ -628,7 +628,8 @@ fallback.
 | `F2` | Toggle the raw GMCP inspector for the focused session — the messages the server is sending behind the scenes | `gmcp_inspector` |
 | `F3` | Switch between the tabbed and side-by-side layouts | `cycle_layout` |
 | `F4` | Show or hide the channel panes | `toggle_channels` |
-| `PgUp` / `PgDn` | Not implemented yet — there is no way to scroll back past what the pane currently shows | — |
+| `PgUp` / `PgDn` | Scroll the focused pane back / forward through its scrollback | — (built in) |
+| `Home` / `End` | Jump to the oldest / newest line in the focused pane | — (built in) |
 
 `F1` shows this same list inside the client, built from your actual
 config — so it stays right even if you remap something. `/help` prints it

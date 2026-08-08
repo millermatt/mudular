@@ -28,12 +28,15 @@ use crate::proto::charset::Charset;
 use crate::session::{self, PeerLinks, SessionCommand, SessionEvent};
 use crate::ui;
 
-/// Bounded so a chatty MUD can't grow the buffer without limit
-/// (docs/ARCHITECTURE.md §8; a fuller ring buffer with disk logging is M9).
-const SCROLLBACK_LIMIT: usize = 10_000;
-
-/// Same rationale as `SCROLLBACK_LIMIT`, for the raw GMCP inspector log.
+/// Same rationale as `scrollback_size` (§8), for the raw GMCP inspector log:
+/// bounded so a chatty MUD can't grow it without limit.
 const GMCP_LOG_LIMIT: usize = 1_000;
+
+/// Rows `PgUp`/`PgDn` move per press. Exact viewport-height paging would
+/// need pane geometry threaded back from the UI layer into `AppState`; a
+/// fixed step is the ordinary simplification most pagers make too
+/// (docs/ARCHITECTURE.md §11.5).
+const SCROLL_PAGE: usize = 10;
 
 /// The client-side commands. Everything else starting with `/` is left
 /// alone, since plenty of MUDs use `/` for their own commands.
@@ -132,12 +135,20 @@ pub struct SessionPane {
     /// Last pane size reported to the server, so a redraw that did not
     /// change this pane sends no NAWS (docs/ARCHITECTURE.md §6.2).
     last_size: Option<(u16, u16)>,
+    /// How many lines `scrollback` keeps (`scrollback_size`, §8).
+    scrollback_limit: usize,
+    /// Distance back from the tail, in wrapped rows: 0 is pinned to the
+    /// newest content, larger is further back in history. Storing distance
+    /// rather than an absolute position means a new line arriving needs no
+    /// compensation to keep a scrolled reader's view stable — the buffer
+    /// grows underneath the same offset (docs/ARCHITECTURE.md §11.5).
+    pub back_offset: usize,
 }
 
 impl SessionPane {
     fn push_line(&mut self, line: String) {
         self.scrollback.push_back(line);
-        if self.scrollback.len() > SCROLLBACK_LIMIT {
+        if self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
         }
     }
@@ -214,12 +225,17 @@ pub struct ChannelPane {
     pub config: Channel,
     pub lines: VecDeque<String>,
     pub unread: usize,
+    /// How many lines `lines` keeps (`scrollback_size`, §8).
+    pub scrollback_limit: usize,
+    /// Same "distance from the tail" scroll state as `SessionPane`, and the
+    /// same sticky-bottom behaviour (§11.5).
+    pub back_offset: usize,
 }
 
 impl ChannelPane {
     fn push(&mut self, line: String) {
         self.lines.push_back(line);
-        if self.lines.len() > SCROLLBACK_LIMIT {
+        if self.lines.len() > self.scrollback_limit {
             self.lines.pop_front();
         }
     }
@@ -260,6 +276,17 @@ pub struct AppState {
     /// what the event loop actually matches against — never a second copy
     /// that can drift (§11.2).
     pub keybinds: Keybinds,
+}
+
+/// `PgUp`/`PgDn`/`Home`/`End`, unmodified — built-in and unremappable, like
+/// `Up`/`Down` (§11.3, §11.5). A modified chord (`Ctrl+PageUp`, etc.) is
+/// left alone rather than swallowed, in case a terminal or a later binding
+/// wants it.
+fn is_scroll_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    matches!(
+        code,
+        KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+    ) && modifiers.is_empty()
 }
 
 impl AppState {
@@ -332,6 +359,29 @@ impl AppState {
         match self.focus {
             Focus::Session(focused) => focused == index,
             Focus::Channel(_) => self.input_session == index,
+        }
+    }
+
+    /// Moves the scroll position of the *visually focused* pane
+    /// (`self.focus`), not the input-bound session — a focused channel pane
+    /// has to scroll on its own, even though typing still goes to whichever
+    /// session `input_session` names (§11.1, §11.5). Exact clamping happens
+    /// at render time, where the real wrapped-row count is known; this only
+    /// adjusts the stored distance from the tail.
+    fn scroll_focused(&mut self, code: KeyCode) {
+        let back_offset = match self.focus {
+            Focus::Session(index) => self.sessions.get_mut(index).map(|s| &mut s.back_offset),
+            Focus::Channel(index) => self.channels.get_mut(index).map(|c| &mut c.back_offset),
+        };
+        let Some(back_offset) = back_offset else {
+            return;
+        };
+        match code {
+            KeyCode::PageUp => *back_offset = back_offset.saturating_add(SCROLL_PAGE),
+            KeyCode::PageDown => *back_offset = back_offset.saturating_sub(SCROLL_PAGE),
+            KeyCode::Home => *back_offset = usize::MAX,
+            KeyCode::End => *back_offset = 0,
+            _ => {}
         }
     }
 
@@ -583,14 +633,28 @@ pub async fn run(
     keybinds: Keybinds,
     channels: Vec<Channel>,
     history_size: usize,
+    scrollback_size: usize,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, targets, keybinds, channels, history_size).await;
+    let result = event_loop(
+        &mut terminal,
+        targets,
+        keybinds,
+        channels,
+        history_size,
+        scrollback_size,
+    )
+    .await;
     ratatui::restore();
     result
 }
 
-fn connect(target: ConnectTarget, history_limit: usize, peers: PeerLinks) -> SessionPane {
+fn connect(
+    target: ConnectTarget,
+    history_limit: usize,
+    scrollback_limit: usize,
+    peers: PeerLinks,
+) -> SessionPane {
     let status = format!("connecting to {}:{}...", target.host, target.port);
     let connected_status = format!("connected to {}:{}", target.host, target.port);
     let Rules {
@@ -633,6 +697,8 @@ fn connect(target: ConnectTarget, history_limit: usize, peers: PeerLinks) -> Ses
         pending_password: None,
         cross: target.cross,
         last_size: None,
+        scrollback_limit,
+        back_offset: 0,
     }
 }
 
@@ -687,6 +753,7 @@ async fn event_loop(
     keybinds: Keybinds,
     channels: Vec<Channel>,
     history_size: usize,
+    scrollback_size: usize,
 ) -> Result<()> {
     // Every session publishes a snapshot of its state and reads every
     // other session's (§7.5). The channels are made up front, so a session
@@ -724,7 +791,7 @@ async fn event_loop(
                 publish: Some(publish),
                 others,
             };
-            connect(target, history_size, links)
+            connect(target, history_size, scrollback_size, links)
         })
         .collect();
     let has_sessions = !sessions.is_empty();
@@ -737,6 +804,8 @@ async fn event_loop(
                 config: config.clone(),
                 lines: VecDeque::new(),
                 unread: 0,
+                scrollback_limit: scrollback_size,
+                back_offset: 0,
             })
             .collect(),
         focus: Focus::Session(0),
@@ -775,6 +844,14 @@ async fn event_loop(
                     report_pane_sizes(&mut state, terminal.get_frame().area()).await;
                 } else if key.code == KeyCode::Enter {
                     submit_input(&mut state, &channels).await;
+                } else if is_scroll_key(key.code, key.modifiers) {
+                    // Scrollback keys are built-in and unremappable, like
+                    // Up/Down below — and they act on the *focused* pane,
+                    // not the input-bound session, so a focused channel pane
+                    // scrolls even while typing stays bound elsewhere
+                    // (§11.1, §11.5). This changes pane content, not size,
+                    // so no NAWS report follows.
+                    state.scroll_focused(key.code);
                 } else if let Some(session) = state.bound_mut() {
                     // Up/Down are built-in and unremappable (§11.3): on a
                     // single-line input they have no other meaning, and
@@ -1019,6 +1096,8 @@ pub(crate) mod test_support {
                 pending_password: None,
                 cross: CrossSession::default(),
                 last_size: None,
+                scrollback_limit: 10_000,
+                back_offset: 0,
             },
             rx,
         )
@@ -1262,6 +1341,8 @@ mod tests {
             config: channel("comms"),
             lines: VecDeque::new(),
             unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
         });
         state.show_channels = true;
 
@@ -1282,6 +1363,8 @@ mod tests {
             config: channel("comms"),
             lines: VecDeque::new(),
             unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
         });
         state.show_channels = true;
 
@@ -1303,6 +1386,8 @@ mod tests {
             },
             lines: VecDeque::new(),
             unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
         });
         state.show_channels = true;
     }
@@ -1655,11 +1740,16 @@ mod tests {
             );
         }
         // The built-ins and client commands are just as invisible otherwise.
-        for text in ["Alt+1", "Up / Down", "/reload", "/help"] {
+        for text in [
+            "Alt+1",
+            "Up / Down",
+            "PgUp / PgDn",
+            "Home / End",
+            "/reload",
+            "/help",
+        ] {
             assert!(listing.contains(text), "{text} missing from:\n{listing}");
         }
-        // An unimplemented binding is shown as such rather than omitted.
-        assert!(listing.contains("not implemented yet"), "{listing}");
     }
 
     #[tokio::test]
@@ -2018,6 +2108,8 @@ mod tests {
             config: channel("comms"),
             lines: VecDeque::new(),
             unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
         });
         state.show_channels = true;
         state.focus_pane(Focus::Channel(0));
@@ -2107,5 +2199,186 @@ mod tests {
         let (state, _rx) = app(&[]);
         let notice = reload_rules(&state, &[]).await;
         assert!(notice.contains("needs a connected session"), "{notice}");
+    }
+
+    // ---- scrollback navigation (§11.5) ----
+
+    /// `scrollback_size` (§8) has to actually bound the buffer, the same
+    /// property `history_is_bounded_and_discards_oldest_first` already
+    /// covers for history — a config knob nobody discards against is a
+    /// setting that doesn't do anything.
+    #[test]
+    fn session_scrollback_is_bounded_and_discards_oldest_first() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].scrollback_limit = 2;
+        for line in ["one", "two", "three"] {
+            state.sessions[0].push_line(line.to_string());
+        }
+
+        assert_eq!(
+            state.sessions[0].scrollback.iter().collect::<Vec<_>>(),
+            ["two", "three"]
+        );
+    }
+
+    /// Same property, the channel-pane code path (`ChannelPane::push`) —
+    /// structurally separate from `SessionPane::push_line`, so nothing
+    /// above proves this one trims too.
+    #[test]
+    fn channel_scrollback_is_bounded_and_discards_oldest_first() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.channels.push(ChannelPane {
+            config: channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 2,
+            back_offset: 0,
+        });
+        state.show_channels = true;
+        for line in ["one", "two", "three"] {
+            state.push_routed(0, "comms", line.to_string());
+        }
+
+        assert_eq!(
+            state.channels[0].lines.iter().collect::<Vec<_>>(),
+            ["two", "three"]
+        );
+    }
+
+    /// The scroll keys are unmodified `PgUp`/`PgDn`/`Home`/`End` only — a
+    /// chord like `Ctrl+PageUp` must fall through rather than being
+    /// silently swallowed as a scroll.
+    #[test]
+    fn a_modified_scroll_key_is_not_a_scroll_key() {
+        assert!(is_scroll_key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(!is_scroll_key(KeyCode::PageUp, KeyModifiers::CONTROL));
+        assert!(!is_scroll_key(KeyCode::Home, KeyModifiers::SHIFT));
+    }
+
+    /// Two presses move twice as far as one — `back_offset` accumulates
+    /// rather than being reset or capped per keypress.
+    #[test]
+    fn repeated_pgup_presses_accumulate() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.scroll_focused(KeyCode::PageUp);
+        state.scroll_focused(KeyCode::PageUp);
+
+        assert_eq!(state.sessions[0].back_offset, SCROLL_PAGE * 2);
+    }
+
+    /// The channel-pane half of `scrolling_up_then_new_output_does_not_move_the_reader`
+    /// / `a_pane_at_the_tail_stays_pinned_on_new_output` below: `push_routed`
+    /// is a structurally separate path from `apply_session_event`, and
+    /// nothing else proves it respects a reader's scroll position too.
+    #[test]
+    fn a_scrolled_channel_pane_is_not_moved_by_new_output() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.channels.push(ChannelPane {
+            config: channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        });
+        state.show_channels = true;
+        state.focus_pane(Focus::Channel(0));
+        state.scroll_focused(KeyCode::PageUp);
+        let offset_before = state.channels[0].back_offset;
+        assert_ne!(offset_before, 0);
+
+        state.push_routed(0, "comms", "more chatter".to_string());
+
+        assert_eq!(
+            state.channels[0].back_offset, offset_before,
+            "a scrolled channel reader's position must not move"
+        );
+    }
+
+    /// `PgUp` acts on the *focused* pane, not the input-bound session — the
+    /// single most likely bug in this feature (§11.1). A channel pane
+    /// focused while a different session is bound must scroll the channel.
+    #[test]
+    fn pgup_scrolls_the_focused_pane_not_the_bound_session() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        state.channels.push(ChannelPane {
+            config: channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        });
+        state.show_channels = true;
+        // Bind input to "tank" (index 0), then focus the channel pane.
+        state.focus_pane(Focus::Session(0));
+        state.focus_pane(Focus::Channel(0));
+        assert_eq!(state.input_session, 0, "input stays bound to tank");
+
+        state.scroll_focused(KeyCode::PageUp);
+
+        assert_eq!(
+            state.channels[0].back_offset, SCROLL_PAGE,
+            "the focused channel pane must scroll"
+        );
+        assert_eq!(
+            state.sessions[0].back_offset, 0,
+            "the bound-but-unfocused session must not scroll"
+        );
+    }
+
+    /// `PgDn` at the tail must not go negative — saturating arithmetic, not
+    /// a panic or wraparound.
+    #[test]
+    fn pgdn_at_the_tail_stays_put() {
+        let (mut state, _rx) = app(&["tank"]);
+        assert_eq!(state.sessions[0].back_offset, 0);
+
+        state.scroll_focused(KeyCode::PageDown);
+
+        assert_eq!(state.sessions[0].back_offset, 0);
+    }
+
+    /// `End` resets to the tail from anywhere, including `Home`'s
+    /// `usize::MAX` sentinel that the render-time clamp resolves to the
+    /// true top.
+    #[test]
+    fn home_and_end_jump_to_the_ends() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        state.scroll_focused(KeyCode::Home);
+        assert_eq!(state.sessions[0].back_offset, usize::MAX);
+
+        state.scroll_focused(KeyCode::End);
+        assert_eq!(state.sessions[0].back_offset, 0);
+    }
+
+    /// New output must not yank a reader who has scrolled away from the
+    /// tail — the offset is stored as distance from the tail, so leaving it
+    /// unchanged is exactly what keeps the reader's relative position
+    /// stable as the buffer grows underneath it (§11.5).
+    #[test]
+    fn scrolling_up_then_new_output_does_not_move_the_reader() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.scroll_focused(KeyCode::PageUp);
+        let offset_before = state.sessions[0].back_offset;
+        assert_ne!(offset_before, 0);
+
+        apply_session_event(&mut state, 0, SessionEvent::Line("more output".into()));
+
+        assert_eq!(
+            state.sessions[0].back_offset, offset_before,
+            "a scrolled reader's position must not move on new output"
+        );
+    }
+
+    /// The complementary case: a pane already at the tail stays pinned as
+    /// new lines arrive — the ordinary "sticky bottom" default (§11.5).
+    #[test]
+    fn a_pane_at_the_tail_stays_pinned_on_new_output() {
+        let (mut state, _rx) = app(&["tank"]);
+        assert_eq!(state.sessions[0].back_offset, 0);
+
+        apply_session_event(&mut state, 0, SessionEvent::Line("more output".into()));
+
+        assert_eq!(state.sessions[0].back_offset, 0);
     }
 }

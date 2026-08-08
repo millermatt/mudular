@@ -16,6 +16,11 @@ keybinds:
 # typed at every prompt, passwords included.
 history_size: 500
 
+# How many lines each pane's scrollback keeps, session panes and channel
+# panes alike. PgUp/PgDn/Home/End scroll back through it; oldest lines drop
+# first once the buffer is full.
+scrollback_size: 10000
+
 # Channel panes: matching lines are pulled out of the main scrollback into
 # their own pane, so slow conversation stays readable under combat spam.
 # Each `match` compiles to an ordinary route trigger, so a rule anywhere
