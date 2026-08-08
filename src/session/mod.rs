@@ -61,6 +61,14 @@ pub enum SessionEvent {
         package: String,
         payload: Option<String>,
     },
+    /// The connection dropped and the session is waiting to try again
+    /// (docs/ARCHITECTURE.md §5). `attempt` counts from 1 and resets once a
+    /// connection comes back up.
+    Reconnecting {
+        attempt: u32,
+        delay: Duration,
+        reason: String,
+    },
     /// The session terminated; the pane stays up showing the reason.
     Ended(String),
 }
@@ -86,8 +94,10 @@ pub enum SessionCommand {
     SetRules(Box<Engine>),
     /// Pane was resized; renegotiate NAWS.
     Resize { cols: u16, rows: u16 },
-    /// Handled here already; no UI affordance sends it yet — per-pane
-    /// connect/disconnect control is not part of any milestone so far.
+    /// End the session for good, cancelling any pending reconnect. No UI
+    /// affordance sends it yet — per-pane connect/disconnect control is not
+    /// part of any milestone so far — but it is what tells the retry loop
+    /// the player is done, as against a connection that merely dropped.
     #[allow(dead_code)]
     Disconnect,
 }
@@ -158,20 +168,6 @@ async fn run(
         .collect();
     engine.set_peers(peers.others);
     let publish_to = peers.publish;
-    let connection = match net::connect(&host, port, tls.as_ref()).await {
-        Ok(connection) => connection,
-        Err(err) => {
-            let _ = events.send(SessionEvent::Ended(format!("{err:#}"))).await;
-            return;
-        }
-    };
-    let net::Connection {
-        transport,
-        security,
-    } = connection;
-    if events.send(SessionEvent::Security(security)).await.is_err() {
-        return;
-    }
 
     let mut recorder = match record {
         Some(path) => match Recorder::create(&path, &host, port) {
@@ -189,6 +185,144 @@ async fn run(
         None => None,
     };
 
+    // Pane size outlives any one connection: the UI only reports a size
+    // that changed (§6.2), so a reconnect has to renegotiate NAWS with the
+    // size it was last told rather than with none.
+    let mut window: Option<(u16, u16)> = None;
+    // Consecutive failures since the last connection came up.
+    let mut attempt: u32 = 0;
+    let mut established = false;
+
+    let reason = loop {
+        let lost = match net::connect(&host, port, tls.as_ref()).await {
+            Ok(connection) => {
+                established = true;
+                attempt = 0;
+                match run_connection(
+                    connection,
+                    charset,
+                    &mut engine,
+                    expand_injected,
+                    &mut login,
+                    &mut watching,
+                    &publish_to,
+                    &mut recorder,
+                    &mut window,
+                    &events,
+                    &mut commands,
+                )
+                .await
+                {
+                    Outcome::Gone => return,
+                    Outcome::Ended(reason) => break reason,
+                    Outcome::Lost(reason) => reason,
+                }
+            }
+            // Nothing to re-establish yet: an address that never answered
+            // is a mistake to report, not a server to wait for.
+            Err(err) if !established => break format!("{err:#}"),
+            Err(err) => format!("{err:#}"),
+        };
+
+        attempt += 1;
+        let delay = backoff_delay(attempt);
+        let notice = SessionEvent::Reconnecting {
+            attempt,
+            delay,
+            reason: lost,
+        };
+        if events.send(notice).await.is_err() {
+            return;
+        }
+        if !wait_to_retry(delay, &mut engine, &mut window, &mut commands).await {
+            break "disconnected".to_string();
+        }
+    };
+
+    let _ = events.send(SessionEvent::Ended(reason)).await;
+}
+
+/// Why one connection ended, and what the session should do next.
+enum Outcome {
+    /// The transport dropped under us: worth another attempt.
+    Lost(String),
+    /// The player ended it (or the UI hung up its command sink): no retry.
+    Ended(String),
+    /// The UI is no longer listening, so there is nothing left to serve.
+    Gone,
+}
+
+/// First backoff step, and the ceiling the doubling stops at. A minute is
+/// long enough that a MUD rebooting for half an hour costs a handful of
+/// attempts, short enough that a player watching the pane sees it come back
+/// (docs/ARCHITECTURE.md §5).
+const RECONNECT_BASE: Duration = Duration::from_secs(1);
+const RECONNECT_CAP: Duration = Duration::from_secs(60);
+
+/// 1s, 2s, 4s … capped. `attempt` counts from 1.
+fn backoff_delay(attempt: u32) -> Duration {
+    let doublings = attempt.saturating_sub(1).min(16);
+    RECONNECT_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(RECONNECT_CAP)
+}
+
+/// Sleeps out the backoff. A retry that could not be called off would
+/// outlive the pane, so the wait still serves commands — the two that mean
+/// anything without a socket, plus the `Disconnect` (or hung-up sink) that
+/// cancels it. Returns whether to go on and reconnect.
+async fn wait_to_retry(
+    delay: Duration,
+    engine: &mut Engine,
+    window: &mut Option<(u16, u16)>,
+    commands: &mut mpsc::Receiver<SessionCommand>,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return true,
+            cmd = commands.recv() => match cmd {
+                Some(SessionCommand::Disconnect) | None => return false,
+                // `/reload` still lands: the reconnect runs the new rules'
+                // `on_connect` and starts their timers, as a reload against
+                // a live socket does (§7.4).
+                Some(SessionCommand::SetRules(rules)) => *engine = *rules,
+                Some(SessionCommand::Resize { cols, rows }) => *window = Some((cols, rows)),
+                // Nothing to send anything down; the status line already
+                // says why.
+                Some(_) => {}
+            },
+        }
+    }
+}
+
+/// Runs one connection to completion: everything from the Telnet handshake
+/// to the disconnect hook. All the protocol state is created here, so each
+/// reconnect starts from a clean machine (§6.5); the engine is not, so
+/// aliases, variables and the rule set survive a reconnect the way they
+/// survive a `/reload`.
+#[allow(clippy::too_many_arguments)]
+async fn run_connection(
+    connection: net::Connection,
+    charset: Charset,
+    engine: &mut Engine,
+    expand_injected: bool,
+    login: &mut Option<Autologin>,
+    watching: &mut [(String, watch::Receiver<PeerSnapshot>)],
+    publish_to: &Option<watch::Sender<PeerSnapshot>>,
+    recorder: &mut Option<Recorder>,
+    window: &mut Option<(u16, u16)>,
+    events: &mpsc::Sender<SessionEvent>,
+    commands: &mut mpsc::Receiver<SessionCommand>,
+) -> Outcome {
+    let net::Connection {
+        transport,
+        security,
+    } = connection;
+    if events.send(SessionEvent::Security(security)).await.is_err() {
+        return Outcome::Gone;
+    }
+
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut telnet = TelnetMachine::new();
     let mut mccp = MccpDecoder::new();
@@ -200,28 +334,25 @@ async fn run(
 
     // Offer NAWS up front; the size follows once the server agrees (§6.2).
     telnet.request_local_enable(option::NAWS);
+    if let Some((cols, rows)) = *window {
+        telnet.set_window_size(cols, rows);
+    }
     if flush_telnet(&mut telnet, &mut writer).await.is_err() {
-        let _ = events
-            .send(SessionEvent::Ended("write failed".to_string()))
-            .await;
-        return;
+        return Outcome::Lost("write failed".to_string());
     }
     engine.start_timers(Instant::now());
     // Scripts get the same starting gun as the timers (§7.4).
     let connected = engine.on_connect();
     if send_lines(&mut writer, &connected.sends).await.is_err() {
-        let _ = events
-            .send(SessionEvent::Ended("write failed".to_string()))
-            .await;
-        return;
+        return Outcome::Lost("write failed".to_string());
     }
     for text in connected.echoes {
         if events.send(SessionEvent::Line(text)).await.is_err() {
-            return;
+            return Outcome::Gone;
         }
     }
 
-    let reason = loop {
+    let outcome = loop {
         // `select!` needs a future even when nothing is scheduled; park
         // far out rather than busy-waiting when there are no timers.
         let timer_deadline = engine
@@ -231,7 +362,7 @@ async fn run(
         tokio::select! {
             result = reader.read(&mut sock_buf) => {
                 match result {
-                    Ok(0) => break "connection closed".to_string(),
+                    Ok(0) => break Outcome::Lost("connection closed".to_string()),
                     Ok(n) => {
                         let raw = &sock_buf[..n];
                         if let Some(recorder) = recorder.as_mut() {
@@ -427,29 +558,29 @@ async fn run(
                                     }
                                     for event in emit {
                                         if events.send(event).await.is_err() {
-                                            return;
+                                            return Outcome::Gone;
                                         }
                                     }
                                 }
                             }
                         }
                         if let Some(reason) = break_reason {
-                            break reason;
+                            break Outcome::Lost(reason);
                         }
-                        publish(&mut engine, &publish_to);
+                        publish(engine, publish_to);
 
                         for notice in login_notices.drain(..) {
                             if events.send(SessionEvent::Line(notice)).await.is_err() {
-                                return;
+                                return Outcome::Gone;
                             }
                         }
                         // Trigger output is sent verbatim: it is never fed
                         // back through aliases, so rules cannot recurse.
                         if send_lines(&mut writer, &outbound).await.is_err() {
-                            break "write failed".to_string();
+                            break Outcome::Lost("write failed".to_string());
                         }
-                        if emit_cross_sends(&events, cross_out, FIRST_HOP).await.is_err() {
-                            return;
+                        if emit_cross_sends(events, cross_out, FIRST_HOP).await.is_err() {
+                            return Outcome::Gone;
                         }
                         for bytes in &raw_out {
                             if writer.write_all(bytes).await.is_err() {
@@ -458,23 +589,23 @@ async fn run(
                             }
                         }
                         if let Some(reason) = break_reason {
-                            break reason;
+                            break Outcome::Lost(reason);
                         }
                         if flush_telnet(&mut telnet, &mut writer).await.is_err() {
-                            break "write failed".to_string();
+                            break Outcome::Lost("write failed".to_string());
                         }
                     }
-                    Err(err) => break format!("connection error: {err}"),
+                    Err(err) => break Outcome::Lost(format!("connection error: {err}")),
                 }
             }
-            Some(peer) = next_peer_change(&mut watching) => {
+            Some(peer) = next_peer_change(watching) => {
                 let outcome = engine.poll_peer(&peer);
                 if send_lines(&mut writer, &outcome.sends).await.is_err() {
-                    break "write failed".to_string();
+                    break Outcome::Lost("write failed".to_string());
                 }
                 for text in outcome.echoes {
                     if events.send(SessionEvent::Line(text)).await.is_err() {
-                        return;
+                        return Outcome::Gone;
                     }
                 }
                 let cross = outcome
@@ -482,12 +613,12 @@ async fn run(
                     .into_iter()
                     .map(|(target, lines)| crate::engine::CrossSend { target, lines })
                     .collect();
-                if emit_cross_sends(&events, cross, FIRST_HOP).await.is_err() {
-                    return;
+                if emit_cross_sends(events, cross, FIRST_HOP).await.is_err() {
+                    return Outcome::Gone;
                 }
                 for event in cross_echoes(outcome.echo_to) {
                     if events.send(event).await.is_err() {
-                        return;
+                        return Outcome::Gone;
                     }
                 }
             }
@@ -497,21 +628,21 @@ async fn run(
                 // Script timers are armed against the same clock and woken
                 // by the same sleep (§7.4).
                 let scripted = engine.fire_due_script_timers(now);
-                publish(&mut engine, &publish_to);
+                publish(engine, publish_to);
                 if send_lines(&mut writer, &due).await.is_err() {
-                    break "write failed".to_string();
+                    break Outcome::Lost("write failed".to_string());
                 }
                 if send_lines(&mut writer, &scripted.sends).await.is_err() {
-                    break "write failed".to_string();
+                    break Outcome::Lost("write failed".to_string());
                 }
                 for text in scripted.echoes {
                     if events.send(SessionEvent::Line(text)).await.is_err() {
-                        return;
+                        return Outcome::Gone;
                     }
                 }
                 for event in cross_echoes(scripted.echo_to) {
                     if events.send(event).await.is_err() {
-                        return;
+                        return Outcome::Gone;
                     }
                 }
                 let cross = scripted
@@ -519,8 +650,8 @@ async fn run(
                     .into_iter()
                     .map(|(target, lines)| crate::engine::CrossSend { target, lines })
                     .collect();
-                if emit_cross_sends(&events, cross, FIRST_HOP).await.is_err() {
-                    return;
+                if emit_cross_sends(events, cross, FIRST_HOP).await.is_err() {
+                    return Outcome::Gone;
                 }
             }
             cmd = commands.recv() => {
@@ -537,27 +668,27 @@ async fn run(
                     // sends two commands rather than three.
                     Some(SessionCommand::SendLine(line)) if line.is_empty() => {
                         if send_lines(&mut writer, &[String::new()]).await.is_err() {
-                            break "write failed".to_string();
+                            break Outcome::Lost("write failed".to_string());
                         }
                     }
                     Some(SessionCommand::SendLine(line)) => {
                         let outcome = engine.expand_input(&line);
-                        publish(&mut engine, &publish_to);
+                        publish(engine, publish_to);
                         if send_lines(&mut writer, &outcome.sends).await.is_err() {
-                            break "write failed".to_string();
+                            break Outcome::Lost("write failed".to_string());
                         }
                         for text in outcome.echoes {
                             if events.send(SessionEvent::Line(text)).await.is_err() {
-                                return;
+                                return Outcome::Gone;
                             }
                         }
                         for event in cross_echoes(outcome.echo_to) {
                             if events.send(event).await.is_err() {
-                                return;
+                                return Outcome::Gone;
                             }
                         }
-                        if emit_cross_sends(&events, outcome.send_to, FIRST_HOP).await.is_err() {
-                            return;
+                        if emit_cross_sends(events, outcome.send_to, FIRST_HOP).await.is_err() {
+                            return Outcome::Gone;
                         }
                     }
                     Some(SessionCommand::Inject { from, lines, hops }) => {
@@ -566,7 +697,7 @@ async fn run(
                         for line in &lines {
                             let echo = SessionEvent::Line(format!("[from {from}] {line}"));
                             if events.send(echo).await.is_err() {
-                                return;
+                                return Outcome::Gone;
                             }
                         }
                         let (sends, cross) = if expand_injected {
@@ -578,7 +709,7 @@ async fn run(
                                 cross.extend(outcome.send_to);
                                 for text in outcome.echoes {
                                     if events.send(SessionEvent::Line(text)).await.is_err() {
-                                        return;
+                                        return Outcome::Gone;
                                     }
                                 }
                             }
@@ -586,40 +717,41 @@ async fn run(
                         } else {
                             (lines, Vec::new())
                         };
-                        publish(&mut engine, &publish_to);
+                        publish(engine, publish_to);
                         if send_lines(&mut writer, &sends).await.is_err() {
-                            break "write failed".to_string();
+                            break Outcome::Lost("write failed".to_string());
                         }
                         // Anything this injection set off is one hop further
                         // from where the chain started, so it runs out.
-                        if emit_cross_sends(&events, cross, hops.saturating_add(1)).await.is_err() {
-                            return;
+                        if emit_cross_sends(events, cross, hops.saturating_add(1)).await.is_err() {
+                            return Outcome::Gone;
                         }
                     }
                     Some(SessionCommand::SetRules(rules)) => {
-                        engine = *rules;
+                        *engine = *rules;
                         engine.start_timers(Instant::now());
                         // Freshly loaded scripts have not seen this
                         // connection come up, so `/reload` is their
                         // `on_connect` — as it is the timers' start.
                         let reloaded = engine.on_connect();
                         if send_lines(&mut writer, &reloaded.sends).await.is_err() {
-                            break "write failed".to_string();
+                            break Outcome::Lost("write failed".to_string());
                         }
                         for text in reloaded.echoes {
                             if events.send(SessionEvent::Line(text)).await.is_err() {
-                                return;
+                                return Outcome::Gone;
                             }
                         }
                     }
                     Some(SessionCommand::Resize { cols, rows }) => {
+                        *window = Some((cols, rows));
                         telnet.set_window_size(cols, rows);
                         if flush_telnet(&mut telnet, &mut writer).await.is_err() {
-                            break "write failed".to_string();
+                            break Outcome::Lost("write failed".to_string());
                         }
                     }
                     Some(SessionCommand::Disconnect) | None => {
-                        break "disconnected".to_string();
+                        break Outcome::Ended("disconnected".to_string());
                     }
                 }
             }
@@ -635,10 +767,10 @@ async fn run(
     let _ = send_lines(&mut writer, &closing.sends).await;
     for text in closing.echoes {
         if events.send(SessionEvent::Line(text)).await.is_err() {
-            return;
+            return Outcome::Gone;
         }
     }
-    let _ = events.send(SessionEvent::Ended(reason)).await;
+    outcome
 }
 
 /// A script's cross-session echoes, as events for the hub to place. They
@@ -1516,10 +1648,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(next_line(&mut events).await, "> Bye!");
-        assert!(matches!(
-            next_matching(&mut events, |ev| matches!(ev, SessionEvent::Ended(_))).await,
-            SessionEvent::Ended(_)
-        ));
+        // The server hanging up is not the player leaving, so the session
+        // lines up a reconnect rather than ending (§5).
+        let (attempt, _delay, _reason) = next_reconnect(&mut events).await;
+        assert_eq!(attempt, 1);
     }
 
     /// M5's acceptance criterion (§14): the same scripted session played
@@ -1652,19 +1784,16 @@ mod tests {
         );
     }
 
-    /// A corrupt stream cannot be recovered from — the session ends with
-    /// the inflate error as its reason rather than emitting garbage.
+    /// A corrupt stream cannot be recovered from — the connection drops
+    /// with the inflate error as its reason rather than emitting garbage.
     #[tokio::test]
-    async fn a_corrupt_compressed_stream_ends_the_session() {
+    async fn a_corrupt_compressed_stream_drops_the_connection() {
         let (mut events, _commands) = serve(|mut sock| async move {
             start_compression(&mut sock, b"\x78\x9c not a deflate block at all").await;
             idle(&mut sock).await;
         });
 
-        let ended = next_matching(&mut events, |ev| matches!(ev, SessionEvent::Ended(_))).await;
-        let SessionEvent::Ended(reason) = ended else {
-            unreachable!()
-        };
+        let (_attempt, _delay, reason) = next_reconnect(&mut events).await;
         assert!(
             reason.contains("compressed stream is corrupt"),
             "unexpected end reason: {reason}"
@@ -1672,19 +1801,16 @@ mod tests {
     }
 
     /// A decompression bomb needs no MUD account to fire — just a hostile
-    /// address in a profile (§13). The session ends instead of growing its
-    /// buffer until the process dies.
+    /// address in a profile (§13). The connection drops instead of growing
+    /// its buffer until the process dies.
     #[tokio::test]
-    async fn a_decompression_bomb_ends_the_session() {
+    async fn a_decompression_bomb_drops_the_connection() {
         let (mut events, _commands) = serve(|mut sock| async move {
             start_compression(&mut sock, &deflate(&vec![0u8; 8 * 1024 * 1024])).await;
             idle(&mut sock).await;
         });
 
-        let ended = next_matching(&mut events, |ev| matches!(ev, SessionEvent::Ended(_))).await;
-        let SessionEvent::Ended(reason) = ended else {
-            unreachable!()
-        };
+        let (_attempt, _delay, reason) = next_reconnect(&mut events).await;
         assert!(
             reason.contains("expanded past"),
             "unexpected end reason: {reason}"
@@ -2233,6 +2359,137 @@ mod tests {
         assert_eq!(next_line(&mut events).await, expected);
     }
 
+    /// A connection the player did not end is worth another attempt, and
+    /// the wait grows between attempts (docs/ARCHITECTURE.md §5).
+    #[tokio::test]
+    async fn a_dropped_connection_is_retried_with_a_growing_backoff() {
+        // The listener goes away with the script, so every retry after
+        // this first connection is refused and the backoff keeps stepping.
+        let (mut events, _commands) = serve(|_sock| async move {});
+
+        let (attempt, delay, _reason) = next_reconnect(&mut events).await;
+        assert_eq!((attempt, delay), (1, Duration::from_secs(1)));
+        let (attempt, delay, reason) = next_reconnect(&mut events).await;
+        assert_eq!(
+            (attempt, delay),
+            (2, Duration::from_secs(2)),
+            "a second failure waits twice as long: {reason}"
+        );
+    }
+
+    /// Backoff describes one outage, not the session's whole life: a
+    /// connection that comes back resets the wait for the next drop.
+    #[tokio::test]
+    async fn a_successful_reconnect_resets_the_backoff() {
+        let (mut events, _commands) = revolving_door(|_sock| {});
+
+        let (attempt, delay, _reason) = next_reconnect(&mut events).await;
+        assert_eq!((attempt, delay), (1, Duration::from_secs(1)));
+        let (attempt, delay, _reason) = next_reconnect(&mut events).await;
+        assert_eq!(
+            (attempt, delay),
+            (1, Duration::from_secs(1)),
+            "the reconnect succeeded, so the next drop starts over"
+        );
+    }
+
+    /// The one ending that is not a dropped connection: an explicit
+    /// disconnect stops the session instead of arming a retry.
+    #[tokio::test]
+    async fn an_explicit_disconnect_is_not_retried() {
+        let (mut events, commands) = serve(|mut sock| async move { idle(&mut sock).await });
+        commands.send(SessionCommand::Disconnect).await.unwrap();
+
+        let event = next_matching(&mut events, |ev| {
+            matches!(
+                ev,
+                SessionEvent::Ended(_) | SessionEvent::Reconnecting { .. }
+            )
+        })
+        .await;
+        assert!(
+            matches!(event, SessionEvent::Ended(_)),
+            "the player left; nothing should be retried: {event:?}"
+        );
+    }
+
+    /// Reconnecting is a fresh connection to the same character: scripts
+    /// get their `on_connect` again, as they do on `/reload` (§7.4).
+    #[cfg(feature = "lua")]
+    #[tokio::test]
+    async fn on_connect_runs_again_after_a_reconnect() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, _commands) = revolving_door_with_rules(
+            move |mut sock| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(read_command(&mut sock).await).await;
+                });
+            },
+            scripted_rules(r#"mud.on_connect(function() mud.send("look") end)"#),
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                timeout(Duration::from_secs(3), sent.recv())
+                    .await
+                    .expect("timed out waiting for on_connect")
+                    .unwrap(),
+                "look"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_the_cap() {
+        assert_eq!(backoff_delay(1), RECONNECT_BASE);
+        assert_eq!(backoff_delay(2), Duration::from_secs(2));
+        assert_eq!(backoff_delay(3), Duration::from_secs(4));
+        assert_eq!(backoff_delay(7), RECONNECT_CAP, "64s is past the ceiling");
+        assert_eq!(backoff_delay(u32::MAX), RECONNECT_CAP, "and it stays there");
+    }
+
+    /// A server that keeps answering but never keeps a connection: each
+    /// accept is handed to `greet` and then dropped, so the session drops
+    /// and reconnects for as long as the test watches it.
+    fn revolving_door<F>(greet: F) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
+    where
+        F: FnMut(tokio::net::TcpStream) + Send + 'static,
+    {
+        revolving_door_with_rules(greet, Engine::default())
+    }
+
+    fn revolving_door_with_rules<F>(
+        mut greet: F,
+        engine: Engine,
+    ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
+    where
+        F: FnMut(tokio::net::TcpStream) + Send + 'static,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            while let Ok((sock, _)) = listener.accept().await {
+                greet(sock);
+            }
+        });
+
+        spawn(
+            "127.0.0.1".to_string(),
+            port,
+            None,
+            None,
+            Charset::Utf8,
+            engine,
+            false,
+            None,
+            PeerLinks::default(),
+        )
+    }
+
     /// Runs `script` against one loopback connection and returns the
     /// session's channels.
     fn serve<F, Fut>(script: F) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
@@ -2337,6 +2594,17 @@ mod tests {
         .await
         {
             SessionEvent::Prompt(text) => text,
+            _ => unreachable!(),
+        }
+    }
+
+    async fn next_reconnect(events: &mut mpsc::Receiver<SessionEvent>) -> (u32, Duration, String) {
+        match next_matching(events, |ev| matches!(ev, SessionEvent::Reconnecting { .. })).await {
+            SessionEvent::Reconnecting {
+                attempt,
+                delay,
+                reason,
+            } => (attempt, delay, reason),
             _ => unreachable!(),
         }
     }

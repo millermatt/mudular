@@ -595,6 +595,21 @@ fn apply_session_event(
             }
             (false, Vec::new())
         }
+        SessionEvent::Reconnecting {
+            attempt,
+            delay,
+            reason,
+        } => {
+            let session = &mut state.sessions[index];
+            session.status = format!(
+                "reconnecting in {}s (attempt {attempt}): {reason}",
+                delay.as_secs()
+            );
+            // Whatever the server had asked us to hide, it is not asking
+            // any more.
+            session.masked = false;
+            (false, Vec::new())
+        }
         SessionEvent::Ended(reason) => {
             let session = &mut state.sessions[index];
             session.status = format!("disconnected: {reason}");

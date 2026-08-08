@@ -131,6 +131,23 @@ By default, the platform config directory:
 Override it with `--config-dir <path>` (useful for testing, or running
 multiple isolated configs).
 
+### If the connection drops
+
+A connection that goes away on its own — the server rebooting, your
+network blinking — is retried automatically. The status line above the
+input says what happened and when the next attempt is:
+
+```
+reconnecting in 4s (attempt 3): connection closed
+```
+
+The wait starts at a second, doubles with each failed attempt, stops
+growing at a minute, and starts over as soon as a connection comes back.
+Your aliases, variables, and rules survive the gap untouched; the
+connection itself is new, so `on_connect` hooks run and timers restart
+just as they do on `/reload`. An address that never answered in the first
+place is reported rather than retried.
+
 ## Playing several characters at once
 
 Name more than one profile and each gets its own session, with its own
