@@ -254,21 +254,23 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         }
     }
 
+    // Security and latency are each absent until they are known, so a pane
+    // never shows an empty bracket or a placeholder round trip.
+    let security = match session.security.is_empty() {
+        true => String::new(),
+        false => format!(" [{}]", session.security),
+    };
+    let latency = match session.latency.is_empty() {
+        true => String::new(),
+        false => format!(" {}", session.latency),
+    };
     let title = if showing_gmcp {
         format!(" {} — GMCP inspector ", session.name)
-    } else if session.security.is_empty() {
-        format!(
-            "{} — {}{} ",
-            pane_title(&session.name, session.unread),
-            session.status,
-            scroll_indicator(session.back_offset)
-        )
     } else {
         format!(
-            "{} — {} [{}]{} ",
+            "{} — {}{security}{latency}{} ",
             pane_title(&session.name, session.unread),
             session.status,
-            session.security,
             scroll_indicator(session.back_offset)
         )
     };
@@ -560,6 +562,23 @@ mod tests {
         let buffer = render(&state);
         assert!(row(&buffer, 1).contains("Char.Vitals"));
         assert!(!row(&buffer, 1).contains("forest"));
+    }
+
+    /// §11: the pane title carries the latency, and carries nothing where
+    /// it would be before the first round trip has been measured.
+    #[test]
+    fn the_pane_title_shows_latency_once_there_is_one() {
+        let mut state = state();
+        state.sessions[0].status = "connected".to_string();
+        state.sessions[0].security = "TLS".to_string();
+
+        let before = row(&render_sized(&state, 60, 12), 0);
+        assert!(before.contains("[TLS]"), "title: {before:?}");
+        assert!(!before.contains("ms"), "title: {before:?}");
+
+        state.sessions[0].latency = "42ms".to_string();
+        let after = row(&render_sized(&state, 60, 12), 0);
+        assert!(after.contains("[TLS] 42ms"), "title: {after:?}");
     }
 
     /// A profile's colour has to reach both places a character is named,

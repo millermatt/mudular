@@ -69,6 +69,11 @@ pub enum SessionEvent {
         delay: Duration,
         reason: String,
     },
+    /// How long the earliest outstanding round trip took: the gap between a
+    /// write reaching the socket and the next data coming back (§11). It is
+    /// a heuristic, not a protocol probe, so it includes however long the
+    /// server took to think — which is the wait a player actually feels.
+    Latency(Duration),
     /// The session terminated; the pane stays up showing the reason.
     Ended(String),
 }
@@ -329,6 +334,8 @@ async fn run_connection(
     let mut decoder = TextDecoder::new(charset);
     let mut assembler = LineAssembler::default();
     let mut sock_buf = [0u8; 4096];
+    // When the round trip currently being timed started, if any (§11).
+    let mut sent_at: Option<Instant> = None;
     // Inflate output, reused across reads.
     let mut plain: Vec<u8> = Vec::new();
 
@@ -337,13 +344,19 @@ async fn run_connection(
     if let Some((cols, rows)) = *window {
         telnet.set_window_size(cols, rows);
     }
-    if flush_telnet(&mut telnet, &mut writer).await.is_err() {
+    if flush_telnet(&mut telnet, &mut writer, &mut sent_at)
+        .await
+        .is_err()
+    {
         return Outcome::Lost("write failed".to_string());
     }
     engine.start_timers(Instant::now());
     // Scripts get the same starting gun as the timers (§7.4).
     let connected = engine.on_connect();
-    if send_lines(&mut writer, &connected.sends).await.is_err() {
+    if send_lines(&mut writer, &connected.sends, &mut sent_at)
+        .await
+        .is_err()
+    {
         return Outcome::Lost("write failed".to_string());
     }
     for text in connected.echoes {
@@ -364,6 +377,14 @@ async fn run_connection(
                 match result {
                     Ok(0) => break Outcome::Lost("connection closed".to_string()),
                     Ok(n) => {
+                        // Anything at all coming back closes the round trip:
+                        // the wait being measured is the player's, and it is
+                        // over as soon as the server says something.
+                        if let Some(started) = sent_at.take()
+                            && events.send(SessionEvent::Latency(started.elapsed())).await.is_err()
+                        {
+                            return Outcome::Gone;
+                        }
                         let raw = &sock_buf[..n];
                         if let Some(recorder) = recorder.as_mut() {
                             recorder.record(raw);
@@ -576,7 +597,7 @@ async fn run_connection(
                         }
                         // Trigger output is sent verbatim: it is never fed
                         // back through aliases, so rules cannot recurse.
-                        if send_lines(&mut writer, &outbound).await.is_err() {
+                        if send_lines(&mut writer, &outbound, &mut sent_at).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                         if emit_cross_sends(events, cross_out, FIRST_HOP).await.is_err() {
@@ -587,11 +608,12 @@ async fn run_connection(
                                 break_reason = Some("write failed".to_string());
                                 break;
                             }
+                            start_round_trip(&mut sent_at);
                         }
                         if let Some(reason) = break_reason {
                             break Outcome::Lost(reason);
                         }
-                        if flush_telnet(&mut telnet, &mut writer).await.is_err() {
+                        if flush_telnet(&mut telnet, &mut writer, &mut sent_at).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                     }
@@ -600,7 +622,7 @@ async fn run_connection(
             }
             Some(peer) = next_peer_change(watching) => {
                 let outcome = engine.poll_peer(&peer);
-                if send_lines(&mut writer, &outcome.sends).await.is_err() {
+                if send_lines(&mut writer, &outcome.sends, &mut sent_at).await.is_err() {
                     break Outcome::Lost("write failed".to_string());
                 }
                 for text in outcome.echoes {
@@ -629,10 +651,10 @@ async fn run_connection(
                 // by the same sleep (§7.4).
                 let scripted = engine.fire_due_script_timers(now);
                 publish(engine, publish_to);
-                if send_lines(&mut writer, &due).await.is_err() {
+                if send_lines(&mut writer, &due, &mut sent_at).await.is_err() {
                     break Outcome::Lost("write failed".to_string());
                 }
-                if send_lines(&mut writer, &scripted.sends).await.is_err() {
+                if send_lines(&mut writer, &scripted.sends, &mut sent_at).await.is_err() {
                     break Outcome::Lost("write failed".to_string());
                 }
                 for text in scripted.echoes {
@@ -667,14 +689,17 @@ async fn run_connection(
                     // splitter — which drops empty parts, so that `a;;b`
                     // sends two commands rather than three.
                     Some(SessionCommand::SendLine(line)) if line.is_empty() => {
-                        if send_lines(&mut writer, &[String::new()]).await.is_err() {
+                        if send_lines(&mut writer, &[String::new()], &mut sent_at)
+                            .await
+                            .is_err()
+                        {
                             break Outcome::Lost("write failed".to_string());
                         }
                     }
                     Some(SessionCommand::SendLine(line)) => {
                         let outcome = engine.expand_input(&line);
                         publish(engine, publish_to);
-                        if send_lines(&mut writer, &outcome.sends).await.is_err() {
+                        if send_lines(&mut writer, &outcome.sends, &mut sent_at).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                         for text in outcome.echoes {
@@ -718,7 +743,7 @@ async fn run_connection(
                             (lines, Vec::new())
                         };
                         publish(engine, publish_to);
-                        if send_lines(&mut writer, &sends).await.is_err() {
+                        if send_lines(&mut writer, &sends, &mut sent_at).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                         // Anything this injection set off is one hop further
@@ -734,7 +759,7 @@ async fn run_connection(
                         // connection come up, so `/reload` is their
                         // `on_connect` — as it is the timers' start.
                         let reloaded = engine.on_connect();
-                        if send_lines(&mut writer, &reloaded.sends).await.is_err() {
+                        if send_lines(&mut writer, &reloaded.sends, &mut sent_at).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                         for text in reloaded.echoes {
@@ -746,7 +771,7 @@ async fn run_connection(
                     Some(SessionCommand::Resize { cols, rows }) => {
                         *window = Some((cols, rows));
                         telnet.set_window_size(cols, rows);
-                        if flush_telnet(&mut telnet, &mut writer).await.is_err() {
+                        if flush_telnet(&mut telnet, &mut writer, &mut sent_at).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                     }
@@ -764,7 +789,7 @@ async fn run_connection(
     // never does — but a write failing now says nothing worth printing over
     // the reason we are already leaving.
     let closing = engine.on_disconnect();
-    let _ = send_lines(&mut writer, &closing.sends).await;
+    let _ = send_lines(&mut writer, &closing.sends, &mut sent_at).await;
     for text in closing.echoes {
         if events.send(SessionEvent::Line(text)).await.is_err() {
             return Outcome::Gone;
@@ -836,19 +861,28 @@ async fn emit_cross_sends(
 }
 
 /// Write each command as its own CRLF-terminated line.
-async fn send_lines<W>(writer: &mut W, lines: &[String]) -> std::io::Result<()>
+async fn send_lines<W>(
+    writer: &mut W,
+    lines: &[String],
+    sent_at: &mut Option<Instant>,
+) -> std::io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
 {
     for line in lines {
         writer.write_all(line.as_bytes()).await?;
         writer.write_all(b"\r\n").await?;
+        start_round_trip(sent_at);
     }
     Ok(())
 }
 
 /// Write any negotiation replies the Telnet machine has queued.
-async fn flush_telnet<W>(telnet: &mut TelnetMachine, writer: &mut W) -> std::io::Result<()>
+async fn flush_telnet<W>(
+    telnet: &mut TelnetMachine,
+    writer: &mut W,
+    sent_at: &mut Option<Instant>,
+) -> std::io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -856,7 +890,17 @@ where
     if out.is_empty() {
         return Ok(());
     }
-    writer.write_all(&out).await
+    writer.write_all(&out).await?;
+    start_round_trip(sent_at);
+    Ok(())
+}
+
+/// Starts timing a round trip, unless one is already being timed. Keeping
+/// the earliest outstanding send means a burst of commands is measured from
+/// the first of them to the first reply, rather than each write resetting
+/// the clock and reporting only the tail of the wait.
+fn start_round_trip(sent_at: &mut Option<Instant>) {
+    sent_at.get_or_insert_with(Instant::now);
 }
 
 /// Drops C0 control bytes other than `\n` (line boundary) and ESC (needed
@@ -1055,6 +1099,34 @@ mod tests {
         assert!(
             !next_mask(&mut events).await,
             "server WONT ECHO unmasks once the password is submitted"
+        );
+    }
+
+    /// §11: the pane reports the round trip a player waits through, which
+    /// is the gap between what they sent and the server answering.
+    #[tokio::test]
+    async fn measures_the_round_trip_of_a_typed_line() {
+        let (mut events, commands) = serve(|mut sock| async move {
+            // The greeting closes the round trip the connect-time NAWS
+            // offer started, so the next one is the typed line's alone.
+            sock.write_all(b"Welcome.\r\n").await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let _typed = sock.read(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sock.write_all(b"You go north.\r\n").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        next_latency(&mut events).await;
+        commands
+            .send(SessionCommand::SendLine("north".into()))
+            .await
+            .unwrap();
+
+        let rtt = next_latency(&mut events).await;
+        assert!(
+            rtt >= Duration::from_millis(20),
+            "round trip shorter than the server's own delay: {rtt:?}"
         );
     }
 
@@ -2575,6 +2647,13 @@ mod tests {
             if want(&event) {
                 return event;
             }
+        }
+    }
+
+    async fn next_latency(events: &mut mpsc::Receiver<SessionEvent>) -> Duration {
+        match next_matching(events, |ev| matches!(ev, SessionEvent::Latency(_))).await {
+            SessionEvent::Latency(rtt) => rtt,
+            _ => unreachable!(),
         }
     }
 

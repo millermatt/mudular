@@ -92,6 +92,11 @@ pub struct SessionPane {
     pub masked: bool,
     /// Transport security shown in the pane title ("TLS", "TLS pinned", …).
     pub security: String,
+    /// Last measured round trip, formatted for the pane title ("42ms").
+    /// Empty until the first one completes, and again whenever the
+    /// connection stops carrying data — a stale number would read as a live
+    /// one (§11).
+    pub latency: String,
     /// Whether the session owns the prompt row. Keeping the row reserved for
     /// the whole session keeps the layout — and so the NAWS pane size —
     /// stable as prompts come and go.
@@ -595,6 +600,10 @@ fn apply_session_event(
             }
             (false, Vec::new())
         }
+        SessionEvent::Latency(rtt) => {
+            state.sessions[index].latency = format!("{}ms", rtt.as_millis());
+            (false, Vec::new())
+        }
         SessionEvent::Reconnecting {
             attempt,
             delay,
@@ -605,6 +614,7 @@ fn apply_session_event(
                 "reconnecting in {}s (attempt {attempt}): {reason}",
                 delay.as_secs()
             );
+            session.latency.clear();
             // Whatever the server had asked us to hide, it is not asking
             // any more.
             session.masked = false;
@@ -613,6 +623,7 @@ fn apply_session_event(
         SessionEvent::Ended(reason) => {
             let session = &mut state.sessions[index];
             session.status = format!("disconnected: {reason}");
+            session.latency.clear();
             session.masked = false;
             session.connected = false;
             (true, Vec::new())
@@ -696,6 +707,7 @@ fn connect(
         status,
         masked: false,
         security: String::new(),
+        latency: String::new(),
         connected: true,
         gmcp_log: VecDeque::new(),
         unread: 0,
@@ -1095,6 +1107,7 @@ pub(crate) mod test_support {
                 status: "connecting".to_string(),
                 masked: false,
                 security: String::new(),
+                latency: String::new(),
                 connected: true,
                 gmcp_log: VecDeque::new(),
                 unread: 0,
@@ -1212,6 +1225,25 @@ mod tests {
 
         assert_eq!(state.sessions[0].security, "TLS");
         assert!(state.sessions[0].scrollback.is_empty());
+    }
+
+    /// A round trip is only worth showing while one is possible: a pane
+    /// that has lost its connection would otherwise keep advertising the
+    /// last good number as though data were still flowing (§11).
+    #[test]
+    fn latency_shows_once_measured_and_goes_with_the_connection() {
+        let (mut state, _rx) = app(&["tank"]);
+        assert!(state.sessions[0].latency.is_empty());
+
+        apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::Latency(std::time::Duration::from_millis(42)),
+        );
+        assert_eq!(state.sessions[0].latency, "42ms");
+
+        apply_session_event(&mut state, 0, SessionEvent::Ended("closed".to_string()));
+        assert!(state.sessions[0].latency.is_empty());
     }
 
     /// A password typed while the server is echoing must not be written to
