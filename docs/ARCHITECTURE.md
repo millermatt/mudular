@@ -500,6 +500,16 @@ and eventually consistent (staleness is one channel hop, microseconds).
 YAML rules reference peer state as `${@tank.hp}`; a `when:` guard (§7.6)
 can combine local and peer values.
 
+The channels are created by the hub before any session connects, so a rule
+may name a peer that is still dialling — it reads that peer's empty
+snapshot until there is something to publish, rather than failing. A
+session publishes only when its own state has moved, so a quiet character
+costs its peers nothing, and it never watches itself: its own variables are
+the live ones. `@` is a namespace of its own — a peer name cannot shadow a
+local variable or a GMCP key, and an unknown peer or key resolves to
+nothing, which leaves a template visibly unexpanded and a guard false, just
+as an unknown local name does.
+
 **Scripting API (M8).** The `mud.*` API (§7.4) adds:
 
 - `mud.session("cleric"):send(cmd)` / `:echo(text)` — routed as above.

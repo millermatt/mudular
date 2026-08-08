@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use crate::engine::Engine;
+use crate::engine::{Engine, PeerSnapshot, Peers};
 use crate::net::{self, TlsConfig};
 use crate::proto::charset::Charset;
 use crate::proto::gmcp;
@@ -92,6 +92,16 @@ pub enum SessionCommand {
 /// command sink. The task runs until the connection ends or `Disconnect`
 /// is received.
 #[allow(clippy::too_many_arguments)]
+/// A session's half of the peer-snapshot mesh (§7.5): the channel it
+/// publishes its own state on, and a receiver for every other session's.
+/// Empty by default — a lone character has no peers to watch.
+#[derive(Default)]
+pub struct PeerLinks {
+    pub publish: Option<watch::Sender<PeerSnapshot>>,
+    pub others: Peers,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     host: String,
     port: u16,
@@ -101,6 +111,7 @@ pub fn spawn(
     engine: Engine,
     expand_injected: bool,
     login: Option<Autologin>,
+    peers: PeerLinks,
 ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>) {
     let (event_tx, event_rx) = mpsc::channel(256);
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -113,6 +124,7 @@ pub fn spawn(
         engine,
         expand_injected,
         login,
+        peers,
         event_tx,
         cmd_rx,
     ));
@@ -129,9 +141,12 @@ async fn run(
     mut engine: Engine,
     expand_injected: bool,
     mut login: Option<Autologin>,
+    peers: PeerLinks,
     events: mpsc::Sender<SessionEvent>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
+    engine.set_peers(peers.others);
+    let publish_to = peers.publish;
     let connection = match net::connect(&host, port, tls.as_ref()).await {
         Ok(connection) => connection,
         Err(err) => {
@@ -395,6 +410,7 @@ async fn run(
                         if let Some(reason) = break_reason {
                             break reason;
                         }
+                        publish(&mut engine, &publish_to);
 
                         for notice in login_notices.drain(..) {
                             if events.send(SessionEvent::Line(notice)).await.is_err() {
@@ -427,6 +443,7 @@ async fn run(
             }
             _ = tokio::time::sleep_until(timer_deadline.into()) => {
                 let due = engine.fire_due_timers(Instant::now());
+                publish(&mut engine, &publish_to);
                 if send_lines(&mut writer, &due).await.is_err() {
                     break "write failed".to_string();
                 }
@@ -450,6 +467,7 @@ async fn run(
                     }
                     Some(SessionCommand::SendLine(line)) => {
                         let outcome = engine.expand_input(&line);
+                        publish(&mut engine, &publish_to);
                         if send_lines(&mut writer, &outcome.sends).await.is_err() {
                             break "write failed".to_string();
                         }
@@ -488,6 +506,7 @@ async fn run(
                         } else {
                             (lines, Vec::new())
                         };
+                        publish(&mut engine, &publish_to);
                         if send_lines(&mut writer, &sends).await.is_err() {
                             break "write failed".to_string();
                         }
@@ -540,6 +559,19 @@ async fn run(
         }
     }
     let _ = events.send(SessionEvent::Ended(reason)).await;
+}
+
+/// Publishes this session's state for its peers to read, if it has moved
+/// since the last time (§7.5). A snapshot is a value, so peers read the
+/// last one published and never this session's live stores — which is what
+/// keeps buffer/state isolation (§3) intact while still letting one
+/// character's rules consult another's vitals.
+fn publish(engine: &mut Engine, publish_to: &Option<watch::Sender<PeerSnapshot>>) {
+    if let Some(sender) = publish_to
+        && let Some(snapshot) = engine.take_snapshot()
+    {
+        let _ = sender.send(snapshot);
+    }
 }
 
 /// A cross-session action a session raised itself is the first hop; the
@@ -842,6 +874,7 @@ mod tests {
             Engine::default(),
             false,
             None,
+            PeerLinks::default(),
         );
         assert_eq!(next_line(&mut events).await, "hi");
 
@@ -859,6 +892,45 @@ mod tests {
     fn rules(yaml: &str) -> Engine {
         let module = serde_yaml::from_str(yaml).expect("valid test YAML");
         Engine::compile(&[module]).expect("compiles")
+    }
+
+    /// A session publishes what its rules learn, so its peers can read it
+    /// without touching its buffers or its engine (§7.5).
+    #[tokio::test]
+    async fn a_session_publishes_its_state_for_peers() {
+        let (publish, snapshots) = watch::channel(PeerSnapshot::default());
+        let (_events, _commands) = serve_with_login(
+            move |mut sock| async move {
+                sock.write_all(b"You are now fighting kobold\r\n")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: '^You are now fighting (?P<foe>\w+)'
+                    set: {target: "${foe}"}
+                "#,
+            ),
+            false,
+            None,
+            PeerLinks {
+                publish: Some(publish),
+                others: crate::engine::Peers::new(),
+            },
+        );
+
+        let mut snapshots = snapshots;
+        timeout(Duration::from_secs(2), snapshots.changed())
+            .await
+            .expect("timed out waiting for a snapshot")
+            .expect("the session is still publishing");
+        assert_eq!(
+            snapshots.borrow().vars.get("target").map(String::as_str),
+            Some("kobold")
+        );
     }
 
     #[cfg(feature = "lua")]
@@ -1725,6 +1797,7 @@ mod tests {
             Engine::default(),
             false,
             Some(login),
+            PeerLinks::default(),
         );
 
         let mut received = Vec::new();
@@ -2052,16 +2125,18 @@ mod tests {
         F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        serve_with_login(script, engine, expand_injected, None)
+        serve_with_login(script, engine, expand_injected, None, PeerLinks::default())
     }
 
     /// As `serve_with`, with an auto-login machine driving the opening
-    /// exchange (docs/ARCHITECTURE.md §10).
+    /// exchange (docs/ARCHITECTURE.md §10), and this session's half of the
+    /// peer mesh (§7.5).
     fn serve_with_login<F, Fut>(
         script: F,
         engine: Engine,
         expand_injected: bool,
         login: Option<Autologin>,
+        peers: PeerLinks,
     ) -> (mpsc::Receiver<SessionEvent>, mpsc::Sender<SessionCommand>)
     where
         F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
@@ -2086,6 +2161,7 @@ mod tests {
             engine,
             expand_injected,
             login,
+            peers,
         )
     }
 

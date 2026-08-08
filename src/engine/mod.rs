@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use regex::{Captures, Regex};
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::sync::watch;
 
 mod condition;
 pub mod script;
@@ -228,6 +229,32 @@ pub struct InputOutcome {
     pub echoes: Vec<String>,
 }
 
+/// What one session publishes about itself for the others to read (§7.5):
+/// its variables and its server-data map, as of the last change. Reads are
+/// local and lock-free — a snapshot is a value, not a query.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PeerSnapshot {
+    pub vars: HashMap<String, String>,
+    pub data: HashMap<String, String>,
+}
+
+/// Every other session's snapshot, by the name that addresses it (§7.5).
+/// A `watch::Receiver` borrow is a lock-free read of a value already in
+/// memory, so consulting one costs a rule no more than reading its own
+/// variables — and `engine` stays sans-IO (§4): nothing here awaits.
+pub type Peers = HashMap<String, watch::Receiver<PeerSnapshot>>;
+
+/// Everything a `${...}` term can resolve against: this line's captures,
+/// this session's own state, and its peers' snapshots. Bundled because
+/// every resolver needs all of it and the set grew past what is worth
+/// threading positionally.
+pub(crate) struct Scope<'a> {
+    pub caps: Option<&'a Captures<'a>>,
+    pub vars: &'a HashMap<String, String>,
+    pub server_data: &'a HashMap<String, String>,
+    pub peers: &'a Peers,
+}
+
 #[derive(Debug)]
 struct CompiledRule {
     regex: Regex,
@@ -260,15 +287,8 @@ struct HostEntry {
 impl CompiledRule {
     /// Whether this rule's `when:` guard permits it to fire. A rule
     /// without one always fires on a match.
-    fn guard_holds(
-        &self,
-        caps: Option<&Captures>,
-        vars: &HashMap<String, String>,
-        server_data: &HashMap<String, String>,
-    ) -> bool {
-        self.when
-            .as_ref()
-            .is_none_or(|when| when.eval(caps, vars, server_data))
+    fn guard_holds(&self, scope: &Scope) -> bool {
+        self.when.as_ref().is_none_or(|when| when.eval(scope))
     }
 }
 
@@ -299,6 +319,12 @@ pub struct Engine {
     /// (§7.4). Empty for a rules-only session, which then never enters a
     /// VM at all.
     hosts: Vec<HostEntry>,
+    /// The other sessions' published state, for `${@name.key}` (§7.5).
+    peers: Peers,
+    /// Whether this session's own state has moved since it last published.
+    /// Snapshots are values, so publishing copies the stores; doing it only
+    /// on change keeps a quiet session free.
+    changed: bool,
 }
 
 impl Engine {
@@ -330,6 +356,27 @@ impl Engine {
             server_data: HashMap::new(),
             gmcp_keys: HashSet::new(),
             hosts,
+            peers: Peers::new(),
+            changed: false,
+        })
+    }
+
+    /// Hands this session the receivers for every other session's snapshot
+    /// (§7.5). Called once, by the hub that knows what else is open.
+    pub fn set_peers(&mut self, peers: Peers) {
+        self.peers = peers;
+    }
+
+    /// This session's state to publish, or `None` if nothing has changed
+    /// since the last call — peers hold the previous value either way, so
+    /// republishing an identical snapshot would only wake them.
+    pub fn take_snapshot(&mut self) -> Option<PeerSnapshot> {
+        self.changed.then(|| {
+            self.changed = false;
+            PeerSnapshot {
+                vars: self.variables.clone(),
+                data: self.server_data.clone(),
+            }
         })
     }
 
@@ -367,6 +414,9 @@ impl Engine {
         }
         self.variables = ctx.vars;
         self.server_data = ctx.server_data;
+        // A hook may have called `mud.set`; asking which is not worth the
+        // bookkeeping when the answer only costs one snapshot.
+        self.changed = true;
         ctx.out
     }
 
@@ -410,35 +460,31 @@ impl Engine {
             let Some(caps) = rule.regex.captures(line) else {
                 continue;
             };
+            let scope = Scope {
+                caps: Some(&caps),
+                vars: &self.variables,
+                server_data: &self.server_data,
+                peers: &self.peers,
+            };
             // A guarded-out rule does nothing at all — not even gag or
             // route the line (§7.6: the rule fires only if both hold).
-            if !rule.guard_holds(Some(&caps), &self.variables, &self.server_data) {
+            if !rule.guard_holds(&scope) {
                 continue;
             }
             for template in &rule.sends {
-                outcome.sends.push(expand(
-                    template,
-                    Some(&caps),
-                    &self.variables,
-                    &self.server_data,
-                ));
+                outcome.sends.push(expand(template, &scope));
             }
             for (target, templates) in &rule.send_to {
                 outcome.send_to.push(CrossSend {
                     target: target.clone(),
                     lines: templates
                         .iter()
-                        .map(|template| {
-                            expand(template, Some(&caps), &self.variables, &self.server_data)
-                        })
+                        .map(|template| expand(template, &scope))
                         .collect(),
                 });
             }
             for (name, template) in &rule.set {
-                updates.push((
-                    name.clone(),
-                    expand(template, Some(&caps), &self.variables, &self.server_data),
-                ));
+                updates.push((name.clone(), expand(template, &scope)));
             }
             if let Some(call) = &rule.script {
                 calls.push((
@@ -455,6 +501,7 @@ impl Engine {
             }
         }
 
+        self.changed |= !updates.is_empty();
         self.variables.extend(updates);
 
         // Scripts run after the trigger table, so a hook sees the variables
@@ -489,7 +536,7 @@ impl Engine {
     /// GMCP always wins over MSDP for the same key (§6.3).
     pub fn update_server_data_from_gmcp(&mut self, key: &str, value: String) {
         self.gmcp_keys.insert(key.to_string());
-        self.server_data.insert(key.to_string(), value);
+        self.changed |= self.server_data.insert(key.to_string(), value.clone()) != Some(value);
     }
 
     /// As [`Self::update_server_data_from_gmcp`], but for MSDP: a no-op if
@@ -499,7 +546,7 @@ impl Engine {
         if self.gmcp_keys.contains(key) {
             return;
         }
-        self.server_data.insert(key.to_string(), value);
+        self.changed |= self.server_data.insert(key.to_string(), value.clone()) != Some(value);
     }
 
     /// Turn one typed input line into the commands to send: split on `;`,
@@ -519,39 +566,35 @@ impl Engine {
             // the literal input — still gets its turn (§7.6).
             match self.aliases.iter().find_map(|rule| {
                 let caps = rule.regex.captures(part)?;
-                rule.guard_holds(Some(&caps), &self.variables, &self.server_data)
-                    .then_some((rule, caps))
+                let scope = Scope {
+                    caps: Some(&caps),
+                    vars: &self.variables,
+                    server_data: &self.server_data,
+                    peers: &self.peers,
+                };
+                rule.guard_holds(&scope).then_some((rule, caps))
             }) {
                 Some((rule, caps)) => {
+                    let scope = Scope {
+                        caps: Some(&caps),
+                        vars: &self.variables,
+                        server_data: &self.server_data,
+                        peers: &self.peers,
+                    };
                     for template in &rule.sends {
-                        out.sends.push(expand(
-                            template,
-                            Some(&caps),
-                            &self.variables,
-                            &self.server_data,
-                        ));
+                        out.sends.push(expand(template, &scope));
                     }
                     for (target, templates) in &rule.send_to {
                         out.send_to.push(CrossSend {
                             target: target.clone(),
                             lines: templates
                                 .iter()
-                                .map(|template| {
-                                    expand(
-                                        template,
-                                        Some(&caps),
-                                        &self.variables,
-                                        &self.server_data,
-                                    )
-                                })
+                                .map(|template| expand(template, &scope))
                                 .collect(),
                         });
                     }
                     for (name, template) in &rule.set {
-                        updates.push((
-                            name.clone(),
-                            expand(template, Some(&caps), &self.variables, &self.server_data),
-                        ));
+                        updates.push((name.clone(), expand(template, &scope)));
                     }
                     if let Some(call) = &rule.script {
                         calls.push((
@@ -566,6 +609,7 @@ impl Engine {
             }
         }
 
+        self.changed |= !updates.is_empty();
         self.variables.extend(updates);
 
         // As on an inbound line: the alias's own commands are collected
@@ -606,22 +650,36 @@ impl Engine {
         let mut sends = Vec::new();
         let mut updates: Vec<(String, String)> = Vec::new();
 
-        for timer in &mut self.timers {
-            if timer.next.is_none_or(|next| next > now) {
-                continue;
+        // Expanding reads the stores this session owns; re-arming writes
+        // the timers. Two passes, so neither borrow has to outlive the
+        // other.
+        let mut fired = Vec::new();
+        {
+            let scope = Scope {
+                caps: None,
+                vars: &self.variables,
+                server_data: &self.server_data,
+                peers: &self.peers,
+            };
+            for (index, timer) in self.timers.iter().enumerate() {
+                if timer.next.is_none_or(|next| next > now) {
+                    continue;
+                }
+                for template in &timer.sends {
+                    sends.push(expand(template, &scope));
+                }
+                for (name, template) in &timer.set {
+                    updates.push((name.clone(), expand(template, &scope)));
+                }
+                fired.push(index);
             }
-            for template in &timer.sends {
-                sends.push(expand(template, None, &self.variables, &self.server_data));
-            }
-            for (name, template) in &timer.set {
-                updates.push((
-                    name.clone(),
-                    expand(template, None, &self.variables, &self.server_data),
-                ));
-            }
+        }
+        for index in fired {
+            let timer = &mut self.timers[index];
             timer.next = timer.repeat.then(|| now + timer.interval);
         }
 
+        self.changed |= !updates.is_empty();
         self.variables.extend(updates);
         sends
     }
@@ -1121,12 +1179,7 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
 /// Substitutes `${...}` in a send/set template: numbered and named regex
 /// captures first, then the variable store (§7.1). An unresolved name is
 /// left verbatim so a typo is visible rather than silently blank.
-fn expand(
-    template: &str,
-    caps: Option<&Captures>,
-    vars: &HashMap<String, String>,
-    server_data: &HashMap<String, String>,
-) -> String {
+fn expand(template: &str, scope: &Scope) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
 
@@ -1139,7 +1192,7 @@ fn expand(
             return out;
         };
         let name = &after[..end];
-        match lookup(name, caps, vars, server_data) {
+        match lookup(name, scope) {
             Some(value) => out.push_str(&value),
             None => {
                 out.push_str("${");
@@ -1157,13 +1210,20 @@ fn expand(
 /// Resolution order: regex captures, then rule-defined variables, then live
 /// server data — a variable a rule author names can always shadow a GMCP/
 /// MSDP key of the same name.
-fn lookup(
-    name: &str,
-    caps: Option<&Captures>,
-    vars: &HashMap<String, String>,
-    server_data: &HashMap<String, String>,
-) -> Option<String> {
-    if let Some(caps) = caps {
+pub(crate) fn lookup(name: &str, scope: &Scope) -> Option<String> {
+    // `@session.key` reads another character's published state (§7.5), and
+    // never this one's: the prefix is what tells them apart, so a peer name
+    // can never shadow a local variable or a GMCP key.
+    if let Some(peer_ref) = name.strip_prefix('@') {
+        let (peer, key) = peer_ref.split_once('.')?;
+        let snapshot = scope.peers.get(peer)?.borrow();
+        return snapshot
+            .vars
+            .get(key)
+            .or_else(|| snapshot.data.get(key))
+            .cloned();
+    }
+    if let Some(caps) = scope.caps {
         if let Ok(index) = name.parse::<usize>() {
             return caps.get(index).map(|m| m.as_str().to_string());
         }
@@ -1171,9 +1231,11 @@ fn lookup(
             return Some(m.as_str().to_string());
         }
     }
-    vars.get(name)
+    scope
+        .vars
+        .get(name)
         .cloned()
-        .or_else(|| server_data.get(name).cloned())
+        .or_else(|| scope.server_data.get(name).cloned())
 }
 
 #[cfg(test)]
@@ -2150,6 +2212,155 @@ triggers:
         assert!(
             matches!(&err, EngineError::UnknownScriptLanguage { script, .. } if script == "combat.rb"),
             "{err}"
+        );
+    }
+
+    // ---- peer snapshots (docs/ARCHITECTURE.md §7.5) ----
+
+    /// A session with one peer, whose published state the test controls.
+    fn with_peer(yaml: &str, peer: &str, snapshot: PeerSnapshot) -> Engine {
+        let (tx, rx) = watch::channel(snapshot);
+        // The sender outlives the engine for the length of the test: a
+        // closed channel would just freeze the last value, which is not
+        // what these are checking.
+        Box::leak(Box::new(tx));
+        let mut engine = engine(yaml);
+        engine.set_peers(Peers::from([(peer.to_string(), rx)]));
+        engine
+    }
+
+    fn snapshot(vars: &[(&str, &str)], data: &[(&str, &str)]) -> PeerSnapshot {
+        let owned = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        PeerSnapshot {
+            vars: owned(vars),
+            data: owned(data),
+        }
+    }
+
+    /// The §7.5 case: the cleric's own rule watches the tank's vitals, so
+    /// the response lives with the character that acts.
+    #[test]
+    fn a_guard_reads_a_peers_server_data() {
+        let mut engine = with_peer(
+            r#"
+            name: test
+            triggers:
+              - pattern: '^You feel rested'
+                when: '${@tank.Char.Vitals.hp} < 40'
+                send: ["cast 'major heal' Grunk"]
+            "#,
+            "tank",
+            snapshot(&[], &[("Char.Vitals.hp", "30")]),
+        );
+
+        assert_eq!(
+            engine.process_line("You feel rested.").sends,
+            vec!["cast 'major heal' Grunk"]
+        );
+    }
+
+    #[test]
+    fn a_template_expands_a_peers_variable() {
+        let mut engine = with_peer(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^help$'
+                send: ["cast heal ${@tank.target}"]
+            "#,
+            "tank",
+            snapshot(&[("target", "kobold")], &[]),
+        );
+
+        assert_eq!(engine.expand_input("help").sends, vec!["cast heal kobold"]);
+    }
+
+    /// An unknown peer, or an unknown key on a known one, resolves to
+    /// nothing — which leaves a template visibly unexpanded and makes a
+    /// guard false (§7.6), exactly as a local name would.
+    #[test]
+    fn an_unknown_peer_resolves_to_nothing() {
+        let mut engine = with_peer(
+            r#"
+            name: test
+            triggers:
+              - pattern: '^guarded$'
+                when: '${@ghost.hp} < 40'
+                send: ["never"]
+              - pattern: '^expanded$'
+                send: ["say ${@ghost.hp}/${@tank.missing}"]
+            "#,
+            "tank",
+            snapshot(&[("hp", "30")], &[]),
+        );
+
+        assert!(engine.process_line("guarded").sends.is_empty());
+        assert_eq!(
+            engine.process_line("expanded").sends,
+            vec!["say ${@ghost.hp}/${@tank.missing}"]
+        );
+    }
+
+    /// A peer name cannot shadow local state, and local state cannot answer
+    /// for a peer: the `@` prefix is what separates the two namespaces.
+    #[test]
+    fn peer_state_and_local_state_are_separate_namespaces() {
+        let mut engine = with_peer(
+            r#"
+            name: test
+            variables:
+              hp: "90"
+            aliases:
+              - pattern: '^both$'
+                send: ["say ${hp} ${@tank.hp}"]
+            "#,
+            "tank",
+            snapshot(&[("hp", "30")], &[]),
+        );
+
+        assert_eq!(engine.expand_input("both").sends, vec!["say 90 30"]);
+    }
+
+    /// A snapshot is published only when this session's state has actually
+    /// moved, so a quiet character costs its peers nothing.
+    #[test]
+    fn a_snapshot_is_published_only_after_a_change() {
+        let mut engine = engine(
+            r#"
+            name: test
+            triggers:
+              - pattern: '^You are now fighting (?P<foe>\w+)'
+                set: {target: "${foe}"}
+            "#,
+        );
+        assert!(engine.take_snapshot().is_none(), "nothing has happened yet");
+
+        engine.process_line("A leaf falls.");
+        assert!(engine.take_snapshot().is_none(), "no rule fired");
+
+        engine.process_line("You are now fighting kobold");
+        let published = engine.take_snapshot().expect("the target changed");
+        assert_eq!(
+            published.vars.get("target").map(String::as_str),
+            Some("kobold")
+        );
+        assert!(engine.take_snapshot().is_none(), "already published");
+
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "30".to_string());
+        let published = engine.take_snapshot().expect("server data changed");
+        assert_eq!(
+            published.data.get("Char.Vitals.hp").map(String::as_str),
+            Some("30")
+        );
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "30".to_string());
+        assert!(
+            engine.take_snapshot().is_none(),
+            "the same value is no news"
         );
     }
 

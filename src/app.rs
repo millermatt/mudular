@@ -16,16 +16,16 @@ use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use ratatui::style::Color;
 
 use crate::config::{self, Channel, CrossSession, Keybinds};
-use crate::engine::Engine;
+use crate::engine::{Engine, PeerSnapshot};
 use crate::proto::charset::Charset;
-use crate::session::{self, SessionCommand, SessionEvent};
+use crate::session::{self, PeerLinks, SessionCommand, SessionEvent};
 use crate::ui;
 
 /// Bounded so a chatty MUD can't grow the buffer without limit
@@ -557,7 +557,7 @@ pub async fn run(
     result
 }
 
-fn connect(target: ConnectTarget, history_limit: usize) -> SessionPane {
+fn connect(target: ConnectTarget, history_limit: usize, peers: PeerLinks) -> SessionPane {
     let status = format!("connecting to {}:{}...", target.host, target.port);
     let connected_status = format!("connected to {}:{}", target.host, target.port);
     let Rules {
@@ -574,6 +574,7 @@ fn connect(target: ConnectTarget, history_limit: usize) -> SessionPane {
         engine,
         target.cross.expand_aliases,
         target.login,
+        peers,
     );
     SessionPane {
         name: target.name,
@@ -654,9 +655,44 @@ async fn event_loop(
     channels: Vec<Channel>,
     history_size: usize,
 ) -> Result<()> {
+    // Every session publishes a snapshot of its state and reads every
+    // other session's (§7.5). The channels are made up front, so a session
+    // can watch a peer that has not finished connecting yet — it simply
+    // sees that peer's empty snapshot until it has something to say.
+    let published: Vec<(
+        String,
+        watch::Sender<PeerSnapshot>,
+        watch::Receiver<PeerSnapshot>,
+    )> = targets
+        .iter()
+        .map(|target| {
+            let (tx, rx) = watch::channel(PeerSnapshot::default());
+            (target.name.clone(), tx, rx)
+        })
+        .collect();
+    let receivers: Vec<(String, watch::Receiver<PeerSnapshot>)> = published
+        .iter()
+        .map(|(name, _, rx)| (name.clone(), rx.clone()))
+        .collect();
+
     let sessions: Vec<SessionPane> = targets
         .into_iter()
-        .map(|target| connect(target, history_size))
+        .zip(published)
+        .map(|(target, (_, publish, _))| {
+            // `*` in a rule means "every other session", and so does this:
+            // a session never watches itself, where its own variables are
+            // already the live ones.
+            let others = receivers
+                .iter()
+                .filter(|(name, _)| *name != target.name)
+                .map(|(name, rx)| (name.clone(), rx.clone()))
+                .collect();
+            let links = PeerLinks {
+                publish: Some(publish),
+                others,
+            };
+            connect(target, history_size, links)
+        })
         .collect();
     let has_sessions = !sessions.is_empty();
 

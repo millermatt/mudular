@@ -10,9 +10,7 @@
 //! Sans-IO and allocation-light: a condition compiles once, at
 //! [`super::Engine::compile`], and matching then costs one tree walk.
 
-use std::collections::HashMap;
-
-use regex::Captures;
+use super::Scope;
 
 /// A compiled `when:` guard.
 #[derive(Debug)]
@@ -45,13 +43,8 @@ impl Condition {
     /// turned an unresolvable term into a reason to fire would be the
     /// unsafe reading of that. Unresolved terms therefore propagate as
     /// [`None`] rather than as a boolean.
-    pub fn eval(
-        &self,
-        caps: Option<&Captures>,
-        vars: &HashMap<String, String>,
-        server_data: &HashMap<String, String>,
-    ) -> bool {
-        self.root.eval(caps, vars, server_data).unwrap_or(false)
+    pub fn eval(&self, scope: &Scope) -> bool {
+        self.root.eval(scope).unwrap_or(false)
     }
 }
 
@@ -84,39 +77,25 @@ enum CmpOp {
 }
 
 impl Node {
-    fn eval(
-        &self,
-        caps: Option<&Captures>,
-        vars: &HashMap<String, String>,
-        server_data: &HashMap<String, String>,
-    ) -> Option<bool> {
+    fn eval(&self, scope: &Scope) -> Option<bool> {
         match self {
             Node::Cmp { lhs, op, rhs } => {
-                let lhs = lhs.resolve(caps, vars, server_data)?;
-                let rhs = rhs.resolve(caps, vars, server_data)?;
+                let lhs = lhs.resolve(scope)?;
+                let rhs = rhs.resolve(scope)?;
                 Some(op.apply(&lhs, &rhs))
             }
-            Node::And(a, b) => {
-                Some(a.eval(caps, vars, server_data)? && b.eval(caps, vars, server_data)?)
-            }
-            Node::Or(a, b) => {
-                Some(a.eval(caps, vars, server_data)? || b.eval(caps, vars, server_data)?)
-            }
-            Node::Not(inner) => Some(!inner.eval(caps, vars, server_data)?),
+            Node::And(a, b) => Some(a.eval(scope)? && b.eval(scope)?),
+            Node::Or(a, b) => Some(a.eval(scope)? || b.eval(scope)?),
+            Node::Not(inner) => Some(!inner.eval(scope)?),
         }
     }
 }
 
 impl Term {
-    fn resolve(
-        &self,
-        caps: Option<&Captures>,
-        vars: &HashMap<String, String>,
-        server_data: &HashMap<String, String>,
-    ) -> Option<String> {
+    fn resolve(&self, scope: &Scope) -> Option<String> {
         match self {
             Term::Literal(value) => Some(value.clone()),
-            Term::Ref(name) => super::lookup(name, caps, vars, server_data),
+            Term::Ref(name) => super::lookup(name, scope),
         }
     }
 }
@@ -325,7 +304,26 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::engine::Peers;
+
+    /// A scope over the three stores a test cares about; peers get their
+    /// own tests in `engine`, where the channels live.
+    fn scope<'a>(
+        caps: Option<&'a regex::Captures<'a>>,
+        vars: &'a HashMap<String, String>,
+        server_data: &'a HashMap<String, String>,
+        peers: &'a Peers,
+    ) -> Scope<'a> {
+        Scope {
+            caps,
+            vars,
+            server_data,
+            peers,
+        }
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -335,11 +333,10 @@ mod tests {
     }
 
     fn eval(src: &str, pairs: &[(&str, &str)]) -> bool {
-        Condition::parse(src).expect("condition should parse").eval(
-            None,
-            &vars(pairs),
-            &HashMap::new(),
-        )
+        let (vars, empty, peers) = (vars(pairs), HashMap::new(), Peers::new());
+        Condition::parse(src)
+            .expect("condition should parse")
+            .eval(&scope(None, &vars, &empty, &peers))
     }
 
     #[test]
@@ -419,14 +416,19 @@ mod tests {
         let regex = regex::Regex::new(r"health: (?P<hp>\d+)").expect("test regex");
         let caps = regex.captures("health: 12").expect("test line matches");
         let condition = Condition::parse("${hp} < 40").expect("condition should parse");
-        assert!(condition.eval(Some(&caps), &vars(&[("hp", "99")]), &HashMap::new()));
+        let (vars, empty, peers) = (vars(&[("hp", "99")]), HashMap::new(), Peers::new());
+        assert!(condition.eval(&scope(Some(&caps), &vars, &empty, &peers)));
     }
 
     #[test]
     fn falls_back_to_server_data() {
         let condition = Condition::parse("${Char.Vitals.hp} < 40").expect("condition should parse");
-        let server_data = vars(&[("Char.Vitals.hp", "12")]);
-        assert!(condition.eval(None, &HashMap::new(), &server_data));
+        let (empty, server_data, peers) = (
+            HashMap::new(),
+            vars(&[("Char.Vitals.hp", "12")]),
+            Peers::new(),
+        );
+        assert!(condition.eval(&scope(None, &empty, &server_data, &peers)));
     }
 
     #[test]
