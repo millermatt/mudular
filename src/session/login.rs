@@ -104,7 +104,7 @@ impl Autologin {
             Some(password) => Some(LoginAction::Send(password)),
             None => Some(LoginAction::Notice(
                 "auto-login: no password in the keyring for this profile \
-                 (store one with `mudular --set-password <profile>`)"
+                 (type it below and you'll be offered to save it)"
                     .to_string(),
             )),
         }
@@ -201,7 +201,9 @@ mod tests {
         );
 
         match login.on_line("Password: ") {
-            Some(LoginAction::Notice(text)) => assert!(text.contains("--set-password"), "{text}"),
+            Some(LoginAction::Notice(text)) => {
+                assert!(text.contains("no password in the keyring"), "{text}")
+            }
             other => panic!("expected a notice, got {other:?}"),
         }
     }

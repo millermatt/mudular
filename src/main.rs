@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
             .map_err(|err: String| anyhow::anyhow!(err))
             .with_context(|| format!("charset in {}", path.display()))?;
         let layers = config::load_rules(&dir, Some(name), &channels)?;
+        let (login, offer_password_save) = autologin(profile.login.as_ref(), name, &dir)?;
         targets.push(app::ConnectTarget {
             name: session_name(name, &mut names),
             host: profile.host,
@@ -125,7 +126,8 @@ async fn main() -> Result<()> {
                 .cross_session
                 .with_override(profile.cross_session),
             color: profile.color,
-            login: autologin(profile.login.as_ref(), name)?,
+            login,
+            offer_password_save,
         });
     }
 
@@ -153,6 +155,7 @@ async fn main() -> Result<()> {
             // nothing to key a stored password on.
             color: None,
             login: None,
+            offer_password_save: false,
         });
     }
 
@@ -168,24 +171,30 @@ async fn main() -> Result<()> {
 /// Builds the auto-login machine for a profile, reading its password from
 /// the OS keyring (docs/ARCHITECTURE.md §10). A profile with no `login:`
 /// block gets `None` and the ordinary hand-typed login.
+///
+/// Also reports whether the session should offer to save the password the
+/// player types: only for a profile that wants auto-login, has nothing
+/// stored, and has not already turned the offer down (§13).
 fn autologin(
     login: Option<&config::Login>,
     profile: &str,
-) -> Result<Option<session::login::Autologin>> {
+    dir: &std::path::Path,
+) -> Result<(Option<session::login::Autologin>, bool)> {
     let Some(login) = login else {
-        return Ok(None);
+        return Ok((None, false));
     };
     // Read once, at startup: the keyring may prompt, and doing that from
     // inside the session task would block the pipeline mid-connection.
     let password = config::stored_password(profile)?;
-    session::login::Autologin::new(
+    let offer_save = password.is_none() && !config::password_save_declined(dir, profile);
+    let machine = session::login::Autologin::new(
         login.name.clone(),
         password,
         login.name_prompt.as_deref(),
         login.password_prompt.as_deref(),
     )
-    .map(Some)
-    .with_context(|| format!("auto-login for {profile}"))
+    .with_context(|| format!("auto-login for {profile}"))?;
+    Ok((Some(machine), offer_save))
 }
 
 /// Stores a profile's password in the OS keyring. Reads it with the

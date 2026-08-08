@@ -122,6 +122,38 @@ pub fn forget_password(profile: &str) -> Result<bool> {
     }
 }
 
+/// Profiles whose player turned down the offer to save a typed password,
+/// one name per line. Only refusals need recording: a "yes" is remembered
+/// by the keyring entry it creates.
+const DECLINED_FILE: &str = "keyring_declined";
+
+/// Whether this profile's player already said no to saving a password. An
+/// unreadable file reads as "not asked" — the cost is one more question,
+/// and refusing to ask because a file is missing is the worse failure.
+pub fn password_save_declined(dir: &Path, profile: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(dir.join(DECLINED_FILE)) else {
+        return false;
+    };
+    text.lines().any(|line| line.trim() == profile)
+}
+
+/// Records a refusal, so the offer is made once per profile and not once
+/// per login.
+pub fn decline_password_save(dir: &Path, profile: &str) -> Result<()> {
+    if password_save_declined(dir, profile) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(DECLINED_FILE);
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(profile);
+    text.push('\n');
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+}
+
 /// How a session treats commands other sessions inject into it (§7.5).
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1069,5 +1101,26 @@ triggers:
         let merged = install.with_override(profile.cross_session);
         assert!(merged.expand_aliases);
         assert_eq!(merged.max_hops, 3, "unnamed fields keep the install value");
+    }
+
+    /// A refusal is per profile, and recording one twice must not turn the
+    /// file into a growing list of the same name.
+    #[test]
+    fn a_refusal_is_recorded_per_profile_and_only_once() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+
+        assert!(!password_save_declined(dir, "kestrel"));
+        decline_password_save(dir, "kestrel").unwrap();
+        decline_password_save(dir, "kestrel").unwrap();
+        decline_password_save(dir, "tank").unwrap();
+
+        assert!(password_save_declined(dir, "kestrel"));
+        assert!(password_save_declined(dir, "tank"));
+        assert!(!password_save_declined(dir, "cleric"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(DECLINED_FILE)).unwrap(),
+            "kestrel\ntank\n"
+        );
     }
 }

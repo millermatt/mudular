@@ -707,6 +707,24 @@ is shaped by what must never happen rather than by convenience.
   would put the secret in shell history; `--forget-password <profile>`
   deletes it again. A missing entry is not an error
   — the name is still sent and the pane says why the rest didn't happen.
+- **The keyring can also fill itself from an ordinary login.** With a
+  `login:` block and nothing stored, the first line typed at a masked
+  prompt is offered to the keyring (`y`/`n`) once per session. The offer
+  is made once per profile: a "yes" is remembered by the entry it creates,
+  and a "no" by a line in `<config dir>/keyring_declined`. The password is
+  held in memory only between the send and the answer, and travels no
+  further — it is a masked line, so it is already excluded from scrollback,
+  history, and logs. Setting it up ahead of time should be an option, not
+  a prerequisite; the alternative is a client where auto-login is a feature
+  people discover after they stop needing it.
+- **A re-masked prompt withdraws the offer.** The server asking to hide
+  input again, with an answer still outstanding, means it re-prompted and
+  so rejected what it was given; storing that would break the next login
+  instead of automating it. This is the only "did it work?" signal every
+  MUD emits — GMCP's `Char.Name` (sent on login) and Aardwolf's
+  `char.status.state` are genuine success acks, but gating the offer on
+  them needs a timer for servers that send neither. The seam is here if
+  that changes; the negative signal covers the case that matters.
 - **A small forward-only state machine** (name → password → done) drives
   it, sans-IO in `session::login` and fed the lines, prompts, and ECHO
   events the pipeline already produces. Each step fires at most once, and

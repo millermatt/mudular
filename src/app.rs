@@ -22,7 +22,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use ratatui::style::Color;
 
-use crate::config::{Channel, CrossSession, Keybinds};
+use crate::config::{self, Channel, CrossSession, Keybinds};
 use crate::engine::Engine;
 use crate::proto::charset::Charset;
 use crate::session::{self, SessionCommand, SessionEvent};
@@ -62,6 +62,10 @@ pub struct ConnectTarget {
     pub color: Option<Color>,
     /// Answers the server's opening prompts, if the profile asked for it.
     pub login: Option<session::login::Autologin>,
+    /// Offer to keep the password the player types at the login prompt
+    /// (docs/ARCHITECTURE.md §13), so a stored password does not have to be
+    /// set up ahead of time.
+    pub offer_password_save: bool,
 }
 
 /// Where a session's rules came from, so `/reload` can recompile them from
@@ -117,6 +121,13 @@ pub struct SessionPane {
     commands: mpsc::Sender<SessionCommand>,
     /// Rule provenance for `/reload`.
     rules: (PathBuf, Option<String>),
+    /// Whether a password typed here should still be offered to the keyring
+    /// (§13). Cleared once the offer has been made, so it happens once.
+    offer_password_save: bool,
+    /// A password typed at a masked prompt, held only until the player
+    /// answers the offer to save it. Never echoed, recalled, or logged —
+    /// the same rule that keeps it out of scrollback and history.
+    pending_password: Option<String>,
     cross: CrossSession,
     /// Last pane size reported to the server, so a redraw that did not
     /// change this pane sends no NAWS (docs/ARCHITECTURE.md §6.2).
@@ -472,7 +483,19 @@ fn apply_session_event(
             (false, Vec::new())
         }
         SessionEvent::EchoMask(masked) => {
-            state.sessions[index].masked = masked;
+            let session = &mut state.sessions[index];
+            session.masked = masked;
+            // Being asked to hide typing again, with a password still
+            // waiting on an answer, means the server re-prompted: the one
+            // it was just given was wrong. Withdraw the offer rather than
+            // let the player save a password that doesn't work (§13).
+            if masked && session.pending_password.take().is_some() {
+                session.push_line(
+                    "** not saved: that password was rejected, so there is \
+                     nothing worth keeping"
+                        .to_string(),
+                );
+            }
             (false, Vec::new())
         }
         SessionEvent::Gmcp { package, payload } => {
@@ -572,6 +595,8 @@ fn connect(target: ConnectTarget, history_limit: usize) -> SessionPane {
         events: Some(events),
         commands,
         rules: (config_dir, profile),
+        offer_password_save: target.offer_password_save,
+        pending_password: None,
         cross: target.cross,
         last_size: None,
     }
@@ -750,6 +775,26 @@ fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
+    // An unanswered save-password offer owns `y` and `n`, and nothing else:
+    // any other key drops the held password and goes on to the input line,
+    // so a stray keystroke costs the offer rather than trapping the player.
+    if let Some(session) = state.bound_mut()
+        && session.pending_password.is_some()
+    {
+        match code {
+            // `true` only to consume the key, as the help overlay does:
+            // the answer must not also land in the input line.
+            KeyCode::Char('y' | 'Y') => {
+                answer_password_offer(session, true);
+                return true;
+            }
+            KeyCode::Char('n' | 'N') => {
+                answer_password_offer(session, false);
+                return true;
+            }
+            _ => session.pending_password = None,
+        }
+    }
     // While the overlay is up it owns the keyboard: any key dismisses it and
     // goes no further. Typing blind into an input line hidden behind the
     // help is worse than the extra keystroke to reopen it (§11.2).
@@ -798,6 +843,31 @@ fn handle_key(
     false
 }
 
+/// Acts on the answer to the save-password offer: `y` stores the held
+/// password in the keyring, `n` records the refusal so the offer is made
+/// once per profile rather than once per login (§13). A keyring or file
+/// error is reported in the pane — the player is logged in either way, and
+/// ending the session over it would help nobody.
+fn answer_password_offer(session: &mut SessionPane, save: bool) {
+    let Some(password) = session.pending_password.take() else {
+        return;
+    };
+    // The offer is only armed for profile sessions, which always have one.
+    let Some(profile) = session.rules.1.clone() else {
+        return;
+    };
+    let outcome = if save {
+        config::store_password(&profile, &password)
+            .map(|()| format!("** password saved in the keyring for `{profile}`"))
+    } else {
+        config::decline_password_save(&session.rules.0, &profile).map(|()| {
+            format!("** not saved; run `mudular --set-password {profile}` to change that")
+        })
+    };
+    let line = outcome.unwrap_or_else(|err| format!("** {err:#}"));
+    session.push_line(line);
+}
+
 /// Sends the bound session's input line. Always the bound session, never
 /// the focused pane: focusing comms must not redirect commands (§11.1).
 async fn submit_input(state: &mut AppState, channels: &[Channel]) {
@@ -815,6 +885,18 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     if !line.is_empty() && !session.masked {
         // Never echo what the server is masking.
         session.push_line(format!("> {line}"));
+    }
+    // A masked line at a login the profile wants automated is the password
+    // it is missing (§13). Offer to keep it rather than making the player
+    // find `--set-password`; it is held in memory only until they answer.
+    if session.offer_password_save && session.masked && !line.is_empty() {
+        session.offer_password_save = false;
+        session.pending_password = Some(line.clone());
+        let profile = session.rules.1.clone().unwrap_or_default();
+        session.push_line(format!(
+            "** Save this password in the OS keyring for `{profile}`, \
+             so it logs you in next time? (y/n)"
+        ));
     }
     if line.trim() == HELP_COMMAND {
         let lines = ui::help_lines(&state.keybinds);
@@ -864,6 +946,8 @@ pub(crate) mod test_support {
                 events: None,
                 commands: tx,
                 rules: (PathBuf::from("/cfg"), None),
+                offer_password_save: false,
+                pending_password: None,
                 cross: CrossSession::default(),
                 last_size: None,
             },
@@ -1597,6 +1681,133 @@ mod tests {
         let session = &mut state.sessions[0];
         assert!(session.walk_history(true));
         assert_eq!(session.input.value(), "look");
+    }
+
+    // ---- offering to keep a typed password (docs/ARCHITECTURE.md §13) ----
+
+    /// A session for a profile that wants auto-login but has nothing stored,
+    /// sitting at a masked prompt.
+    fn armed(dir: &std::path::Path) -> (AppState, Vec<mpsc::Receiver<SessionCommand>>) {
+        let (mut state, receivers) = app(&["kestrel"]);
+        let session = &mut state.sessions[0];
+        session.rules = (dir.to_path_buf(), Some("kestrel".to_string()));
+        session.offer_password_save = true;
+        session.masked = true;
+        (state, receivers)
+    }
+
+    #[tokio::test]
+    async fn a_masked_login_password_is_offered_to_the_keyring() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, mut receivers) = armed(dir.path());
+
+        submit(&mut state, "hunter2").await;
+
+        assert!(
+            scrollback(&state.sessions[0]).contains("(y/n)"),
+            "{:?}",
+            scrollback(&state.sessions[0])
+        );
+        assert!(
+            matches!(receivers[0].try_recv(), Ok(SessionCommand::SendLine(line)) if line == "hunter2"),
+            "the password must still reach the server; the offer is only an offer"
+        );
+
+        // Once per session: a second masked line is not another question.
+        state.sessions[0].pending_password = None;
+        state.sessions[0].scrollback.clear();
+        submit(&mut state, "again").await;
+        assert!(state.sessions[0].pending_password.is_none());
+    }
+
+    /// Only the masked prompt is a password. Ordinary commands must never be
+    /// offered to the keyring.
+    #[tokio::test]
+    async fn an_unmasked_line_is_never_taken_for_a_password() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = armed(dir.path());
+        state.sessions[0].masked = false;
+
+        submit(&mut state, "look").await;
+
+        assert!(state.sessions[0].pending_password.is_none());
+        assert!(state.sessions[0].offer_password_save);
+    }
+
+    /// "No" is remembered, so the offer costs one question per profile
+    /// rather than one per login.
+    #[tokio::test]
+    async fn refusing_is_recorded_against_the_profile() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = armed(dir.path());
+        submit(&mut state, "hunter2").await;
+
+        assert!(press(&mut state, KeyCode::Char('n'), KeyModifiers::NONE));
+
+        assert!(state.sessions[0].pending_password.is_none());
+        assert!(crate::config::password_save_declined(dir.path(), "kestrel"));
+    }
+
+    /// The server hiding input again means it re-prompted, which means the
+    /// password it was just given was wrong. Saving that would break the
+    /// next login rather than automate it.
+    #[tokio::test]
+    async fn a_rejected_password_is_never_offered_to_the_keyring() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = armed(dir.path());
+        submit(&mut state, "wrong").await;
+
+        // The password prompt ends, then the MUD asks for one again.
+        apply_session_event(&mut state, 0, SessionEvent::EchoMask(false));
+        apply_session_event(&mut state, 0, SessionEvent::EchoMask(true));
+
+        assert!(state.sessions[0].pending_password.is_none());
+        assert!(
+            scrollback(&state.sessions[0]).contains("rejected"),
+            "{:?}",
+            scrollback(&state.sessions[0])
+        );
+        // A withdrawn offer is not a refusal: nothing was answered.
+        assert!(!crate::config::password_save_declined(
+            dir.path(),
+            "kestrel"
+        ));
+    }
+
+    /// The offer only exists to fill an empty keyring. A profile whose
+    /// password was already stored with `--set-password` is never armed,
+    /// so nothing asks about the password it types at a masked prompt.
+    #[tokio::test]
+    async fn a_profile_with_a_stored_password_is_never_asked() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = armed(dir.path());
+        // What `autologin` produces when the keyring already has one.
+        state.sessions[0].offer_password_save = false;
+
+        submit(&mut state, "hunter2").await;
+
+        assert!(state.sessions[0].pending_password.is_none());
+        assert!(state.sessions[0].scrollback.is_empty());
+    }
+
+    /// A stray keystroke must not answer the question, and must not be read
+    /// as a refusal either — it just drops the held password.
+    #[tokio::test]
+    async fn a_stray_key_drops_the_offer_without_recording_a_refusal() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = armed(dir.path());
+        submit(&mut state, "hunter2").await;
+
+        assert!(
+            !press(&mut state, KeyCode::Char('k'), KeyModifiers::NONE),
+            "an unrelated key still belongs to the input line"
+        );
+
+        assert!(state.sessions[0].pending_password.is_none());
+        assert!(!crate::config::password_save_declined(
+            dir.path(),
+            "kestrel"
+        ));
     }
 
     #[tokio::test]

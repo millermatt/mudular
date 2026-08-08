@@ -76,6 +76,28 @@ drop it again with:
 mudular --forget-password kestrel
 ```
 
+You don't have to set it up in advance, though. The first time you log in
+on a profile with a `login:` block and nothing stored, mudular sends your
+character name, you type the password as usual, and the pane asks:
+
+```
+** Save this password in the OS keyring for `kestrel`, so it logs you in
+   next time? (y/n)
+```
+
+`y` stores it — the next login is automatic. `n` is remembered, and you
+are not asked again for that profile; the refusal is a line in
+`<config dir>/keyring_declined`, so deleting it puts the offer back. Any
+other key just dismisses the question, and it comes back next login. The
+password is only offered once per session, and only for what you type at
+a masked prompt.
+
+If the MUD rejects the password and asks for another, the question is
+withdrawn before you can answer it — a password that didn't work is not
+worth keeping. You are only ever asked about a profile with nothing
+stored: once `--set-password` or a `y` has put one in the keyring,
+nothing asks again.
+
 If your MUD's prompts aren't recognised, override them with regexes:
 
 ```yaml
