@@ -32,6 +32,11 @@ use crate::ui;
 /// bounded so a chatty MUD can't grow it without limit.
 const GMCP_LOG_LIMIT: usize = 1_000;
 
+/// Columns the channel column grows or shrinks per press (§11.4). One column
+/// a press makes a real adjustment a dozen keystrokes; two lands on a usable
+/// width in a few.
+const CHANNEL_WIDTH_STEP: u16 = 2;
+
 /// Rows `PgUp`/`PgDn` move per press. Exact viewport-height paging would
 /// need pane geometry threaded back from the UI layer into `AppState`; a
 /// fixed step is the ordinary simplification most pagers make too
@@ -272,6 +277,10 @@ pub struct AppState {
     pub input_session: usize,
     pub layout: LayoutMode,
     pub show_channels: bool,
+    /// Live width of the channel column, in columns. State, not layout:
+    /// `ui::layout` recomputes every rect from it each frame, and the keys
+    /// only move this number (docs/ARCHITECTURE.md §11.4).
+    pub channel_width: u16,
     /// Whether the focused session's pane shows `gmcp_log` instead of its
     /// scrollback.
     pub show_gmcp: bool,
@@ -660,6 +669,7 @@ pub async fn run(
     channels: Vec<Channel>,
     history_size: usize,
     scrollback_size: usize,
+    channel_width: u16,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let result = event_loop(
@@ -669,6 +679,7 @@ pub async fn run(
         channels,
         history_size,
         scrollback_size,
+        channel_width,
     )
     .await;
     ratatui::restore();
@@ -781,6 +792,7 @@ async fn event_loop(
     channels: Vec<Channel>,
     history_size: usize,
     scrollback_size: usize,
+    channel_width: u16,
 ) -> Result<()> {
     // Every session publishes a snapshot of its state and reads every
     // other session's (§7.5). The channels are made up front, so a session
@@ -839,10 +851,15 @@ async fn event_loop(
         input_session: 0,
         layout: LayoutMode::Tabs,
         show_channels: !channels.is_empty(),
+        channel_width,
         show_gmcp: false,
         show_help: false,
         keybinds: keybinds.clone(),
     };
+    // A config value wider than this terminal is clamped before the first
+    // frame, the same as a `Resize` clamps it later (§11.4).
+    state.channel_width =
+        ui::clamp_channel_width(state.channel_width, terminal.get_frame().area().width);
 
     if !has_sessions {
         // Nothing to drive the loop but the terminal; the empty-state help
@@ -867,7 +884,8 @@ async fn event_loop(
                 if keybinds.quit.matches(key.code, key.modifiers) {
                     return Ok(());
                 }
-                if handle_key(&mut state, &keybinds, key.code, key.modifiers) {
+                let area_width = terminal.get_frame().area().width;
+                if handle_key(&mut state, &keybinds, key.code, key.modifiers, area_width) {
                     report_pane_sizes(&mut state, terminal.get_frame().area()).await;
                 } else if key.code == KeyCode::Enter {
                     submit_input(&mut state, &channels).await;
@@ -895,6 +913,10 @@ async fn event_loop(
             }
             Wake::Terminal(Some(Ok(Event::Resize(cols, rows)))) => {
                 let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+                // A narrower terminal can leave the column wider than the
+                // session area can spare, so the width re-clamps on every
+                // resize before the sizes are reported (§11.4).
+                state.channel_width = ui::clamp_channel_width(state.channel_width, area.width);
                 report_pane_sizes(&mut state, area).await;
             }
             Wake::Terminal(Some(Ok(_))) => {}
@@ -942,11 +964,14 @@ fn try_recv(state: &mut AppState, index: usize) -> Option<SessionEvent> {
 
 /// Handles the layout/focus keys. Returns `true` when the key changed which
 /// panes are on screen, so the caller can re-report NAWS sizes.
+/// `area_width` is the terminal's current width, which bounds how wide the
+/// channel column may grow (§11.4).
 fn handle_key(
     state: &mut AppState,
     keybinds: &Keybinds,
     code: KeyCode,
     modifiers: KeyModifiers,
+    area_width: u16,
 ) -> bool {
     // An unanswered save-password offer owns `y` and `n`, and nothing else:
     // any other key drops the held password and goes on to the input line,
@@ -1000,6 +1025,23 @@ fn handle_key(
         if !state.show_channels && matches!(state.focus, Focus::Channel(_)) {
             state.focus_pane(Focus::Session(state.input_session));
         }
+        return true;
+    }
+    // Resizing the column resizes the session panes beside it, so both keys
+    // report `true` and the caller re-reports NAWS (§6.2, §11.4). A press
+    // that is already at a limit stops there rather than hiding a pane.
+    if keybinds.channel_wider.matches(code, modifiers) {
+        state.channel_width = ui::clamp_channel_width(
+            state.channel_width.saturating_add(CHANNEL_WIDTH_STEP),
+            area_width,
+        );
+        return true;
+    }
+    if keybinds.channel_narrower.matches(code, modifiers) {
+        state.channel_width = ui::clamp_channel_width(
+            state.channel_width.saturating_sub(CHANNEL_WIDTH_STEP),
+            area_width,
+        );
         return true;
     }
     // Alt+1..9 jumps straight to a session (§11).
@@ -1149,6 +1191,7 @@ pub(crate) mod test_support {
                 input_session: 0,
                 layout: LayoutMode::Tabs,
                 show_channels: false,
+                channel_width: crate::ui::CHANNEL_WIDTH,
                 show_gmcp: false,
                 show_help: false,
                 keybinds: Keybinds::default(),
@@ -1779,6 +1822,8 @@ mod tests {
             &keybinds.focus_next,
             &keybinds.cycle_layout,
             &keybinds.toggle_channels,
+            &keybinds.channel_wider,
+            &keybinds.channel_narrower,
             &keybinds.help,
         ] {
             assert!(
@@ -2113,7 +2158,9 @@ mod tests {
     // ---- keys (docs/ARCHITECTURE.md §11) ----
 
     fn press(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        handle_key(state, &Keybinds::default(), code, modifiers)
+        // Wide enough that the channel-width clamp never binds by accident;
+        // the tests that care about the ceiling pass their own width.
+        handle_key(state, &Keybinds::default(), code, modifiers, 120)
     }
 
     #[test]
@@ -2144,6 +2191,51 @@ mod tests {
         assert_eq!(state.layout, LayoutMode::Splits);
         assert!(press(&mut state, KeyCode::F(3), KeyModifiers::NONE));
         assert_eq!(state.layout, LayoutMode::Tabs);
+    }
+
+    /// The width keys move `AppState`'s number and report `true`, so the
+    /// caller re-reports NAWS: the sessions beside the column are told their
+    /// new width (§6.2, §11.4).
+    #[test]
+    fn the_channel_width_keys_resize_the_column_and_ask_for_a_size_report() {
+        let (mut state, _rx) = app(&["tank"]);
+        let start = state.channel_width;
+
+        assert!(press(&mut state, KeyCode::Char('-'), KeyModifiers::ALT));
+        assert_eq!(state.channel_width, start + CHANNEL_WIDTH_STEP);
+        assert!(press(&mut state, KeyCode::Char('='), KeyModifiers::ALT));
+        assert_eq!(state.channel_width, start);
+    }
+
+    /// Narrowing stops at the floor rather than shrinking the column to
+    /// nothing, and widening stops before the session area goes under
+    /// `MIN_MAIN_WIDTH` — hiding channels is the toggle key's job (§11.4).
+    #[test]
+    fn the_channel_width_keys_stop_at_both_limits() {
+        let (mut state, _rx) = app(&["tank"]);
+        let keybinds = Keybinds::default();
+
+        state.channel_width = ui::MIN_CHANNEL_WIDTH;
+        assert!(handle_key(
+            &mut state,
+            &keybinds,
+            KeyCode::Char('='),
+            KeyModifiers::ALT,
+            120
+        ));
+        assert_eq!(state.channel_width, ui::MIN_CHANNEL_WIDTH);
+
+        // 60 columns wide leaves 30 for the column once the main area keeps
+        // its minimum; a press at 30 must not take a 31st.
+        state.channel_width = 30;
+        assert!(handle_key(
+            &mut state,
+            &keybinds,
+            KeyCode::Char('-'),
+            KeyModifiers::ALT,
+            60
+        ));
+        assert_eq!(state.channel_width, 30);
     }
 
     /// Hiding the channel column while a channel pane has focus must move

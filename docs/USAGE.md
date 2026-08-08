@@ -641,10 +641,11 @@ fallback.
 | `F1` | Show the help overlay: every key and client command, including any you've remapped. Any key closes it. | `help` |
 | `Ctrl+C` | Quit | `quit` |
 | `Alt+1` … `Alt+9` | Jump straight to session 1–9 | — (built in) |
-| `Ctrl+Tab` | Cycle focus to the next pane, including channel panes | `focus_next` |
+| `Ctrl+Tab` | Cycle focus to the next pane, including comms panes | `focus_next` |
 | `F2` | Toggle the raw GMCP inspector for the focused session — the messages the server is sending behind the scenes | `gmcp_inspector` |
 | `F3` | Switch between the tabbed and side-by-side layouts | `cycle_layout` |
-| `F4` | Show or hide the channel panes | `toggle_channels` |
+| `F4` | Show or hide comms | `toggle_channels` |
+| `Alt+-` / `Alt+=` | Widen / narrow the comms column | `channel_wider` / `channel_narrower` |
 | `PgUp` / `PgDn` | Scroll the focused pane back / forward through its scrollback | — (built in) |
 | `Home` / `End` | Jump to the oldest / newest line in the focused pane | — (built in) |
 
@@ -670,6 +671,8 @@ keybinds:
   gmcp_inspector: f2
   cycle_layout: f3
   toggle_channels: f4
+  channel_wider: "alt+-"
+  channel_narrower: "alt+="
   help: f1
 ```
 
@@ -686,6 +689,15 @@ cleric's input — and it records what you typed, before aliases expand, so
 input masked, nothing is stored and `Up` does nothing, so an old command
 can't be sent as your password. History is kept in memory only and is
 gone when you quit; nothing is written to disk.
+
+`channel_width:` (default 28) sets how wide the comms column starts.
+`Alt+-`/`Alt+=` resize it live for the rest of the session; neither the
+keys nor a terminal resize ever rewrite this file, so it's just the
+starting point:
+
+```yaml
+channel_width: 28
+```
 
 Keybindings are written as `modifier+modifier+key` — modifiers are
 `ctrl`, `alt`, and `shift`; keys are a single character (`c`), a function

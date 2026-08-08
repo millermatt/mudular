@@ -165,6 +165,7 @@ async fn main() -> Result<()> {
         channels,
         app_config.history_size,
         app_config.scrollback_size,
+        app_config.channel_width,
     )
     .await
 }

@@ -18,10 +18,28 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 use crate::app::{AppState, ChannelPane, Focus, LayoutMode};
 use crate::config::Keybinds;
 
-/// Width of the docked channel column, and the smallest main area worth
-/// keeping beside it — below that the channels are simply not drawn.
-const CHANNEL_WIDTH: u16 = 28;
+/// Default width of the docked channel column, and the smallest main area
+/// worth keeping beside it — below that the channels are simply not drawn.
+/// The live width is `AppState::channel_width`; this is only where it starts
+/// (docs/ARCHITECTURE.md §11.4).
+pub(crate) const CHANNEL_WIDTH: u16 = 28;
 const MIN_MAIN_WIDTH: u16 = 30;
+/// The narrowest the column may be resized to: enough for a channel name and
+/// a couple of words inside the border. Shrinking a pane to nothing is a way
+/// to lose a pane you cannot then find — hiding channels is what the toggle
+/// key is for (§11.4).
+pub(crate) const MIN_CHANNEL_WIDTH: u16 = 14;
+
+/// Clamps a requested channel width to what a terminal `area_width` wide can
+/// hold: never under `MIN_CHANNEL_WIDTH`, never so wide that the session area
+/// falls below `MIN_MAIN_WIDTH`. On a terminal too narrow for both, the floor
+/// wins and `layout` declines to draw the channels at all (§11.4).
+pub(crate) fn clamp_channel_width(width: u16, area_width: u16) -> u16 {
+    let max = area_width
+        .saturating_sub(MIN_MAIN_WIDTH)
+        .max(MIN_CHANNEL_WIDTH);
+    width.clamp(MIN_CHANNEL_WIDTH, max)
+}
 
 /// Column the descriptions start at in the help listing.
 const HELP_KEY_WIDTH: usize = 14;
@@ -45,11 +63,13 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         String::new(),
         "Characters".to_string(),
         row("Alt+1 … Alt+9", "jump to character 1-9"),
-        row(keybinds.focus_next, "cycle focus, channels included"),
+        row(keybinds.focus_next, "cycle focus, comms included"),
         String::new(),
         "Views".to_string(),
         row(keybinds.cycle_layout, "tabs / side-by-side layout"),
-        row(keybinds.toggle_channels, "show or hide channel panes"),
+        row(keybinds.toggle_channels, "show or hide comms"),
+        row(keybinds.channel_wider, "widen the comms column"),
+        row(keybinds.channel_narrower, "narrow the comms column"),
         row(keybinds.gmcp_inspector, "raw GMCP inspector"),
         row(keybinds.help, "this help"),
         String::new(),
@@ -89,11 +109,11 @@ pub fn layout(area: Rect, state: &AppState) -> Panes {
 
     let show_channels = state.show_channels
         && !state.channels.is_empty()
-        && body.width >= MIN_MAIN_WIDTH + CHANNEL_WIDTH;
+        && body.width >= MIN_MAIN_WIDTH + state.channel_width;
     let (main, channel_column) = if show_channels {
         let [main, column] = Layout::horizontal([
             Constraint::Min(MIN_MAIN_WIDTH),
-            Constraint::Length(CHANNEL_WIDTH),
+            Constraint::Length(state.channel_width),
         ])
         .areas(body);
         (main, Some(column))
@@ -805,6 +825,75 @@ mod tests {
         let joined: String = (0..12).map(|y| row(&buffer, y)).collect();
         assert!(joined.contains("comms ●2"), "{joined}");
         assert!(joined.contains("Bob tells you hi"), "{joined}");
+    }
+
+    /// The column's width comes from `AppState`, not the constant — that is
+    /// the whole point of §11.4's "state, not layout", and the session panes
+    /// beside it give up exactly what the column takes.
+    #[test]
+    fn the_channel_column_takes_its_width_from_state() {
+        let mut state = state();
+        state.channels.push(ChannelPane {
+            config: test_support::channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        });
+        state.show_channels = true;
+        let area = Rect::new(0, 0, 80, 12);
+
+        state.channel_width = 40;
+        let panes = layout(area, &state);
+        assert_eq!(panes.channels[0].width, 40);
+        assert_eq!(
+            panes.sessions[0].width, 40,
+            "the main area gives up the rest"
+        );
+
+        state.channel_width = MIN_CHANNEL_WIDTH;
+        let panes = layout(area, &state);
+        assert_eq!(panes.channels[0].width, MIN_CHANNEL_WIDTH);
+    }
+
+    /// Clamps, not disappearances (§11.4): the width never falls below the
+    /// floor nor squeezes the session area under `MIN_MAIN_WIDTH`, and a
+    /// terminal too narrow for both drops the channels entirely rather than
+    /// drawing a sliver of each.
+    #[test]
+    fn the_channel_width_clamps_and_the_column_vanishes_on_a_narrow_terminal() {
+        assert_eq!(clamp_channel_width(2, 200), MIN_CHANNEL_WIDTH);
+        assert_eq!(clamp_channel_width(500, 100), 100 - MIN_MAIN_WIDTH);
+        assert_eq!(
+            clamp_channel_width(28, 100),
+            28,
+            "a fitting width is left alone"
+        );
+        // Narrower than the floor plus a usable main area: the floor wins,
+        // and `layout` is what declines to draw the column.
+        assert_eq!(clamp_channel_width(28, 20), MIN_CHANNEL_WIDTH);
+
+        let mut state = state();
+        state.channels.push(ChannelPane {
+            config: test_support::channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        });
+        state.show_channels = true;
+        state.channel_width = MIN_CHANNEL_WIDTH;
+
+        let wide = layout(
+            Rect::new(0, 0, MIN_MAIN_WIDTH + MIN_CHANNEL_WIDTH, 12),
+            &state,
+        );
+        assert_eq!(wide.channels.len(), 1);
+        let narrow = layout(
+            Rect::new(0, 0, MIN_MAIN_WIDTH + MIN_CHANNEL_WIDTH - 1, 12),
+            &state,
+        );
+        assert!(narrow.channels.is_empty(), "channels are not drawn at all");
     }
 
     /// One draw of a static, already-overflowing state: exercises the

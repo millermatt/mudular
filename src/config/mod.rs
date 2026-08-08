@@ -283,6 +283,10 @@ pub struct AppConfig {
     /// Lines kept per pane's scrollback buffer (docs/ARCHITECTURE.md §8).
     #[serde(default = "default_scrollback_size")]
     pub scrollback_size: usize,
+    /// Starting width of the docked channel column (docs/ARCHITECTURE.md
+    /// §11.4). The keybinds move it from here; nothing writes it back.
+    #[serde(default = "default_channel_width")]
+    pub channel_width: u16,
 }
 
 /// Hand-written rather than derived: a derived `Default` would give a
@@ -296,6 +300,7 @@ impl Default for AppConfig {
             cross_session: CrossSession::default(),
             history_size: default_history_size(),
             scrollback_size: default_scrollback_size(),
+            channel_width: default_channel_width(),
         }
     }
 }
@@ -306,6 +311,10 @@ fn default_history_size() -> usize {
 
 fn default_scrollback_size() -> usize {
     10_000
+}
+
+fn default_channel_width() -> u16 {
+    crate::ui::CHANNEL_WIDTH
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -327,6 +336,12 @@ pub struct Keybinds {
     /// Shows or hides the channel panes (§11.1).
     #[serde(default = "default_toggle_channels")]
     pub toggle_channels: KeyBinding,
+    /// Widens the channel column (§11.4).
+    #[serde(default = "default_channel_wider")]
+    pub channel_wider: KeyBinding,
+    /// Narrows the channel column (§11.4).
+    #[serde(default = "default_channel_narrower")]
+    pub channel_narrower: KeyBinding,
     /// Opens the help overlay listing every binding (§11.2).
     #[serde(default = "default_help")]
     pub help: KeyBinding,
@@ -340,6 +355,8 @@ impl Default for Keybinds {
             focus_next: default_focus_next(),
             cycle_layout: default_cycle_layout(),
             toggle_channels: default_toggle_channels(),
+            channel_wider: default_channel_wider(),
+            channel_narrower: default_channel_narrower(),
             help: default_help(),
         }
     }
@@ -355,6 +372,23 @@ fn default_cycle_layout() -> KeyBinding {
 
 fn default_toggle_channels() -> KeyBinding {
     "f4".parse().expect("built-in default keybinding")
+}
+
+/// `Alt+-`/`Alt+=` — the channel column is the rightmost pane, so widening
+/// it moves its left edge left and narrowing moves it right; the keys sit
+/// left-to-right on the keyboard the same way, `-` widening and `=`
+/// narrowing. Alt keeps them clear of the F-key toggles and of Ctrl+arrow,
+/// which the binding parser does not name. Not `Alt+[`/`Alt+]`: those
+/// bytes (`ESC` `[`) are the ANSI CSI prefix, the same ones many terminals
+/// send for arrow keys and friends, so terminals resolve the ambiguity
+/// inconsistently — some report it as Alt+`[`, others hand back a bare
+/// `[` once the escape times out with nothing CSI-shaped following it.
+fn default_channel_wider() -> KeyBinding {
+    "alt+-".parse().expect("built-in default keybinding")
+}
+
+fn default_channel_narrower() -> KeyBinding {
+    "alt+=".parse().expect("built-in default keybinding")
 }
 
 fn default_help() -> KeyBinding {
@@ -781,6 +815,24 @@ mod tests {
 
         std::fs::write(dir.join("mudular.yaml"), "scrollback_size: 20\n").unwrap();
         assert_eq!(load_app_config(&dir).unwrap().scrollback_size, 20);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mirrors the two above for the channel column's starting width: a
+    /// config-less install gets the built-in 28, not a zero-width column
+    /// (docs/ARCHITECTURE.md §11.4).
+    #[test]
+    fn channel_width_defaults_with_and_without_a_config_file() {
+        let dir = std::env::temp_dir().join(format!("mudular-cfg5-{}", std::process::id()));
+        assert_eq!(load_app_config(&dir).unwrap().channel_width, 28);
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mudular.yaml"), "keybinds:\n  quit: ctrl+q\n").unwrap();
+        assert_eq!(load_app_config(&dir).unwrap().channel_width, 28);
+
+        std::fs::write(dir.join("mudular.yaml"), "channel_width: 40\n").unwrap();
+        assert_eq!(load_app_config(&dir).unwrap().channel_width, 40);
 
         std::fs::remove_dir_all(&dir).ok();
     }
