@@ -394,7 +394,7 @@ fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: b
 }
 
 /// `↑ scrolled` when a pane isn't pinned to the tail — distinct from the
-/// unread badge (`●N`), and shown even on a focused pane, which the unread
+/// unread badge (`● N`), and shown even on a focused pane, which the unread
 /// badge deliberately never marks: unread means "you haven't looked",
 /// scrolled means "you're looking at something old right now"
 /// (docs/ARCHITECTURE.md §11.5).
@@ -491,12 +491,15 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.set_cursor_position((area.x + 1 + cursor, area.y + 1));
 }
 
-/// `name ●3` — the unread badge for a pane that isn't focused (§11).
+/// `name ● 3` — the unread badge for a pane that isn't focused (§11). The
+/// space before the count matters: `●` commonly renders wider than the
+/// single cell it's measured as, and packed straight against a digit it
+/// visually collides with it in most terminal fonts.
 fn pane_title(name: &str, unread: usize) -> String {
     if unread == 0 {
         format!(" {name}")
     } else {
-        format!(" {name} ●{unread}")
+        format!(" {name} ● {unread}")
     }
 }
 
@@ -868,7 +871,7 @@ mod tests {
         state.sessions[1].unread = 3;
 
         let buffer = render_sized(&state, 60, 12);
-        assert!(row(&buffer, 0).contains("●3"), "{:?}", row(&buffer, 0));
+        assert!(row(&buffer, 0).contains("● 3"), "{:?}", row(&buffer, 0));
     }
 
     /// Focusing a channel pane must not change where typing goes, and the
@@ -910,7 +913,7 @@ mod tests {
 
         let buffer = render_sized(&state, 70, 12);
         let joined: String = (0..12).map(|y| row(&buffer, y)).collect();
-        assert!(joined.contains("comms ●2"), "{joined}");
+        assert!(joined.contains("comms ● 2"), "{joined}");
         assert!(joined.contains("Bob tells you hi"), "{joined}");
     }
 
