@@ -368,14 +368,12 @@ impl AppState {
     /// Resolves a `send_to` address and produces the injections to deliver.
     /// Anything undeliverable is reported in the *originating* pane, so a
     /// rule that quietly does nothing is impossible (§7.5).
-    fn route_send_to(
-        &mut self,
-        from: usize,
-        target: &str,
-        lines: Vec<String>,
-        hops: u8,
-    ) -> Vec<(usize, SessionCommand)> {
-        let matched: Vec<usize> = if target == ALL_SESSIONS {
+    /// The sessions an address names (§7.5): one by name, or every other
+    /// session for `*`. Never the sender — `*` means "the others", and a
+    /// session addressing itself by name would be talking to the pane it
+    /// is already writing to.
+    fn addressed(&self, from: usize, target: &str) -> Vec<usize> {
+        if target == ALL_SESSIONS {
             (0..self.sessions.len()).filter(|&i| i != from).collect()
         } else {
             self.sessions
@@ -384,7 +382,38 @@ impl AppState {
                 .filter(|&index| index != from)
                 .into_iter()
                 .collect()
-        };
+        }
+    }
+
+    /// Writes a script's cross-session echo straight into the addressed
+    /// panes (§7.5). Nothing runs at the far end, so there is no hop limit
+    /// to apply and no reason to care whether that session is still
+    /// connected — its pane is still on screen, and text is the one thing
+    /// it can still show. The `[from x]` tag is the same one an injected
+    /// command carries: nothing another session does to this one may
+    /// happen anonymously.
+    fn route_echo_to(&mut self, from: usize, target: &str, text: String) {
+        let matched = self.addressed(from, target);
+        if matched.is_empty() {
+            let notice = format!("** echo_to: no session named `{target}`");
+            self.sessions[from].push_line(notice);
+            return;
+        }
+
+        let name = self.sessions[from].name.clone();
+        for index in matched {
+            self.sessions[index].push_line(format!("[from {name}] {text}"));
+        }
+    }
+
+    fn route_send_to(
+        &mut self,
+        from: usize,
+        target: &str,
+        lines: Vec<String>,
+        hops: u8,
+    ) -> Vec<(usize, SessionCommand)> {
+        let matched = self.addressed(from, target);
 
         if matched.is_empty() {
             let notice = format!("** send_to: no session named `{target}`");
@@ -478,6 +507,10 @@ fn apply_session_event(
             lines,
             hops,
         } => (false, state.route_send_to(index, &target, lines, hops)),
+        SessionEvent::EchoTo { target, text } => {
+            state.route_echo_to(index, &target, text);
+            (false, Vec::new())
+        }
         SessionEvent::Prompt(text) => {
             state.sessions[index].prompt = text;
             (false, Vec::new())
@@ -1350,6 +1383,50 @@ mod tests {
             },
         );
         assert!(state.channels.is_empty());
+    }
+
+    // ---- cross-session echo_to (§7.5) ----
+
+    /// A script's `mud.session("cleric"):echo(text)` reaches that pane and
+    /// no other, tagged with the character it came from.
+    #[test]
+    fn echo_to_writes_only_the_named_session_pane() {
+        let (mut state, _rx) = app(&["tank", "cleric", "mage"]);
+
+        let (_, commands) = apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::EchoTo {
+                target: "cleric".into(),
+                text: "he is about to fall".into(),
+            },
+        );
+
+        // Display-only: nothing is asked of the target session.
+        assert!(commands.is_empty(), "{commands:?}");
+        assert_eq!(
+            state.sessions[1].scrollback.back().map(String::as_str),
+            Some("[from tank] he is about to fall")
+        );
+        assert!(state.sessions[0].scrollback.is_empty(), "not the sender");
+        assert!(state.sessions[2].scrollback.is_empty(), "not a bystander");
+    }
+
+    #[test]
+    fn echo_to_an_unknown_session_warns_in_the_origin_pane() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::EchoTo {
+                target: "ghost".into(),
+                text: "anyone there".into(),
+            },
+        );
+
+        let notice = state.sessions[0].scrollback.back().expect("a notice");
+        assert!(notice.contains("ghost"), "{notice}");
     }
 
     // ---- cross-session send_to (§7.5) ----

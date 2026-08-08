@@ -214,6 +214,9 @@ pub struct LineOutcome {
     pub route: Option<String>,
     /// Text a script asked to show in this session only (§7.4).
     pub echoes: Vec<String>,
+    /// Text a script asked to show in *another* session's pane, by the
+    /// name that addresses it (§7.5). Display-only.
+    pub echo_to: Vec<(String, String)>,
     /// Replacement text for the line, from a script's `mud.substitute`.
     pub substitute: Option<String>,
 }
@@ -227,6 +230,8 @@ pub struct InputOutcome {
     pub send_to: Vec<CrossSend>,
     /// Text a script action asked to show in this session only (§7.4).
     pub echoes: Vec<String>,
+    /// Text for another session's pane (§7.5).
+    pub echo_to: Vec<(String, String)>,
 }
 
 /// What one session publishes about itself for the others to read (§7.5):
@@ -292,6 +297,15 @@ impl CompiledRule {
     }
 }
 
+/// One armed `mud.timer` callback: which host issued it, that host's id
+/// for the callback, and when it comes due.
+#[derive(Debug)]
+struct ScriptTimer {
+    host: usize,
+    id: u64,
+    at: Instant,
+}
+
 #[derive(Debug)]
 struct CompiledTimer {
     interval: Duration,
@@ -324,6 +338,10 @@ pub struct Engine {
     /// The last snapshot each peer was seen at, so a change can be
     /// reported as the keys that moved rather than as "something did".
     peers_seen: HashMap<String, PeerSnapshot>,
+    /// Timers scripts armed with `mud.timer`, alongside the YAML ones
+    /// (§7.4). The engine holds the deadlines and the session does the
+    /// sleeping, exactly as for `timers:`.
+    script_timers: Vec<ScriptTimer>,
     /// Whether this session's own state has moved since it last published.
     /// Snapshots are values, so publishing copies the stores; doing it only
     /// on change keeps a quiet session free.
@@ -361,6 +379,7 @@ impl Engine {
             hosts,
             peers: Peers::new(),
             peers_seen: HashMap::new(),
+            script_timers: Vec::new(),
             changed: false,
         })
     }
@@ -409,6 +428,8 @@ impl Engine {
             peers: std::mem::take(&mut self.peers),
             out: ScriptOutcome::default(),
         };
+        let mut armed: Vec<ScriptTimer> = Vec::new();
+        let now = Instant::now();
         for (index, entry) in self.hosts.iter_mut().enumerate() {
             if only.is_some_and(|wanted| wanted != index) {
                 continue;
@@ -416,7 +437,15 @@ impl Engine {
             if let Err(err) = entry.host.call(hook, &mut ctx) {
                 ctx.out.echoes.push(format!("** {err}"));
             }
+            // Drained per host: an id means nothing outside the host that
+            // issued it.
+            armed.extend(ctx.out.timers.drain(..).map(|(id, after)| ScriptTimer {
+                host: index,
+                id,
+                at: now + after,
+            }));
         }
+        self.script_timers.extend(armed);
         self.variables = ctx.vars;
         self.server_data = ctx.server_data;
         self.peers = ctx.peers;
@@ -574,6 +603,7 @@ impl Engine {
         merge(&mut scripted, self.run_hook(&Hook::Line(line.to_string())));
         outcome.sends.extend(scripted.sends);
         outcome.send_to.extend(cross_sends(scripted.send_to));
+        outcome.echo_to = scripted.echo_to;
         outcome.echoes = scripted.echoes;
         outcome.gag |= scripted.gag;
         outcome.substitute = scripted.substitute;
@@ -676,6 +706,7 @@ impl Engine {
             out.sends.extend(scripted.sends);
             out.echoes.extend(scripted.echoes);
             out.send_to.extend(cross_sends(scripted.send_to));
+            out.echo_to.extend(scripted.echo_to);
         }
         out
     }
@@ -688,9 +719,35 @@ impl Engine {
         }
     }
 
-    /// When the earliest armed timer is due, if any.
+    /// When the earliest armed timer is due, if any — a script's and a
+    /// rule's are the same kind of thing to the session that sleeps on it.
     pub fn next_timer_deadline(&self) -> Option<Instant> {
-        self.timers.iter().filter_map(|timer| timer.next).min()
+        self.timers
+            .iter()
+            .filter_map(|timer| timer.next)
+            .chain(self.script_timers.iter().map(|timer| timer.at))
+            .min()
+    }
+
+    /// Fire every `mud.timer` callback due at `now`, earliest first. They
+    /// are one-shot: a script that wants a heartbeat re-arms from inside
+    /// its own callback, which is also what keeps a slow callback from
+    /// stacking up behind itself.
+    pub fn fire_due_script_timers(&mut self, now: Instant) -> ScriptOutcome {
+        let mut due: Vec<(Instant, usize, u64)> = self
+            .script_timers
+            .iter()
+            .filter(|timer| timer.at <= now)
+            .map(|timer| (timer.at, timer.host, timer.id))
+            .collect();
+        due.sort();
+        self.script_timers.retain(|timer| timer.at > now);
+
+        let mut out = ScriptOutcome::default();
+        for (_, host, id) in due {
+            merge(&mut out, self.run_hook_on(&Hook::Timer { id }, Some(host)));
+        }
+        out
     }
 
     /// Fire every timer due at `now`, returning the commands to send.
@@ -1139,6 +1196,7 @@ fn merge(into: &mut ScriptOutcome, from: ScriptOutcome) {
     into.echoes.extend(from.echoes);
     into.gag |= from.gag;
     into.send_to.extend(from.send_to);
+    into.echo_to.extend(from.echo_to);
     if from.substitute.is_some() {
         into.substitute = from.substitute;
     }
@@ -2690,6 +2748,93 @@ triggers:
                 engine.process_line("You are now fighting kobold").sends,
                 vec!["consider kobold"]
             );
+        }
+
+        /// A script's timer is armed against the same clock the session
+        /// already sleeps on, so `mud.timer` needs nothing of the session
+        /// that `timers:` did not already need (§7.4).
+        #[test]
+        fn a_script_timer_shares_the_engines_clock() {
+            let mut engine = scripted_engine(
+                r#"
+                name: test
+                timers:
+                  - id: autosave
+                    every: 5m
+                    send: ["save"]
+                "#,
+                r#"
+                mud.on_connect(function()
+                  mud.timer(30, function() mud.send("stand") end)
+                end)
+                "#,
+            );
+
+            let start = Instant::now();
+            engine.start_timers(start);
+            assert_eq!(
+                engine.next_timer_deadline(),
+                Some(start + Duration::from_secs(300)),
+                "only the YAML timer is armed before the hook runs"
+            );
+
+            engine.on_connect();
+            assert!(
+                engine.next_timer_deadline().expect("a deadline")
+                    <= start + Duration::from_secs(31),
+                "the script's timer is the earlier one now"
+            );
+
+            // Nothing is due yet, and the YAML timer is unaffected either
+            // way.
+            assert!(
+                engine
+                    .fire_due_script_timers(start + Duration::from_secs(29))
+                    .sends
+                    .is_empty()
+            );
+            let outcome = engine.fire_due_script_timers(start + Duration::from_secs(31));
+            assert_eq!(outcome.sends, vec!["stand"]);
+
+            // One-shot: with the script timer spent, the YAML timer's
+            // deadline is what is left.
+            assert!(
+                engine
+                    .fire_due_script_timers(start + Duration::from_secs(60))
+                    .sends
+                    .is_empty()
+            );
+            assert_eq!(
+                engine.next_timer_deadline(),
+                Some(start + Duration::from_secs(300))
+            );
+        }
+
+        /// A timer callback may arm the next one, which is how a script
+        /// keeps a heartbeat without a repeating timer to leak.
+        #[test]
+        fn a_timer_callback_can_re_arm_itself() {
+            let mut engine = scripted_engine(
+                "name: test",
+                r#"
+                function beat()
+                  mud.send("look")
+                  mud.timer(10, beat)
+                end
+                mud.on_connect(function() mud.timer(10, beat) end)
+                "#,
+            );
+
+            let start = Instant::now();
+            engine.on_connect();
+            for tick in 1..=3 {
+                let at = start + Duration::from_secs(10 * tick + 1);
+                assert_eq!(
+                    engine.fire_due_script_timers(at).sends,
+                    vec!["look"],
+                    "beat {tick}"
+                );
+            }
         }
 
         /// The M8 acceptance case for §7.5: the cleric's own script watches

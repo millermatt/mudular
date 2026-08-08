@@ -14,9 +14,9 @@
 //! `Function` constructor, both of which compile code from a string) are
 //! dropped once the bootstrap has run.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rquickjs::context::intrinsic;
 use rquickjs::function::Func;
@@ -38,9 +38,13 @@ const BOOTSTRAP: &str = r#"
   const peerVars = mud.__peer_vars;
   const peerData = mud.__peer_data;
   const sendTo = mud.__send_to;
+  const echoTo = mud.__echo_to;
+  const armTimer = mud.__timer;
   delete mud.__peer_vars;
   delete mud.__peer_data;
   delete mud.__send_to;
+  delete mud.__echo_to;
+  delete mud.__timer;
 
   // One handle onto one peer (§7.5), built from the snapshot as it stands
   // now, so a script reading `.data` twice in one hook sees one consistent
@@ -53,6 +57,7 @@ const BOOTSTRAP: &str = r#"
       vars: vars,
       data: peerData(name),
       send: function (command) { sendTo(name, command); },
+      echo: function (text) { echoTo(name, text); },
     };
   };
 
@@ -64,6 +69,15 @@ const BOOTSTRAP: &str = r#"
   // `mud.on_peer(session, event, fn)` — one peer's server data (§7.5).
   // Filtered per subscription rather than broadcast, so `Char.Affects`
   // catches `Char.Affects.blessed` without naming it.
+  // `mud.timer(seconds, fn)` — one-shot, so a heartbeat re-arms from
+  // inside its own callback (§7.4).
+  const timers = {};
+  mud.timer = function (after, fn) {
+    const id = armTimer(after);
+    timers[id] = fn;
+    return id;
+  };
+
   const peerHooks = [];
   mud.on_peer = function (session, event, fn) {
     peerHooks.push({ session: session, event: event, fn: fn });
@@ -75,6 +89,13 @@ const BOOTSTRAP: &str = r#"
   mud.on_gmcp = register("gmcp");
   Object.defineProperty(globalThis, "__mudular_dispatch", {
     value: function (name, args) {
+      if (name === "timer") {
+        const id = args[0];
+        const fn = timers[id];
+        delete timers[id];
+        if (fn) { fn(); }
+        return;
+      }
       if (name === "peer") {
         const session = args[0], key = args[1], value = args[2];
         for (let i = 0; i < peerHooks.length; i++) {
@@ -107,6 +128,9 @@ pub struct JsHost {
     /// the current session state without copying it.
     shared: Arc<Mutex<ScriptCtx>>,
     budget: Arc<Budget>,
+    /// Ids for armed timers. Unique within this host, which is as far as
+    /// they travel.
+    next_timer: Arc<AtomicU64>,
 }
 
 /// QuickJS gives no way to attach state to the interrupt callback, so the
@@ -152,6 +176,7 @@ impl JsHost {
                 deadline: Mutex::new(None),
                 aborted: AtomicBool::new(false),
             }),
+            next_timer: Arc::new(AtomicU64::new(0)),
         };
         host.install_api()?;
         host.install_budget();
@@ -230,6 +255,28 @@ impl JsHost {
             "__send_to",
             Func::from(move |target: String, command: String| {
                 lock(&shared).out.send_to.push((target, vec![command]));
+            }),
+        )?;
+
+        // `mud.timer(seconds, fn)` (§7.4). The bridge issues the id and
+        // records the delay; the bootstrap keeps the callback, since a
+        // Rust closure cannot hold a JS value.
+        let shared = Arc::clone(&self.shared);
+        let next_timer = Arc::clone(&self.next_timer);
+        mud.set(
+            "__timer",
+            Func::from(move |after: f64| {
+                let id = next_timer.fetch_add(1, Ordering::Relaxed);
+                lock(&shared).out.timers.push((id, seconds(after)));
+                id
+            }),
+        )?;
+
+        let shared = Arc::clone(&self.shared);
+        mud.set(
+            "__echo_to",
+            Func::from(move |target: String, text: String| {
+                lock(&shared).out.echo_to.push((target, text));
             }),
         )?;
 
@@ -361,6 +408,7 @@ fn call_hooks(ctx: &Ctx<'_>, hook: &Hook) -> rquickjs::Result<()> {
             args.set(1, key.as_str())?;
             args.set(2, value.as_str())?;
         }
+        Hook::Timer { id } => args.set(0, *id)?,
         // Handled by the caller: a rule's `script:` action names its
         // function rather than going through the dispatcher.
         Hook::Function { .. } => unreachable!(),
@@ -394,6 +442,13 @@ fn call_named(ctx: &Ctx<'_>, name: &str, line: &str, captures: &Captures) -> rqu
 /// so recovering beats taking the session down with it.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A delay a script asked for, in seconds. Anything not a sane positive
+/// number becomes "as soon as possible": a timer that fires late is a bug
+/// in the script, and one that never fires is a bug the player cannot see.
+fn seconds(after: f64) -> Duration {
+    Duration::try_from_secs_f64(after).unwrap_or(Duration::ZERO)
 }
 
 fn load_error(script: &str, reason: &str) -> ScriptError {
@@ -471,6 +526,7 @@ mod tests {
                       } else {
                         mud.echo(tank.vars.hp + "/" + tank.data["Char.Vitals.hp"]);
                         tank.send("stand");
+                        tank.echo("healing");
                       }
                     });
                 "#,
@@ -481,6 +537,11 @@ mod tests {
                     });
                     mud.on_peer("healer", "Char.Affects", function (key) {
                       mud.echo("healer " + key);
+                    });
+                "#,
+                timer: r#"
+                    mud.on_line(function () {
+                      mud.timer(30, function () { mud.send("stand"); });
                     });
                 "#,
                 broken: "function (",

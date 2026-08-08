@@ -70,6 +70,11 @@ pub enum Hook {
         key: String,
         value: String,
     },
+    /// A timer the script armed with `mud.timer` has come due. The id is
+    /// the host's own: only the host that issued it knows what it names.
+    Timer {
+        id: u64,
+    },
     /// A function a YAML rule named in its `script:` action, called with
     /// the text that matched and the rule's captures.
     Function {
@@ -98,6 +103,7 @@ impl Hook {
             Hook::Prompt(_) => "prompt",
             Hook::Gmcp { .. } => "gmcp",
             Hook::Peer { .. } => "peer",
+            Hook::Timer { .. } => "timer",
             Hook::Function { .. } => "script action",
         }
     }
@@ -118,6 +124,14 @@ pub struct ScriptOutcome {
     /// Commands for other sessions, by the name that addresses them
     /// (§7.5). Routed by the hub exactly like a rule's `send_to:`.
     pub send_to: Vec<(String, Vec<String>)>,
+    /// Text for another session's pane, by the name that addresses it
+    /// (§7.5). Display-only: it reaches no server, this one's or theirs.
+    pub echo_to: Vec<(String, String)>,
+    /// Timers the hook armed: the host's own id for each callback, and how
+    /// long from now to call it. The engine owns the clock — `engine` is
+    /// sans-IO, and a script must not be able to sleep on the session's
+    /// task (§7.4).
+    pub timers: Vec<(u64, Duration)>,
 }
 
 /// The state a hook reads and writes, lent to the host for one call.

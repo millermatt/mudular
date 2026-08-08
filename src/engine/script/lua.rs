@@ -5,9 +5,9 @@
 //! `os.execute` for a shared community module to find. Everything a script
 //! is allowed to do arrives through the one `mud` table.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
 
@@ -23,6 +23,9 @@ const HOOKS_KEY: &str = "mudular.hooks";
 /// enough that the check is noise against real script work.
 const CHECK_EVERY: u32 = 10_000;
 
+/// Registry key for callbacks armed with `mud.timer`, by id.
+const TIMERS_KEY: &str = "mudular.timers";
+
 #[derive(Debug)]
 pub struct LuaHost {
     lua: Lua,
@@ -31,6 +34,9 @@ pub struct LuaHost {
     /// the current session state without copying it.
     shared: Arc<Mutex<ScriptCtx>>,
     budget: Arc<Budget>,
+    /// Ids for armed timers. Unique within this host, which is as far as
+    /// they travel.
+    next_timer: Arc<AtomicU64>,
 }
 
 /// The deadline the VM hook enforces. `aborted` distinguishes "we stopped
@@ -61,6 +67,7 @@ impl LuaHost {
             lua,
             shared: Arc::clone(&shared),
             budget: Arc::clone(&budget),
+            next_timer: Arc::new(AtomicU64::new(0)),
         };
         host.seal_globals()?;
         host.install_api()?;
@@ -101,6 +108,10 @@ impl LuaHost {
         for name in ["connect", "disconnect", "line", "prompt", "gmcp", "peer"] {
             hooks.set(name, lua.create_table()?)?;
         }
+        // Armed `mud.timer` callbacks, keyed by the id handed to the
+        // engine. In the registry with the hooks, and private for the same
+        // reason.
+        lua.set_named_registry_value(TIMERS_KEY, lua.create_table()?)?;
         lua.set_named_registry_value(HOOKS_KEY, hooks)?;
 
         let ctx = Arc::clone(&self.shared);
@@ -190,7 +201,33 @@ impl LuaHost {
                         Ok(())
                     })?,
                 )?;
+
+                let echoes = Arc::clone(&ctx);
+                let target = name.clone();
+                handle.set(
+                    "echo",
+                    lua.create_function(move |_, (_, text): (mlua::Table, String)| {
+                        lock(&echoes).out.echo_to.push((target.clone(), text));
+                        Ok(())
+                    })?,
+                )?;
                 Ok(mlua::Value::Table(handle))
+            })?,
+        )?;
+
+        // `mud.timer(seconds, fn)` — call `fn` once, `seconds` from now
+        // (§7.4). One-shot: a heartbeat re-arms from inside its callback,
+        // which is also what stops a slow one stacking up behind itself.
+        let ctx = Arc::clone(&self.shared);
+        let next_timer = Arc::clone(&self.next_timer);
+        mud.set(
+            "timer",
+            lua.create_function(move |lua, (after, callback): (f64, Function)| {
+                let id = next_timer.fetch_add(1, Ordering::Relaxed);
+                lua.named_registry_value::<Table>(TIMERS_KEY)?
+                    .set(id, callback)?;
+                lock(&ctx).out.timers.push((id, seconds(after)));
+                Ok(id)
             })?,
         )?;
 
@@ -314,6 +351,10 @@ impl ScriptHost for LuaHost {
             return self.call_peer(session, key, value, ctx);
         }
 
+        if let Hook::Timer { id } = hook {
+            return self.call_timer(*id, ctx);
+        }
+
         let name = hook.name();
         let callbacks = self.callbacks(name)?;
         if callbacks.is_empty() {
@@ -329,10 +370,12 @@ impl ScriptHost for LuaHost {
                     Hook::Gmcp { package, json } => {
                         callback.call::<()>((package.clone(), json.clone()))?
                     }
-                    // Both handled above: a rule's `script:` action names
-                    // its function, and a peer update is filtered per
-                    // subscription rather than broadcast.
-                    Hook::Function { .. } | Hook::Peer { .. } => unreachable!(),
+                    // All handled above: a rule's `script:` action names
+                    // its function, a peer update is filtered per
+                    // subscription, and a timer names one callback.
+                    Hook::Function { .. } | Hook::Peer { .. } | Hook::Timer { .. } => {
+                        unreachable!()
+                    }
                 }
             }
             Ok(())
@@ -421,6 +464,28 @@ impl LuaHost {
         result
     }
 
+    /// Calls one armed timer and forgets it. An id with no callback is
+    /// not an error: the host may have been reloaded out from under the
+    /// engine's deadline, and there is nothing left to run.
+    fn call_timer(&mut self, id: u64, ctx: &mut ScriptCtx) -> Result<(), ScriptError> {
+        let timers = self
+            .lua
+            .named_registry_value::<Table>(TIMERS_KEY)
+            .map_err(|err| ScriptError::Runtime {
+                hook: "timer".to_string(),
+                reason: err.to_string(),
+            })?;
+        let Ok(callback) = timers.get::<Function>(id) else {
+            return Ok(());
+        };
+        let _ = timers.set(id, mlua::Value::Nil);
+
+        self.swap_ctx(ctx);
+        let result = self.with_budget("timer", || callback.call::<()>(()));
+        self.swap_ctx(ctx);
+        result
+    }
+
     fn callbacks(&self, hook: &str) -> Result<Vec<Function>, ScriptError> {
         self.lua
             .named_registry_value::<Table>(HOOKS_KEY)
@@ -442,6 +507,13 @@ impl LuaHost {
 /// so recovering beats taking the session down with it.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A delay a script asked for, in seconds. Anything not a sane positive
+/// number becomes "as soon as possible": a timer that fires late is a bug
+/// in the script, and one that never fires is a bug the player cannot see.
+fn seconds(after: f64) -> Duration {
+    Duration::try_from_secs_f64(after).unwrap_or(Duration::ZERO)
 }
 
 fn load_error(script: &str, err: mlua::Error) -> ScriptError {
@@ -531,6 +603,7 @@ mod tests {
                       else
                         mud.echo(tank.vars.hp .. "/" .. tank.data["Char.Vitals.hp"])
                         tank:send("stand")
+                        tank:echo("healing")
                       end
                     end)
                 "#,
@@ -541,6 +614,11 @@ mod tests {
                     end)
                     mud.on_peer("healer", "Char.Affects", function(key)
                       mud.echo("healer " .. key)
+                    end)
+                "#,
+                timer: r#"
+                    mud.on_line(function()
+                      mud.timer(30, function() mud.send("stand") end)
                     end)
                 "#,
                 broken: "this is not lua",

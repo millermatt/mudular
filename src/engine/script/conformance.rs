@@ -9,7 +9,7 @@
 //! without knowing which language it speaks.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{
     Captures, Hook, PeerSnapshot, Peers, ScriptCtx, ScriptError, ScriptHost, ScriptSource,
@@ -46,11 +46,15 @@ pub struct Ported {
     pub runaway: &'static str,
     /// Registers a line hook that reads the peer `tank`'s `hp` variable
     /// and `Char.Vitals.hp` data, echoes them as `<hp>/<data>`, sends the
-    /// tank `stand`, and echoes `no tank` when there is no such peer.
+    /// tank `stand` and echoes it `healing`, and echoes `no tank` locally
+    /// when there is no such peer.
     pub peers: &'static str,
     /// Subscribes to peer `tank`'s `Char.Affects`, echoing `<key>=<value>`
     /// for each update, and to peer `healer`'s, echoing `healer <key>`.
     pub peer_hook: &'static str,
+    /// Registers a line hook that arms a 30-second timer whose callback
+    /// sends `stand`.
+    pub timer: &'static str,
     /// Not a valid program in this language.
     pub broken: &'static str,
 }
@@ -231,6 +235,10 @@ pub fn run(new_host: impl Fn() -> Box<dyn ScriptHost>, ported: &Ported) {
             ctx.out.send_to,
             vec![("tank".to_string(), vec!["stand".to_string()])]
         );
+        assert_eq!(
+            ctx.out.echo_to,
+            vec![("tank".to_string(), "healing".to_string())]
+        );
 
         // A peer that is not there is absent, not an error: sessions come
         // and go, and a script must be able to ask.
@@ -238,6 +246,7 @@ pub fn run(new_host: impl Fn() -> Box<dyn ScriptHost>, ported: &Ported) {
         call(&mut host, line("x"), &mut ctx);
         assert_eq!(ctx.out.echoes, vec!["no tank"]);
         assert!(ctx.out.send_to.is_empty());
+        assert!(ctx.out.echo_to.is_empty());
 
         drop(tx);
     }
@@ -281,6 +290,30 @@ pub fn run(new_host: impl Fn() -> Box<dyn ScriptHost>, ported: &Ported) {
             ctx.out.echoes,
             vec!["Char.Affects.blessed=0", "healer Char.Affects.blessed"]
         );
+    }
+
+    // `mud.timer` hands the delay to the engine and keeps the callback
+    // (§7.4). The host owns the id; the engine owns the clock.
+    {
+        let mut host = load(ported.timer);
+        let mut ctx = ScriptCtx::default();
+        call(&mut host, line("x"), &mut ctx);
+        assert!(ctx.out.sends.is_empty(), "a timer does not fire on arming");
+        let [(id, after)] = ctx.out.timers[..] else {
+            panic!("one armed timer, got {:?}", ctx.out.timers);
+        };
+        assert_eq!(after, Duration::from_secs(30));
+
+        let mut ctx = ScriptCtx::default();
+        call(&mut host, Hook::Timer { id }, &mut ctx);
+        assert_eq!(ctx.out.sends, vec!["stand"]);
+
+        // One-shot: the same id does not fire twice, and an id that was
+        // never armed is not an error.
+        let mut ctx = ScriptCtx::default();
+        call(&mut host, Hook::Timer { id }, &mut ctx);
+        call(&mut host, Hook::Timer { id: id + 99 }, &mut ctx);
+        assert!(ctx.out.sends.is_empty());
     }
 
     // A script that will not compile names the file it came from.

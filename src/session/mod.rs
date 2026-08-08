@@ -45,6 +45,10 @@ pub enum SessionEvent {
         /// action, one more for each further bounce.
         hops: u8,
     },
+    /// Text a script asked another session's pane to show (§7.5). The hub
+    /// resolves `target` as for [`SessionEvent::SendTo`] and writes it
+    /// straight to that pane: nothing is sent to any server.
+    EchoTo { target: String, text: String },
     /// The text that should sit above the input line. Empty means none.
     Prompt(String),
     /// Server asked us to mask/unmask local input (Telnet ECHO).
@@ -376,6 +380,7 @@ async fn run(
                                             emit.extend(
                                                 outcome.echoes.into_iter().map(SessionEvent::Line),
                                             );
+                                            emit.extend(cross_echoes(outcome.echo_to));
                                         }
                                         SessionEvent::Prompt(text) => {
                                             let outcome = engine.process_prompt(&strip_ansi(&text));
@@ -392,6 +397,7 @@ async fn run(
                                             emit.extend(
                                                 outcome.echoes.into_iter().map(SessionEvent::Line),
                                             );
+                                            emit.extend(cross_echoes(outcome.echo_to));
                                         }
                                         SessionEvent::Gmcp { package, payload } => {
                                             let outcome = engine.process_gmcp(
@@ -403,6 +409,7 @@ async fn run(
                                             emit.extend(
                                                 outcome.echoes.into_iter().map(SessionEvent::Line),
                                             );
+                                            emit.extend(cross_echoes(outcome.echo_to));
                                         }
                                         other => emit.push(other),
                                     }
@@ -466,12 +473,42 @@ async fn run(
                 if emit_cross_sends(&events, cross, FIRST_HOP).await.is_err() {
                     return;
                 }
+                for event in cross_echoes(outcome.echo_to) {
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
             }
             _ = tokio::time::sleep_until(timer_deadline.into()) => {
-                let due = engine.fire_due_timers(Instant::now());
+                let now = Instant::now();
+                let due = engine.fire_due_timers(now);
+                // Script timers are armed against the same clock and woken
+                // by the same sleep (§7.4).
+                let scripted = engine.fire_due_script_timers(now);
                 publish(&mut engine, &publish_to);
                 if send_lines(&mut writer, &due).await.is_err() {
                     break "write failed".to_string();
+                }
+                if send_lines(&mut writer, &scripted.sends).await.is_err() {
+                    break "write failed".to_string();
+                }
+                for text in scripted.echoes {
+                    if events.send(SessionEvent::Line(text)).await.is_err() {
+                        return;
+                    }
+                }
+                for event in cross_echoes(scripted.echo_to) {
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                let cross = scripted
+                    .send_to
+                    .into_iter()
+                    .map(|(target, lines)| crate::engine::CrossSend { target, lines })
+                    .collect();
+                if emit_cross_sends(&events, cross, FIRST_HOP).await.is_err() {
+                    return;
                 }
             }
             cmd = commands.recv() => {
@@ -499,6 +536,11 @@ async fn run(
                         }
                         for text in outcome.echoes {
                             if events.send(SessionEvent::Line(text)).await.is_err() {
+                                return;
+                            }
+                        }
+                        for event in cross_echoes(outcome.echo_to) {
+                            if events.send(event).await.is_err() {
                                 return;
                             }
                         }
@@ -585,6 +627,16 @@ async fn run(
         }
     }
     let _ = events.send(SessionEvent::Ended(reason)).await;
+}
+
+/// A script's cross-session echoes, as events for the hub to place. They
+/// are events rather than commands because nothing runs at the far end:
+/// the hub owns the panes, so it can write the text itself (§7.5).
+fn cross_echoes(echoes: Vec<(String, String)>) -> Vec<SessionEvent> {
+    echoes
+        .into_iter()
+        .map(|(target, text)| SessionEvent::EchoTo { target, text })
+        .collect()
 }
 
 /// Waits for any peer to publish something new, and says which. Parks

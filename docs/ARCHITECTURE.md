@@ -378,6 +378,13 @@ trait ScriptHost {
   `gag`/`substitute`, variables, server data (GMCP/MSDP), timers, and event
   hooks (`on_line`, `on_prompt`, `on_gmcp`, `on_connect`/`on_disconnect`).
   The API is defined once as Rust types; each host binds it to its language.
+- **Timers: `mud.timer(seconds, fn)`.** The host keeps the callback and
+  hands the engine an id and a delay; the engine holds the deadline
+  alongside the YAML `timers:`, and the session sleeps on the earlier of
+  the two. A script therefore cannot sleep on the session's task, and
+  `engine` needs no clock of its own. They are one-shot: a heartbeat
+  re-arms from inside its own callback, which is also what stops a slow
+  callback stacking up behind itself.
 - **Engines, feature-gated** so the binary carries only what's wanted:
   - **Lua** first, via `mlua` (vendored Lua 5.4, statically linked) — the
     MUD community's lingua franca; eases migration from Mudlet.
@@ -512,7 +519,11 @@ as an unknown local name does.
 
 **Scripting API (M8).** The `mud.*` API (§7.4) adds:
 
-- `mud.session("cleric"):send(cmd)` / `:echo(text)` — routed as above.
+- `mud.session("cleric"):send(cmd)` / `:echo(text)` — `send` is routed as
+  above; `echo` is display-only, written straight into that character's
+  pane by the hub, which owns the panes, so nothing runs at the far end and
+  no hop limit applies. Both carry the `[from tank]` tag an injected
+  command carries: nothing one session does to another happens anonymously.
   `mud.session` answers `nil` for a name no session holds, so a script can
   ask rather than assume.
 - `mud.session("tank").data` / `.vars` — the peer snapshot (read-only), as
