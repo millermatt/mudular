@@ -298,10 +298,10 @@ pinned by integration tests with synthetic compressed captures.
   (`send:` list) and set variables.
 - **Trigger:** fires on *inbound* completed lines (or prompt lines —
   matched against the ANSI-stripped text; a later option can match raw).
-  Actions: send commands, set variables, highlight/gag/substitute the
-  line, echo a local note, play the terminal bell, call a script (§7.4),
-  send commands to *another* session (§7.5), route the line to a channel
-  pane (§11.1).
+  Actions: send commands, set variables, restyle the matched text or the
+  whole line (`highlight:`, §7.7), gag/substitute the line, echo a local
+  note, play the terminal bell, call a script (§7.4), send commands to
+  *another* session (§7.5), route the line to a channel pane (§11.1).
 - **Condition:** an optional `when:` guard on an alias or trigger. The
   pattern decides what matched; the condition decides whether to act on it,
   reading captures, variables, and live server data (§7.6).
@@ -543,6 +543,73 @@ seconds" — belongs in an `on_line` hook or a `script:` action (§7.4), which
 can simply return early. That split is the same one §7.4 already draws:
 YAML for the common cases, scripts for everything else.
 
+### 7.7 Highlights (M9, built early)
+
+Recolouring text the server sent is the cheapest attention mechanism a MUD
+client has: your name in a wall of chat, the one word in a room
+description that matters, a rare drop in a loot list. Unlike a channel
+pane it moves nothing and hides nothing, so it is safe to apply liberally.
+
+**A highlight is a trigger action, not a rule type of its own.**
+
+```yaml
+triggers:
+  - pattern: '\bKestrel\b'
+    highlight: {fg: bright_yellow, bold: true}
+  - id: low-hp
+    pattern: '^You are bleeding'
+    highlight: {fg: white, bg: red, whole_line: true}
+```
+
+Making it an action rather than a parallel `highlights:` list is the whole
+design decision, and everything below follows from it: highlights inherit
+`id`-based shadowing and `enabled: false` across scope layers (§7.3), the
+`;`-free regex machinery with named captures, `when:` guards when those
+land (§7.6), and the ability to sit on a rule that *also* sends or gags. A
+separate list would have needed its own copy of all of that.
+
+- **Style fields:** `fg`, `bg` (a colour name, `#rrggbb`, or a 0-255
+  palette index — the same vocabulary as a profile's `color:`, §11), and
+  the boolean attributes `bold`, `italic`, `underline`, `reverse`. All
+  optional; a `highlight:` block that sets none is a load error rather
+  than a rule that silently does nothing.
+- **Scope of the restyle:** the matched text only, or `whole_line: true`
+  for the entire line. Matching a capture group rather than the whole
+  match is deliberately *not* offered — the pattern can be narrowed
+  instead, and one obvious behaviour beats two.
+- **Compiled at load.** The style block becomes an SGR parameter string
+  (`"1;93"`) at `Engine::compile`, so a bad colour name fails at startup
+  naming the rule, and the hot path per line is a string splice rather
+  than a colour lookup.
+
+**Layering: the engine returns ranges, the session applies them.**
+`LineOutcome` grows a list of `(byte range, SGR)` spans over the
+*stripped* line the engine matched against. It deliberately does not
+return styled text: the engine never sees the original ANSI, and
+inventing escape sequences there would put rendering decisions in a
+sans-IO module (§4). The session, which holds both the raw line and the
+stripped projection, maps the ranges back through the same offset walk
+`strip_ansi` already performs and splices the sequences in.
+
+**Preserving the server's own colour is the hard part.** A naive
+implementation closes a highlight with `ESC[0m` and destroys whatever
+colour the server had running for the rest of the line. So the splice
+restores the SGR state that was active at that point, recomputed from the
+prefix of the raw line. A highlight inside a coloured region must leave
+the region looking untouched on both sides — that is the acceptance test,
+not an implementation detail.
+
+- **Overlaps: first match wins**, matching `route:`'s rule (§11.1). Spans
+  are applied in scope order and a span overlapping one already applied is
+  dropped whole rather than nested — nested SGR has no well-defined
+  "restore to the middle state", and a rule that silently half-applies is
+  worse than one that doesn't.
+- Highlights apply to lines and to lines copied into channel panes, since
+  both carry the same styled text. Prompts are out of scope: they do not
+  go through `process_line`.
+- Gagged lines are never highlighted, for the obvious reason. A rule that
+  sets both is not an error — `gag` simply wins.
+
 ---
 
 ## 8. Line Assembly & Scrollback
@@ -551,6 +618,10 @@ YAML for the common cases, scripts for everything else.
   `Line` values: styled spans (parsed SGR state carried across chunks) +
   plain-text projection (for triggers/search) + kind (`Output | Prompt |
   Local | Gagged`).
+- Rule highlights (§7.7) are spliced into the line's escape sequences
+  before this point, so a highlighted line is an ordinary styled line by
+  the time it reaches the renderer — nothing downstream knows the
+  difference.
 - ANSI parsing uses `ansi-to-tui` to turn SGR (16/256/TrueColor) into
   ratatui spans; unknown/unsafe escape sequences are dropped, not rendered
   raw. If MUD-specific quirks outgrow it, the fallback is a thin parser on
@@ -874,7 +945,7 @@ exist from M0, even where a stage is a passthrough).
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
-| **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), and keyring-backed auto-login (§10.1) — all built early, as soon as they were useful; scrollback search, disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either |
+| **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), keyring-backed auto-login (§10.1), and rule highlights (§7.7) — all built early, as soon as they were useful; scrollback search, disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either |
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
