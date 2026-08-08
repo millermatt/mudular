@@ -24,7 +24,7 @@ use crate::proto::gmcp;
 use crate::proto::mccp::MccpDecoder;
 use crate::proto::msdp;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, encode_subnegotiation, option};
-use line::{LineAssembler, strip_ansi};
+use line::{LineAssembler, apply_highlights, strip_ansi};
 use login::{Autologin, LoginAction};
 
 /// Session → UI.
@@ -365,7 +365,19 @@ async fn run(
                                             // never two different texts.
                                             // Its styling goes with it: the
                                             // script chose the replacement.
-                                            let text = outcome.substitute.unwrap_or(text);
+                                            // Highlight ranges are offsets
+                                            // into the line the engine
+                                            // matched, which the
+                                            // replacement is not, so a
+                                            // substitution drops them
+                                            // rather than restyling text
+                                            // they never described.
+                                            let text = match outcome.substitute {
+                                                Some(replacement) => replacement,
+                                                None => {
+                                                    apply_highlights(&text, &outcome.highlights)
+                                                }
+                                            };
                                             if let Some(channel) = outcome.route {
                                                 emit.push(SessionEvent::Route {
                                                     channel,
@@ -2183,6 +2195,42 @@ mod tests {
             SessionEvent::Route { .. }
         ));
         assert_eq!(next_line(&mut events).await, "Bob tells you hi");
+    }
+
+    // ---- highlights (docs/ARCHITECTURE.md §7.7) ----
+
+    /// The engine matched the stripped line, but what reaches the pane is
+    /// the raw line with the span spliced into it — and the channel copy
+    /// is the same text, since a routed line is not a second rendering.
+    #[tokio::test]
+    async fn a_highlight_is_spliced_into_the_line_and_its_channel_copy() {
+        let (mut events, _commands) = serve_with_rules(
+            |mut sock| async move {
+                sock.write_all(b"\x1b[32mBob tells you hi\x1b[0m\r\n")
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: '\bBob\b'
+                    highlight: {fg: bright_yellow, bold: true}
+                    route: comms
+                "#,
+            ),
+        );
+
+        let expected = "\x1b[32m\x1b[1;93mBob\x1b[0m\x1b[32m tells you hi\x1b[0m";
+        match next_matching(&mut events, |ev| matches!(ev, SessionEvent::Route { .. })).await {
+            SessionEvent::Route { channel, text } => {
+                assert_eq!(channel, "comms");
+                assert_eq!(text, expected);
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+        assert_eq!(next_line(&mut events).await, expected);
     }
 
     /// Runs `script` against one loopback connection and returns the

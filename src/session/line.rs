@@ -12,6 +12,8 @@
 //! why a server that never sends GA/EOR can still run a partial line into
 //! the following output.
 
+use std::ops::Range;
+
 use super::SessionEvent;
 
 #[derive(Debug, Default)]
@@ -62,26 +64,37 @@ impl LineAssembler {
 /// with ANSI escape sequences removed, which is what triggers match against
 /// (§7.1) so a pattern never has to account for colour codes.
 pub fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
+    strip_ansi_with_map(text).0
+}
 
-    while let Some(ch) = chars.next() {
+/// As [`strip_ansi`], plus the offset walk highlight splicing needs
+/// (§7.7): for each byte of the stripped text, the offset it came from in
+/// `text`, and a final entry one past the last kept byte.
+fn strip_ansi_with_map(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(text.len());
+    let mut map: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    let mut end = 0;
+    let mut chars = text.char_indices();
+
+    while let Some((at, ch)) = chars.next() {
         if ch != '\x1b' {
             out.push(ch);
+            map.extend(at..at + ch.len_utf8());
+            end = at + ch.len_utf8();
             continue;
         }
         match chars.next() {
             // CSI: parameters and intermediates, then one final byte.
-            Some('[') => {
-                for ch in chars.by_ref() {
+            Some((_, '[')) => {
+                for (_, ch) in chars.by_ref() {
                     if ('\x40'..='\x7e').contains(&ch) {
                         break;
                     }
                 }
             }
             // OSC: runs to BEL or the ST two-byte terminator.
-            Some(']') => {
-                while let Some(ch) = chars.next() {
+            Some((_, ']')) => {
+                while let Some((_, ch)) = chars.next() {
                     if ch == '\x07' {
                         break;
                     }
@@ -97,6 +110,61 @@ pub fn strip_ansi(text: &str) -> String {
         }
     }
 
+    map.push(end);
+    (out, map)
+}
+
+/// Splices highlight ranges (§7.7) into the raw line the server sent.
+/// Ranges are byte offsets over the stripped projection, so they are
+/// mapped back through the same walk `strip_ansi` performs.
+///
+/// Closing a highlight with a bare `ESC[0m` would destroy whatever colour
+/// the server had running for the rest of the line. Instead the close
+/// replays, verbatim, every SGR sequence that appeared earlier in the raw
+/// line: re-emitting the same sequences in the same order leaves the
+/// terminal in the state it was in, without this module having to know
+/// what any of them mean.
+pub fn apply_highlights(raw: &str, spans: &[(Range<usize>, String)]) -> String {
+    if spans.is_empty() {
+        return raw.to_string();
+    }
+    let (_, map) = strip_ansi_with_map(raw);
+
+    let mut mapped: Vec<(usize, usize, &str)> = spans
+        .iter()
+        .filter_map(|(span, sgr)| Some((*map.get(span.start)?, *map.get(span.end)?, sgr.as_str())))
+        .collect();
+    // Highest offset first: each insertion then leaves the raw offsets of
+    // the spans still to come untouched.
+    mapped.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut out = raw.to_string();
+    for (start, end, sgr) in mapped {
+        out.insert_str(end, &format!("\x1b[0m{}", sgr_prefix(raw, end)));
+        out.insert_str(start, &format!("\x1b[{sgr}m"));
+    }
+    out
+}
+
+/// Every `ESC[...m` sequence in `raw` before `upto`, concatenated in order.
+fn sgr_prefix(raw: &str, upto: usize) -> String {
+    let mut out = String::new();
+    let head = &raw[..upto];
+    let mut chars = head.char_indices();
+
+    while let Some((at, ch)) = chars.next() {
+        if ch != '\x1b' || !matches!(chars.next(), Some((_, '['))) {
+            continue;
+        }
+        for (end, ch) in chars.by_ref() {
+            if ('\x40'..='\x7e').contains(&ch) {
+                if ch == 'm' {
+                    out.push_str(&head[at..end + 1]);
+                }
+                break;
+            }
+        }
+    }
     out
 }
 
@@ -232,5 +300,87 @@ mod strip_tests {
     fn tolerates_a_truncated_escape_at_the_end() {
         assert_eq!(strip_ansi("text\x1b"), "text");
         assert_eq!(strip_ansi("text\x1b["), "text");
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::{apply_highlights, strip_ansi};
+
+    fn span(range: std::ops::Range<usize>, sgr: &str) -> (std::ops::Range<usize>, String) {
+        (range, sgr.to_string())
+    }
+
+    #[test]
+    fn splices_a_span_into_a_plain_line() {
+        assert_eq!(
+            apply_highlights("You see Kestrel here.", &[span(8..15, "1;93")]),
+            "You see \x1b[1;93mKestrel\x1b[0m here."
+        );
+    }
+
+    #[test]
+    fn a_line_with_no_spans_is_returned_untouched() {
+        assert_eq!(
+            apply_highlights("\x1b[32mplain\x1b[0m", &[]),
+            "\x1b[32mplain\x1b[0m"
+        );
+    }
+
+    /// §7.7's acceptance test: a highlight inside a coloured region leaves
+    /// the region looking untouched on both sides. Closing with a bare
+    /// `ESC[0m` would leave the rest of the line uncoloured; replaying the
+    /// server's own sequences puts its green back.
+    #[test]
+    fn a_highlight_restores_the_servers_colour_after_itself() {
+        let raw = "\x1b[32mYou see Kestrel here\x1b[0m";
+        let spliced = apply_highlights(raw, &[span(8..15, "1;93")]);
+
+        assert_eq!(
+            spliced,
+            "\x1b[32mYou see \x1b[1;93mKestrel\x1b[0m\x1b[32m here\x1b[0m"
+        );
+        // The text either side is still whatever the server sent, and the
+        // line reads the same with the colour taken back off.
+        assert_eq!(strip_ansi(&spliced), strip_ansi(raw));
+    }
+
+    /// Offsets are over the stripped line, so escapes *before* the span
+    /// have to shift it — and all of them are replayed at the close, not
+    /// just the last.
+    #[test]
+    fn offsets_are_mapped_through_the_escapes_that_precede_them() {
+        let raw = "\x1b[32mThe \x1b[1mkobold\x1b[22m is here";
+        let spliced = apply_highlights(raw, &[span(14..18, "31")]);
+
+        assert_eq!(
+            spliced,
+            "\x1b[32mThe \x1b[1mkobold\x1b[22m is \x1b[31mhere\x1b[0m\x1b[32m\x1b[1m\x1b[22m"
+        );
+        assert_eq!(strip_ansi(&spliced), "The kobold is here");
+    }
+
+    /// Two spans on one line: splicing the later one first keeps the raw
+    /// offsets of the earlier one valid.
+    #[test]
+    fn several_spans_do_not_disturb_each_others_offsets() {
+        assert_eq!(
+            apply_highlights(
+                "Ærlend meets Kestrel",
+                &[span(0..7, "1"), span(14..21, "31")]
+            ),
+            "\x1b[1mÆrlend\x1b[0m meets \x1b[31mKestrel\x1b[0m"
+        );
+    }
+
+    /// A whole-line span over a coloured line stops at the last character,
+    /// leaving the server's trailing reset where it was.
+    #[test]
+    fn a_whole_line_span_wraps_the_text_not_the_trailing_reset() {
+        let raw = "\x1b[32mYou are bleeding\x1b[0m";
+        assert_eq!(
+            apply_highlights(raw, &[span(0..16, "97;41")]),
+            "\x1b[32m\x1b[97;41mYou are bleeding\x1b[0m\x1b[32m\x1b[0m"
+        );
     }
 }

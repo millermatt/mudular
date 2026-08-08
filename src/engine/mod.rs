@@ -123,8 +123,37 @@ pub struct Trigger {
     /// the main scrollback alone (§11.1).
     #[serde(default)]
     pub route: Option<String>,
+    /// Recolour the matched text, or the whole line (§7.7).
+    #[serde(default)]
+    pub highlight: Option<HighlightSpec>,
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// A trigger's `highlight:` action (§7.7). Colours stay as the player
+/// wrote them until `Engine::compile` turns the block into an SGR string:
+/// deserializing them here would report a bad name without being able to
+/// say which rule it came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HighlightSpec {
+    /// A colour name, `#rrggbb`, or a 0-255 palette index — the same
+    /// vocabulary as a profile's `color:` (§11).
+    #[serde(default)]
+    pub fg: Option<String>,
+    #[serde(default)]
+    pub bg: Option<String>,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub reverse: bool,
+    /// Restyle the entire line rather than only the matched text.
+    #[serde(default)]
+    pub whole_line: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -159,6 +188,12 @@ pub enum EngineError {
     BadCondition {
         module: String,
         condition: String,
+        reason: String,
+    },
+    #[error("invalid `highlight:` on rule `{rule}` in `{module}`: {reason}")]
+    BadHighlight {
+        module: String,
+        rule: String,
         reason: String,
     },
     #[error("rule in `{module}` needs an `id` or a `pattern`")]
@@ -219,6 +254,11 @@ pub struct LineOutcome {
     pub echo_to: Vec<(String, String)>,
     /// Replacement text for the line, from a script's `mud.substitute`.
     pub substitute: Option<String>,
+    /// Ranges to restyle, as byte offsets into the *stripped* line the
+    /// engine matched, each with the SGR parameters to wrap them in
+    /// (§7.7). The engine never sees the original ANSI, so it returns
+    /// ranges rather than styled text and the session splices them.
+    pub highlights: Vec<(std::ops::Range<usize>, String)>,
 }
 
 /// What a typed input line expands to.
@@ -273,6 +313,15 @@ struct CompiledRule {
     script: Option<CompiledScriptCall>,
     gag: bool,
     route: Option<String>,
+    highlight: Option<CompiledHighlight>,
+}
+
+/// A `highlight:` block reduced to what the hot path needs: the SGR
+/// parameters to emit and how far they reach.
+#[derive(Debug)]
+struct CompiledHighlight {
+    sgr: String,
+    whole_line: bool,
 }
 
 #[derive(Debug)]
@@ -576,6 +625,28 @@ impl Engine {
             // fire in scope order, so the most specific layer decides.
             if outcome.route.is_none() {
                 outcome.route.clone_from(&rule.route);
+            }
+            if let Some(highlight) = &rule.highlight {
+                let span = match highlight.whole_line {
+                    true => 0..line.len(),
+                    // Group 0 is the whole match, which always
+                    // participates; capture groups are deliberately not
+                    // offered as a target (§7.7).
+                    false => {
+                        let whole = caps.get(0).expect("group 0 always participates");
+                        whole.start()..whole.end()
+                    }
+                };
+                // Overlaps: first match wins, as with `route:`. Nested SGR
+                // has no defined "restore to the middle state", so a span
+                // colliding with one already taken is dropped whole.
+                let clash = outcome
+                    .highlights
+                    .iter()
+                    .any(|(taken, _)| span.start < taken.end && taken.start < span.end);
+                if !clash {
+                    outcome.highlights.push((span, highlight.sgr.clone()));
+                }
             }
         }
 
@@ -917,6 +988,7 @@ impl Layered for Trigger {
         self.script = self.script.take().or_else(|| base.script.clone());
         self.gag = self.gag.or(base.gag);
         self.route = self.route.take().or_else(|| base.route.clone());
+        self.highlight = self.highlight.take().or_else(|| base.highlight.clone());
         self.enabled = self.enabled.or(base.enabled);
     }
 }
@@ -963,6 +1035,7 @@ trait CompilableRule {
     fn script(&self) -> Option<ScriptAction>;
     fn gag(&self) -> bool;
     fn route(&self) -> Option<String>;
+    fn highlight(&self) -> Option<HighlightSpec>;
 }
 
 impl CompilableRule for Alias {
@@ -998,6 +1071,10 @@ impl CompilableRule for Alias {
         false
     }
     fn route(&self) -> Option<String> {
+        None
+    }
+    /// Aliases never render server output, so there is nothing to restyle.
+    fn highlight(&self) -> Option<HighlightSpec> {
         None
     }
 }
@@ -1036,6 +1113,9 @@ impl CompilableRule for Trigger {
     }
     fn route(&self) -> Option<String> {
         self.route.clone()
+    }
+    fn highlight(&self) -> Option<HighlightSpec> {
+        self.highlight.clone()
     }
 }
 
@@ -1076,9 +1156,88 @@ fn compile_rules<T: CompilableRule>(
                 .transpose()?,
             gag: rule.gag(),
             route: rule.route(),
+            highlight: rule
+                .highlight()
+                .map(|spec| {
+                    compile_highlight(&spec).map_err(|reason| EngineError::BadHighlight {
+                        module: "merged rules".to_string(),
+                        rule: match rule.id_label().is_empty() {
+                            true => pattern.to_string(),
+                            false => rule.id_label(),
+                        },
+                        reason,
+                    })
+                })
+                .transpose()?,
         });
     }
     Ok(out)
+}
+
+/// Turns a `highlight:` block into SGR parameters once, at load, so the
+/// per-line cost is a string splice rather than a colour lookup (§7.7).
+fn compile_highlight(spec: &HighlightSpec) -> Result<CompiledHighlight, String> {
+    let mut params: Vec<String> = Vec::new();
+    for (set, code) in [
+        (spec.bold, "1"),
+        (spec.italic, "3"),
+        (spec.underline, "4"),
+        (spec.reverse, "7"),
+    ] {
+        if set {
+            params.push(code.to_string());
+        }
+    }
+    if let Some(fg) = &spec.fg {
+        params.push(sgr_color(fg, false)?);
+    }
+    if let Some(bg) = &spec.bg {
+        params.push(sgr_color(bg, true)?);
+    }
+    // A block that styles nothing is a typo, not a rule the player meant
+    // to have no effect.
+    if params.is_empty() {
+        return Err("sets no colour or attribute".to_string());
+    }
+    Ok(CompiledHighlight {
+        sgr: params.join(";"),
+        whole_line: spec.whole_line,
+    })
+}
+
+/// One colour as an SGR parameter. The vocabulary is a profile's `color:`
+/// (§11), so the same parser backs both; backgrounds are the foreground
+/// codes offset by ten.
+fn sgr_color(name: &str, background: bool) -> Result<String, String> {
+    use ratatui::style::Color;
+    use std::str::FromStr;
+
+    let color = Color::from_str(name).map_err(|_| {
+        format!("unknown color {name:?}: use a name (cyan, light blue), #rrggbb, or 0-255")
+    })?;
+    let shift = u32::from(background) * 10;
+    let basic = |code: u32| (code + shift).to_string();
+    Ok(match color {
+        Color::Reset => basic(39),
+        Color::Black => basic(30),
+        Color::Red => basic(31),
+        Color::Green => basic(32),
+        Color::Yellow => basic(33),
+        Color::Blue => basic(34),
+        Color::Magenta => basic(35),
+        Color::Cyan => basic(36),
+        Color::Gray => basic(37),
+        Color::DarkGray => basic(90),
+        Color::LightRed => basic(91),
+        Color::LightGreen => basic(92),
+        Color::LightYellow => basic(93),
+        Color::LightBlue => basic(94),
+        Color::LightMagenta => basic(95),
+        Color::LightCyan => basic(96),
+        Color::White => basic(97),
+        Color::Indexed(index) => format!("{};5;{index}", 38 + shift),
+        Color::Rgb(r, g, b) => format!("{};2;{r};{g};{b}", 38 + shift),
+    })
 }
 
 /// Starts a host for each language the layers use and loads their scripts
@@ -2170,6 +2329,188 @@ triggers:
             engine.process_line("Bob tells you hi").route.as_deref(),
             Some("comms")
         );
+    }
+
+    // ---- highlights (docs/ARCHITECTURE.md §7.7) ----
+
+    /// §7.7's own example: the matched text only, as a range over the
+    /// stripped line plus the SGR the session will splice in.
+    #[test]
+    fn a_highlight_covers_the_matched_text_and_carries_its_sgr() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: '\bKestrel\b'
+    highlight: {fg: bright_yellow, bold: true}
+"#,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            engine.process_line("You see Kestrel here.").highlights,
+            vec![(8..15, "1;93".to_string())]
+        );
+        assert!(engine.process_line("You see a rat.").highlights.is_empty());
+    }
+
+    #[test]
+    fn whole_line_covers_the_line_however_little_the_pattern_matched() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: '^You are bleeding'
+    highlight: {fg: white, bg: red, whole_line: true}
+"#,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            engine.process_line("You are bleeding badly.").highlights,
+            vec![(0..23, "97;41".to_string())]
+        );
+    }
+
+    #[test]
+    fn palette_indexes_and_hex_colours_compile_to_extended_sgr() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'rare'
+    highlight: {fg: 208, bg: '#102030', underline: true}
+"#,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            engine.process_line("a rare drop").highlights,
+            vec![(2..6, "4;38;5;208;48;2;16;32;48".to_string())]
+        );
+    }
+
+    /// Nested SGR has no defined "restore to the middle state", so an
+    /// overlapping span is dropped whole rather than nested — the same
+    /// first-match-wins rule `route:` follows.
+    #[test]
+    fn an_overlapping_highlight_is_dropped_rather_than_nested() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'Kestrel the'
+    highlight: {bold: true}
+  - pattern: 'the Bold'
+    highlight: {fg: red}
+  - pattern: 'arrives'
+    highlight: {fg: cyan}
+"#,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            engine.process_line("Kestrel the Bold arrives.").highlights,
+            vec![(0..11, "1".to_string()), (17..24, "36".to_string())],
+            "the overlapping span goes, the disjoint one stays"
+        );
+    }
+
+    /// A gagged line never reaches the scrollback, so its highlights are
+    /// moot — but computing them anyway keeps the two actions independent.
+    #[test]
+    fn a_gagged_line_still_reports_its_highlights() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'spam'
+    highlight: {bold: true}
+    gag: true
+"#,
+        )])
+        .unwrap();
+
+        let outcome = engine.process_line("spam here");
+        assert!(outcome.gag);
+        assert_eq!(outcome.highlights, vec![(0..4, "1".to_string())]);
+    }
+
+    #[test]
+    fn a_later_layer_patches_a_highlight_by_id() {
+        let mut engine = layers(&[
+            r#"
+            name: module
+            triggers:
+              - id: my-name
+                pattern: 'Kestrel'
+                highlight: {fg: bright_yellow}
+            "#,
+            r#"
+            name: profile
+            triggers:
+              - id: my-name
+                highlight: {fg: red, bold: true}
+            "#,
+        ]);
+        assert_eq!(
+            engine.process_line("Kestrel waves").highlights,
+            vec![(0..7, "1;31".to_string())],
+            "the profile's block replaces the module's whole"
+        );
+
+        // And a patch that restates neither keeps the inherited one.
+        let mut engine = layers(&[
+            r#"
+            name: module
+            triggers:
+              - id: my-name
+                pattern: 'Kestrel'
+                highlight: {fg: bright_yellow}
+            "#,
+            "name: profile\ntriggers:\n  - id: my-name\n    send: [\"wave\"]\n",
+        ]);
+        let outcome = engine.process_line("Kestrel waves");
+        assert_eq!(outcome.sends, vec!["wave"]);
+        assert_eq!(outcome.highlights, vec![(0..7, "93".to_string())]);
+    }
+
+    #[test]
+    fn a_highlight_that_styles_nothing_is_a_load_error_naming_the_rule() {
+        let err = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - id: low-hp
+    pattern: 'bleeding'
+    highlight: {whole_line: true}
+"#,
+        )])
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(matches!(err, EngineError::BadHighlight { .. }), "{message}");
+        assert!(message.contains("low-hp"), "{message}");
+    }
+
+    /// An id-less rule is named by the pattern the player wrote, which is
+    /// the only identity it has.
+    #[test]
+    fn a_bad_highlight_colour_is_a_load_error_naming_the_rule() {
+        let err = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: '\bKestrel\b'
+    highlight: {fg: chartreuse}
+"#,
+        )])
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(matches!(err, EngineError::BadHighlight { .. }), "{message}");
+        assert!(message.contains("chartreuse"), "{message}");
+        assert!(message.contains("Kestrel"), "{message}");
     }
 
     /// §7.6's own example: a threshold the pattern cannot express, read

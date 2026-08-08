@@ -270,6 +270,39 @@ becoming a rule that silently never fires. So does a bare term:
 `when: '${combat}'` is an error, not a guess about what counts as true —
 write the comparison out.
 
+### Colouring what matters
+
+A trigger can recolour the text it matched instead of — or as well as —
+acting on it. That is the cheapest way to find your name in a wall of
+chat:
+
+```yaml
+triggers:
+  - pattern: '\bKestrel\b'
+    highlight: {fg: bright_yellow, bold: true}
+  - id: low-hp
+    pattern: '^You are bleeding'
+    highlight: {fg: white, bg: red, whole_line: true}
+```
+
+`fg` and `bg` take a colour name, `#rrggbb`, or a 0-255 palette index —
+the same vocabulary as a profile's `color:`. The attributes are `bold`,
+`italic`, `underline`, and `reverse`. All of them are optional, but a
+`highlight:` that sets none of them is an error at startup rather than a
+rule that quietly does nothing, and so is a colour name nobody has heard
+of.
+
+By default only the matched text is recoloured; `whole_line: true`
+recolours the line. Matching a capture group isn't offered — narrow the
+pattern instead.
+
+The rest of the line keeps whatever colour the server gave it, so a
+highlight inside a coloured region leaves the region looking untouched on
+both sides. Where two highlights would overlap, the first one wins and
+the second is dropped rather than nested, the same way `route:` picks a
+channel. A rule that both gags and highlights just gags: the line isn't
+there to colour.
+
 ### Driving another character
 
 With more than one character connected, a rule can send commands to a
