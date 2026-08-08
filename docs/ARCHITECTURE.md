@@ -768,6 +768,8 @@ is shaped by what must never happen rather than by convenience.
   it. Scrollback text is never recoloured — that space belongs to the
   server's own ANSI. Channel panes take no colour: they aggregate across
   characters, so no one profile's colour could stand for the pane.
+- **Pane sizes:** the channel column's width is a config setting and a pair
+  of keybinds; the mouse is not captured, and §11.4 records why.
 - **Status bar:** connection state, TLS lock icon, charset, MCCP badge,
   latency (M9).
 - **Discoverability:** every binding above is remappable, so no key may be
@@ -903,6 +905,88 @@ Built early for the same reason as §11.2: it is small, it is table stakes,
 and the client is already usable enough that its absence is felt every
 session.
 
+### 11.4 Resizable channel panes (M9)
+
+The channel column is a fixed 28 columns and the stacked channel panes
+divide it evenly (`ui::layout`). That is the right default and the wrong
+permanent answer: how much room comms deserve depends on the MUD, the
+terminal, and the evening.
+
+What M9 ships is the cheap version of that, because it fixes the actual
+complaint — 28 is the wrong number for this terminal — without buying
+anything else:
+
+- **`channel_width:` in `mudular.yaml`** sets the column's starting width,
+  alongside the other install-wide UI settings.
+- **`channel_wider` / `channel_narrower` keybinds** adjust it live,
+  remappable like every other binding and therefore listed in the help
+  overlay for free (§11.2).
+- **What the keys change is state, not layout.** `AppState` holds the
+  width; `ui::layout` keeps computing every `Rect` from it each frame.
+  Ratatui is immediate mode, so a resize is one number changing between
+  frames — no retained widget tree to keep in step, and no second layout
+  path that could disagree with the first.
+- **Clamps, not disappearances.** The session area keeps `MIN_MAIN_WIDTH`
+  and the column a `MIN_CHANNEL_WIDTH`; a resize past a limit stops at it.
+  Shrinking a pane to nothing is a way to lose a pane you cannot then
+  find, and hiding channels is what the toggle key is for. The existing
+  rule that channels are not drawn at all below
+  `MIN_MAIN_WIDTH + CHANNEL_WIDTH` still governs terminal resizes, and the
+  width re-clamps on every `Resize`.
+- **Resizing is a NAWS event** (§6.2): the session panes' widths change,
+  so a resize ends in the same per-pane size report a layout key triggers.
+  A server told the wrong pane width wraps its output wrong.
+- **The width lasts the session.** The config sets the starting value and
+  the keys move it; nothing rewrites the user's config file. Config is a
+  file the user owns and hand-edits with comments, and a client that
+  silently rewrites it is one whose config you cannot trust to stay as you
+  left it. Persisting layout later belongs in a separate state file, not
+  in `mudular.yaml`.
+
+Per-channel heights within the column stay evenly split. Splitting three
+comms panes unevenly is a want nobody has voiced; the column's width
+against the game text is the ratio that actually bites.
+
+#### Dragging borders with the mouse: possible, deliberately not scheduled
+
+It works, and it is not scheduled, and the distinction is worth writing
+down so it stops being re-litigated.
+
+**Feasible.** Crossterm's `EnableMouseCapture` puts the terminal in SGR
+(1006) mouse mode — coordinates work past column 223 — and delivers
+`Event::Mouse` with `MouseEventKind::{Down, Drag, Up, ScrollUp,
+ScrollDown}` and cell coordinates. The existing `EventStream` already
+yields them; today they land in the event loop's catch-all arm and are
+dropped. Hit testing would derive from `ui::layout` rather than a second
+copy of its arithmetic — two implementations of where the border is drift
+the moment either changes, and a drag handle a column off from the line it
+draws is a bug nobody files, they just stop using the feature.
+
+**Not scheduled, for three reasons.**
+
+- **The cost is paid by everyone, the benefit by the people who drag.**
+  Mouse capture takes click-drag text selection away from the terminal:
+  copying a tell or an item block out of the scrollback then needs
+  `Shift`+drag (xterm, VTE, Windows Terminal) or `Option`/`Fn`+drag
+  (Terminal.app, iTerm2). Default-on makes every user pay for a border
+  handle; default-off means nobody finds it. Neither setting is good.
+- **It is not "resizable panes", it is mouse support.** Capture means
+  owning the wheel: wheel events stop scrolling the terminal and arrive as
+  application events, so scroll-the-pane-under-the-pointer would have to
+  ship in the same change, with its own hit testing and viewport work.
+  Click-to-focus becomes conspicuous by its absence immediately after.
+  The honest scope is roughly three times the feature's title.
+- **The keyboard path above already gets most of it**, for a config field,
+  two bindings, and a clamp — no capture, no drag state, no wheel, no hit
+  test, and no new branch in the event loop's `select!`, which is the most
+  load-bearing function in the client.
+
+**What would change the answer:** the keybinds landing and proving
+insufficient in real use — someone resizing often enough that reaching for
+a binding is the friction. Then it gets specced as mouse support proper
+(capture, wheel, click-to-focus, drag), with `mouse:` in `mudular.yaml`
+defaulting to off, and not as a resize handle bolted onto the layout.
+
 ---
 
 ## 12. Errors, Logging, Testing
@@ -964,7 +1048,7 @@ exist from M0, even where a stage is a passthrough).
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
-| **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), keyring-backed auto-login (§10.1), and rule highlights (§7.7) — all built early, as soon as they were useful; scrollback search, disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either |
+| **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), keyring-backed auto-login (§10.1), and rule highlights (§7.7) — all built early, as soon as they were useful; scrollback search, disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), resizable channel column (§11.4), in-TUI new-profile form, self-update check | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either; the channel column can be widened from the keyboard and the sessions beside it are told their new size |
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
