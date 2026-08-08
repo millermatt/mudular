@@ -149,6 +149,22 @@ By default, the platform config directory:
 Override it with `--config-dir <path>` (useful for testing, or running
 multiple isolated configs).
 
+### Saving a transcript
+
+Add `log: true` to a profile and everything that reaches that character's
+scrollback — what the server sends, what you type, aliases' and triggers'
+output — is also appended to `<config dir>/logs/<name>.log`:
+
+```yaml
+log: true
+```
+
+The file grows for as long as you play; nothing rotates or truncates it.
+A masked line never makes it in, for the same reason it's excluded from
+scrollback and command history. If the file can't be opened, or a later
+write fails, logging quietly turns itself off for that session rather
+than ending it.
+
 ### If the connection drops
 
 A connection that goes away on its own — the server rebooting, your
@@ -216,6 +232,35 @@ to a channel to pin it to a single character instead.
 Focusing a channel pane does **not** change where your typing goes — it
 stays with the last character you focused, which is what the input box
 border is telling you.
+
+## Speedwalking
+
+A line starting with `.` followed by count+direction pairs expands into
+one movement command per step — the classic `.3n2e` notation:
+
+```
+.3n2e
+```
+
+sends `n`, `n`, `n`, `e`, `e` in order. Directions are `n s e w u d ne nw
+se sw`; a count defaults to 1 when omitted, and a two-letter diagonal is
+recognised before the one-letter moves it could also be read as, so `.ne`
+is one move, not two (`n` then `e`).
+
+It works wherever a send is queued from typed input, so it's also a way
+to store a named macro — put the path in an alias's `send:` and it
+expands the same as if you'd typed it directly:
+
+```yaml
+aliases:
+  - pattern: '^home$'
+    send: [".2s1w"]
+```
+
+There's no room graph or pathfinding behind it, just text expansion —
+anything that doesn't parse as a path (no leading `.`, or a token that
+isn't a digit run followed by a known direction) is sent exactly as
+typed, so `.` stays an ordinary character everywhere else.
 
 ## Automation: aliases, triggers, timers
 
@@ -337,6 +382,22 @@ both sides. Where two highlights would overlap, the first one wins and
 the second is dropped rather than nested, the same way `route:` picks a
 channel. A rule that both gags and highlights just gags: the line isn't
 there to colour.
+
+### Getting your attention
+
+A trigger can ring the terminal bell — and a desktop notification, on
+terminals that turn it into one (iTerm2, kitty, foot, and others) — when
+it fires in a pane you aren't looking at:
+
+```yaml
+triggers:
+  - pattern: 'You have been slain'
+    bell: true
+```
+
+It only rings for a session that isn't focused; the one you're already
+looking at stays quiet. Independent of `gag:` — a line worth hiding from
+scrollback can still be worth an alert, so a rule can set both.
 
 ### Driving another character
 
