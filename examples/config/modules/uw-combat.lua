@@ -36,6 +36,16 @@ mud.on_gmcp(function(package)
   end
 end)
 
+-- Called by a rule's `script:` action rather than by an event. The
+-- arguments are the matched line and its captures: numbered groups at
+-- caps[1], caps[2], ..., named groups under their own names.
+local kills = 0
+
+function on_death(_, caps)
+  kills = kills + 1
+  mud.echo("** " .. caps.victim .. " down (" .. kills .. " this session)")
+end
+
 -- Greet the MUD in this character's own words once the connection is up.
 mud.on_connect(function()
   mud.send("say " .. (mud.get("greeting") or "hello"))

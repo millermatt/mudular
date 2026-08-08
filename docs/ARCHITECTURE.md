@@ -402,7 +402,14 @@ trait ScriptHost {
   reads the files and hands over their text.
 - **Wiring:** YAML rules reference scripts
   (`script: {file: combat.lua, fn: on_death}`); scripts can also register
-  triggers/aliases/timers programmatically.
+  triggers/aliases/timers programmatically. The function is called with the
+  matched line and the rule's captures — numbered groups by position, named
+  groups by name — so the pattern stays in the YAML where it can be read
+  and overridden per scope, and only the *action* moves into code. Both
+  halves are checked when the rules compile: the file must be one a layer
+  declared, and the function must exist in it, so a typo'd `fn:` fails at
+  load rather than becoming a rule that never does anything. A `when:`
+  guard governs a script action like any other (§7.6): no fire, no call.
 - **Shared state, not a parallel world.** `mud.get`/`mud.set` read and
   write the same variable store as `variables:` and a rule's `set:`, and
   `mud.data` the same server-data store as `${...}` and `when:`. A hook is

@@ -25,6 +25,11 @@ triggers:
   - id: autoloot
     pattern: '(?P<victim>.+) is DEAD!'
     send: ["get all corpse"]
+  # Hand the match to a function in the script above — for anything a
+  # `send:` list cannot express.
+  - id: tally-kills
+    pattern: '(?P<victim>.+) is DEAD!'
+    script: {file: uw-combat.lua, fn: on_death}
   # Remember what we are fighting, so `k` targets it.
   - id: track-target
     pattern: '^You are now fighting (?P<foe>\w+)'

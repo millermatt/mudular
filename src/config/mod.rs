@@ -999,6 +999,7 @@ triggers:
 
     /// The shipped examples are documentation: if they stop loading, the
     /// docs are wrong. Loading them here keeps that from going unnoticed.
+    #[cfg(feature = "lua")]
     #[test]
     fn shipped_example_config_loads_and_compiles() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/config");
@@ -1011,26 +1012,13 @@ triggers:
         );
 
         let layers = load_rules(&dir, Some("kestrel"), &app.channels).expect("example rules load");
-        // The example module ships a Lua script. A build without that
-        // engine still has to prove the *rules* in these files load, so it
-        // checks them without it — refusing the script is its own test.
-        #[cfg(not(feature = "lua"))]
-        let layers: Vec<_> = layers
-            .into_iter()
-            .map(|mut layer| {
-                layer.script_sources.clear();
-                layer
-            })
-            .collect();
         let engine = crate::engine::Engine::compile(&layers).expect("example rules compile");
 
         // The profile disables the module's autoloot and overrides its
         // greeting — the layering the comments in those files describe.
         let mut engine = engine;
-        assert!(
-            engine.process_line("The kobold is DEAD!").sends.is_empty(),
-            "profile disables autoloot"
-        );
+        let death = engine.process_line("The kobold is DEAD!");
+        assert!(death.sends.is_empty(), "profile disables autoloot");
         assert_eq!(
             engine.process_line("Ærlend has arrived.").sends,
             vec!["say well met, Ærlend"]
@@ -1051,12 +1039,31 @@ triggers:
         // its YAML set.
         #[cfg(feature = "lua")]
         {
+            // ...and the still-enabled rule beside autoloot called into it.
+            assert_eq!(death.echoes, vec!["** The kobold down (1 this session)"]);
             assert_eq!(engine.on_connect().sends, vec!["say well met"]);
             assert_eq!(
                 engine.process_line("You quaff a blue potion.").echoes,
                 vec!["** 1 potions this session"]
             );
         }
+    }
+
+    /// The examples use a Lua script, so a build without that engine
+    /// cannot run them — and the one thing it owes the player is to say so
+    /// by name rather than fail obscurely.
+    #[cfg(not(feature = "lua"))]
+    #[test]
+    fn shipped_example_config_says_which_engine_this_build_lacks() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/config");
+        let app = load_app_config(&dir).expect("example mudular.yaml loads");
+
+        let layers = load_rules(&dir, Some("kestrel"), &app.channels).expect("example rules load");
+        let err = crate::engine::Engine::compile(&layers).unwrap_err();
+        assert!(
+            matches!(err, crate::engine::EngineError::ScriptEngineMissing { .. }),
+            "{err}"
+        );
     }
 
     // ---- channel panes (docs/ARCHITECTURE.md §11.1) ----

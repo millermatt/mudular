@@ -247,6 +247,15 @@ impl ScriptHost for LuaHost {
     }
 
     fn call(&mut self, hook: &Hook, ctx: &mut ScriptCtx) -> Result<(), ScriptError> {
+        if let Hook::Function {
+            name,
+            line,
+            captures,
+        } = hook
+        {
+            return self.call_function(name, line, captures, ctx);
+        }
+
         let name = hook.name();
         let callbacks = self.callbacks(name)?;
         if callbacks.is_empty() {
@@ -262,6 +271,9 @@ impl ScriptHost for LuaHost {
                     Hook::Gmcp { package, json } => {
                         callback.call::<()>((package.clone(), json.clone()))?
                     }
+                    // Handled above: a rule's `script:` action names its
+                    // function rather than going through a registry.
+                    Hook::Function { .. } => unreachable!(),
                 }
             }
             Ok(())
@@ -272,9 +284,44 @@ impl ScriptHost for LuaHost {
         self.swap_ctx(ctx);
         result
     }
+
+    fn has_function(&self, name: &str) -> bool {
+        self.lua.globals().get::<Function>(name).is_ok()
+    }
 }
 
 impl LuaHost {
+    /// Calls a global the script defined, as `fn(line, captures)`. Numbered
+    /// groups land in the array part so `caps[1]` is group 1, named ones
+    /// under their own names — the shape a Lua author would have written by
+    /// hand.
+    fn call_function(
+        &mut self,
+        name: &str,
+        line: &str,
+        captures: &super::Captures,
+        ctx: &mut ScriptCtx,
+    ) -> Result<(), ScriptError> {
+        self.swap_ctx(ctx);
+        let result = self.with_budget(name, || {
+            let table = self.lua.create_table()?;
+            for (index, value) in captures.numbered.iter().enumerate() {
+                if let Some(value) = value {
+                    table.set(index + 1, value.as_str())?;
+                }
+            }
+            for (key, value) in &captures.named {
+                table.set(key.as_str(), value.as_str())?;
+            }
+            self.lua
+                .globals()
+                .get::<Function>(name)?
+                .call::<()>((line, table))
+        });
+        self.swap_ctx(ctx);
+        result
+    }
+
     fn callbacks(&self, hook: &str) -> Result<Vec<Function>, ScriptError> {
         self.lua
             .named_registry_value::<Table>(HOOKS_KEY)

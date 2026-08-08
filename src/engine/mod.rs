@@ -76,8 +76,22 @@ pub struct Alias {
     pub send_to: Option<BTreeMap<String, Vec<String>>>,
     #[serde(default)]
     pub set: Option<BTreeMap<String, String>>,
+    /// Call a function a script defined (§7.4).
+    #[serde(default)]
+    pub script: Option<ScriptAction>,
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// A rule's `script:` action: `{file: combat.lua, fn: on_death}`. The file
+/// picks the engine and must be one the module declared; the function is a
+/// global that file's language defined.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptAction {
+    pub file: String,
+    #[serde(rename = "fn")]
+    pub function: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -99,6 +113,9 @@ pub struct Trigger {
     pub send_to: Option<BTreeMap<String, Vec<String>>>,
     #[serde(default)]
     pub set: Option<BTreeMap<String, String>>,
+    /// Call a function a script defined (§7.4).
+    #[serde(default)]
+    pub script: Option<ScriptAction>,
     #[serde(default)]
     pub gag: Option<bool>,
     /// Send the matched line to this channel pane instead of leaving it to
@@ -169,6 +186,10 @@ pub enum EngineError {
         script: String,
         reason: String,
     },
+    #[error("a rule calls `{script}`, which no module or profile declares in `scripts:`")]
+    UndeclaredScript { script: String },
+    #[error("a rule calls `{function}`, which `{script}` does not define")]
+    UnknownScriptFunction { script: String, function: String },
 }
 
 /// Commands a rule asks another session to run (docs/ARCHITECTURE.md §7.5).
@@ -203,6 +224,8 @@ pub struct InputOutcome {
     pub sends: Vec<String>,
     /// Commands for other sessions, for the hub to route (§7.5).
     pub send_to: Vec<CrossSend>,
+    /// Text a script action asked to show in this session only (§7.4).
+    pub echoes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -213,8 +236,25 @@ struct CompiledRule {
     sends: Vec<String>,
     send_to: Vec<(String, Vec<String>)>,
     set: Vec<(String, String)>,
+    /// A `script:` action, resolved at compile time to the host that will
+    /// run it, so firing costs no lookup.
+    script: Option<CompiledScriptCall>,
     gag: bool,
     route: Option<String>,
+}
+
+#[derive(Debug)]
+struct CompiledScriptCall {
+    host: usize,
+    function: String,
+}
+
+/// A script host and the language it speaks, so a rule's `script:` action
+/// can be routed to the engine its file belongs to.
+#[derive(Debug)]
+struct HostEntry {
+    language: &'static str,
+    host: Box<dyn ScriptHost>,
 }
 
 impl CompiledRule {
@@ -258,7 +298,7 @@ pub struct Engine {
     /// One host per script language this session's modules actually use
     /// (§7.4). Empty for a rules-only session, which then never enters a
     /// VM at all.
-    hosts: Vec<Box<dyn ScriptHost>>,
+    hosts: Vec<HostEntry>,
 }
 
 impl Engine {
@@ -277,14 +317,19 @@ impl Engine {
             merge_layer(&mut timers, &layer.timers, &layer.name)?;
         }
 
+        // Scripts load before the rules compile: a rule's `script:` action
+        // is checked against the functions its file actually defined, so a
+        // typo fails here rather than never firing.
+        let (hosts, declared) = compile_scripts(layers)?;
+
         Ok(Engine {
-            aliases: compile_rules(&aliases)?,
-            triggers: compile_rules(&triggers)?,
+            aliases: compile_rules(&aliases, &hosts, &declared)?,
+            triggers: compile_rules(&triggers, &hosts, &declared)?,
             timers: compile_timers(&timers)?,
             variables,
             server_data: HashMap::new(),
             gmcp_keys: HashSet::new(),
-            hosts: compile_scripts(layers)?,
+            hosts,
         })
     }
 
@@ -296,6 +341,13 @@ impl Engine {
     /// that stopped working is exactly as invisible as a trigger that
     /// stopped firing, and neither should be.
     fn run_hook(&mut self, hook: &Hook) -> ScriptOutcome {
+        self.run_hook_on(hook, None)
+    }
+
+    /// As [`Self::run_hook`], but `only` narrows it to a single host — what
+    /// a rule's `script:` action needs, since it names one function in one
+    /// language.
+    fn run_hook_on(&mut self, hook: &Hook, only: Option<usize>) -> ScriptOutcome {
         if self.hosts.is_empty() {
             return ScriptOutcome::default();
         }
@@ -305,8 +357,11 @@ impl Engine {
             server_data: std::mem::take(&mut self.server_data),
             out: ScriptOutcome::default(),
         };
-        for host in &mut self.hosts {
-            if let Err(err) = host.call(hook, &mut ctx) {
+        for (index, entry) in self.hosts.iter_mut().enumerate() {
+            if only.is_some_and(|wanted| wanted != index) {
+                continue;
+            }
+            if let Err(err) = entry.host.call(hook, &mut ctx) {
                 ctx.out.echoes.push(format!("** {err}"));
             }
         }
@@ -349,6 +404,7 @@ impl Engine {
     pub fn process_line(&mut self, line: &str) -> LineOutcome {
         let mut outcome = LineOutcome::default();
         let mut updates: Vec<(String, String)> = Vec::new();
+        let mut calls: Vec<(usize, String, script::Captures)> = Vec::new();
 
         for rule in &self.triggers {
             let Some(caps) = rule.regex.captures(line) else {
@@ -384,6 +440,13 @@ impl Engine {
                     expand(template, Some(&caps), &self.variables, &self.server_data),
                 ));
             }
+            if let Some(call) = &rule.script {
+                calls.push((
+                    call.host,
+                    call.function.clone(),
+                    captured(&rule.regex, &caps),
+                ));
+            }
             outcome.gag |= rule.gag;
             // First route wins: a line belongs in one channel, and rules
             // fire in scope order, so the most specific layer decides.
@@ -396,8 +459,23 @@ impl Engine {
 
         // Scripts run after the trigger table, so a hook sees the variables
         // this line's rules just set and can override their verdict on the
-        // line itself.
-        let scripted = self.run_hook(&Hook::Line(line.to_string()));
+        // line itself. Rules' own `script:` actions go first, in rule
+        // order, then the `on_line` hooks.
+        let mut scripted = ScriptOutcome::default();
+        for (host, function, captures) in calls {
+            merge(
+                &mut scripted,
+                self.run_hook_on(
+                    &Hook::Function {
+                        name: function,
+                        line: line.to_string(),
+                        captures,
+                    },
+                    Some(host),
+                ),
+            );
+        }
+        merge(&mut scripted, self.run_hook(&Hook::Line(line.to_string())));
         outcome.sends.extend(scripted.sends);
         outcome.echoes = scripted.echoes;
         outcome.gag |= scripted.gag;
@@ -430,6 +508,7 @@ impl Engine {
     pub fn expand_input(&mut self, input: &str) -> InputOutcome {
         let mut out = InputOutcome::default();
         let mut updates: Vec<(String, String)> = Vec::new();
+        let mut calls: Vec<(usize, String, String, script::Captures)> = Vec::new();
 
         for part in input.split(';') {
             let part = part.trim();
@@ -474,12 +553,35 @@ impl Engine {
                             expand(template, Some(&caps), &self.variables, &self.server_data),
                         ));
                     }
+                    if let Some(call) = &rule.script {
+                        calls.push((
+                            call.host,
+                            call.function.clone(),
+                            part.to_string(),
+                            captured(&rule.regex, &caps),
+                        ));
+                    }
                 }
                 None => out.sends.push(part.to_string()),
             }
         }
 
         self.variables.extend(updates);
+
+        // As on an inbound line: the alias's own commands are collected
+        // first, then its script action runs over the variables they set.
+        for (host, function, part, captures) in calls {
+            let scripted = self.run_hook_on(
+                &Hook::Function {
+                    name: function,
+                    line: part,
+                    captures,
+                },
+                Some(host),
+            );
+            out.sends.extend(scripted.sends);
+            out.echoes.extend(scripted.echoes);
+        }
         out
     }
 
@@ -616,6 +718,7 @@ impl Layered for Alias {
         self.send = self.send.take().or_else(|| base.send.clone());
         self.send_to = self.send_to.take().or_else(|| base.send_to.clone());
         self.set = self.set.take().or_else(|| base.set.clone());
+        self.script = self.script.take().or_else(|| base.script.clone());
         self.enabled = self.enabled.or(base.enabled);
     }
 }
@@ -645,6 +748,7 @@ impl Layered for Trigger {
         self.send = self.send.take().or_else(|| base.send.clone());
         self.send_to = self.send_to.take().or_else(|| base.send_to.clone());
         self.set = self.set.take().or_else(|| base.set.clone());
+        self.script = self.script.take().or_else(|| base.script.clone());
         self.gag = self.gag.or(base.gag);
         self.route = self.route.take().or_else(|| base.route.clone());
         self.enabled = self.enabled.or(base.enabled);
@@ -690,6 +794,7 @@ trait CompilableRule {
     fn sends(&self) -> Vec<String>;
     fn send_to(&self) -> Vec<(String, Vec<String>)>;
     fn sets(&self) -> Vec<(String, String)>;
+    fn script(&self) -> Option<ScriptAction>;
     fn gag(&self) -> bool;
     fn route(&self) -> Option<String>;
 }
@@ -719,6 +824,9 @@ impl CompilableRule for Alias {
     }
     fn sets(&self) -> Vec<(String, String)> {
         self.set.clone().unwrap_or_default().into_iter().collect()
+    }
+    fn script(&self) -> Option<ScriptAction> {
+        self.script.clone()
     }
     fn gag(&self) -> bool {
         false
@@ -754,6 +862,9 @@ impl CompilableRule for Trigger {
     fn sets(&self) -> Vec<(String, String)> {
         self.set.clone().unwrap_or_default().into_iter().collect()
     }
+    fn script(&self) -> Option<ScriptAction> {
+        self.script.clone()
+    }
     fn gag(&self) -> bool {
         self.gag.unwrap_or(false)
     }
@@ -762,7 +873,11 @@ impl CompilableRule for Trigger {
     }
 }
 
-fn compile_rules<T: CompilableRule>(rules: &[T]) -> Result<Vec<CompiledRule>, EngineError> {
+fn compile_rules<T: CompilableRule>(
+    rules: &[T],
+    hosts: &[HostEntry],
+    declared: &HashSet<String>,
+) -> Result<Vec<CompiledRule>, EngineError> {
     let mut out = Vec::new();
     for rule in rules.iter().filter(|rule| rule.enabled()) {
         let pattern = rule.pattern_str().ok_or_else(|| EngineError::UnknownRule {
@@ -789,6 +904,10 @@ fn compile_rules<T: CompilableRule>(rules: &[T]) -> Result<Vec<CompiledRule>, En
             sends: rule.sends(),
             send_to: rule.send_to(),
             set: rule.sets(),
+            script: rule
+                .script()
+                .map(|action| compile_script_call(&action, hosts, declared))
+                .transpose()?,
             gag: rule.gag(),
             route: rule.route(),
         });
@@ -798,9 +917,13 @@ fn compile_rules<T: CompilableRule>(rules: &[T]) -> Result<Vec<CompiledRule>, En
 
 /// Starts a host for each language the layers use and loads their scripts
 /// in scope order, so a profile's script sees whatever a shared module's
-/// script registered first (§7.3).
-fn compile_scripts(layers: &[RuleModule]) -> Result<Vec<Box<dyn ScriptHost>>, EngineError> {
-    let mut hosts: Vec<(&'static str, Box<dyn ScriptHost>)> = Vec::new();
+/// script registered first (§7.3). Also returns every declared file name,
+/// which is what a rule's `script:` action must name.
+fn compile_scripts(
+    layers: &[RuleModule],
+) -> Result<(Vec<HostEntry>, HashSet<String>), EngineError> {
+    let mut hosts: Vec<HostEntry> = Vec::new();
+    let mut declared = HashSet::new();
 
     for layer in layers {
         for source in &layer.script_sources {
@@ -809,25 +932,98 @@ fn compile_scripts(layers: &[RuleModule]) -> Result<Vec<Box<dyn ScriptHost>>, En
                     module: layer.name.clone(),
                     script: source.name.clone(),
                 })?;
-            let index = match hosts.iter().position(|(lang, _)| *lang == language) {
+            let index = match hosts.iter().position(|entry| entry.language == language) {
                 Some(index) => index,
                 None => {
-                    hosts.push((language, new_host(language, layer, &source.name)?));
+                    hosts.push(HostEntry {
+                        language,
+                        host: new_host(language, layer, &source.name)?,
+                    });
                     hosts.len() - 1
                 }
             };
             hosts[index]
-                .1
+                .host
                 .load(source)
                 .map_err(|err| EngineError::BadScript {
                     module: layer.name.clone(),
                     script: source.name.clone(),
                     reason: err.to_string(),
                 })?;
+            declared.insert(source.name.clone());
         }
     }
 
-    Ok(hosts.into_iter().map(|(_, host)| host).collect())
+    Ok((hosts, declared))
+}
+
+/// Resolves a rule's `script:` action to the host that will run it. Both
+/// halves are checked now: the file must be one the layers declared, and
+/// the function must exist in it — a rule that would never fire is a load
+/// error, exactly like an invalid pattern.
+fn compile_script_call(
+    action: &ScriptAction,
+    hosts: &[HostEntry],
+    declared: &HashSet<String>,
+) -> Result<CompiledScriptCall, EngineError> {
+    if !declared.contains(&action.file) {
+        return Err(EngineError::UndeclaredScript {
+            script: action.file.clone(),
+        });
+    }
+    let language = language_of(&action.file).ok_or_else(|| EngineError::UnknownScriptLanguage {
+        module: "merged rules".to_string(),
+        script: action.file.clone(),
+    })?;
+    let host = hosts
+        .iter()
+        .position(|entry| entry.language == language)
+        .ok_or_else(|| EngineError::ScriptEngineMissing {
+            module: "merged rules".to_string(),
+            script: action.file.clone(),
+            language,
+        })?;
+    if !hosts[host].host.has_function(&action.function) {
+        return Err(EngineError::UnknownScriptFunction {
+            script: action.file.clone(),
+            function: action.function.clone(),
+        });
+    }
+    Ok(CompiledScriptCall {
+        host,
+        function: action.function.clone(),
+    })
+}
+
+/// Collects a rule's captures in the shape scripts see them: numbered
+/// groups in order, named groups by name, non-participating groups absent.
+fn captured(regex: &Regex, caps: &Captures) -> script::Captures {
+    script::Captures {
+        numbered: caps
+            .iter()
+            .skip(1)
+            .map(|group| group.map(|m| m.as_str().to_string()))
+            .collect(),
+        named: regex
+            .capture_names()
+            .flatten()
+            .filter_map(|name| {
+                caps.name(name)
+                    .map(|m| (name.to_string(), m.as_str().to_string()))
+            })
+            .collect(),
+    }
+}
+
+/// Folds one script call's results into the line's running total. `gag` is
+/// sticky and a later `substitute` wins, matching how the rules combine.
+fn merge(into: &mut ScriptOutcome, from: ScriptOutcome) {
+    into.sends.extend(from.sends);
+    into.echoes.extend(from.echoes);
+    into.gag |= from.gag;
+    if from.substitute.is_some() {
+        into.substitute = from.substitute;
+    }
 }
 
 /// A script's extension picks its engine — the same file name a player
@@ -2111,6 +2307,132 @@ triggers:
 
             let mut engine = Engine::compile(&[shared, profile]).expect("compiles");
             assert_eq!(engine.process_line("x").sends, vec!["hello"]);
+        }
+
+        /// The `script:` action from §7.4: a rule matches, and the function
+        /// it names gets the line and its captures.
+        #[test]
+        fn a_rule_calls_a_script_function_with_its_captures() {
+            let mut engine = scripted_engine(
+                r#"
+                name: test
+                triggers:
+                  - pattern: '^(?P<killer>\w+) killed (\w+)!$'
+                    script: {file: test.lua, fn: on_death}
+                "#,
+                r#"
+                function on_death(line, caps)
+                  mud.echo(line)
+                  mud.send("say " .. caps.killer .. " got " .. caps[2])
+                end
+                "#,
+            );
+
+            let outcome = engine.process_line("Grunk killed kobold!");
+            assert_eq!(outcome.echoes, vec!["Grunk killed kobold!"]);
+            assert_eq!(outcome.sends, vec!["say Grunk got kobold"]);
+        }
+
+        #[test]
+        fn an_alias_can_call_a_script_function() {
+            let mut engine = scripted_engine(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^hunt (\w+)$'
+                    script: {file: test.lua, fn: hunt}
+                "#,
+                r#"function hunt(_, caps) mud.send("kill " .. caps[1]) end"#,
+            );
+
+            assert_eq!(engine.expand_input("hunt rat").sends, vec!["kill rat"]);
+        }
+
+        /// A rule's script action runs after the trigger table, so it reads
+        /// what this line's rules just set — the same order the `on_line`
+        /// hooks see.
+        #[test]
+        fn a_script_action_sees_the_variables_its_line_set() {
+            let mut engine = scripted_engine(
+                r#"
+                name: test
+                triggers:
+                  - pattern: '^You are now fighting (?P<foe>\w+)'
+                    set: {target: "${foe}"}
+                  - pattern: '^You are now fighting'
+                    script: {file: test.lua, fn: engaged}
+                "#,
+                r#"function engaged() mud.send("consider " .. mud.get("target")) end"#,
+            );
+
+            assert_eq!(
+                engine.process_line("You are now fighting kobold").sends,
+                vec!["consider kobold"]
+            );
+        }
+
+        /// A guard governs the script action like any other: no match, no
+        /// call.
+        #[test]
+        fn a_guarded_out_rule_does_not_call_its_script() {
+            let mut engine = scripted_engine(
+                r#"
+                name: test
+                triggers:
+                  - pattern: '^Your health: (?P<hp>\d+)%'
+                    when: '${hp} < 40'
+                    script: {file: test.lua, fn: hurt}
+                "#,
+                r#"function hurt() mud.send("quaff heal") end"#,
+            );
+
+            assert!(engine.process_line("Your health: 90%").sends.is_empty());
+            assert_eq!(
+                engine.process_line("Your health: 30%").sends,
+                vec!["quaff heal"]
+            );
+        }
+
+        /// A typo in `fn:` is a load error, not a rule that quietly never
+        /// does anything — the same promise `when:` and `pattern:` make.
+        #[test]
+        fn a_rule_naming_a_function_that_does_not_exist_fails_at_load() {
+            let mut layer = module(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'x'
+                    script: {file: test.lua, fn: on_deth}
+                "#,
+            );
+            layer.script_sources.push(ScriptSource {
+                name: "test.lua".to_string(),
+                code: "function on_death() end".to_string(),
+            });
+
+            let err = Engine::compile(&[layer]).unwrap_err();
+            assert!(
+                matches!(&err, EngineError::UnknownScriptFunction { function, .. } if function == "on_deth"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn a_rule_naming_an_undeclared_script_fails_at_load() {
+            let layer = module(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'x'
+                    script: {file: ghost.lua, fn: boo}
+                "#,
+            );
+
+            let err = Engine::compile(&[layer]).unwrap_err();
+            assert!(
+                matches!(&err, EngineError::UndeclaredScript { script } if script == "ghost.lua"),
+                "{err}"
+            );
         }
 
         #[test]

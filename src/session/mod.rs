@@ -453,6 +453,11 @@ async fn run(
                         if send_lines(&mut writer, &outcome.sends).await.is_err() {
                             break "write failed".to_string();
                         }
+                        for text in outcome.echoes {
+                            if events.send(SessionEvent::Line(text)).await.is_err() {
+                                return;
+                            }
+                        }
                         if emit_cross_sends(&events, outcome.send_to, FIRST_HOP).await.is_err() {
                             return;
                         }
@@ -473,6 +478,11 @@ async fn run(
                                 let outcome = engine.expand_input(line);
                                 sends.extend(outcome.sends);
                                 cross.extend(outcome.send_to);
+                                for text in outcome.echoes {
+                                    if events.send(SessionEvent::Line(text)).await.is_err() {
+                                        return;
+                                    }
+                                }
                             }
                             (sends, cross)
                         } else {

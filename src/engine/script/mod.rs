@@ -17,7 +17,7 @@
 // here unused in that configuration, which is the point of them.
 #![cfg_attr(not(feature = "lua"), allow(dead_code))]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -55,6 +55,22 @@ pub enum Hook {
         package: String,
         json: String,
     },
+    /// A function a YAML rule named in its `script:` action, called with
+    /// the text that matched and the rule's captures.
+    Function {
+        name: String,
+        line: String,
+        captures: Captures,
+    },
+}
+
+/// A rule's regex captures, in a shape every language can bind naturally:
+/// `numbered[0]` is group 1, and named groups keep their names. Groups that
+/// did not participate in the match are absent rather than empty.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Captures {
+    pub numbered: Vec<Option<String>>,
+    pub named: BTreeMap<String, String>,
 }
 
 impl Hook {
@@ -66,6 +82,7 @@ impl Hook {
             Hook::Line(_) => "line",
             Hook::Prompt(_) => "prompt",
             Hook::Gmcp { .. } => "gmcp",
+            Hook::Function { .. } => "script action",
         }
     }
 }
@@ -121,4 +138,9 @@ pub trait ScriptHost: std::fmt::Debug + Send {
     /// Run every hook registered for `hook`, in registration order.
     /// A host that has none returns `Ok` without entering its VM.
     fn call(&mut self, hook: &Hook, ctx: &mut ScriptCtx) -> Result<(), ScriptError>;
+
+    /// Whether a loaded script defined this function. Checked when the
+    /// rules compile, so a typo in a rule's `fn:` fails at load like a bad
+    /// pattern does — not silently never firing.
+    fn has_function(&self, name: &str) -> bool;
 }
