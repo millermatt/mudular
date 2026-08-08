@@ -93,6 +93,7 @@ Supporting crates:
 | Config paths | `directories` | platform config dir discovery |
 | Secrets | `keyring` | OS keychain for auto-login passwords (§10.1) |
 | Scripting | `mlua` (vendored Lua 5.4) | feature `lua`, on by default; statically linked, so §15 still ships one file (§7.4) |
+| Scripting (2nd engine) | `rquickjs` (QuickJS) | feature `js`, off by default; also static, and proves the `ScriptHost` abstraction (§7.4) |
 
 ### 2.1 Dependency policy
 
@@ -381,7 +382,15 @@ trait ScriptHost {
   - **Lua** first, via `mlua` (vendored Lua 5.4, statically linked) — the
     MUD community's lingua franca; eases migration from Mudlet.
   - **JavaScript** second, via `rquickjs` (QuickJS, statically linked) —
-    shipping a second engine early proves the abstraction is real.
+    shipping a second engine early proves the abstraction is real. Behind
+    the non-default `js` feature: it exists to keep the abstraction honest,
+    not because every build should carry two VMs.
+  - **The proof is a shared suite, not a shared shape.** Both hosts run the
+    same conformance scenarios — same hooks, same effects, same errors,
+    same abort — from ports that differ only in syntax. That is what makes
+    "identical across languages" a testable claim rather than a promise
+    about which functions exist. A session can host both at once: the file
+    extension picks the engine per script, and a line reaches every host.
   - Others (e.g. `rhai`) slot in behind the same trait. Engines requiring a
     system runtime (Python/pyo3) are excluded: they break the single-binary
     distribution goal (§15).

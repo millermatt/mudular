@@ -15,13 +15,18 @@
 // carries this API, so that declaring a script fails with "this build has
 // no Lua engine" instead of an unknown-field error. That leaves the types
 // here unused in that configuration, which is the point of them.
-#![cfg_attr(not(feature = "lua"), allow(dead_code))]
+#![cfg_attr(not(any(feature = "lua", feature = "js")), allow(dead_code))]
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use thiserror::Error;
 
+#[cfg(test)]
+mod conformance;
+
+#[cfg(feature = "js")]
+pub mod js;
 #[cfg(feature = "lua")]
 pub mod lua;
 

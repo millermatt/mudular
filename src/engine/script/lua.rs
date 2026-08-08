@@ -355,6 +355,7 @@ fn load_error(script: &str, err: mlua::Error) -> ScriptError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::script::conformance;
 
     fn host_with(code: &str) -> LuaHost {
         let mut host = LuaHost::new().expect("VM starts");
@@ -366,197 +367,71 @@ mod tests {
         host
     }
 
-    fn call(host: &mut LuaHost, hook: Hook, ctx: &mut ScriptCtx) {
-        host.call(&hook, ctx).expect("hook runs");
-    }
-
+    /// The Lua port of the cross-language suite (§7.4). Everything the API
+    /// promises is asserted there, once, for every engine.
     #[test]
-    fn line_hook_sends_and_gags() {
-        let mut host = host_with(
-            r#"
-            mud.on_line(function(line)
-              if line:match("^You are hungry") then
-                mud.send("eat bread")
-                mud.gag()
-              end
-            end)
-            "#,
-        );
-
-        let mut ctx = ScriptCtx::default();
-        call(
-            &mut host,
-            Hook::Line("You are hungry.".to_string()),
-            &mut ctx,
-        );
-        assert_eq!(ctx.out.sends, vec!["eat bread"]);
-        assert!(ctx.out.gag);
-
-        let mut ctx = ScriptCtx::default();
-        call(&mut host, Hook::Line("You are full.".to_string()), &mut ctx);
-        assert!(ctx.out.sends.is_empty());
-        assert!(!ctx.out.gag);
-    }
-
-    #[test]
-    fn variables_survive_between_calls_and_reach_the_engine() {
-        let mut host = host_with(
-            r#"
-            mud.on_line(function(line)
-              local seen = tonumber(mud.get("seen") or "0")
-              mud.set("seen", tostring(seen + 1))
-            end)
-            "#,
-        );
-
-        let mut ctx = ScriptCtx::default();
-        call(&mut host, Hook::Line("a".to_string()), &mut ctx);
-        assert_eq!(ctx.vars.get("seen").map(String::as_str), Some("1"));
-        // The engine keeps the store between lines, so the count continues.
-        call(&mut host, Hook::Line("b".to_string()), &mut ctx);
-        assert_eq!(ctx.vars.get("seen").map(String::as_str), Some("2"));
-    }
-
-    #[test]
-    fn server_data_is_readable() {
-        let mut host = host_with(
-            r#"
-            mud.on_prompt(function()
-              if tonumber(mud.data("Char.Vitals.hp")) < 40 then
-                mud.send("quaff heal")
-              end
-            end)
-            "#,
-        );
-
-        let mut ctx = ScriptCtx::default();
-        ctx.server_data
-            .insert("Char.Vitals.hp".to_string(), "30".to_string());
-        call(&mut host, Hook::Prompt("HP:30".to_string()), &mut ctx);
-        assert_eq!(ctx.out.sends, vec!["quaff heal"]);
-    }
-
-    #[test]
-    fn gmcp_hook_receives_package_and_payload() {
-        let mut host = host_with(
-            r#"
-            mud.on_gmcp(function(package, json)
-              mud.echo(package .. " " .. json)
-            end)
-            "#,
-        );
-
-        let mut ctx = ScriptCtx::default();
-        call(
-            &mut host,
-            Hook::Gmcp {
-                package: "Char.Vitals".to_string(),
-                json: r#"{"hp":30}"#.to_string(),
+    fn passes_the_hook_api_conformance_suite() {
+        conformance::run(
+            || Box::new(LuaHost::new().expect("VM starts")),
+            &conformance::Ported {
+                line_hook: r#"
+                    mud.on_line(function(line)
+                      if line:match("^You are hungry") then
+                        mud.send("eat bread")
+                        mud.gag()
+                      end
+                    end)
+                "#,
+                counter: r#"
+                    mud.on_line(function()
+                      mud.set("seen", tostring(tonumber(mud.get("seen") or "0") + 1))
+                    end)
+                "#,
+                reads_server_data: r#"
+                    mud.on_prompt(function()
+                      if tonumber(mud.data("Char.Vitals.hp")) < 40 then
+                        mud.send("quaff heal")
+                      end
+                    end)
+                "#,
+                gmcp: r#"
+                    mud.on_gmcp(function(package, json)
+                      mud.echo(package .. " " .. json)
+                    end)
+                "#,
+                two_hooks: r#"
+                    mud.on_line(function() mud.send("first") end)
+                    mud.on_line(function() mud.send("second") end)
+                "#,
+                lifecycle: r#"
+                    mud.on_connect(function() mud.send("look") end)
+                    mud.on_disconnect(function() mud.echo("bye") end)
+                "#,
+                substitute: r#"
+                    mud.on_line(function(line)
+                      if line == "raw" then mud.substitute("polished") end
+                    end)
+                "#,
+                rule_action: r#"
+                    function on_death(line, caps)
+                      mud.echo(line)
+                      mud.send("say " .. caps.killer .. " got " .. caps[2])
+                    end
+                "#,
+                failing: r#"
+                    mud.on_line(function()
+                      mud.send("sent before the error")
+                      error("boom")
+                    end)
+                "#,
+                runaway: "mud.on_line(function() while true do end end)",
+                broken: "this is not lua",
             },
-            &mut ctx,
-        );
-        assert_eq!(ctx.out.echoes, vec![r#"Char.Vitals {"hp":30}"#]);
-    }
-
-    #[test]
-    fn hooks_run_in_registration_order() {
-        let mut host = host_with(
-            r#"
-            mud.on_line(function() mud.send("first") end)
-            mud.on_line(function() mud.send("second") end)
-            "#,
-        );
-
-        let mut ctx = ScriptCtx::default();
-        call(&mut host, Hook::Line("x".to_string()), &mut ctx);
-        assert_eq!(ctx.out.sends, vec!["first", "second"]);
-    }
-
-    #[test]
-    fn connect_and_disconnect_take_no_argument() {
-        let mut host = host_with(
-            r##"
-            mud.on_connect(function(...) mud.send("wake " .. select("#", ...)) end)
-            mud.on_disconnect(function() mud.echo("bye") end)
-            "##,
-        );
-
-        let mut ctx = ScriptCtx::default();
-        call(&mut host, Hook::Connect, &mut ctx);
-        call(&mut host, Hook::Disconnect, &mut ctx);
-        assert_eq!(ctx.out.sends, vec!["wake 0"]);
-        assert_eq!(ctx.out.echoes, vec!["bye"]);
-    }
-
-    #[test]
-    fn a_broken_script_names_its_file() {
-        let mut host = LuaHost::new().unwrap();
-        let err = host
-            .load(&ScriptSource {
-                name: "combat.lua".to_string(),
-                code: "this is not lua".to_string(),
-            })
-            .unwrap_err();
-        assert!(
-            matches!(&err, ScriptError::Load { script, .. } if script == "combat.lua"),
-            "{err}"
         );
     }
 
-    #[test]
-    fn a_failing_hook_reports_the_hook_and_keeps_its_effects() {
-        let mut host = host_with(
-            r#"
-            mud.on_line(function()
-              mud.send("sent before the error")
-              error("boom")
-            end)
-            "#,
-        );
-
-        let mut ctx = ScriptCtx::default();
-        let err = host
-            .call(&Hook::Line("x".to_string()), &mut ctx)
-            .unwrap_err();
-        assert!(
-            matches!(&err, ScriptError::Runtime { hook, .. } if hook == "line"),
-            "{err}"
-        );
-        assert_eq!(ctx.out.sends, vec!["sent before the error"]);
-    }
-
-    #[test]
-    fn a_runaway_hook_is_aborted_within_the_budget() {
-        let mut host = host_with("mud.on_line(function() while true do end end)");
-
-        let mut ctx = ScriptCtx::default();
-        let started = Instant::now();
-        let err = host
-            .call(&Hook::Line("x".to_string()), &mut ctx)
-            .unwrap_err();
-        assert!(matches!(err, ScriptError::Timeout { .. }), "{err}");
-        assert!(
-            started.elapsed() < TIME_BUDGET * 10,
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
-    #[test]
-    fn a_later_hook_still_runs_after_a_timeout() {
-        let mut host = host_with(
-            r#"
-            mud.on_line(function() while true do end end)
-            mud.on_prompt(function() mud.send("still here") end)
-            "#,
-        );
-
-        let mut ctx = ScriptCtx::default();
-        assert!(host.call(&Hook::Line("x".to_string()), &mut ctx).is_err());
-        call(&mut host, Hook::Prompt("HP:100".to_string()), &mut ctx);
-        assert_eq!(ctx.out.sends, vec!["still here"]);
-    }
-
+    /// Lua-specific: the sandbox is what the VM was built without, not what
+    /// a script politely avoids.
     #[test]
     fn the_sandbox_has_no_filesystem_or_process_access() {
         let host = host_with("");
@@ -570,6 +445,8 @@ mod tests {
         }
     }
 
+    /// Registered hooks live in the registry, so a script cannot unregister
+    /// another script's by assigning over the `mud` table.
     #[test]
     fn hooks_are_not_reachable_from_a_script() {
         let mut host = host_with(
@@ -580,7 +457,8 @@ mod tests {
         );
 
         let mut ctx = ScriptCtx::default();
-        call(&mut host, Hook::Line("x".to_string()), &mut ctx);
+        host.call(&Hook::Line("x".to_string()), &mut ctx)
+            .expect("hook runs");
         assert_eq!(ctx.out.sends, vec!["registered"]);
     }
 }

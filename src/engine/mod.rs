@@ -1031,6 +1031,7 @@ fn merge(into: &mut ScriptOutcome, from: ScriptOutcome) {
 fn language_of(script: &str) -> Option<&'static str> {
     match script.rsplit('.').next() {
         Some("lua") => Some("lua"),
+        Some("js") => Some("JavaScript"),
         _ => None,
     }
 }
@@ -1045,15 +1046,19 @@ fn new_host(
         script: script.to_string(),
         language,
     };
+    // Unused in a build with no engine compiled in, where every arm below
+    // is cfg'd away and only `missing()` is left.
+    #[cfg_attr(not(any(feature = "lua", feature = "js")), allow(unused_variables))]
+    let failed = |err: script::ScriptError| EngineError::BadScript {
+        module: layer.name.clone(),
+        script: script.to_string(),
+        reason: err.to_string(),
+    };
     match language {
         #[cfg(feature = "lua")]
-        "lua" => Ok(Box::new(script::lua::LuaHost::new().map_err(|err| {
-            EngineError::BadScript {
-                module: layer.name.clone(),
-                script: script.to_string(),
-                reason: err.to_string(),
-            }
-        })?)),
+        "lua" => Ok(Box::new(script::lua::LuaHost::new().map_err(failed)?)),
+        #[cfg(feature = "js")]
+        "JavaScript" => Ok(Box::new(script::js::JsHost::new().map_err(failed)?)),
         _ => Err(missing()),
     }
 }
@@ -2163,6 +2168,51 @@ triggers:
         assert!(
             matches!(&err, EngineError::ScriptEngineMissing { language, .. } if *language == "lua"),
             "{err}"
+        );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn a_javascript_module_is_hosted_like_a_lua_one() {
+        let mut layer = module(
+            r#"
+            name: test
+            triggers:
+              - pattern: '^(\w+) is DEAD!$'
+                script: {file: combat.js, fn: onDeath}
+            "#,
+        );
+        layer.script_sources.push(ScriptSource {
+            name: "combat.js".to_string(),
+            code: r#"function onDeath(_, caps) { mud.send("loot " + caps[1]); }"#.to_string(),
+        });
+
+        let mut engine = Engine::compile(&[layer]).expect("compiles");
+        assert_eq!(
+            engine.process_line("kobold is DEAD!").sends,
+            vec!["loot kobold"]
+        );
+    }
+
+    /// Two languages in one session get one host each, and a line reaches
+    /// both — the engine never asks which language it is dispatching to.
+    #[cfg(all(feature = "lua", feature = "js"))]
+    #[test]
+    fn two_languages_share_one_session() {
+        let mut layer = module("name: test");
+        layer.script_sources.push(ScriptSource {
+            name: "a.lua".to_string(),
+            code: r#"mud.on_line(function() mud.send("from lua") end)"#.to_string(),
+        });
+        layer.script_sources.push(ScriptSource {
+            name: "b.js".to_string(),
+            code: r#"mud.on_line(function () { mud.send("from js"); });"#.to_string(),
+        });
+
+        let mut engine = Engine::compile(&[layer]).expect("compiles");
+        assert_eq!(
+            engine.process_line("anything").sends,
+            vec!["from lua", "from js"]
         );
     }
 
