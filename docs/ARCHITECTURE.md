@@ -524,6 +524,14 @@ job (below).
   `${foo}` verbatim so a typo is visible on screen — a boolean has no
   equivalent way to show itself, and "don't fire" is the safe failure for a
   rule that would otherwise send commands.
+- **A bare term is not a condition.** `when: '${combat}'` is a load-time
+  error, not a rule that quietly never fires: every value in the stores is
+  a string, so a term alone has no truthiness to define. Write the
+  comparison out.
+- **A guarded-out rule does nothing at all** — it does not `gag:` or
+  `route:` the line either, since the rule as a whole did not fire. For an
+  alias, a false guard is not a match, so the next matching alias, or
+  failing that the literal input, still gets its turn.
 - **Peer values (M8):** `${@tank.hp}` resolves through the peer snapshot
   (§7.5) with the same rules, so one character's guard can read another's
   vitals.

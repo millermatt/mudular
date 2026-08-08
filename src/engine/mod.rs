@@ -21,6 +21,10 @@ use regex::{Captures, Regex};
 use serde::Deserialize;
 use thiserror::Error;
 
+mod condition;
+
+use condition::Condition;
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleModule {
@@ -50,6 +54,10 @@ pub struct Alias {
     pub id: Option<String>,
     #[serde(default)]
     pub pattern: Option<String>,
+    /// Guard: the rule fires only if the pattern matches *and* this
+    /// evaluates true (§7.6).
+    #[serde(default)]
+    pub when: Option<String>,
     #[serde(default)]
     pub send: Option<Vec<String>>,
     /// Commands for *other* sessions, keyed by session name (§7.5).
@@ -69,6 +77,10 @@ pub struct Trigger {
     pub id: Option<String>,
     #[serde(default)]
     pub pattern: Option<String>,
+    /// Guard: the rule fires only if the pattern matches *and* this
+    /// evaluates true (§7.6).
+    #[serde(default)]
+    pub when: Option<String>,
     #[serde(default)]
     pub send: Option<Vec<String>>,
     /// Commands for *other* sessions, keyed by session name (§7.5).
@@ -113,6 +125,12 @@ pub enum EngineError {
         module: String,
         pattern: String,
         source: regex::Error,
+    },
+    #[error("invalid `when:` condition `{condition}` in `{module}`: {reason}")]
+    BadCondition {
+        module: String,
+        condition: String,
+        reason: String,
     },
     #[error("rule in `{module}` needs an `id` or a `pattern`")]
     RuleWithoutIdentity { module: String },
@@ -161,11 +179,28 @@ pub struct InputOutcome {
 #[derive(Debug)]
 struct CompiledRule {
     regex: Regex,
+    /// Compiled `when:` guard, if the rule has one (§7.6).
+    when: Option<Condition>,
     sends: Vec<String>,
     send_to: Vec<(String, Vec<String>)>,
     set: Vec<(String, String)>,
     gag: bool,
     route: Option<String>,
+}
+
+impl CompiledRule {
+    /// Whether this rule's `when:` guard permits it to fire. A rule
+    /// without one always fires on a match.
+    fn guard_holds(
+        &self,
+        caps: Option<&Captures>,
+        vars: &HashMap<String, String>,
+        server_data: &HashMap<String, String>,
+    ) -> bool {
+        self.when
+            .as_ref()
+            .is_none_or(|when| when.eval(caps, vars, server_data))
+    }
 }
 
 #[derive(Debug)]
@@ -230,6 +265,11 @@ impl Engine {
             let Some(caps) = rule.regex.captures(line) else {
                 continue;
             };
+            // A guarded-out rule does nothing at all — not even gag or
+            // route the line (§7.6: the rule fires only if both hold).
+            if !rule.guard_holds(Some(&caps), &self.variables, &self.server_data) {
+                continue;
+            }
             for template in &rule.sends {
                 outcome.sends.push(expand(
                     template,
@@ -298,11 +338,13 @@ impl Engine {
             if part.is_empty() {
                 continue;
             }
-            match self
-                .aliases
-                .iter()
-                .find_map(|rule| rule.regex.captures(part).map(|caps| (rule, caps)))
-            {
+            // A guarded-out alias is not a match, so a later alias — or
+            // the literal input — still gets its turn (§7.6).
+            match self.aliases.iter().find_map(|rule| {
+                let caps = rule.regex.captures(part)?;
+                rule.guard_holds(Some(&caps), &self.variables, &self.server_data)
+                    .then_some((rule, caps))
+            }) {
                 Some((rule, caps)) => {
                     for template in &rule.sends {
                         out.sends.push(expand(
@@ -472,6 +514,7 @@ impl Layered for Alias {
     fn fill_from(&mut self, base: &Self) {
         self.id = self.id.take().or_else(|| base.id.clone());
         self.pattern = self.pattern.take().or_else(|| base.pattern.clone());
+        self.when = self.when.take().or_else(|| base.when.clone());
         self.send = self.send.take().or_else(|| base.send.clone());
         self.send_to = self.send_to.take().or_else(|| base.send_to.clone());
         self.set = self.set.take().or_else(|| base.set.clone());
@@ -500,6 +543,7 @@ impl Layered for Trigger {
     fn fill_from(&mut self, base: &Self) {
         self.id = self.id.take().or_else(|| base.id.clone());
         self.pattern = self.pattern.take().or_else(|| base.pattern.clone());
+        self.when = self.when.take().or_else(|| base.when.clone());
         self.send = self.send.take().or_else(|| base.send.clone());
         self.send_to = self.send_to.take().or_else(|| base.send_to.clone());
         self.set = self.set.take().or_else(|| base.set.clone());
@@ -543,6 +587,7 @@ impl Layered for Timer {
 trait CompilableRule {
     fn id_label(&self) -> String;
     fn pattern_str(&self) -> Option<&str>;
+    fn when_str(&self) -> Option<&str>;
     fn enabled(&self) -> bool;
     fn sends(&self) -> Vec<String>;
     fn send_to(&self) -> Vec<(String, Vec<String>)>;
@@ -557,6 +602,9 @@ impl CompilableRule for Alias {
     }
     fn pattern_str(&self) -> Option<&str> {
         self.pattern.as_deref()
+    }
+    fn when_str(&self) -> Option<&str> {
+        self.when.as_deref()
     }
     fn enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
@@ -589,6 +637,9 @@ impl CompilableRule for Trigger {
     fn pattern_str(&self) -> Option<&str> {
         self.pattern.as_deref()
     }
+    fn when_str(&self) -> Option<&str> {
+        self.when.as_deref()
+    }
     fn enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
     }
@@ -620,12 +671,23 @@ fn compile_rules<T: CompilableRule>(rules: &[T]) -> Result<Vec<CompiledRule>, En
             module: "merged rules".to_string(),
             id: rule.id_label(),
         })?;
+        let when = rule
+            .when_str()
+            .map(|src| {
+                Condition::parse(src).map_err(|reason| EngineError::BadCondition {
+                    module: "merged rules".to_string(),
+                    condition: src.to_string(),
+                    reason,
+                })
+            })
+            .transpose()?;
         out.push(CompiledRule {
             regex: Regex::new(pattern).map_err(|source| EngineError::BadPattern {
                 module: "merged rules".to_string(),
                 pattern: pattern.to_string(),
                 source,
             })?,
+            when,
             sends: rule.sends(),
             send_to: rule.send_to(),
             set: rule.sets(),
@@ -1562,6 +1624,150 @@ triggers:
         assert_eq!(
             engine.process_line("Bob tells you hi").route.as_deref(),
             Some("comms")
+        );
+    }
+
+    /// §7.6's own example: a threshold the pattern cannot express, read
+    /// from a capture and a variable.
+    #[test]
+    fn a_guard_gates_a_trigger_on_a_capture_and_a_variable() {
+        let mut engine = engine(
+            r#"
+            name: test
+            variables:
+              heal_at: "40"
+            triggers:
+              - pattern: '^Your health: (?P<hp>\d+)%'
+                when: '${hp} < ${heal_at}'
+                send: ["quaff heal"]
+            "#,
+        );
+        assert_eq!(
+            engine.process_line("Your health: 30%").sends,
+            vec!["quaff heal"]
+        );
+        assert!(engine.process_line("Your health: 90%").sends.is_empty());
+    }
+
+    #[test]
+    fn a_guard_can_read_server_data() {
+        let mut engine = engine(
+            r#"
+            name: test
+            triggers:
+              - pattern: 'The dragon roars'
+                when: '${Char.Vitals.hp} < 50'
+                send: ["flee"]
+            "#,
+        );
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "80".to_string());
+        assert!(engine.process_line("The dragon roars").sends.is_empty());
+        engine.update_server_data_from_gmcp("Char.Vitals.hp", "20".to_string());
+        assert_eq!(engine.process_line("The dragon roars").sends, vec!["flee"]);
+    }
+
+    /// A guarded-out trigger does nothing at all: the line reaches the
+    /// scrollback it would otherwise have been gagged from or routed away.
+    #[test]
+    fn a_guarded_out_trigger_neither_gags_nor_routes() {
+        let mut engine = engine(
+            r#"
+            name: test
+            variables:
+              quiet: "0"
+            triggers:
+              - pattern: 'tells you'
+                when: '${quiet} == 1'
+                gag: true
+                route: comms
+            "#,
+        );
+        let outcome = engine.process_line("Bob tells you hi");
+        assert!(!outcome.gag);
+        assert_eq!(outcome.route, None);
+    }
+
+    /// A guard that fails is not a match, so the next alias — or the
+    /// literal input — still gets its turn.
+    #[test]
+    fn a_guarded_out_alias_falls_through_to_the_next_one() {
+        let mut engine = engine(
+            r#"
+            name: test
+            variables:
+              mounted: "0"
+            aliases:
+              - id: ride
+                pattern: '^go$'
+                when: '${mounted} == 1'
+                send: ["ride north"]
+              - id: walk
+                pattern: '^go$'
+                send: ["walk north"]
+            "#,
+        );
+        assert_eq!(engine.expand_input("go").sends, vec!["walk north"]);
+    }
+
+    #[test]
+    fn an_undefined_name_in_a_guard_stops_the_rule_firing() {
+        let mut engine = engine(
+            r#"
+            name: test
+            triggers:
+              - pattern: 'The dragon roars'
+                when: '${Char.Vitals.hp} < 50'
+                send: ["flee"]
+            "#,
+        );
+        assert!(engine.process_line("The dragon roars").sends.is_empty());
+    }
+
+    /// Malformed guards fail at load with module context, like an invalid
+    /// pattern, rather than silently never firing at runtime (§7.6).
+    #[test]
+    fn a_malformed_guard_is_a_compile_error() {
+        let err = Engine::compile(&[module(
+            r#"
+            name: test
+            triggers:
+              - pattern: 'x'
+                when: '${hp} =! 40'
+                send: ["y"]
+            "#,
+        )])
+        .expect_err("a malformed condition should not compile");
+        assert!(matches!(err, EngineError::BadCondition { .. }));
+    }
+
+    #[test]
+    fn a_later_layer_inherits_and_can_replace_a_guard() {
+        let base = module(
+            r#"
+            name: base
+            triggers:
+              - id: heal
+                pattern: '^Your health: (?P<hp>\d+)%'
+                when: '${hp} < 40'
+                send: ["quaff heal"]
+            "#,
+        );
+        let patch = module(
+            r#"
+            name: profile
+            triggers:
+              - id: heal
+                when: '${hp} < 80'
+            "#,
+        );
+
+        let mut inherited = Engine::compile(std::slice::from_ref(&base)).expect("compiles");
+        assert!(inherited.process_line("Your health: 60%").sends.is_empty());
+
+        let mut patched = Engine::compile(&[base, patch]).expect("compiles");
+        assert_eq!(
+            patched.process_line("Your health: 60%").sends,
+            vec!["quaff heal"]
         );
     }
 }
