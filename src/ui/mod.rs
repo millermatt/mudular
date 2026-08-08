@@ -56,7 +56,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         String::new(),
         "Commands you can type".to_string(),
         row("/help", "print this help into the pane"),
-        row("/reload", "recompile rules from disk"),
+        row("/reload", "recompile rules and scripts from disk"),
         String::new(),
         "Leaving".to_string(),
         row(keybinds.quit, "quit"),

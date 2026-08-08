@@ -18,9 +18,11 @@ Add `--tls` for a TLS ("STelnet") MUD:
 mudular --host mud.example.org --port 4443 --tls
 ```
 
-Type a line and press Enter to send it. `Ctrl+C` quits (remappable, see
-below). If the server masks input (a password prompt), the input box
-shows `(hidden)` and what you type isn't echoed or kept in scrollback.
+Type a line and press Enter to send it. What you typed is echoed into
+your own scrollback as `> line`, so it's part of the transcript alongside
+the server's replies. `Ctrl+C` quits (remappable, see below). If the
+server masks input (a password prompt), the input box shows `(hidden)`
+and what you type isn't echoed or kept in scrollback.
 
 ## Profiles
 
@@ -214,14 +216,129 @@ timers:             # act on a schedule
   colour codes already stripped — so a pattern never has to account for
   ANSI escapes.
 - **`${...}`** substitutes a capture group (`${1}`, or `${name}` for a
-  named group like `(?P<who>...)`) or a variable. A name that resolves to
-  neither is left as-is, so a typo is visible rather than silently blank.
+  named group like `(?P<who>...)`), a variable, or a value the server sent
+  over GMCP/MSDP (`${Char.Vitals.hp}`). A name that resolves to none of
+  them is left as-is, so a typo is visible rather than silently blank.
 - **`set:`** on any rule updates a variable, so a trigger can record
   something (say, your current target) for a later alias to use.
 - **Typing several commands at once**: `north; k; look` is split on `;`
   and each part expanded separately. Alias output is never re-expanded,
   so aliases cannot loop.
 - **Durations** need a unit: `500ms`, `30s`, `5m`, `2h`.
+
+### Firing only when it matters
+
+A pattern says *what* matched; `when:` says whether to act on it. Add it
+to any alias or trigger and the rule fires only if the pattern matches
+**and** the condition is true:
+
+```yaml
+variables:
+  heal_at: 40
+
+triggers:
+  - pattern: '^Your health: (?P<hp>\d+)%'
+    when: '${hp} < ${heal_at}'
+    send: ["quaff heal"]
+  - pattern: '^(?P<who>\w+) tells you'
+    when: '${Char.Status.combat} == "0" and ${who} != "Bob"'
+    send: ["reply on my way"]
+```
+
+The grammar is deliberately small — comparisons (`< <= > >= == !=`),
+`and`/`or`/`not`, parentheses, numbers, quoted strings, and `${...}`
+terms. `${...}` reads the same things `send:` does: captures first, then
+variables, then server data. Anything more involved than that is a
+script's job (see [Scripting](#scripting)).
+
+Two things to know:
+
+- Numbers compare as numbers, text as text. `${hp} < 40` does the
+  arithmetic you expect even though everything in the stores is a string.
+- **A name that resolves to nothing makes the condition false** and the
+  rule does not fire. That is the opposite of `send:`, which leaves a
+  typo visible on screen — a guard has no way to show itself, so not
+  firing is the safe failure.
+
+A guarded-out rule does nothing at all: it doesn't `gag:` or `route:` the
+line either, and for an alias a false guard is simply not a match, so the
+next matching alias — or what you literally typed — still gets its turn.
+
+Bad conditions are caught when the rules compile, the same as a bad
+regex, so `when: '${hp} <'` fails at startup or on `/reload` rather than
+becoming a rule that silently never fires. So does a bare term:
+`when: '${combat}'` is an error, not a guess about what counts as true —
+write the comparison out.
+
+### Driving another character
+
+With more than one character connected, a rule can send commands to a
+*different* session with `send_to:`, keyed by the name that addresses it
+(the profile name, or `cleric-2` for a second copy):
+
+```yaml
+# tank profile — get healed when I drop below 40%
+triggers:
+  - pattern: '^HP: (?P<hp>\d+)%'
+    when: '${hp} < 40'
+    send_to:
+      cleric: ["cast 'major heal' Grunk"]
+
+# an alias that moves the whole group
+aliases:
+  - pattern: '^gn$'
+    send: ["north"]
+    send_to:
+      '*': ["north"]        # `*` means every *other* session
+```
+
+The receiving pane echoes `[from tank] cast 'major heal' Grunk`, so
+nothing happens invisibly. If the named session isn't connected, the
+command is dropped with a warning in the *sending* pane.
+
+By default an injected command is sent verbatim — the target's own
+aliases do not expand it. That is the receiver's call to change, never
+the sender's:
+
+```yaml
+# mudular.yaml — install-wide default
+cross_session:
+  expand_aliases: false   # injected commands are sent verbatim
+  max_hops: 1             # how far a chain of injections may travel
+
+# profiles/cleric.yaml — this character opts in
+cross_session:
+  expand_aliases: true
+```
+
+`max_hops` is the loop brake: rules that fire while a remote command is
+being handled can only `send_to` again until the budget runs out, so two
+characters' rules can't ping-pong forever.
+
+#### Reading another character's state
+
+The other direction is to watch instead of push. Every session publishes
+its variables and its server data (GMCP/MSDP vitals, affects, room), and
+any rule can read a peer's with `${@name.key}`:
+
+```yaml
+# cleric profile — the reaction lives with the character that acts
+triggers:
+  - pattern: '^You finish your prayer'
+    when: '${@tank.Char.Vitals.hp} < 50'
+    send: ["cast 'major heal' Grunk"]
+```
+
+`@` is its own namespace, so a peer name can never shadow one of your own
+variables. An unknown peer or key resolves to nothing — which leaves a
+`${...}` in `send:` visibly unexpanded and makes a `when:` guard false,
+exactly like an unknown local name. Naming a character who hasn't
+finished connecting is fine: you read an empty snapshot until there's
+something to read.
+
+Prefer this to `send_to:` when the reaction is really the other
+character's job. The rule then lives with the character that acts, and it
+keeps working no matter which session noticed first.
 
 ### Sharing rules between characters
 
@@ -268,8 +385,178 @@ The rules are recompiled from disk and swapped into the running session —
 no reconnect, no losing your place. If a file has an error, the reload
 reports it and keeps the rules you already had.
 
-Note that this reloads *rules* only. Changing a profile's `host`, `port`,
-`tls`, or `charset` still needs a restart.
+Scripts come back with them: their files are re-read, the fresh VM has no
+memory of the old one, and its `on_connect` hooks run, since as far as a
+just-loaded script is concerned the connection is only now up. Timers
+restart on the same reasoning.
+
+Note that this reloads *rules and scripts* only. Changing a profile's
+`host`, `port`, `tls`, or `charset` still needs a restart.
+
+## Scripting
+
+YAML covers the common cases; a script covers everything else — anything
+that needs memory between lines, arithmetic, or more than one step.
+Scripts are written in Lua, listed by file name in the module or profile
+that owns them:
+
+```yaml
+# modules/uw-combat.yaml
+name: uw-combat
+scripts: [uw-combat.lua]     # beside this file
+```
+
+A name is a name, not a path: the file lives next to the YAML that
+declares it, so a shared module is one directory to copy and a module you
+downloaded can't reach the rest of your disk by naming `../`. Scripts
+load in the same order as the rules (global, then modules, then the
+profile), and they all share one VM per character — so a profile's script
+can build on what a module's script defined, and both see the same
+variables your rules do.
+
+```lua
+-- modules/uw-combat.lua
+local potions = 0
+
+mud.on_line(function(line)
+  if line:match("^You quaff a %w+ potion") then
+    potions = potions + 1
+    mud.echo("** " .. potions .. " potions this session")
+  end
+end)
+
+mud.on_gmcp(function(package, json)
+  if package ~= "Char.Vitals" then return end
+  local hp = tonumber(mud.data("Char.Vitals.hp"))
+  local max = tonumber(mud.data("Char.Vitals.maxhp"))
+  if hp and max and max > 0 and hp / max < 0.3 then
+    mud.send("quaff heal")
+  end
+end)
+```
+
+Everything a script can do arrives through the `mud` table:
+
+| Call | Does |
+|---|---|
+| `mud.send(cmd)` | Send a command, as if you had typed it |
+| `mud.echo(text)` | Write a line into this character's pane only |
+| `mud.gag()` / `mud.substitute(text)` | Hide the current line, or replace its text |
+| `mud.get(name)` / `mud.set(name, value)` | Read and write the same variables `variables:` and a rule's `set:` use |
+| `mud.data(key)` | Read server data by dotted key (`Char.Vitals.hp`) |
+| `mud.timer(seconds, fn)` | Run `fn` once, later |
+| `mud.on_line(fn)` / `mud.on_prompt(fn)` | Called with the line's text, colour codes already stripped |
+| `mud.on_gmcp(fn)` | Called with the package name and its raw JSON — decode it with the JSON library you prefer |
+| `mud.on_connect(fn)` / `mud.on_disconnect(fn)` | Called when the connection comes up or goes away |
+| `mud.session(name)` | A handle on another character (below), or `nil` if no session has that name |
+| `mud.on_peer(name, key, fn)` | Watch another character's server data (below) |
+
+`mud.get`/`mud.set` and `mud.data` are the *same* stores the rules use,
+not a parallel copy — a trigger's `set:` and a hook can hand work to each
+other. On an inbound line the triggers run first and then the line hooks,
+so a script sees what that line's rules just set, and has the last word
+on gagging it.
+
+`mud.timer` is one-shot. A heartbeat re-arms itself from inside its own
+callback, which is also what stops a slow callback stacking up behind
+itself:
+
+```lua
+local function tick()
+  mud.send("save")
+  mud.timer(300, tick)
+end
+mud.timer(300, tick)
+```
+
+### Calling a script from a rule
+
+For a reaction that only needs a different *action*, leave the pattern in
+the YAML where you can read and override it, and point the rule at a
+function:
+
+```yaml
+triggers:
+  - id: tally-kills
+    pattern: '(?P<victim>.+) is DEAD!'
+    script: {file: uw-combat.lua, fn: on_death}
+```
+
+```lua
+local kills = 0
+
+function on_death(line, caps)
+  kills = kills + 1
+  mud.echo("** " .. caps.victim .. " down (" .. kills .. " this session)")
+end
+```
+
+The function gets the matched line and its captures — numbered groups at
+`caps[1]`, `caps[2]`, …, named groups under their own names. Both halves
+are checked when the rules compile: the file must be one a layer
+declared, and the function must exist in it, so a mistyped `fn:` fails at
+load rather than becoming a rule that never does anything. A `when:`
+guard applies here like anywhere else — no fire, no call.
+
+`script:` works on aliases and triggers. A timer that needs to do more
+than `send:` should arm itself with `mud.timer` instead.
+
+### Reaching other characters from a script
+
+`mud.session(name)` is the scripting side of `send_to:` and
+`${@name.key}`:
+
+```lua
+-- cleric script: rebuff the tank when his blessing drops
+mud.on_peer("tank", "Char.Affects", function(key, value)
+  if key == "Char.Affects.blessed" and value == "0" then
+    mud.send("cast bless Grunk")
+    mud.session("tank"):echo("blessing you now")
+  end
+end)
+```
+
+- `mud.on_peer(name, key, fn)` subscribes by dotted key *prefix*, so
+  `"Char.Affects"` catches `Char.Affects.blessed` without naming it, and
+  `fn(key, value)` is called once per key that changed.
+- `mud.session("tank").vars` and `.data` are that character's state as it
+  stood when you asked for the handle — so reading two keys shows you one
+  moment of their life rather than two.
+- `handle:send(cmd)` is routed exactly like `send_to:`, hop limit and
+  all. `handle:echo(text)` only writes into their pane, so nothing runs at
+  the far end and no limit applies. Both carry the `[from tank]` tag.
+- `mud.session` answers `nil` for a name no session holds, so a script can
+  ask rather than assume.
+
+### What a script can't do
+
+Scripts are sandboxed, because a shared module you downloaded may carry
+one. There is no filesystem, no network, and no process access: `io`,
+`os`, `package`, and `debug` are never created in the first place, and
+`load`, `dofile`, `require`, and `print` are gone — a script cannot fetch
+more code or write around the TUI.
+
+Hooks run on their own character's task and are expected to be quick. One
+that runs longer than 100ms is aborted, so a runaway loop can't stall the
+character it belongs to (and never another one). An aborted or failing
+hook says so in that character's scrollback — a script that quietly
+stopped working is otherwise as invisible as a trigger that stopped
+firing.
+
+### JavaScript
+
+Lua ships in the default build. JavaScript is available behind a feature
+flag:
+
+```sh
+cargo build --features js
+```
+
+The `mud` API is identical — same calls, same hooks, same semantics,
+spelled the way JavaScript spells things (`mud.session("tank").send(cmd)`
+rather than `:send`). The file extension picks the engine per script, and
+a character can run both at once; each language gets its own VM, and a
+line reaches every script in both.
 
 ## TLS certificate verification
 
@@ -308,6 +595,7 @@ fallback.
 | `F2` | Toggle the raw GMCP inspector for the focused session — the messages the server is sending behind the scenes | `gmcp_inspector` |
 | `F3` | Switch between the tabbed and side-by-side layouts | `cycle_layout` |
 | `F4` | Show or hide the channel panes | `toggle_channels` |
+| `PgUp` / `PgDn` | Not implemented yet — there is no way to scroll back past what the pane currently shows | — |
 
 `F1` shows this same list inside the client, built from your actual
 config — so it stays right even if you remap something. `/help` prints it
