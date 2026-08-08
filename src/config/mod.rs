@@ -9,11 +9,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::style::Color;
 use serde::{Deserialize, Deserializer};
 
+use crate::engine::script::ScriptSource;
 use crate::engine::{Alias, RuleModule, Timer, Trigger};
 use crate::net::VerifyMode;
 
@@ -64,6 +65,9 @@ pub struct Profile {
     pub triggers: Vec<Trigger>,
     #[serde(default)]
     pub timers: Vec<Timer>,
+    /// Profile-local scripts, loaded from beside the profile file (§7.4).
+    #[serde(default)]
+    pub scripts: Vec<String>,
     /// Overrides the install-wide `cross_session` block for this character
     /// (docs/ARCHITECTURE.md §7.5). Receiver-side by design: only the
     /// profile whose aliases would run can opt into running them.
@@ -473,7 +477,32 @@ pub fn load_module(path: &Path) -> Result<RuleModule> {
     if module.name.is_empty() {
         module.name = path.display().to_string();
     }
+    module.script_sources = load_scripts(path, &module.scripts)?;
     Ok(module)
+}
+
+/// Reads the scripts a module declares. They live beside the file that
+/// declares them (§7.4), so a shared module is one directory to copy —
+/// and a bare name can never reach outside it.
+fn load_scripts(module_path: &Path, names: &[String]) -> Result<Vec<ScriptSource>> {
+    let dir = module_path.parent().unwrap_or(Path::new("."));
+    names
+        .iter()
+        .map(|name| {
+            if Path::new(name).components().count() != 1 {
+                bail!(
+                    "script `{name}` in {}: expected a file name beside the module, not a path",
+                    module_path.display()
+                );
+            }
+            let path = dir.join(name);
+            Ok(ScriptSource {
+                name: name.clone(),
+                code: std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading script {}", path.display()))?,
+            })
+        })
+        .collect()
 }
 
 /// The ordered scope layers for a session, lowest precedence first
@@ -513,6 +542,8 @@ pub fn load_rules(
             aliases: profile.aliases,
             triggers: profile.triggers,
             timers: profile.timers,
+            script_sources: load_scripts(&path, &profile.scripts)?,
+            scripts: profile.scripts,
         });
     }
 
@@ -887,6 +918,66 @@ triggers:
         assert_eq!(cleric.expand_input("ll").sends, vec!["look"]);
     }
 
+    /// Scripts come off disk here, not in `engine`, and from beside the
+    /// module that declared them (§7.4).
+    #[test]
+    fn a_module_loads_the_scripts_it_declares_from_beside_itself() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("modules")).unwrap();
+        std::fs::write(
+            dir.join("modules/combat.yaml"),
+            "name: combat\nscripts: [combat.lua]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("modules/combat.lua"),
+            "mud.on_line(function() end)",
+        )
+        .unwrap();
+
+        let module = load_module(&dir.join("modules/combat.yaml")).expect("module loads");
+        assert_eq!(module.script_sources.len(), 1);
+        assert_eq!(module.script_sources[0].name, "combat.lua");
+        assert!(module.script_sources[0].code.contains("mud.on_line"));
+    }
+
+    /// A shared community module is one directory to copy, so a script name
+    /// is a name — not a way to reach the rest of the filesystem.
+    #[test]
+    fn a_script_name_that_is_a_path_is_refused() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("modules")).unwrap();
+        std::fs::write(
+            dir.join("modules/combat.yaml"),
+            "name: combat\nscripts: ['../../etc/passwd.lua']\n",
+        )
+        .unwrap();
+
+        let err = load_module(&dir.join("modules/combat.yaml")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("passwd.lua"), "{message}");
+    }
+
+    /// A missing script must name itself: a module that half-loaded is
+    /// worse than one that refused to.
+    #[test]
+    fn a_missing_script_names_the_file() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("modules")).unwrap();
+        std::fs::write(
+            dir.join("modules/combat.yaml"),
+            "name: combat\nscripts: [combat.lua]\n",
+        )
+        .unwrap();
+
+        let err = load_module(&dir.join("modules/combat.yaml")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("combat.lua"), "{message}");
+    }
+
     /// A profile naming a module that isn't there must say which module and
     /// which profile, not just "file not found".
     #[test]
@@ -920,6 +1011,17 @@ triggers:
         );
 
         let layers = load_rules(&dir, Some("kestrel"), &app.channels).expect("example rules load");
+        // The example module ships a Lua script. A build without that
+        // engine still has to prove the *rules* in these files load, so it
+        // checks them without it — refusing the script is its own test.
+        #[cfg(not(feature = "lua"))]
+        let layers: Vec<_> = layers
+            .into_iter()
+            .map(|mut layer| {
+                layer.script_sources.clear();
+                layer
+            })
+            .collect();
         let engine = crate::engine::Engine::compile(&layers).expect("example rules compile");
 
         // The profile disables the module's autoloot and overrides its
@@ -944,6 +1046,17 @@ triggers:
         let outcome = engine.process_line("You are badly wounded and bleeding");
         assert_eq!(outcome.send_to.len(), 1, "{outcome:?}");
         assert_eq!(outcome.send_to[0].target, "cleric");
+
+        // The example module's script loaded too, and reads the variables
+        // its YAML set.
+        #[cfg(feature = "lua")]
+        {
+            assert_eq!(engine.on_connect().sends, vec!["say well met"]);
+            assert_eq!(
+                engine.process_line("You quaff a blue potion.").echoes,
+                vec!["** 1 potions this session"]
+            );
+        }
     }
 
     // ---- channel panes (docs/ARCHITECTURE.md §11.1) ----

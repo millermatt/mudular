@@ -92,6 +92,7 @@ Supporting crates:
 | Input editing | `tui-input` | grapheme-aware line editor widget |
 | Config paths | `directories` | platform config dir discovery |
 | Secrets | `keyring` | OS keychain for auto-login passwords (§10.1) |
+| Scripting | `mlua` (vendored Lua 5.4) | feature `lua`, on by default; statically linked, so §15 still ships one file (§7.4) |
 
 ### 2.1 Dependency policy
 
@@ -384,17 +385,46 @@ trait ScriptHost {
   - Others (e.g. `rhai`) slot in behind the same trait. Engines requiring a
     system runtime (Python/pyo3) are excluded: they break the single-binary
     distribution goal (§15).
+- **Declaring scripts:** a module (or profile) lists them by file name:
+
+  ```yaml
+  name: uw-combat
+  scripts: [uw-combat.lua]     # beside this file; the extension picks the engine
+  ```
+
+  A name is a name, not a path: scripts live next to the YAML that
+  declares them, so a shared module is one directory to copy and a
+  community module cannot reach the rest of the disk by naming `../`.
+  Loading follows the scope layering (§7.3) — a profile's script sees what
+  a shared module's script defined — and all scripts of one language share
+  that session's single VM, so they can build on each other the way a
+  Mudlet package expects. `engine` stays sans-IO (§4): the config loader
+  reads the files and hands over their text.
 - **Wiring:** YAML rules reference scripts
   (`script: {file: combat.lua, fn: on_death}`); scripts can also register
-  triggers/aliases/timers programmatically. Script files live next to the
-  YAML module that declares them and follow the same scope layering (§7.3).
+  triggers/aliases/timers programmatically.
+- **Shared state, not a parallel world.** `mud.get`/`mud.set` read and
+  write the same variable store as `variables:` and a rule's `set:`, and
+  `mud.data` the same server-data store as `${...}` and `when:`. A hook is
+  another way to act on this session's state, not a second copy of it.
+  Ordering is fixed and documented: on an inbound line the trigger table
+  runs first, then the line hooks, so a script sees the variables that
+  line's rules just set and has the last word on gagging it.
 - **Execution model:** hooks run synchronously on the owning session's task
-  and are expected to return quickly; a time budget logs/aborts runaway
-  scripts so one session's script can't stall its pipeline (and never
-  another session's).
+  and are expected to return quickly; a 100ms budget per invocation aborts
+  runaway scripts so one session's script can't stall its pipeline (and
+  never another session's). An aborted or failing hook says so in that
+  session's scrollback — a script that stopped working is otherwise exactly
+  as invisible as a trigger that stopped firing — and the effects it
+  already asked for still stand, since they may already have been half
+  applied.
 - **Sandboxed by default:** no filesystem, network, or process access
   unless the profile grants it explicitly — shared community modules may
-  carry scripts, and untrusted-by-default is the safe posture.
+  carry scripts, and untrusted-by-default is the safe posture. The Lua host
+  loads only the table, string, math, coroutine, and utf8 libraries — `io`,
+  `os`, `package`, and `debug` are never created rather than deleted
+  afterwards — and drops `load`/`dofile`/`require` so a script cannot
+  fetch more code, and `print` so it cannot write through the TUI.
 
 ### 7.5 Cross-session automation (M7/M8)
 

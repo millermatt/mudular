@@ -14,6 +14,14 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 directories = "6"
 flate2 = "1"
 futures = "0.3"
+# `vendored` statically links Lua 5.4 so the single-binary promise (§15)
+# survives; `send` is required because a compiled `Engine` is moved into the
+# session task and handed over `/reload`.
+mlua = { version = "0.12", features = [
+  "lua54",
+  "vendored",
+  "send",
+], optional = true }
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -51,3 +59,10 @@ keyring = { version = "4", default-features = false, features = [
 [dev-dependencies]
 libc = "0.2.189"
 rcgen = "0.14"
+
+# Script engines are feature-gated so a build carries only the VMs it wants
+# (TAD §7.4). Lua is on by default: it is the MUD community's lingua franca,
+# so the stock binary is the one scripts are written against.
+[features]
+default = ["lua"]
+lua = ["dep:mlua"]

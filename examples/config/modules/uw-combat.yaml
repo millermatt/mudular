@@ -5,8 +5,12 @@
 # without repeating the pattern — see profiles/kestrel.yaml.
 name: uw-combat
 description: Combat reactions shared by all Underworld characters
+# Scripts pick up where YAML stops. They live beside this file and share
+# its variables; the extension picks the engine.
+scripts: [uw-combat.lua]
 variables:
   target: rat
+  greeting: "well met"
 aliases:
   - id: quickkill
     pattern: '^k$'

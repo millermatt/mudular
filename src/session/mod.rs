@@ -181,6 +181,19 @@ async fn run(
         return;
     }
     engine.start_timers(Instant::now());
+    // Scripts get the same starting gun as the timers (§7.4).
+    let connected = engine.on_connect();
+    if send_lines(&mut writer, &connected.sends).await.is_err() {
+        let _ = events
+            .send(SessionEvent::Ended("write failed".to_string()))
+            .await;
+        return;
+    }
+    for text in connected.echoes {
+        if events.send(SessionEvent::Line(text)).await.is_err() {
+            return;
+        }
+    }
 
     let reason = loop {
         // `select!` needs a future even when nothing is scheduled; park
@@ -319,6 +332,14 @@ async fn run(
                                             let outcome = engine.process_line(&strip_ansi(&text));
                                             outbound.extend(outcome.sends);
                                             cross_out.extend(outcome.send_to);
+                                            // A substitution replaces the
+                                            // line everywhere it would have
+                                            // appeared — including the
+                                            // channel copy — so one line is
+                                            // never two different texts.
+                                            // Its styling goes with it: the
+                                            // script chose the replacement.
+                                            let text = outcome.substitute.unwrap_or(text);
                                             if let Some(channel) = outcome.route {
                                                 emit.push(SessionEvent::Route {
                                                     channel,
@@ -328,6 +349,38 @@ async fn run(
                                             if !outcome.gag {
                                                 emit.push(SessionEvent::Line(text));
                                             }
+                                            // Echoes follow the line that
+                                            // provoked them.
+                                            emit.extend(
+                                                outcome.echoes.into_iter().map(SessionEvent::Line),
+                                            );
+                                        }
+                                        SessionEvent::Prompt(text) => {
+                                            let outcome = engine.process_prompt(&strip_ansi(&text));
+                                            outbound.extend(outcome.sends);
+                                            // A gagged prompt is an empty
+                                            // one: the input line still has
+                                            // to know there is nothing above
+                                            // it now.
+                                            let text = match outcome.gag {
+                                                true => String::new(),
+                                                false => outcome.substitute.unwrap_or(text),
+                                            };
+                                            emit.push(SessionEvent::Prompt(text));
+                                            emit.extend(
+                                                outcome.echoes.into_iter().map(SessionEvent::Line),
+                                            );
+                                        }
+                                        SessionEvent::Gmcp { package, payload } => {
+                                            let outcome = engine.process_gmcp(
+                                                &package,
+                                                payload.as_deref().unwrap_or(""),
+                                            );
+                                            outbound.extend(outcome.sends);
+                                            emit.push(SessionEvent::Gmcp { package, payload });
+                                            emit.extend(
+                                                outcome.echoes.into_iter().map(SessionEvent::Line),
+                                            );
                                         }
                                         other => emit.push(other),
                                     }
@@ -437,6 +490,18 @@ async fn run(
                     Some(SessionCommand::SetRules(rules)) => {
                         engine = *rules;
                         engine.start_timers(Instant::now());
+                        // Freshly loaded scripts have not seen this
+                        // connection come up, so `/reload` is their
+                        // `on_connect` — as it is the timers' start.
+                        let reloaded = engine.on_connect();
+                        if send_lines(&mut writer, &reloaded.sends).await.is_err() {
+                            break "write failed".to_string();
+                        }
+                        for text in reloaded.echoes {
+                            if events.send(SessionEvent::Line(text)).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                     Some(SessionCommand::Resize { cols, rows }) => {
                         telnet.set_window_size(cols, rows);
@@ -452,6 +517,18 @@ async fn run(
         }
     };
 
+    // The disconnect hook runs on the way out. Its commands are attempted
+    // rather than dropped — a session ending on `/disconnect` still has a
+    // socket, and a farewell that only sometimes arrives beats one that
+    // never does — but a write failing now says nothing worth printing over
+    // the reason we are already leaving.
+    let closing = engine.on_disconnect();
+    let _ = send_lines(&mut writer, &closing.sends).await;
+    for text in closing.echoes {
+        if events.send(SessionEvent::Line(text)).await.is_err() {
+            return;
+        }
+    }
     let _ = events.send(SessionEvent::Ended(reason)).await;
 }
 
@@ -772,6 +849,103 @@ mod tests {
     fn rules(yaml: &str) -> Engine {
         let module = serde_yaml::from_str(yaml).expect("valid test YAML");
         Engine::compile(&[module]).expect("compiles")
+    }
+
+    #[cfg(feature = "lua")]
+    fn scripted_rules(lua: &str) -> Engine {
+        let mut module: crate::engine::RuleModule =
+            serde_yaml::from_str("name: test").expect("valid test YAML");
+        module
+            .script_sources
+            .push(crate::engine::script::ScriptSource {
+                name: "test.lua".to_string(),
+                code: lua.to_string(),
+            });
+        Engine::compile(&[module]).expect("compiles")
+    }
+
+    /// The script counterpart of `a_trigger_answers_the_server_automatically`:
+    /// a hook's command reaches the socket, and its echo reaches the pane
+    /// without ever reaching the server.
+    #[cfg(feature = "lua")]
+    #[tokio::test]
+    async fn a_script_hook_answers_the_server_and_echoes_locally() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (mut events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(b"The kobold is DEAD!\r\n").await.unwrap();
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            scripted_rules(
+                r#"
+                mud.on_line(function(line)
+                  if line:match("is DEAD!") then
+                    mud.send("get all corpse")
+                    mud.echo("** looted")
+                  end
+                end)
+                "#,
+            ),
+        );
+
+        assert_eq!(next_line(&mut events).await, "The kobold is DEAD!");
+        assert_eq!(next_line(&mut events).await, "** looted");
+        assert_eq!(
+            timeout(Duration::from_secs(2), sent.recv())
+                .await
+                .expect("timed out")
+                .unwrap(),
+            "get all corpse"
+        );
+    }
+
+    /// `mud.substitute` rewrites what the pane shows without the server
+    /// ever knowing, and `mud.gag` keeps a line off it entirely.
+    #[cfg(feature = "lua")]
+    #[tokio::test]
+    async fn a_script_can_rewrite_and_hide_lines_in_the_pane() {
+        let (mut events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(b"a boring line\r\nsomething shouty\r\n")
+                    .await
+                    .unwrap();
+                // Hold the connection open so the pane is not cut short.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            },
+            scripted_rules(
+                r#"
+                mud.on_line(function(line)
+                  if line == "a boring line" then mud.gag() end
+                  if line == "something shouty" then mud.substitute("something calm") end
+                end)
+                "#,
+            ),
+        );
+
+        assert_eq!(next_line(&mut events).await, "something calm");
+    }
+
+    /// The connect hook runs when the timers are armed, so a script can
+    /// take its first action without waiting for the server to say
+    /// something.
+    #[cfg(feature = "lua")]
+    #[tokio::test]
+    async fn a_connect_hook_sends_before_any_server_output() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            scripted_rules(r#"mud.on_connect(function() mud.send("look") end)"#),
+        );
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), sent.recv())
+                .await
+                .expect("timed out")
+                .unwrap(),
+            "look"
+        );
     }
 
     /// A trigger fires against real server output and its command reaches

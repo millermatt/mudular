@@ -22,8 +22,10 @@ use serde::Deserialize;
 use thiserror::Error;
 
 mod condition;
+pub mod script;
 
 use condition::Condition;
+use script::{Hook, ScriptCtx, ScriptHost, ScriptOutcome, ScriptSource};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +46,15 @@ pub struct RuleModule {
     pub triggers: Vec<Trigger>,
     #[serde(default)]
     pub timers: Vec<Timer>,
+    /// Script files this module brings, by name relative to the module
+    /// (§7.4). The extension picks the engine.
+    #[serde(default)]
+    pub scripts: Vec<String>,
+    /// The declared scripts, read off disk by the loader — `engine` is
+    /// sans-IO (§4), so it compiles source text it is handed rather than
+    /// opening files itself.
+    #[serde(skip)]
+    pub script_sources: Vec<ScriptSource>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -144,6 +155,20 @@ pub enum EngineError {
         value: String,
         reason: String,
     },
+    #[error("`{module}` declares `{script}`, but no script engine handles that extension")]
+    UnknownScriptLanguage { module: String, script: String },
+    #[error("`{module}` declares `{script}`, but this build has no {language} engine")]
+    ScriptEngineMissing {
+        module: String,
+        script: String,
+        language: &'static str,
+    },
+    #[error("script `{script}` in `{module}`: {reason}")]
+    BadScript {
+        module: String,
+        script: String,
+        reason: String,
+    },
 }
 
 /// Commands a rule asks another session to run (docs/ARCHITECTURE.md §7.5).
@@ -165,6 +190,10 @@ pub struct LineOutcome {
     pub send_to: Vec<CrossSend>,
     /// Channel pane this line also belongs in (§11.1).
     pub route: Option<String>,
+    /// Text a script asked to show in this session only (§7.4).
+    pub echoes: Vec<String>,
+    /// Replacement text for the line, from a script's `mud.substitute`.
+    pub substitute: Option<String>,
 }
 
 /// What a typed input line expands to.
@@ -226,6 +255,10 @@ pub struct Engine {
     /// Keys currently sourced from GMCP. MSDP updates to one of these keys
     /// are dropped, since §6.3 says GMCP wins when a server offers both.
     gmcp_keys: HashSet<String>,
+    /// One host per script language this session's modules actually use
+    /// (§7.4). Empty for a rules-only session, which then never enters a
+    /// VM at all.
+    hosts: Vec<Box<dyn ScriptHost>>,
 }
 
 impl Engine {
@@ -251,6 +284,62 @@ impl Engine {
             variables,
             server_data: HashMap::new(),
             gmcp_keys: HashSet::new(),
+            hosts: compile_scripts(layers)?,
+        })
+    }
+
+    /// Runs one hook across every host, in the order their languages first
+    /// appeared. Scripts read and write the same variable store the rules
+    /// use, so a `set:` and a `mud.set` are the same variable.
+    ///
+    /// A host that fails says so in the session's own scrollback: a script
+    /// that stopped working is exactly as invisible as a trigger that
+    /// stopped firing, and neither should be.
+    fn run_hook(&mut self, hook: &Hook) -> ScriptOutcome {
+        if self.hosts.is_empty() {
+            return ScriptOutcome::default();
+        }
+
+        let mut ctx = ScriptCtx {
+            vars: std::mem::take(&mut self.variables),
+            server_data: std::mem::take(&mut self.server_data),
+            out: ScriptOutcome::default(),
+        };
+        for host in &mut self.hosts {
+            if let Err(err) = host.call(hook, &mut ctx) {
+                ctx.out.echoes.push(format!("** {err}"));
+            }
+        }
+        self.variables = ctx.vars;
+        self.server_data = ctx.server_data;
+        ctx.out
+    }
+
+    /// Session lifecycle hooks (§7.4). `on_connect` runs once the
+    /// connection is up, alongside timer arming, so a script can log in or
+    /// prime its state exactly when a timer would first fire.
+    pub fn on_connect(&mut self) -> ScriptOutcome {
+        self.run_hook(&Hook::Connect)
+    }
+
+    pub fn on_disconnect(&mut self) -> ScriptOutcome {
+        self.run_hook(&Hook::Disconnect)
+    }
+
+    /// Runs prompt hooks. Prompts do not go through the trigger table —
+    /// they are not scrollback lines — so this is a script's only view of
+    /// them.
+    pub fn process_prompt(&mut self, text: &str) -> ScriptOutcome {
+        self.run_hook(&Hook::Prompt(text.to_string()))
+    }
+
+    /// Runs GMCP hooks with the message as it arrived. The flattened values
+    /// are already in the server-data store by then, so a script can either
+    /// decode the JSON itself or read `mud.data`.
+    pub fn process_gmcp(&mut self, package: &str, json: &str) -> ScriptOutcome {
+        self.run_hook(&Hook::Gmcp {
+            package: package.to_string(),
+            json: json.to_string(),
         })
     }
 
@@ -304,6 +393,15 @@ impl Engine {
         }
 
         self.variables.extend(updates);
+
+        // Scripts run after the trigger table, so a hook sees the variables
+        // this line's rules just set and can override their verdict on the
+        // line itself.
+        let scripted = self.run_hook(&Hook::Line(line.to_string()));
+        outcome.sends.extend(scripted.sends);
+        outcome.echoes = scripted.echoes;
+        outcome.gag |= scripted.gag;
+        outcome.substitute = scripted.substitute;
         outcome
     }
 
@@ -696,6 +794,72 @@ fn compile_rules<T: CompilableRule>(rules: &[T]) -> Result<Vec<CompiledRule>, En
         });
     }
     Ok(out)
+}
+
+/// Starts a host for each language the layers use and loads their scripts
+/// in scope order, so a profile's script sees whatever a shared module's
+/// script registered first (§7.3).
+fn compile_scripts(layers: &[RuleModule]) -> Result<Vec<Box<dyn ScriptHost>>, EngineError> {
+    let mut hosts: Vec<(&'static str, Box<dyn ScriptHost>)> = Vec::new();
+
+    for layer in layers {
+        for source in &layer.script_sources {
+            let language =
+                language_of(&source.name).ok_or_else(|| EngineError::UnknownScriptLanguage {
+                    module: layer.name.clone(),
+                    script: source.name.clone(),
+                })?;
+            let index = match hosts.iter().position(|(lang, _)| *lang == language) {
+                Some(index) => index,
+                None => {
+                    hosts.push((language, new_host(language, layer, &source.name)?));
+                    hosts.len() - 1
+                }
+            };
+            hosts[index]
+                .1
+                .load(source)
+                .map_err(|err| EngineError::BadScript {
+                    module: layer.name.clone(),
+                    script: source.name.clone(),
+                    reason: err.to_string(),
+                })?;
+        }
+    }
+
+    Ok(hosts.into_iter().map(|(_, host)| host).collect())
+}
+
+/// A script's extension picks its engine — the same file name a player
+/// types into `scripts:` says which VM runs it, with nothing to configure.
+fn language_of(script: &str) -> Option<&'static str> {
+    match script.rsplit('.').next() {
+        Some("lua") => Some("lua"),
+        _ => None,
+    }
+}
+
+fn new_host(
+    language: &'static str,
+    layer: &RuleModule,
+    script: &str,
+) -> Result<Box<dyn ScriptHost>, EngineError> {
+    let missing = || EngineError::ScriptEngineMissing {
+        module: layer.name.clone(),
+        script: script.to_string(),
+        language,
+    };
+    match language {
+        #[cfg(feature = "lua")]
+        "lua" => Ok(Box::new(script::lua::LuaHost::new().map_err(|err| {
+            EngineError::BadScript {
+                module: layer.name.clone(),
+                script: script.to_string(),
+                reason: err.to_string(),
+            }
+        })?)),
+        _ => Err(missing()),
+    }
 }
 
 fn compile_timers(timers: &[Timer]) -> Result<Vec<CompiledTimer>, EngineError> {
@@ -1769,5 +1933,198 @@ triggers:
             patched.process_line("Your health: 60%").sends,
             vec!["quaff heal"]
         );
+    }
+
+    /// A module whose script name has no engine behind it must say so at
+    /// load, not stay silent while its hooks never run.
+    #[test]
+    fn a_script_in_an_unknown_language_fails_to_compile() {
+        let mut layer = module("name: test");
+        layer.script_sources.push(ScriptSource {
+            name: "combat.rb".to_string(),
+            code: String::new(),
+        });
+
+        let err = Engine::compile(&[layer]).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::UnknownScriptLanguage { script, .. } if script == "combat.rb"),
+            "{err}"
+        );
+    }
+
+    /// A build without the engine a script needs must say which engine is
+    /// missing — the script is fine, this binary is not the one to run it.
+    #[cfg(not(feature = "lua"))]
+    #[test]
+    fn a_lua_script_without_a_lua_engine_says_which_engine_is_missing() {
+        let mut layer = module("name: test");
+        layer.script_sources.push(ScriptSource {
+            name: "combat.lua".to_string(),
+            code: String::new(),
+        });
+
+        let err = Engine::compile(&[layer]).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::ScriptEngineMissing { language, .. } if *language == "lua"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "lua")]
+    mod scripted {
+        use super::*;
+
+        fn scripted_engine(yaml: &str, lua: &str) -> Engine {
+            let mut layer = module(yaml);
+            layer.script_sources.push(ScriptSource {
+                name: "test.lua".to_string(),
+                code: lua.to_string(),
+            });
+            Engine::compile(&[layer]).expect("compiles")
+        }
+
+        /// The M8 acceptance case in the other direction from `when:`: what
+        /// YAML cannot express, a script can, over the same state.
+        #[test]
+        fn a_script_hook_reads_the_rules_own_variables_and_server_data() {
+            let mut engine = scripted_engine(
+                r#"
+                name: test
+                variables:
+                  heal_at: "40"
+                triggers:
+                  - pattern: '^Your health: (?P<hp>\d+)%'
+                    set: {hp: "${hp}"}
+                "#,
+                r#"
+                mud.on_line(function()
+                  local hp = tonumber(mud.get("hp") or "100")
+                  if hp < tonumber(mud.get("heal_at")) and mud.data("Char.Status.combat") == "1" then
+                    mud.send("quaff heal")
+                  end
+                end)
+                "#,
+            );
+            engine.update_server_data_from_gmcp("Char.Status.combat", "1".to_string());
+
+            // The trigger's `set:` runs first, so the hook sees this line's
+            // health rather than the previous line's.
+            assert_eq!(
+                engine.process_line("Your health: 30%").sends,
+                vec!["quaff heal"]
+            );
+            assert!(engine.process_line("Your health: 90%").sends.is_empty());
+        }
+
+        #[test]
+        fn a_script_variable_is_visible_to_the_rules() {
+            let mut engine = scripted_engine(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^t$'
+                    send: ["kill ${quarry}"]
+                "#,
+                r#"mud.on_line(function(line) mud.set("quarry", line) end)"#,
+            );
+
+            engine.process_line("kobold");
+            assert_eq!(engine.expand_input("t").sends, vec!["kill kobold"]);
+        }
+
+        #[test]
+        fn a_script_can_gag_and_substitute_a_line() {
+            let mut engine = scripted_engine(
+                "name: test",
+                r#"
+                mud.on_line(function(line)
+                  if line == "spam" then mud.gag() end
+                  if line == "raw" then mud.substitute("polished") end
+                end)
+                "#,
+            );
+
+            assert!(engine.process_line("spam").gag);
+            assert_eq!(
+                engine.process_line("raw").substitute.as_deref(),
+                Some("polished")
+            );
+            assert!(engine.process_line("plain").substitute.is_none());
+        }
+
+        #[test]
+        fn lifecycle_and_server_data_hooks_reach_the_same_script() {
+            let mut engine = scripted_engine(
+                "name: test",
+                r#"
+                mud.on_connect(function() mud.send("look") end)
+                mud.on_prompt(function(text) mud.echo("prompt: " .. text) end)
+                mud.on_gmcp(function(package, json) mud.echo(package .. "=" .. json) end)
+                mud.on_disconnect(function() mud.echo("bye") end)
+                "#,
+            );
+
+            assert_eq!(engine.on_connect().sends, vec!["look"]);
+            assert_eq!(engine.process_prompt("HP:30").echoes, vec!["prompt: HP:30"]);
+            assert_eq!(
+                engine.process_gmcp("Char.Vitals", r#"{"hp":30}"#).echoes,
+                vec![r#"Char.Vitals={"hp":30}"#]
+            );
+            assert_eq!(engine.on_disconnect().echoes, vec!["bye"]);
+        }
+
+        /// A script that stops working must be as visible as a trigger that
+        /// stops firing — in the player's scrollback, with the line's own
+        /// rules still honoured.
+        #[test]
+        fn a_failing_hook_reports_itself_without_stopping_the_line() {
+            let mut engine = scripted_engine(
+                r#"
+                name: test
+                triggers:
+                  - pattern: '^ouch$'
+                    send: ["quaff heal"]
+                "#,
+                r#"mud.on_line(function() error("boom") end)"#,
+            );
+
+            let outcome = engine.process_line("ouch");
+            assert_eq!(outcome.sends, vec!["quaff heal"]);
+            assert_eq!(outcome.echoes.len(), 1, "{:?}", outcome.echoes);
+            assert!(outcome.echoes[0].contains("line"), "{:?}", outcome.echoes);
+        }
+
+        /// Scripts layer like rules do (§7.3), and later layers see what
+        /// earlier ones left behind.
+        #[test]
+        fn scripts_load_in_scope_order_into_one_vm() {
+            let mut shared = module("name: shared");
+            shared.script_sources.push(ScriptSource {
+                name: "shared.lua".to_string(),
+                code: "greeting = 'hello'".to_string(),
+            });
+            let mut profile = module("name: profile");
+            profile.script_sources.push(ScriptSource {
+                name: "profile.lua".to_string(),
+                code: r#"mud.on_line(function() mud.send(greeting) end)"#.to_string(),
+            });
+
+            let mut engine = Engine::compile(&[shared, profile]).expect("compiles");
+            assert_eq!(engine.process_line("x").sends, vec!["hello"]);
+        }
+
+        #[test]
+        fn a_broken_script_names_its_file_and_module() {
+            let mut layer = module("name: uw-combat");
+            layer.script_sources.push(ScriptSource {
+                name: "combat.lua".to_string(),
+                code: "this is not lua".to_string(),
+            });
+
+            let err = Engine::compile(&[layer]).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("combat.lua"), "{message}");
+            assert!(message.contains("uw-combat"), "{message}");
+        }
     }
 }
