@@ -7,6 +7,8 @@
 use serde_json::json;
 use thiserror::Error;
 
+use super::Flattened;
+
 /// What the client identifies itself as in `Core.Hello`.
 const CLIENT_NAME: &str = "Mudular";
 
@@ -67,21 +69,6 @@ pub fn supports_message() -> GmcpMessage {
         package: "Core.Supports.Set".to_string(),
         payload: Some(json!(["Char 1", "Room 1"]).to_string()),
     }
-}
-
-/// A flattened GMCP payload.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Flattened {
-    /// Dotted-path `(key, value)` pairs for the server-data store.
-    pub pairs: Vec<(String, String)>,
-    /// `(path, length)` for every array flattened, including empty ones.
-    ///
-    /// Arrays flatten to *positional* keys (`Char.Affects.0`), so a store
-    /// that only merges `pairs` keeps `Char.Affects.1` forever once the
-    /// array shrinks — a dropped buff that never expires. These let the
-    /// store drop the indices the new payload no longer has
-    /// (docs/ARCHITECTURE.md §6.3, §7.5).
-    pub arrays: Vec<(String, usize)>,
 }
 
 /// Flattens a message's JSON payload into dotted-path `(key, value)` pairs

@@ -10,6 +10,8 @@
 
 use thiserror::Error;
 
+use super::Flattened;
+
 pub const VAR: u8 = 1;
 pub const VAL: u8 = 2;
 pub const TABLE_OPEN: u8 = 3;
@@ -55,11 +57,17 @@ pub fn parse(data: &[u8]) -> Result<Vec<(String, MsdpValue)>, MsdpError> {
 
 /// Flattens a parsed value into dotted-path `(key, value)` pairs, mirroring
 /// [`crate::proto::gmcp::flatten`] so both protocols land in one shape for
-/// the server-data store.
-pub fn flatten(name: &str, value: &MsdpValue, out: &mut Vec<(String, String)>) {
+/// the server-data store — [`Flattened`] included, since MSDP arrays are
+/// positional for exactly the same reason GMCP's are and go stale the same
+/// way when one shrinks.
+pub fn flatten(name: &str, value: &MsdpValue, out: &mut Flattened) {
     match value {
-        MsdpValue::String(s) => out.push((name.to_string(), s.clone())),
+        MsdpValue::String(s) => out.pairs.push((name.to_string(), s.clone())),
         MsdpValue::Array(items) => {
+            // Before the recursion, and for an empty array too: `[]` emits
+            // no pairs at all, which is the case where a stale `….0` would
+            // otherwise survive unnoticed.
+            out.arrays.push((name.to_string(), items.len()));
             for (index, item) in items.iter().enumerate() {
                 flatten(&format!("{name}.{index}"), item, out);
             }
@@ -326,14 +334,25 @@ mod tests {
                 MsdpValue::Array(vec![MsdpValue::String("north".to_string())]),
             ),
         ]);
-        let mut out = Vec::new();
+        let mut out = Flattened::default();
         flatten("Char.Vitals", &value, &mut out);
         assert_eq!(
-            out,
+            out.pairs,
             vec![
                 ("Char.Vitals.hp".to_string(), "100".to_string()),
                 ("Char.Vitals.exits.0".to_string(), "north".to_string()),
             ]
         );
+        assert_eq!(out.arrays, vec![("Char.Vitals.exits".to_string(), 1)]);
+    }
+
+    /// An emptied MSDP array reports its length and nothing else — the
+    /// only signal that the indices it used to have are gone.
+    #[test]
+    fn an_emptied_msdp_array_still_reports_its_length() {
+        let mut out = Flattened::default();
+        flatten("Char.Affects", &MsdpValue::Array(vec![]), &mut out);
+        assert!(out.pairs.is_empty());
+        assert_eq!(out.arrays, vec![("Char.Affects".to_string(), 0)]);
     }
 }

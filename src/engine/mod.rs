@@ -729,9 +729,33 @@ impl Engine {
     /// indices at or past the new length are removed, along with anything
     /// nested under them.
     pub fn prune_gmcp_array(&mut self, path: &str, len: usize) {
+        for key in self.stale_array_keys(path, len) {
+            self.server_data.remove(&key);
+            self.gmcp_keys.remove(&key);
+            self.changed = true;
+        }
+    }
+
+    /// As [`Self::prune_gmcp_array`], but for MSDP: MSDP arrays are
+    /// positional too and go stale identically. Keys GMCP owns are left
+    /// alone — a server offering both has GMCP preferred, so MSDP must not
+    /// expire a value it was never allowed to set (§6.3).
+    pub fn prune_msdp_array(&mut self, path: &str, len: usize) {
+        for key in self.stale_array_keys(path, len) {
+            if self.gmcp_keys.contains(&key) {
+                continue;
+            }
+            self.server_data.remove(&key);
+            self.changed = true;
+        }
+    }
+
+    /// The keys under `path` whose array index is at or past `len` — what a
+    /// shrunken array left behind, including anything nested under those
+    /// elements.
+    fn stale_array_keys(&self, path: &str, len: usize) -> Vec<String> {
         let prefix = format!("{path}.");
-        let stale: Vec<String> = self
-            .server_data
+        self.server_data
             .keys()
             .filter(|key| {
                 let Some(rest) = key.strip_prefix(&prefix) else {
@@ -744,13 +768,7 @@ impl Engine {
                 index.parse::<usize>().is_ok_and(|i| i >= len)
             })
             .cloned()
-            .collect();
-
-        for key in stale {
-            self.server_data.remove(&key);
-            self.gmcp_keys.remove(&key);
-            self.changed = true;
-        }
+            .collect()
     }
 
     /// As [`Self::update_server_data_from_gmcp`], but for MSDP: a no-op if
@@ -1976,6 +1994,32 @@ mod tests {
         ] {
             assert!(engine.server_data.contains_key(kept), "{kept} was pruned");
         }
+    }
+
+    /// MSDP arrays are positional too, so they go stale exactly as GMCP's
+    /// do — but MSDP must not expire a key GMCP owns, since a server
+    /// offering both has GMCP preferred (§6.3) and MSDP was never allowed
+    /// to write it in the first place.
+    #[test]
+    fn pruning_an_msdp_array_spares_the_keys_gmcp_owns() {
+        let mut engine = engine("name: test");
+        engine.update_server_data_from_msdp("Room.Exits.0", "north".to_string());
+        engine.update_server_data_from_msdp("Room.Exits.1", "south".to_string());
+        // GMCP claims this one; MSDP's own write is already a no-op.
+        engine.update_server_data_from_gmcp("Room.Exits.2", "up".to_string());
+
+        engine.prune_msdp_array("Room.Exits", 1);
+
+        assert_eq!(
+            engine.server_data.get("Room.Exits.0"),
+            Some(&"north".to_string())
+        );
+        assert_eq!(engine.server_data.get("Room.Exits.1"), None, "stale MSDP");
+        assert_eq!(
+            engine.server_data.get("Room.Exits.2"),
+            Some(&"up".to_string()),
+            "GMCP owns this key; MSDP must not expire it"
+        );
     }
 
     #[test]

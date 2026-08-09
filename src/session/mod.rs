@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::engine::{Engine, PeerSnapshot, Peers};
 use crate::net::{self, TlsConfig};
+use crate::proto::Flattened;
 use crate::proto::charset::Charset;
 use crate::proto::gmcp;
 use crate::proto::mccp::MccpDecoder;
@@ -473,12 +474,17 @@ async fn run_connection(
                                     }
                                     TelnetEvent::Subnegotiation { option: option::MSDP, data } => {
                                         if let Ok(pairs) = msdp::parse(&data) {
-                                            let mut flat = Vec::new();
+                                            let mut flat = Flattened::default();
                                             for (name, value) in &pairs {
                                                 msdp::flatten(name, value, &mut flat);
                                             }
-                                            for (key, value) in flat {
+                                            for (key, value) in flat.pairs {
                                                 engine.update_server_data_from_msdp(&key, value);
+                                            }
+                                            // As for GMCP: only stale once
+                                            // the new indices are in (§6.3).
+                                            for (path, len) in flat.arrays {
+                                                engine.prune_msdp_array(&path, len);
                                             }
                                         }
                                         Vec::new()
@@ -1766,6 +1772,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_sent(&mut sent).await, "you see The Bazaar");
+    }
+
+    /// The MSDP twin of `a_shrinking_gmcp_array_does_not_leave_a_phantom_entry`:
+    /// MSDP arrays are positional for the same reason and went stale the
+    /// same way, feeding the same server-data namespace (§6.3).
+    #[tokio::test]
+    async fn a_shrinking_msdp_array_does_not_leave_a_phantom_entry() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (mut events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::MSDP]).await.unwrap();
+                await_agreement(&mut sock, option::MSDP).await;
+
+                // `ROOM_EXITS` as a two-element array, then a one-element
+                // one — the exit that closed behind you.
+                let exits = |values: &[&str]| {
+                    let mut payload = vec![msdp::VAR];
+                    payload.extend_from_slice(b"ROOM_EXITS");
+                    payload.push(msdp::VAL);
+                    payload.push(msdp::ARRAY_OPEN);
+                    for value in values {
+                        payload.push(msdp::VAL);
+                        payload.extend_from_slice(value.as_bytes());
+                    }
+                    payload.push(msdp::ARRAY_CLOSE);
+                    encode_subnegotiation(option::MSDP, &payload)
+                };
+
+                let mut combined = exits(&["north", "south"]).to_vec();
+                combined.extend_from_slice(&exits(&["north"]));
+                // Same synchronisation as the test above: MSDP raises no
+                // event of its own, and the session processes the stream in
+                // order, so a plain line after both updates means both have
+                // landed by the time the test sees it.
+                combined.extend_from_slice(b"msdp applied\r\n");
+                sock.write_all(&combined).await.unwrap();
+
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^exits$'
+                    send: ["tell 0=${ROOM_EXITS.0} 1=${ROOM_EXITS.1}"]
+                "#,
+            ),
+        );
+
+        assert_eq!(next_line(&mut events).await, "msdp applied");
+
+        commands
+            .send(SessionCommand::SendLine("exits".into()))
+            .await
+            .unwrap();
+        assert_eq!(next_sent(&mut sent).await, "tell 0=north 1=${ROOM_EXITS.1}");
     }
 
     /// Reads complete `IAC SB <option> … IAC SE` subnegotiations,
