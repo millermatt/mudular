@@ -806,6 +806,20 @@ home; .2s1w → whatever `home` sends, then s, s, w
   assembly and render (the highlight splice, `mud.substitute`). If
   MUD-specific quirks outgrow it, the fallback is a thin parser on `vte`
   (Alacritty's escape parser).
+- **Two escape parsers, deliberately not unified.** `strip_ansi` (what
+  triggers match, §7.1) and `ansi-to-tui` (what renders) do not agree on
+  every input: `strip_ansi` treats `ESC` + any byte as a two-byte escape
+  and drops both, and consumes DCS/APC/PM strings, where `ansi-to-tui`
+  keeps the trailing byte as literal text. So a line containing `ESC M`
+  displays as `M` while a trigger matched the line without it. Unifying
+  means either loosening `strip_ansi` — which would weaken the projection
+  §13 depends on — or normalising every line before render, a per-line
+  pass on the hot path §2 exists to protect. Neither is worth paying for
+  sequences no MUD sends: the divergence is between two *strict* readings
+  of escapes that are already meaningless here. What made it matter was
+  `Alt+V` building a pattern with the render-path parser, so a picked line
+  could not match itself; that used the retained projection instead
+  (§10.2). Revisit if a real server is ever found sending these.
 - Scrollback is a bounded `VecDeque<RetainedLine>` per pane — session panes
   and channel panes alike (§11.1) — discarded oldest-first, bounded by the
   `scrollback_size` setting in `mudular.yaml` (a `usize`, 10,000 default,
