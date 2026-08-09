@@ -3,6 +3,7 @@ mod config;
 mod engine;
 mod net;
 mod proto;
+mod scrollback;
 mod session;
 mod ui;
 

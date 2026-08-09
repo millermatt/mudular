@@ -25,6 +25,7 @@ use ratatui::style::Color;
 use crate::config::{self, Channel, CrossSession, Keybinds};
 use crate::engine::{Engine, PeerSnapshot};
 use crate::proto::charset::Charset;
+use crate::scrollback::RetainedLine;
 use crate::session::{self, PeerLinks, SessionCommand, SessionEvent};
 use crate::ui;
 
@@ -93,7 +94,7 @@ pub struct Rules {
 /// isolation between sessions is structural (docs/ARCHITECTURE.md §3).
 pub struct SessionPane {
     pub name: String,
-    pub scrollback: VecDeque<String>,
+    pub scrollback: VecDeque<RetainedLine>,
     /// Text pinned above the input line; empty means no prompt.
     pub prompt: String,
     pub input: Input,
@@ -166,13 +167,16 @@ pub struct SessionPane {
 }
 
 impl SessionPane {
-    fn push_line(&mut self, line: String) {
+    fn push_line(&mut self, line: RetainedLine) {
         if let Some(log) = &mut self.log {
             use std::io::Write as _;
             // Best-effort: a full disk or a yanked log file must not take
             // the session down. Silently stop trying rather than repeat a
             // failing write every line.
-            if writeln!(log, "{line}").and_then(|()| log.flush()).is_err() {
+            if writeln!(log, "{}", line.text)
+                .and_then(|()| log.flush())
+                .is_err()
+            {
                 self.log = None;
             }
         }
@@ -252,7 +256,7 @@ impl SessionPane {
 /// that isn't excluded by `session:` (docs/ARCHITECTURE.md §11.1).
 pub struct ChannelPane {
     pub config: Channel,
-    pub lines: VecDeque<String>,
+    pub lines: VecDeque<RetainedLine>,
     pub unread: usize,
     /// How many lines `lines` keeps (`scrollback_size`, §8).
     pub scrollback_limit: usize,
@@ -262,7 +266,7 @@ pub struct ChannelPane {
 }
 
 impl ChannelPane {
-    fn push(&mut self, line: String) {
+    fn push(&mut self, line: RetainedLine) {
         self.lines.push_back(line);
         if self.lines.len() > self.scrollback_limit {
             self.lines.pop_front();
@@ -431,7 +435,10 @@ impl AppState {
     }
 
     /// Appends a routed line to its channel pane, tagging the origin session
-    /// when more than one character is active (§11.1).
+    /// when more than one character is active (§11.1). The tag and the
+    /// timestamp are the line's `origin` and `at`, not text spliced onto the
+    /// front of it — `ui::draw_channel` composes both from the pane's own
+    /// `timestamps:` setting at render time (§8).
     fn push_routed(&mut self, from: usize, channel: &str, text: String) {
         let tag = self.aggregating().then(|| self.sessions[from].name.clone());
         let Some(index) = self.channel_index(channel) else {
@@ -439,16 +446,10 @@ impl AppState {
         };
         let focused = self.focus == Focus::Channel(index);
         let pane = &mut self.channels[index];
-        let mut line = String::new();
-        if pane.config.timestamps {
-            line.push_str(&timestamp());
-            line.push(' ');
-        }
-        if let Some(tag) = tag {
-            line.push_str(&format!("[{tag}] "));
-        }
-        line.push_str(&text);
-        pane.push(line);
+        pane.push(match tag {
+            Some(tag) => RetainedLine::from_session(tag, text),
+            None => RetainedLine::server(text),
+        });
         if !focused {
             pane.unread += 1;
         }
@@ -491,13 +492,16 @@ impl AppState {
         let matched = self.addressed(from, target);
         if matched.is_empty() {
             let notice = format!("** echo_to: no session named `{target}`");
-            self.sessions[from].push_line(notice);
+            self.sessions[from].push_line(RetainedLine::client(notice));
             return;
         }
 
         let name = self.sessions[from].name.clone();
         for index in matched {
-            self.sessions[index].push_line(format!("[from {name}] {text}"));
+            self.sessions[index].push_line(RetainedLine::from_session(
+                &name,
+                format!("[from {name}] {text}"),
+            ));
         }
     }
 
@@ -512,7 +516,7 @@ impl AppState {
 
         if matched.is_empty() {
             let notice = format!("** send_to: no session named `{target}`");
-            self.sessions[from].push_line(notice);
+            self.sessions[from].push_line(RetainedLine::client(notice));
             return Vec::new();
         }
 
@@ -549,17 +553,10 @@ impl AppState {
             ));
         }
         for notice in notices {
-            self.sessions[from].push_line(notice);
+            self.sessions[from].push_line(RetainedLine::client(notice));
         }
         out
     }
-}
-
-/// `HH:MM:SS` in the player's local timezone for channel panes that ask
-/// for timestamps — a UTC clock silently mislabeled as local would be
-/// wrong for most players, every day, all year.
-fn timestamp() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 /// Applies one session event to `state`. Returns the injections the hub
@@ -599,7 +596,7 @@ fn apply_session_event(
     match ev {
         SessionEvent::Line(line) => {
             let session = &mut state.sessions[index];
-            session.push_line(line);
+            session.push_line(RetainedLine::server(line));
             if !focused {
                 session.unread += 1;
             }
@@ -630,11 +627,10 @@ fn apply_session_event(
             // it was just given was wrong. Withdraw the offer rather than
             // let the player save a password that doesn't work (§13).
             if masked && session.pending_password.take().is_some() {
-                session.push_line(
+                session.push_line(RetainedLine::client(
                     "** not saved: that password was rejected, so there is \
-                     nothing worth keeping"
-                        .to_string(),
-                );
+                     nothing worth keeping",
+                ));
             }
             (false, Vec::new())
         }
@@ -651,7 +647,7 @@ fn apply_session_event(
             // §13 requires an insecure connection (or a newly pinned
             // certificate) to be visible, not just implied by a label.
             if let Some(warning) = security.warning {
-                session.push_line(format!("** {warning}"));
+                session.push_line(RetainedLine::client(format!("** {warning}")));
             }
             (false, Vec::new())
         }
@@ -685,7 +681,7 @@ fn apply_session_event(
             // Scrollback wraps and never truncates, so the full reason
             // always lands there too, the same way §13 already puts a
             // security warning in both places.
-            session.push_line(format!("** disconnected: {reason}"));
+            session.push_line(RetainedLine::client(format!("** disconnected: {reason}")));
             session.latency.clear();
             session.masked = false;
             session.connected = false;
@@ -729,9 +725,9 @@ fn open_config_editor(state: &mut AppState, channels: &[Channel]) {
     let (dir, profile) = session.rules.clone();
     let Some(name) = profile else {
         if let Some(session) = state.bound_mut() {
-            session.push_line(
-                "** /config needs a profile session — this one was started with --host".to_string(),
-            );
+            session.push_line(RetainedLine::client(
+                "** /config needs a profile session — this one was started with --host",
+            ));
         }
         return;
     };
@@ -755,7 +751,9 @@ fn open_config_editor(state: &mut AppState, channels: &[Channel]) {
         }
         Err(err) => {
             if let Some(session) = state.bound_mut() {
-                session.push_line(format!("** could not open the profile editor: {err:#}"));
+                session.push_line(RetainedLine::client(format!(
+                    "** could not open the profile editor: {err:#}"
+                )));
             }
         }
     }
@@ -797,15 +795,14 @@ fn open_new_trigger_from_line(state: &mut AppState, channels: &[Channel], back_o
     else {
         return;
     };
-    let pattern = regex::escape(&ui::plain_text(raw));
+    let pattern = regex::escape(&ui::plain_text(&raw.text));
     let (dir, profile) = session.rules.clone();
     let Some(name) = profile else {
         if let Some(session) = state.bound_mut() {
-            session.push_line(
+            session.push_line(RetainedLine::client(
                 "** picking a trigger needs a profile session — this one was started with \
-                 --host"
-                    .to_string(),
-            );
+                 --host",
+            ));
         }
         return;
     };
@@ -831,7 +828,9 @@ fn open_new_trigger_from_line(state: &mut AppState, channels: &[Channel], back_o
         }
         Err(err) => {
             if let Some(session) = state.bound_mut() {
-                session.push_line(format!("** could not open the profile editor: {err:#}"));
+                session.push_line(RetainedLine::client(format!(
+                    "** could not open the profile editor: {err:#}"
+                )));
             }
         }
     }
@@ -905,7 +904,7 @@ async fn service_config_save(state: &mut AppState, channels: &[Channel], mode: c
                                 format!("** config saved, but rules failed to reload: {err:#}")
                             }
                         };
-                    state.sessions[index].push_line(text);
+                    state.sessions[index].push_line(RetainedLine::client(text));
                 }
             }
         }
@@ -1583,7 +1582,7 @@ fn answer_password_offer(session: &mut SessionPane, save: bool) {
         })
     };
     let line = outcome.unwrap_or_else(|err| format!("** {err:#}"));
-    session.push_line(line);
+    session.push_line(RetainedLine::client(line));
 }
 
 /// Sends the bound session's input line. Always the bound session, never
@@ -1602,7 +1601,7 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     // own response is the feedback that matters.
     if !line.is_empty() && !session.masked {
         // Never echo what the server is masking.
-        session.push_line(format!("> {line}"));
+        session.push_line(RetainedLine::echo(format!("> {line}")));
     }
     // A masked line at a login the profile wants automated is the password
     // it is missing (§13). Offer to keep it rather than making the player
@@ -1611,16 +1610,16 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         session.offer_password_save = false;
         session.pending_password = Some(line.clone());
         let profile = session.rules.1.clone().unwrap_or_default();
-        session.push_line(format!(
+        session.push_line(RetainedLine::client(format!(
             "** Save this password in the OS keyring for `{profile}`, \
              so it logs you in next time? (y/n)"
-        ));
+        )));
     }
     if line.trim() == HELP_COMMAND {
         let lines = ui::help_lines(&state.keybinds);
         if let Some(session) = state.bound_mut() {
             for line in lines {
-                session.push_line(line);
+                session.push_line(RetainedLine::client(line));
             }
         }
         return;
@@ -1628,7 +1627,7 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     if line.trim() == RELOAD_COMMAND {
         let notice = reload_rules(state, channels).await;
         if let Some(session) = state.bound_mut() {
-            session.push_line(notice);
+            session.push_line(RetainedLine::client(notice));
         }
         return;
     }
@@ -1733,28 +1732,39 @@ mod tests {
     use super::test_support::{app_with_receivers as app, channel};
     use super::*;
     use crate::net::Security;
+    use crate::scrollback::Origin;
 
     fn scrollback(session: &SessionPane) -> String {
         session
             .scrollback
             .iter()
-            .cloned()
+            .map(|line| line.text.clone())
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    /// `timestamp()` must stay `HH:MM:SS` — a regression back to hand-rolled
-    /// arithmetic on Unix-epoch seconds (as opposed to `chrono::Local`)
-    /// would silently mislabel a UTC clock as local time again.
-    #[test]
-    fn timestamp_is_hh_mm_ss() {
-        let stamp = timestamp();
-        let parts: Vec<&str> = stamp.split(':').collect();
-        assert_eq!(parts.len(), 3, "{stamp}");
-        for part in parts {
-            assert_eq!(part.len(), 2, "{stamp}");
-            assert!(part.chars().all(|c| c.is_ascii_digit()), "{stamp}");
-        }
+    /// The client's own voice has to stay distinguishable from the MUD's
+    /// after the fact (docs/UX_REVIEW.md D): a `**` in the text is a
+    /// convention anyone can type, `origin` is what the pane actually knows.
+    #[tokio::test]
+    async fn a_pane_records_who_wrote_each_line() {
+        let (mut state, _rx) = app(&["tank"]);
+        apply_session_event(&mut state, 0, SessionEvent::Line("You see a rat.".into()));
+        state.sessions[0].input = Input::default().with_value("kill rat".into());
+        submit_input(&mut state, &[]).await;
+        apply_session_event(&mut state, 0, SessionEvent::Ended("host went away".into()));
+
+        let origins: Vec<&Origin> = state.sessions[0]
+            .scrollback
+            .iter()
+            .map(|line| &line.origin)
+            .collect();
+        assert_eq!(
+            origins,
+            [&Origin::Server, &Origin::Echo, &Origin::Client],
+            "{}",
+            scrollback(&state.sessions[0])
+        );
     }
 
     /// §13: an unverified connection must be visible in the pane, not just
@@ -1861,12 +1871,12 @@ mod tests {
         let session = &mut state.sessions[0];
         let line = "hunter2".to_string();
         if !session.masked {
-            session.push_line(format!("> {line}"));
+            session.push_line(RetainedLine::echo(format!("> {line}")));
         }
         assert!(session.scrollback.is_empty());
 
         session.masked = false;
-        session.push_line("> look".to_string());
+        session.push_line(RetainedLine::echo("> look"));
         assert_eq!(scrollback(session), "> look");
     }
 
@@ -1889,11 +1899,11 @@ mod tests {
         // Mirrors the Enter branch of the event loop: a masked line never
         // reaches push_line at all.
         if !session.masked {
-            session.push_line(format!("> {line}"));
+            session.push_line(RetainedLine::echo(format!("> {line}")));
         }
 
         session.masked = false;
-        session.push_line("> look".to_string());
+        session.push_line(RetainedLine::echo("> look"));
         drop(session);
 
         let logged = std::fs::read_to_string(&path).unwrap();
@@ -1938,8 +1948,8 @@ mod tests {
         session.log = open_log(&path);
         assert!(session.log.is_some(), "log file failed to open");
 
-        session.push_line("You see a rat.".to_string());
-        session.push_line("You swing your sword.".to_string());
+        session.push_line(RetainedLine::server("You see a rat."));
+        session.push_line(RetainedLine::server("You swing your sword."));
         drop(session); // flushes the BufWriter
 
         let logged = std::fs::read_to_string(&path).unwrap();
@@ -2137,7 +2147,13 @@ mod tests {
             },
         );
 
-        assert_eq!(state.channels[0].lines[0], "[cleric] Bob tells you hi");
+        // The tag is provenance, not text: `ui::draw_channel` composes the
+        // `[cleric]` from it (§8).
+        assert_eq!(state.channels[0].lines[0].text, "Bob tells you hi");
+        assert_eq!(
+            state.channels[0].lines[0].origin,
+            Origin::Session("cleric".to_string())
+        );
         assert_eq!(state.channels[0].unread, 1);
         assert!(
             state.sessions[1].scrollback.is_empty(),
@@ -2161,26 +2177,8 @@ mod tests {
             },
         );
 
-        assert_eq!(state.channels[0].lines[0], "Bob tells you hi");
-    }
-
-    #[test]
-    fn a_timestamped_channel_prefixes_the_clock() {
-        let (mut state, _rx) = app(&["tank"]);
-        with_channel(&mut state, "comms", true);
-
-        apply_session_event(
-            &mut state,
-            0,
-            SessionEvent::Route {
-                channel: "comms".into(),
-                text: "Bob tells you hi".into(),
-            },
-        );
-
-        let line = &state.channels[0].lines[0];
-        assert!(line.ends_with("Bob tells you hi"), "{line}");
-        assert_eq!(line.len(), "00:00:00 Bob tells you hi".len(), "{line}");
+        assert_eq!(state.channels[0].lines[0].text, "Bob tells you hi");
+        assert_eq!(state.channels[0].lines[0].origin, Origin::Server);
     }
 
     /// A line routed to a channel that isn't declared must not panic or
@@ -2218,10 +2216,9 @@ mod tests {
 
         // Display-only: nothing is asked of the target session.
         assert!(commands.is_empty(), "{commands:?}");
-        assert_eq!(
-            state.sessions[1].scrollback.back().map(String::as_str),
-            Some("[from tank] he is about to fall")
-        );
+        let line = state.sessions[1].scrollback.back().expect("the echo");
+        assert_eq!(line.text, "[from tank] he is about to fall");
+        assert_eq!(line.origin, Origin::Session("tank".to_string()));
         assert!(state.sessions[0].scrollback.is_empty(), "not the sender");
         assert!(state.sessions[2].scrollback.is_empty(), "not a bystander");
     }
@@ -2240,7 +2237,8 @@ mod tests {
         );
 
         let notice = state.sessions[0].scrollback.back().expect("a notice");
-        assert!(notice.contains("ghost"), "{notice}");
+        assert!(notice.text.contains("ghost"), "{}", notice.text);
+        assert_eq!(notice.origin, Origin::Client);
     }
 
     // ---- cross-session send_to (§7.5) ----
@@ -2490,12 +2488,7 @@ mod tests {
 
         submit_input(&mut state, &[]).await;
 
-        let printed = state.sessions[0]
-            .scrollback
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
+        let printed = scrollback(&state.sessions[0]);
         for line in ui::help_lines(&state.keybinds) {
             assert!(printed.contains(&line), "{line:?} missing from:\n{printed}");
         }
@@ -2992,13 +2985,10 @@ mod tests {
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].scrollback_limit = 2;
         for line in ["one", "two", "three"] {
-            state.sessions[0].push_line(line.to_string());
+            state.sessions[0].push_line(RetainedLine::server(line));
         }
 
-        assert_eq!(
-            state.sessions[0].scrollback.iter().collect::<Vec<_>>(),
-            ["two", "three"]
-        );
+        assert_eq!(scrollback(&state.sessions[0]), "two\nthree");
     }
 
     /// Same property, the channel-pane code path (`ChannelPane::push`) —
@@ -3019,10 +3009,12 @@ mod tests {
             state.push_routed(0, "comms", line.to_string());
         }
 
-        assert_eq!(
-            state.channels[0].lines.iter().collect::<Vec<_>>(),
-            ["two", "three"]
-        );
+        let kept: Vec<&str> = state.channels[0]
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(kept, ["two", "three"]);
     }
 
     /// The scroll keys are unmodified `PgUp`/`PgDn`/`Home`/`End` only — a

@@ -800,12 +800,26 @@ home; .2s1w → whatever `home` sends, then s, s, w
   assembly and render (the highlight splice, `mud.substitute`). If
   MUD-specific quirks outgrow it, the fallback is a thin parser on `vte`
   (Alacritty's escape parser).
-- Scrollback is a bounded `VecDeque<String>` per pane — session panes and
-  channel panes alike (§11.1) — plain raw text, discarded oldest-first, at
-  a fixed 10,000 lines today. **Planned (M9, §11.5): making that bound a
-  `scrollback_size` setting in `mudular.yaml`**, the same shape as
-  `history_size` (§11.3) — a `usize`, same 10,000 default so nothing
-  changes for a config that doesn't set it, no file persistence.
+- Scrollback is a bounded `VecDeque<RetainedLine>` per pane — session panes
+  and channel panes alike (§11.1) — discarded oldest-first, bounded by the
+  `scrollback_size` setting in `mudular.yaml` (a `usize`, 10,000 default,
+  no file persistence), the same shape as `history_size` (§11.3).
+- A `RetainedLine` (`src/scrollback.rs`) is `text` plus `at` (local arrival
+  time) and `origin` — `Server`, `Client` (the client's own notices),
+  `Echo` (a command echoed back as it was sent), or `Session(name)` (a
+  cross-session `echo_to`, §7.5, or a channel route naming the character it
+  arrived in). `text` is the line as it should read — server ANSI with
+  `highlight:` splices already applied (§7.7) — and carries nothing a pane's
+  own layout can add back at render time: a channel pane's `HH:MM:SS` and
+  `[character]` tag are composed by `ui::draw_channel` from `at` and
+  `origin`, not spliced into the text when the line was routed.
+  The distinction is not decoration. Flattening provenance into the string
+  is what makes a client warning indistinguishable from server text once it
+  has scrolled (`UX_REVIEW.md` D), and what a "while you were away" digest,
+  tell threading, transcript export, and scrollback search (§11.5) would
+  each have to parse their way back out of. `push_line` is the one funnel
+  every line passes, so the buffer records what it knows and the renderer
+  composes — rather than the reverse.
 - **Disk logging** (M9): a profile's `log: true` appends every line that
   reaches `push_line` — the same choke point scrollback fills from — to
   `<config dir>/logs/<session name>.log`, opened once at connect and kept

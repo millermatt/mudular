@@ -45,6 +45,17 @@ pre-parsed retained lines — which entangles it with the next finding.
 
 ## The retained-line problem
 
+> **Fixed.** `src/scrollback.rs` now holds `RetainedLine { text, at,
+> origin }`, and both panes store it. `push_line` takes one, so every call
+> site states who wrote the line — `Server`, `Client`, `Echo`, or
+> `Session(name)` — rather than leaving it to whether someone remembered to
+> type `**`. The channel timestamp and `[character]` tag are no longer
+> spliced into the text: `ui::draw_channel` composes them from `at` and
+> `origin` at render time, so a routed line stores what the MUD sent. Screen
+> output is unchanged. §8 now specifies the type; what it unblocks is
+> unblocked, not built — `/errors` (finding D) and search are still their
+> own work, but neither has to parse a rendered string to get there.
+
 Scrollback is `VecDeque<String>` (`SessionPane.scrollback`,
 `ChannelPane.lines`). By the time a line arrives there it has been
 flattened: highlights spliced into the ANSI (§7.7), channel timestamps and
@@ -159,8 +170,9 @@ feature wanting a new region pays for this.
 
 ## One-way doors, ranked by cost if deferred
 
-1. **The scrollback line type.** One struct now; after 1.0 it is the log
-   format, the transcript, and eight features.
+1. ~~**The scrollback line type.**~~ Closed — see above. One struct now;
+   after 1.0 it would have been the log format, the transcript, and eight
+   features.
 2. **Dynamic peer mesh and session lifecycle.** `Focus::Session(usize)` and
    `input_session: usize` bake index-as-identity into `AppState`, `ui`, and
    the tests. Adding a session is survivable; removing one is not — and

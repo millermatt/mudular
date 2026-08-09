@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::app::{AppState, ChannelPane, Focus, LayoutMode};
 use crate::config::Keybinds;
+use crate::scrollback::{Origin, RetainedLine};
 
 pub mod config_editor;
 
@@ -391,8 +392,8 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
             area.height,
             content_width,
             back_offset,
-            |i, raw| {
-                let rendered = ansi_lines(raw);
+            |i, line| {
+                let rendered = ansi_lines(&line.text);
                 if Some(i) != picked_line {
                     return rendered;
                 }
@@ -411,12 +412,13 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
 }
 
 fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: bool) {
+    let timestamps = channel.config.timestamps;
     let (lines, scroll) = visible_window(
         &channel.lines,
         area.height,
         area.width.saturating_sub(2),
         channel.back_offset,
-        |_, raw| ansi_lines(raw),
+        |_, line| channel_line(line, timestamps),
     );
     let title = format!(
         "{}{} ",
@@ -426,6 +428,34 @@ fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: b
     // Channels aggregate across characters, so no one profile's colour
     // could stand for the pane.
     render_scrollback(frame, area, lines, title, focused, None, scroll);
+}
+
+/// A channel line as the pane shows it. The `HH:MM:SS` and the `[character]`
+/// tag are composed here from the line's own `at` and `origin`, rather than
+/// spliced into its text when it was routed (§8): the pane's `timestamps:`
+/// setting then decides at render time, and the stored line stays the text
+/// the MUD actually sent.
+fn channel_line(line: &RetainedLine, timestamps: bool) -> Vec<Line<'static>> {
+    let mut prefix = String::new();
+    if timestamps {
+        // Local, not UTC: a clock silently mislabeled as local would be
+        // wrong for most players, every day, all year.
+        prefix.push_str(&line.at.format("%H:%M:%S ").to_string());
+    }
+    if let Origin::Session(name) = &line.origin {
+        prefix.push_str(&format!("[{name}] "));
+    }
+    if prefix.is_empty() {
+        return ansi_lines(&line.text);
+    }
+    // Only the first row is prefixed; a wrapped continuation is the same
+    // line, and repeating the stamp down its rows would read as several.
+    let mut rendered = ansi_lines(&line.text);
+    match rendered.first_mut() {
+        Some(first) => first.spans.insert(0, Span::raw(prefix)),
+        None => rendered.push(Line::raw(prefix)),
+    }
+    rendered
 }
 
 /// `↑ scrolled` when a pane isn't pinned to the tail — distinct from the
@@ -474,12 +504,12 @@ fn wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
 /// Cost is O(visible rows) while a pane is tailing, and O(visible rows +
 /// `back_offset`) while scrolled back — proportional to what the player
 /// asked to see, rather than to everything they have ever seen.
-fn visible_window(
-    raws: &VecDeque<String>,
+fn visible_window<T>(
+    raws: &VecDeque<T>,
     area_height: u16,
     content_width: u16,
     back_offset: usize,
-    parse: impl Fn(usize, &str) -> Vec<Line<'static>>,
+    parse: impl Fn(usize, &T) -> Vec<Line<'static>>,
 ) -> (Vec<Line<'static>>, u16) {
     let viewport = area_height.saturating_sub(2) as usize; // borders
     let needed = viewport.saturating_add(back_offset);
@@ -659,6 +689,7 @@ mod tests {
 
     use super::*;
     use crate::app::{ChannelPane, test_support};
+    use crate::config::Channel;
 
     /// A 30x10 terminal splits into a 6-tall output pane (4 content rows
     /// inside its border), a 1-row prompt, and a 3-tall input box. Content
@@ -713,7 +744,7 @@ mod tests {
         let mut state = state();
         state.sessions[0]
             .scrollback
-            .push_back("You are in a forest.".to_string());
+            .push_back(RetainedLine::server("You are in a forest."));
         state.sessions[0].prompt = "HP:100 MP:50>".to_string();
 
         let buffer = render(&state);
@@ -736,7 +767,7 @@ mod tests {
         let mut state = state();
         state.sessions[0]
             .scrollback
-            .push_back("You are in a forest.".to_string());
+            .push_back(RetainedLine::server("You are in a forest."));
         state.sessions[0]
             .gmcp_log
             .push_back(r#"Char.Vitals {"hp":100}"#.to_string());
@@ -805,7 +836,7 @@ mod tests {
         for _ in 0..40 {
             state.sessions[0]
                 .scrollback
-                .push_back("You are in a forest.".to_string());
+                .push_back(RetainedLine::server("You are in a forest."));
         }
 
         let without = render_sized(&state, 70, 40);
@@ -930,10 +961,10 @@ mod tests {
         state.layout = LayoutMode::Splits;
         state.sessions[0]
             .scrollback
-            .push_back("tankline".to_string());
+            .push_back(RetainedLine::server("tankline"));
         state.sessions[1]
             .scrollback
-            .push_back("clericline".to_string());
+            .push_back(RetainedLine::server("clericline"));
 
         let buffer = render_sized(&state, 60, 10);
         let joined: String = (0..10).map(|y| row(&buffer, y)).collect();
@@ -947,10 +978,10 @@ mod tests {
         let mut state = test_support::app(&["tank", "cleric"]);
         state.sessions[0]
             .scrollback
-            .push_back("tankline".to_string());
+            .push_back(RetainedLine::server("tankline"));
         state.sessions[1]
             .scrollback
-            .push_back("clericline".to_string());
+            .push_back(RetainedLine::server("clericline"));
 
         let buffer = render_sized(&state, 60, 12);
         let joined: String = (0..12).map(|y| row(&buffer, y)).collect();
@@ -1011,7 +1042,9 @@ mod tests {
             scrollback_limit: 10_000,
             back_offset: 0,
         };
-        channel.lines.push_back("Bob tells you hi".to_string());
+        channel
+            .lines
+            .push_back(RetainedLine::server("Bob tells you hi"));
         state.channels.push(channel);
         state.show_channels = true;
 
@@ -1019,6 +1052,67 @@ mod tests {
         let joined: String = (0..12).map(|y| row(&buffer, y)).collect();
         assert!(joined.contains("comms ● 2"), "{joined}");
         assert!(joined.contains("Bob tells you hi"), "{joined}");
+    }
+
+    /// The timestamp is not stored in the line's text (§8): the pane owns
+    /// the `timestamps:` setting, so the clock is composed here, from the
+    /// line's own arrival time, and only on the pane that asked for one.
+    #[test]
+    fn a_timestamped_channel_composes_the_clock_from_the_lines_arrival_time() {
+        let stored = "Bob tells you hi";
+        let at = RetainedLine::server(stored)
+            .at
+            .format("%H:%M:%S")
+            .to_string();
+
+        for timestamps in [false, true] {
+            let mut state = state();
+            let mut channel = ChannelPane {
+                config: Channel {
+                    timestamps,
+                    ..test_support::channel("comms")
+                },
+                lines: VecDeque::new(),
+                unread: 0,
+                scrollback_limit: 10_000,
+                back_offset: 0,
+            };
+            channel.lines.push_back(RetainedLine::server(stored));
+            state.channels.push(channel);
+            state.show_channels = true;
+
+            let buffer = render_sized(&state, 70, 12);
+            let joined: String = (0..12).map(|y| row(&buffer, y)).collect();
+            assert_eq!(
+                joined.contains(&format!("{at} {stored}")),
+                timestamps,
+                "timestamps: {timestamps}\n{joined}"
+            );
+        }
+    }
+
+    /// With several characters open a routed line says which one it came
+    /// from — composed from the line's `origin`, not spliced into its text
+    /// when it was routed (§11.1).
+    #[test]
+    fn a_channel_line_from_another_character_is_tagged_with_its_name() {
+        let mut state = state();
+        let mut channel = ChannelPane {
+            config: test_support::channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        };
+        channel
+            .lines
+            .push_back(RetainedLine::from_session("cleric", "Bob tells you hi"));
+        state.channels.push(channel);
+        state.show_channels = true;
+
+        let buffer = render_sized(&state, 70, 12);
+        let joined: String = (0..12).map(|y| row(&buffer, y)).collect();
+        assert!(joined.contains("[cleric] Bob tells you hi"), "{joined}");
     }
 
     /// The column's width comes from `AppState`, not the constant — that is
@@ -1097,14 +1191,18 @@ mod tests {
     #[test]
     fn scroll_offset_matches_real_wrap_count() {
         let mut state = state();
-        state.sessions[0].scrollback.push_back(format!(
-            "{} {} {}",
-            "a".repeat(4),
-            "b".repeat(24),
-            "c".repeat(4)
-        ));
+        state.sessions[0]
+            .scrollback
+            .push_back(RetainedLine::server(format!(
+                "{} {} {}",
+                "a".repeat(4),
+                "b".repeat(24),
+                "c".repeat(4)
+            )));
         for i in 0..10 {
-            state.sessions[0].scrollback.push_back(format!("line {i}"));
+            state.sessions[0]
+                .scrollback
+                .push_back(RetainedLine::server(format!("line {i}")));
         }
         state.sessions[0].prompt = "By what name do you wish to be known?".to_string();
 
@@ -1126,7 +1224,9 @@ mod tests {
             "It was the best of times, it was the worst of times.",
         ];
         for line in banner {
-            state.sessions[0].scrollback.push_back(line.to_string());
+            state.sessions[0]
+                .scrollback
+                .push_back(RetainedLine::server(line));
             terminal.draw(|frame| draw(frame, &state)).unwrap();
             assert_left_border_intact(terminal.backend().buffer());
         }
@@ -1138,9 +1238,11 @@ mod tests {
         state.sessions[0].prompt.clear();
         state.sessions[0]
             .scrollback
-            .push_back("> crazy-foo".to_string());
+            .push_back(RetainedLine::server("> crazy-foo"));
         for line in ["Password:", "Reconnecting.", "", "i107 >"] {
-            state.sessions[0].scrollback.push_back(line.to_string());
+            state.sessions[0]
+                .scrollback
+                .push_back(RetainedLine::server(line));
             terminal.draw(|frame| draw(frame, &state)).unwrap();
             assert_left_border_intact(terminal.backend().buffer());
         }
@@ -1155,7 +1257,9 @@ mod tests {
     fn a_scrolled_pane_shows_an_indicator_the_tail_does_not() {
         let mut state = state();
         for i in 0..20 {
-            state.sessions[0].scrollback.push_back(format!("line {i}"));
+            state.sessions[0]
+                .scrollback
+                .push_back(RetainedLine::server(format!("line {i}")));
         }
 
         let at_tail = rows(&render_sized(&state, 40, 12));
@@ -1179,7 +1283,9 @@ mod tests {
     fn an_oversized_back_offset_clamps_to_the_true_top() {
         let mut state = state();
         for i in 0..20 {
-            state.sessions[0].scrollback.push_back(format!("line {i}"));
+            state.sessions[0]
+                .scrollback
+                .push_back(RetainedLine::server(format!("line {i}")));
         }
         state.sessions[0].back_offset = usize::MAX;
 
@@ -1251,11 +1357,15 @@ mod tests {
     fn a_huge_buffer_shows_the_same_tail_as_a_small_one() {
         let mut big = state();
         for i in 0..5_000 {
-            big.sessions[0].scrollback.push_back(format!("line {i}"));
+            big.sessions[0]
+                .scrollback
+                .push_back(RetainedLine::server(format!("line {i}")));
         }
         let mut small = state();
         for i in 4_980..5_000 {
-            small.sessions[0].scrollback.push_back(format!("line {i}"));
+            small.sessions[0]
+                .scrollback
+                .push_back(RetainedLine::server(format!("line {i}")));
         }
 
         assert_eq!(
@@ -1271,7 +1381,9 @@ mod tests {
     fn scrolling_back_into_a_large_buffer_lands_on_the_right_lines() {
         let mut state = state();
         for i in 0..5_000 {
-            state.sessions[0].scrollback.push_back(format!("line {i}"));
+            state.sessions[0]
+                .scrollback
+                .push_back(RetainedLine::server(format!("line {i}")));
         }
         state.sessions[0].back_offset = 100;
 
