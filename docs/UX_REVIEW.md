@@ -1,6 +1,6 @@
 # UX Review — 2026-08-08
 
-An adversarial pass through the live TUI (via the `run` skill, against a
+An adversarial pass through the live TUI (driven via a pty, against a
 throwaway local fake MUD server) reviewed through each persona in
 `docs/ACTORS.md`, plus a general workflow read of `docs/USAGE.md` looking
 for friction that isn't a bug so much as a rough edge. Findings here are a
@@ -25,8 +25,8 @@ it over gets what looks like a crash.
 > profile name..." shell shown once a profile exists and `mudular` runs
 > bare). It now falls through instead of returning early. Verified live,
 > not just in a unit test — main.rs had none — by driving the actual
-> binary through a pty with the `run` skill both before and after: the
-> process died on `Esc` pre-fix, and stayed up showing the shell post-fix.
+> binary through a pty both before and after: the process died on `Esc`
+> pre-fix, and stayed up showing the shell post-fix.
 
 **2. Security-conscious player — TLS pin-mismatch reason is truncated to
 illegibility.** When a pinned certificate changes (simulated MITM/rotation),
@@ -42,7 +42,7 @@ needs a complete explanation, and gets a clipped fragment instead.
 > line). Scrollback wraps and never truncates, so the complete reason is
 > always reachable regardless of length. Verified with a unit test built
 > from the review's own reported message (fails without the fix — empty
-> scrollback) and confirmed live via the `run` skill against a real refused
+> scrollback) and confirmed live via a pty against a real refused
 > connection, where the full reason renders correctly through the actual
 > render/wrap pipeline.
 
