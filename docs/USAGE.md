@@ -224,6 +224,9 @@ channels:
     timestamps: true
 ```
 
+`timestamps: true` prefixes each line with `HH:MM:SS` in your system's
+local time (not the MUD server's time, and not UTC).
+
 The panes dock in a column beside the character panes; `F4` shows or hides
 them. With more than one character connected, lines are tagged with the
 one that received them (`[cleric] Bob tells you …`). Add `session: tank`

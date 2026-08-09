@@ -555,16 +555,11 @@ impl AppState {
     }
 }
 
-/// `HH:MM:SS` for channel panes that ask for timestamps. Seconds since the
-/// epoch is all `std::time` offers, so the clock arithmetic is done here
-/// rather than pulling in a date library for one format (§2.1).
+/// `HH:MM:SS` in the player's local timezone for channel panes that ask
+/// for timestamps — a UTC clock silently mislabeled as local would be
+/// wrong for most players, every day, all year.
 fn timestamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let day = secs % 86_400;
-    format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 /// Applies one session event to `state`. Returns the injections the hub
@@ -1738,6 +1733,20 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// `timestamp()` must stay `HH:MM:SS` — a regression back to hand-rolled
+    /// arithmetic on Unix-epoch seconds (as opposed to `chrono::Local`)
+    /// would silently mislabel a UTC clock as local time again.
+    #[test]
+    fn timestamp_is_hh_mm_ss() {
+        let stamp = timestamp();
+        let parts: Vec<&str> = stamp.split(':').collect();
+        assert_eq!(parts.len(), 3, "{stamp}");
+        for part in parts {
+            assert_eq!(part.len(), 2, "{stamp}");
+            assert!(part.chars().all(|c| c.is_ascii_digit()), "{stamp}");
+        }
     }
 
     /// §13: an unverified connection must be visible in the pane, not just

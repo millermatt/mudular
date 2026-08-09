@@ -9,6 +9,7 @@ license = "MIT"
 ansi-to-tui = "7"
 anyhow = "1"
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 directories = "6"
