@@ -8,6 +8,8 @@
 //! sequences are rendered via `ansi-to-tui`; unknown/malformed escapes are
 //! dropped rather than shown raw.
 
+use std::collections::VecDeque;
+
 use ansi_to_tui::IntoText;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -341,26 +343,7 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         .flatten()
         .and_then(|cursor| session.scrollback.len().checked_sub(1 + cursor));
 
-    let mut lines: Vec<Line> = Vec::new();
-    if showing_gmcp {
-        for raw in &session.gmcp_log {
-            lines.push(Line::raw(raw.clone()));
-        }
-    } else {
-        for (i, raw) in session.scrollback.iter().enumerate() {
-            let rendered = ansi_lines(raw);
-            if Some(i) == picked_line {
-                // `REVERSED` rather than a fixed colour: it reads clearly
-                // over whatever ANSI colours the server's own line already
-                // has, instead of clashing with or hiding them.
-                lines.extend(rendered.into_iter().map(|line| {
-                    line.patch_style(Style::default().add_modifier(Modifier::REVERSED))
-                }));
-            } else {
-                lines.extend(rendered);
-            }
-        }
-    }
+    let content_width = area.width.saturating_sub(2);
 
     // Security and latency are each absent until they are known, so a pane
     // never shows an empty bracket or a placeholder round trip.
@@ -394,23 +377,47 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     // indicator to explain why (§11.5 scopes navigation to scrollback).
     let back_offset = if showing_gmcp { 0 } else { session.back_offset };
 
-    render_scrollback(
-        frame,
-        area,
-        lines,
-        title,
-        focused,
-        session.color,
-        back_offset,
-    );
+    let (lines, scroll) = if showing_gmcp {
+        visible_window(
+            &session.gmcp_log,
+            area.height,
+            content_width,
+            back_offset,
+            |_, raw| vec![Line::raw(raw.to_string())],
+        )
+    } else {
+        visible_window(
+            &session.scrollback,
+            area.height,
+            content_width,
+            back_offset,
+            |i, raw| {
+                let rendered = ansi_lines(raw);
+                if Some(i) != picked_line {
+                    return rendered;
+                }
+                // `REVERSED` rather than a fixed colour: it reads clearly
+                // over whatever ANSI colours the server's own line already
+                // has, instead of clashing with or hiding them.
+                rendered
+                    .into_iter()
+                    .map(|line| line.patch_style(Style::default().add_modifier(Modifier::REVERSED)))
+                    .collect()
+            },
+        )
+    };
+
+    render_scrollback(frame, area, lines, title, focused, session.color, scroll);
 }
 
 fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: bool) {
-    let lines: Vec<Line> = channel
-        .lines
-        .iter()
-        .flat_map(|raw| ansi_lines(raw))
-        .collect();
+    let (lines, scroll) = visible_window(
+        &channel.lines,
+        area.height,
+        area.width.saturating_sub(2),
+        channel.back_offset,
+        |_, raw| ansi_lines(raw),
+    );
     let title = format!(
         "{}{} ",
         pane_title(&channel.config.name, channel.unread),
@@ -418,15 +425,7 @@ fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: b
     );
     // Channels aggregate across characters, so no one profile's colour
     // could stand for the pane.
-    render_scrollback(
-        frame,
-        area,
-        lines,
-        title,
-        focused,
-        None,
-        channel.back_offset,
-    );
+    render_scrollback(frame, area, lines, title, focused, None, scroll);
 }
 
 /// `↑ scrolled` when a pane isn't pinned to the tail — distinct from the
@@ -442,11 +441,84 @@ fn scroll_indicator(back_offset: usize) -> &'static str {
     }
 }
 
-/// Renders a bordered pane, tailed to the newest content unless `back_offset`
-/// says otherwise. Clamping happens here, not at key-press time: this is
-/// where `wrapped_rows` — ratatui's real wrap algorithm, not an estimate —
-/// and the viewport height are both already known (docs/ARCHITECTURE.md
-/// §11.5).
+/// How many rows `lines` occupy once wrapped at `width`. Uses ratatui's
+/// real wrap algorithm rather than an estimate, for the same reason the
+/// renderer always has: a long line's tail must never be silently
+/// truncated.
+///
+/// Safe to call per source line and sum, because `Wrap` splits a `Line`
+/// into rows but never joins two `Line`s — so the rows of a slice are
+/// exactly the rows of its parts. `window_is_row_exact_against_the_full_buffer`
+/// pins that.
+fn wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
+    if width == 0 || lines.is_empty() {
+        return lines.len();
+    }
+    Paragraph::new(Text::from(lines.to_vec()))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+/// Parses and returns only the tail of `raws` that the viewport can
+/// actually show at `back_offset`, plus the scroll offset to apply within
+/// that window.
+///
+/// Rendering used to parse and wrap the *entire* buffer every frame, which
+/// made per-frame cost O(buffered lines × panes) — and every inbound line
+/// is a frame, so a spammy MUD with full 10,000-line buffers paid tens of
+/// thousands of ANSI parses and a whole-`Text` clone per arriving line.
+/// That is the worst-case latency profile §2.1 chose this stack to avoid,
+/// and §11.1's "cost scales with the viewport" only becomes true with this
+/// walk: stop as soon as enough rows are covered, newest first.
+///
+/// Cost is O(visible rows) while a pane is tailing, and O(visible rows +
+/// `back_offset`) while scrolled back — proportional to what the player
+/// asked to see, rather than to everything they have ever seen.
+fn visible_window(
+    raws: &VecDeque<String>,
+    area_height: u16,
+    content_width: u16,
+    back_offset: usize,
+    parse: impl Fn(usize, &str) -> Vec<Line<'static>>,
+) -> (Vec<Line<'static>>, u16) {
+    let viewport = area_height.saturating_sub(2) as usize; // borders
+    let needed = viewport.saturating_add(back_offset);
+
+    let mut window: Vec<Line<'static>> = Vec::new();
+    let mut rows = 0usize;
+    // Distinguishes "stopped because the viewport is covered" from "ran out
+    // of buffer" — only the latter knows the true total, and only the
+    // latter therefore has to clamp `back_offset` (below).
+    let mut exhausted = true;
+
+    for (i, raw) in raws.iter().enumerate().rev() {
+        if rows >= needed {
+            exhausted = false;
+            break;
+        }
+        let mut parsed = parse(i, raw);
+        rows += wrapped_rows(&parsed, content_width);
+        parsed.append(&mut window);
+        window = parsed;
+    }
+
+    let scroll = if exhausted {
+        // The whole buffer was walked, so `rows` is the exact total and
+        // this is the original clamp verbatim: a `back_offset` past the top
+        // pins to the top rather than scrolling into blank space (§11.5).
+        let max_scroll = rows.saturating_sub(viewport);
+        max_scroll.saturating_sub(back_offset.min(max_scroll))
+    } else {
+        // More lines exist above the window, so `back_offset` is in range
+        // and the window's own top is the only reference needed.
+        rows.saturating_sub(viewport).saturating_sub(back_offset)
+    };
+
+    (window, scroll as u16)
+}
+
+/// Renders a bordered pane over an already-windowed `lines` and the
+/// `scroll` [`visible_window`] computed for it.
 fn render_scrollback(
     frame: &mut Frame,
     area: Rect,
@@ -454,17 +526,8 @@ fn render_scrollback(
     title: String,
     focused: bool,
     color: Option<Color>,
-    back_offset: usize,
+    scroll: u16,
 ) {
-    // Content width matches the Paragraph's own wrapping width (area minus
-    // borders). `line_count` runs ratatui's real wrap algorithm rather than
-    // an estimate, so a long line's tail is never silently truncated.
-    let content_width = area.width.saturating_sub(2);
-    let text = Text::from(lines);
-    let wrapped_rows = Paragraph::new(text.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(content_width) as u16;
-
     // A profile's colour tints the border; dimming still marks the pane as
     // unfocused, so colour identifies the character and brightness
     // identifies focus — two signals that don't compete (§11).
@@ -478,10 +541,10 @@ fn render_scrollback(
     let block = Block::bordered()
         .title(if focused { title.bold() } else { title.into() })
         .border_style(border);
-    let body = Paragraph::new(text)
+    let body = Paragraph::new(Text::from(lines))
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((scroll_offset(area.height, wrapped_rows, back_offset), 0));
+        .scroll((scroll, 0));
     frame.render_widget(body, area);
 }
 
@@ -562,17 +625,6 @@ fn tab_line(state: &AppState) -> Line<'static> {
         spans.push(Span::styled(label, style));
     }
     Line::from(spans)
-}
-
-/// Turns a pane's `back_offset` (distance from the tail) into the ratatui
-/// scroll row, clamped to `[0, max_scroll]` here — the one place both the
-/// real wrapped-row count and the viewport height are known
-/// (docs/ARCHITECTURE.md §11.5).
-fn scroll_offset(area_height: u16, content_lines: u16, back_offset: usize) -> u16 {
-    let viewport = area_height.saturating_sub(2); // borders
-    let max_scroll = content_lines.saturating_sub(viewport);
-    let back = back_offset.min(max_scroll as usize) as u16;
-    max_scroll - back
 }
 
 fn ansi_lines(raw: &str) -> Vec<Line<'static>> {
@@ -1136,6 +1188,104 @@ mod tests {
             rows(&buffer).contains("line 0"),
             "the oldest line must be reachable, not scrolled past: {}",
             rows(&buffer)
+        );
+    }
+
+    /// The load-bearing assumption behind windowing: `Wrap` splits a
+    /// `Line` into rows but never joins two of them, so the rows of a
+    /// window equal the rows of those same lines inside the whole buffer.
+    /// If ratatui ever reflowed across `Line` boundaries, every scroll
+    /// position computed from a window would drift.
+    #[test]
+    fn window_is_row_exact_against_the_full_buffer() {
+        let width = 20;
+        let raws: Vec<String> = vec![
+            "short".to_string(),
+            "x".repeat(75), // wraps to several rows
+            "\x1b[31mcoloured\x1b[0m".to_string(),
+            "y".repeat(21), // wraps to exactly two
+            String::new(),  // empty line still occupies one row
+        ];
+        let parsed: Vec<Line<'static>> = raws.iter().flat_map(|r| ansi_lines(r)).collect();
+
+        let whole = wrapped_rows(&parsed, width);
+        let sum_of_parts: usize = raws
+            .iter()
+            .map(|r| wrapped_rows(&ansi_lines(r), width))
+            .sum();
+
+        assert_eq!(whole, sum_of_parts, "wrapping must not join lines");
+    }
+
+    /// The point of the windowed renderer (§2.1): per-frame cost must
+    /// scale with the viewport, not the buffer. Before this, `draw_session`
+    /// ANSI-parsed every line in the deque and cloned the whole wrapped
+    /// `Text` on every frame — and every inbound line is a frame.
+    #[test]
+    fn a_tailing_pane_parses_only_what_it_can_show() {
+        let mut raws: VecDeque<String> = VecDeque::new();
+        for i in 0..10_000 {
+            raws.push_back(format!("line {i}"));
+        }
+
+        let parsed = std::cell::Cell::new(0usize);
+        let (window, _) = visible_window(&raws, 22, 40, 0, |_, raw| {
+            parsed.set(parsed.get() + 1);
+            ansi_lines(raw)
+        });
+
+        // 22 rows of pane = 20 of viewport, so ~20 single-row lines cover
+        // it. The bound is deliberately loose; what matters is that it is
+        // a function of the viewport and not of the 10,000 buffered lines.
+        assert!(
+            parsed.get() <= 24,
+            "parsed {} lines to fill a 20-row viewport",
+            parsed.get()
+        );
+        assert!(window.len() <= 24, "window was {} lines", window.len());
+    }
+
+    /// Windowing must not change what the player sees: the tail of a huge
+    /// buffer renders exactly as the same tail does on its own.
+    #[test]
+    fn a_huge_buffer_shows_the_same_tail_as_a_small_one() {
+        let mut big = state();
+        for i in 0..5_000 {
+            big.sessions[0].scrollback.push_back(format!("line {i}"));
+        }
+        let mut small = state();
+        for i in 4_980..5_000 {
+            small.sessions[0].scrollback.push_back(format!("line {i}"));
+        }
+
+        assert_eq!(
+            rows(&render_sized(&big, 40, 12)),
+            rows(&render_sized(&small, 40, 12))
+        );
+    }
+
+    /// Scrolled back into a large buffer, the window has to start further
+    /// up — the offset must still land on the right lines rather than
+    /// silently pinning to the tail.
+    #[test]
+    fn scrolling_back_into_a_large_buffer_lands_on_the_right_lines() {
+        let mut state = state();
+        for i in 0..5_000 {
+            state.sessions[0].scrollback.push_back(format!("line {i}"));
+        }
+        state.sessions[0].back_offset = 100;
+
+        // `back_offset` is a distance from the tail in rows, so with 5,000
+        // single-row lines the newest visible one is 5000 - 100 - 1.
+        let shown = rows(&render_sized(&state, 40, 12));
+        assert!(shown.contains("line 4899"), "{shown}");
+        assert!(
+            !shown.contains("line 4900"),
+            "scrolled too far forward: {shown}"
+        );
+        assert!(
+            !shown.contains("line 4999"),
+            "tail must be scrolled off: {shown}"
         );
     }
 

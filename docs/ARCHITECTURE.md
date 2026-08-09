@@ -1043,9 +1043,18 @@ spam — and conversely, so slow conversations stay visible.
   the *last focused session*, shown in the input border — reading comms
   must never silently change which character your commands go to. A
   per-channel `reply_prefix` (e.g. `reply `) can prefill responses (M9).
-- Rendering is diff-based via ratatui; a full redraw of a 4-pane 200×60
-  terminal is well under a millisecond, so we redraw on every event batch
-  rather than tracking damage manually.
+- Rendering is diff-based via ratatui and we redraw on every event batch
+  rather than tracking damage manually. That is only affordable because a
+  pane renders its *viewport*, not its buffer: `ui::visible_window` walks
+  back from the newest line and stops as soon as enough wrapped rows are
+  covered, so per-frame cost is O(visible rows), not O(buffered lines).
+  This was originally stated as an assumption and was false in the
+  implementation — every frame ANSI-parsed the whole scrollback and cloned
+  the entire wrapped `Text`, which measured at 624ms per frame against a
+  full 10,000-line buffer (vs 10ms windowed, same debug build). Since every
+  inbound line is a frame, that was the exact worst-case latency profile §2
+  chose this stack to avoid. Scrolled back, cost is O(visible rows +
+  `back_offset`) — proportional to what the player asked to see.
 
 ### 11.2 In-client help (M9, built early)
 

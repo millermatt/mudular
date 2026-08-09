@@ -11,6 +11,12 @@ where a claim was corrected on verification, that's noted inline.
 
 ## The headline: the latency thesis is contradicted by its own render path
 
+> **Fixed.** `ui::visible_window` now renders the viewport rather than the
+> buffer. Measured against a full 10,000-line scrollback, same debug build:
+> **624ms → 10ms per frame (~61×)**. §11.1 has been corrected to state the
+> windowing as a mechanism rather than an assumption. The analysis below is
+> kept as the record of what was wrong and why.
+
 §2 chose Rust for flat worst-case latency, and §11.1 asserts that
 "rendering cost scales with the viewport." It does not.
 
