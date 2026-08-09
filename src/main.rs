@@ -70,7 +70,16 @@ async fn main() -> Result<()> {
     let mut cli = Cli::parse();
 
     if let Some(path) = &cli.log {
-        let file = std::fs::File::create(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // Diagnostic output can end up carrying scrollback fragments —
+        // owner-only rather than the process umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()

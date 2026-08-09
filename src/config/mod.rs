@@ -780,7 +780,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::result::Result<(), SaveError>
     let tmp = dir.join(tmp_name);
 
     let write_result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // A profile can carry account names and other details the player
+        // treats as private, even with no `password:` field — owner-only
+        // rather than the process umask. `rename` below preserves this.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()
     })();
@@ -937,6 +947,20 @@ fn load_scripts(module_path: &Path, names: &[String]) -> Result<Vec<ScriptSource
         .collect()
 }
 
+/// Resolves a profile's `modules:` entry to the file it names under
+/// `dir/modules`, refusing anything that isn't a bare file-stem (`..`, an
+/// absolute path, or a path separator) — the same bare-name rule
+/// `load_scripts` applies to scripts, so a hostile profile can't reach a
+/// module path outside the profile directory.
+fn module_path(dir: &Path, module: &str, profile_name: &str) -> Result<PathBuf> {
+    if Path::new(module).components().count() != 1 {
+        bail!(
+            "module `{module}` listed in profile `{profile_name}`: expected a file name, not a path"
+        );
+    }
+    Ok(dir.join("modules").join(format!("{module}.yaml")))
+}
+
 /// The ordered scope layers for a session, lowest precedence first
 /// (docs/ARCHITECTURE.md §7.3): global defaults, then the shared modules
 /// the profile lists in order, then the profile's own inline rules.
@@ -960,9 +984,9 @@ pub fn load_rules(
         let profile = load_profile(&path)?;
 
         for module in &profile.modules {
-            let module_path = dir.join("modules").join(format!("{module}.yaml"));
+            let path = module_path(dir, module, name)?;
             layers.push(
-                load_module(&module_path)
+                load_module(&path)
                     .with_context(|| format!("module `{module}` listed in profile `{name}`"))?,
             );
         }
@@ -1014,9 +1038,9 @@ pub fn validate_profile_rules(
     }
 
     for module in &draft.modules {
-        let module_path = dir.join("modules").join(format!("{module}.yaml"));
+        let path = module_path(dir, module, name)?;
         layers.push(
-            load_module(&module_path)
+            load_module(&path)
                 .with_context(|| format!("module `{module}` listed in profile `{name}`"))?,
         );
     }
@@ -1566,6 +1590,51 @@ triggers:
         assert!(message.contains("tank"), "{message}");
     }
 
+    /// A shared/imported profile is one file, and a module name in it is a
+    /// name — not a way to make `load_rules` read an arbitrary file on the
+    /// victim's disk and fold its contents into the rule engine.
+    #[test]
+    fn a_module_name_that_is_a_path_is_refused() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        // The escape route: `modules/` must actually exist for `..` to
+        // climb out of it, so this fixture creates it — a bare-name-only
+        // subdir like the shipped examples use — with a real file one
+        // level up for a would-be traversal to land on.
+        std::fs::create_dir_all(dir.join("modules")).unwrap();
+        std::fs::write(dir.join("secret.yaml"), "name: leaked\n").unwrap();
+        std::fs::write(
+            dir.join("profiles/tank.yaml"),
+            "name: tank\nhost: h\nport: 1\nmodules: ['../secret']\n",
+        )
+        .unwrap();
+
+        let err = load_rules(dir, Some("tank"), &[]).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("../secret"), "{message}");
+        assert!(message.contains("tank"), "{message}");
+    }
+
+    /// `validate_profile_rules` (the in-editor validator, §10.2) must refuse
+    /// the same traversal `load_rules` does — it runs the identical
+    /// construction against a draft that isn't on disk yet.
+    #[test]
+    fn validate_profile_rules_also_refuses_a_module_path() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::create_dir_all(dir.join("modules")).unwrap();
+        std::fs::write(dir.join("secret.yaml"), "name: leaked\n").unwrap();
+
+        let mut draft = minimal_profile("tank", "h");
+        draft.modules = vec!["../secret".to_string()];
+
+        let err = validate_profile_rules(dir, "tank", &draft, &[]).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("../secret"), "{message}");
+    }
+
     /// The shipped examples are documentation: if they stop loading, the
     /// docs are wrong. Loading them here keeps that from going unnoticed.
     #[cfg(feature = "lua")]
@@ -1861,6 +1930,22 @@ triggers:
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
         assert!(!leftover, "no temp file should survive a successful write");
+    }
+
+    /// A profile can carry an account name and other details the player
+    /// treats as private — owner-only on disk, not left at the process
+    /// umask.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_the_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        atomic_write(&path, b"host: h\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
     }
 
     #[test]

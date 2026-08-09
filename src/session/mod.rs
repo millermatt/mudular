@@ -935,7 +935,16 @@ struct Recorder {
 
 impl Recorder {
     fn create(path: &Path, host: &str, port: u16) -> std::io::Result<Self> {
-        let file = std::fs::File::create(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // Raw capture is inbound server bytes verbatim — owner-only, same
+        // as the transcript log it sits alongside.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
         let mut writer = std::io::BufWriter::new(file);
         writeln!(writer, "# mudular raw capture of {host}:{port}")?;
         Ok(Self {
@@ -1031,6 +1040,27 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+
+    /// Raw capture (`--record`) is inbound server bytes verbatim, which can
+    /// include a login exchange — owner-only on disk, not left at the
+    /// process umask.
+    #[cfg(unix)]
+    #[test]
+    fn recorder_create_creates_the_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "mudular-test-record-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let recorder = Recorder::create(&path, "example.org", 4000).unwrap();
+        drop(recorder);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
 
     const IAC: u8 = 255;
     const DO: u8 = 253;

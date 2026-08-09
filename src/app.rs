@@ -1131,11 +1131,17 @@ fn open_log(path: &std::path::Path) -> Option<std::io::BufWriter<std::fs::File>>
         tracing::warn!("could not create log directory {}: {err}", dir.display());
         return None;
     }
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    // Transcripts can hold anything a server echoes back, including a MUD
+    // account's own login exchange — owner-only, like the config it sits
+    // beside, rather than left at the process umask.
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
         Ok(file) => Some(std::io::BufWriter::new(file)),
         Err(err) => {
             tracing::warn!("could not open log file {}: {err}", path.display());
@@ -1856,6 +1862,28 @@ mod tests {
         assert_eq!(logged, "> look\n");
         assert!(!logged.contains("hunter2"));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A transcript can hold anything a server echoes back, including a MUD
+    /// account's own login exchange — owner-only on disk, not left at the
+    /// process umask.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_creates_the_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "mudular-test-perms-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let log = open_log(&path);
+        assert!(log.is_some(), "log file failed to open");
+        drop(log);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
     }
 
     /// Disk logging (§8, §12) writes through the same choke point as
