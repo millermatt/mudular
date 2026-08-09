@@ -178,6 +178,7 @@ src/
   main.rs        CLI entry (clap), tracing init, runtime setup
   app.rs         UI event loop: terminal setup, select! over input + sessions
   ui/            ratatui widgets: pane grid, status bar, input line, tabs
+  scrollback.rs  RetainedLine: what a pane keeps (text + arrival + origin)
   session/       Session task: pipeline assembly, SessionEvent/Command types
   net/           Transport: TCP / TLS connect, unified AsyncRead+Write
   proto/
