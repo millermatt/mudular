@@ -537,18 +537,27 @@ impl Engine {
             return out;
         }
         let previous = previous.unwrap_or_default();
-        let mut changed: Vec<(&String, &String)> = current
+        let mut changed: Vec<(String, String)> = current
             .data
             .iter()
             .filter(|(key, value)| previous.data.get(*key) != Some(*value))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
+        // A key that *vanished* is news too — §7.5's headline example is a
+        // buff dropping, and watching only the keys still present would
+        // never report it. Empty is the value an absent key already
+        // resolves to everywhere else (`${@peer.gone}`), so a hook needs no
+        // new vocabulary to test for it.
+        changed.extend(
+            previous
+                .data
+                .keys()
+                .filter(|key| !current.data.contains_key(*key))
+                .map(|key| (key.clone(), String::new())),
+        );
         changed.sort();
 
-        for (key, value) in changed
-            .into_iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<Vec<_>>()
-        {
+        for (key, value) in changed {
             merge(
                 &mut out,
                 self.run_hook(&Hook::Peer {
@@ -703,6 +712,45 @@ impl Engine {
     pub fn update_server_data_from_gmcp(&mut self, key: &str, value: String) {
         self.gmcp_keys.insert(key.to_string());
         self.changed |= self.server_data.insert(key.to_string(), value.clone()) != Some(value);
+    }
+
+    /// Drops the positional keys a GMCP array left behind when it shrank.
+    ///
+    /// Arrays flatten to `Char.Affects.0`, `Char.Affects.1`, … so merging
+    /// each new payload key-by-key keeps the tail of a longer previous
+    /// array forever: `["bless","haste"]` followed by `["haste"]` leaves
+    /// `Char.Affects.1` reading `haste` for the rest of the session — a
+    /// phantom buff that never expires, which is precisely §7.5's own
+    /// "rebuff the tank when his blessing drops" example failing.
+    ///
+    /// Deliberately narrower than replacing the package's whole subtree:
+    /// servers that send partial object updates (`Char.Vitals {"hp":90}`
+    /// after a fuller one) would lose the keys they omitted, so only
+    /// indices at or past the new length are removed, along with anything
+    /// nested under them.
+    pub fn prune_gmcp_array(&mut self, path: &str, len: usize) {
+        let prefix = format!("{path}.");
+        let stale: Vec<String> = self
+            .server_data
+            .keys()
+            .filter(|key| {
+                let Some(rest) = key.strip_prefix(&prefix) else {
+                    return false;
+                };
+                // The component right after the array path is the index;
+                // anything deeper (`…​.2.name`) belongs to that element and
+                // goes with it.
+                let index = rest.split('.').next().unwrap_or_default();
+                index.parse::<usize>().is_ok_and(|i| i >= len)
+            })
+            .cloned()
+            .collect();
+
+        for key in stale {
+            self.server_data.remove(&key);
+            self.gmcp_keys.remove(&key);
+            self.changed = true;
+        }
     }
 
     /// As [`Self::update_server_data_from_gmcp`], but for MSDP: a no-op if
@@ -1875,6 +1923,59 @@ mod tests {
         );
         engine.update_server_data_from_gmcp("Char.Vitals.hp", "87".to_string());
         assert_eq!(engine.expand_input("hp").sends, vec!["hp is 87"]);
+    }
+
+    /// A shorter array's leftover indices go, along with anything nested
+    /// under them — `Char.Group.1.name` belongs to the element that left.
+    #[test]
+    fn pruning_an_array_drops_stale_indices_and_their_nested_keys() {
+        let mut engine = engine("name: test");
+        for (key, value) in [
+            ("Char.Group.0.name", "Grunk"),
+            ("Char.Group.1.name", "Bob"),
+            ("Char.Group.1.hp", "50"),
+            ("Char.Group.2.name", "Ann"),
+        ] {
+            engine.update_server_data_from_gmcp(key, value.to_string());
+        }
+
+        engine.prune_gmcp_array("Char.Group", 1);
+
+        assert_eq!(
+            engine.server_data.get("Char.Group.0.name"),
+            Some(&"Grunk".to_string())
+        );
+        for gone in ["Char.Group.1.name", "Char.Group.1.hp", "Char.Group.2.name"] {
+            assert_eq!(engine.server_data.get(gone), None, "{gone} survived");
+        }
+    }
+
+    /// The prune is deliberately narrower than replacing a package's whole
+    /// subtree: a server sending a partial object update must not lose the
+    /// keys it did not mention. Only indices are eligible.
+    #[test]
+    fn pruning_an_array_leaves_sibling_and_object_keys_alone() {
+        let mut engine = engine("name: test");
+        for (key, value) in [
+            ("Char.Vitals.hp", "90"),
+            ("Char.Vitals.maxhp", "100"),
+            ("Char.Affects.0", "haste"),
+            // A key whose path merely *starts* like the array's.
+            ("Char.AffectsCount", "1"),
+        ] {
+            engine.update_server_data_from_gmcp(key, value.to_string());
+        }
+
+        engine.prune_gmcp_array("Char.Affects", 1);
+
+        for kept in [
+            "Char.Vitals.hp",
+            "Char.Vitals.maxhp",
+            "Char.Affects.0",
+            "Char.AffectsCount",
+        ] {
+            assert!(engine.server_data.contains_key(kept), "{kept} was pruned");
+        }
     }
 
     #[test]
@@ -3397,6 +3498,47 @@ triggers:
 
             // Nothing new: nothing fires.
             assert!(engine.poll_peer("tank").send_to.is_empty());
+        }
+
+        /// The other half of a buff dropping: when the affect is an array
+        /// element rather than a `0`/`1` flag, the key does not change
+        /// value — it *disappears*. Watching only the keys still present
+        /// would report nothing at all, so a vanished key is reported with
+        /// an empty value, matching what an absent `${@peer.key}` already
+        /// resolves to.
+        #[test]
+        fn a_vanished_peer_key_is_reported_as_empty() {
+            let mut layer = module("name: cleric");
+            layer.script_sources.push(ScriptSource {
+                name: "cleric.lua".to_string(),
+                code: r#"
+                mud.on_peer("tank", "Char.Affects", function(key, value)
+                  if value == "" then
+                    mud.session("tank"):send("cast bless Grunk")
+                  end
+                end)
+                "#
+                .to_string(),
+            });
+            let mut engine = Engine::compile(&[layer]).expect("compiles");
+
+            let (tank, rx) = watch::channel(snapshot(
+                &[],
+                &[("Char.Affects.0", "bless"), ("Char.Affects.1", "haste")],
+            ));
+            engine.set_peers(Peers::from([("tank".to_string(), rx)]));
+            assert!(engine.poll_peer("tank").send_to.is_empty());
+
+            // The blessing wears off: the array shrinks, so `…​.1` is gone
+            // rather than changed.
+            tank.send(snapshot(&[], &[("Char.Affects.0", "haste")]))
+                .expect("the engine holds a receiver");
+
+            assert_eq!(
+                engine.poll_peer("tank").send_to,
+                vec![("tank".to_string(), vec!["cast bless Grunk".to_string()])]
+            );
+            assert!(engine.poll_peer("tank").send_to.is_empty(), "fires once");
         }
 
         /// A guard governs the script action like any other: no match, no

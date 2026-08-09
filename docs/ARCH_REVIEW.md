@@ -107,6 +107,13 @@ viewport split that is explicitly not server-visible.
 
 ## A real defect in a documented feature
 
+> **Fixed.** Flattening now reports each array's length, and
+> `Engine::prune_gmcp_array` drops indices at or past it — narrower than a
+> package-wide subtree replace, so partial object updates still merge.
+> `poll_peer` also reports vanished keys (empty value), without which the
+> array form of a dropped buff produced no event at all. §6.3 now states
+> the merge/replace semantics that were previously unspecified.
+
 `Engine::update_server_data_from_gmcp` (`src/engine/mod.rs:703`) only ever
 inserts; keys are never removed. Combined with `gmcp::flatten_json`'s
 positional array indexing, a shrinking array leaves a phantom entry that

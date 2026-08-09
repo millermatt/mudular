@@ -267,6 +267,16 @@ assembler (§8) uses prompt boundaries to distinguish "prompt" from
   `ARRAY_OPEN/CLOSE` into a recursive `MsdpValue` enum. Where a server
   offers both, GMCP is preferred; MSDP values are normalized into the same
   internal "server data" map so the engine sees one namespace.
+- **Store semantics:** payloads *merge* into the server-data map key by
+  key, so a server sending a partial object update (`Char.Vitals {"hp":90}`
+  after a fuller one) does not blank the keys it omitted. Arrays are the
+  exception: they flatten to positional keys (`Char.Affects.0`), so a
+  merge alone would keep a longer previous array's tail forever — a buff
+  that never expires. Flattening therefore reports each array's length
+  alongside its pairs, and the store drops indices at or past it
+  (`Engine::prune_gmcp_array`). Removal is a change like any other: a key
+  that vanished is reported to `on_peer` watchers with an empty value,
+  which is what an absent `${...}` already resolves to (§7.1, §7.5).
 
 ### 6.4 Stream control: MCCP2/MCCP3
 

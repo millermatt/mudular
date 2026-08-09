@@ -452,8 +452,16 @@ async fn run_connection(
                                     TelnetEvent::Subnegotiation { option: option::GMCP, data } => {
                                         match gmcp::parse(&data) {
                                             Ok(message) => {
-                                                for (key, value) in gmcp::flatten(&message) {
+                                                let flat = gmcp::flatten(&message);
+                                                for (key, value) in flat.pairs {
                                                     engine.update_server_data_from_gmcp(&key, value);
+                                                }
+                                                // After the inserts: a shorter
+                                                // array's leftover indices are
+                                                // only stale once the new ones
+                                                // are in (§6.3).
+                                                for (path, len) in flat.arrays {
+                                                    engine.prune_gmcp_array(&path, len);
                                                 }
                                                 vec![SessionEvent::Gmcp {
                                                     package: message.package,
@@ -1650,6 +1658,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_sent(&mut sent).await, "tell hp 87");
+    }
+
+    /// GMCP arrays flatten to positional keys, so merging each payload
+    /// key-by-key would keep the tail of a longer previous array forever:
+    /// `["bless","haste"]` then `["haste"]` left `Char.Affects.1` reading
+    /// `haste` for the rest of the session — a buff that never expires,
+    /// which is §7.5's "rebuff when a blessing drops" example failing
+    /// silently. End-to-end rather than against the engine alone, because
+    /// the merge and the prune are composed in this loop (§6.3).
+    #[tokio::test]
+    async fn a_shrinking_gmcp_array_does_not_leave_a_phantom_entry() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (mut events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::GMCP]).await.unwrap();
+
+                let mut subnegs = SubnegReader::default();
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Hello
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Supports.Set
+
+                for payload in [
+                    br#"Char.Affects ["bless","haste"]"#.as_slice(),
+                    br#"Char.Affects ["haste"]"#.as_slice(),
+                ] {
+                    sock.write_all(&encode_subnegotiation(option::GMCP, payload))
+                        .await
+                        .unwrap();
+                }
+
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^aff$'
+                    send: ["tell 0=${Char.Affects.0} 1=${Char.Affects.1}"]
+                "#,
+            ),
+        );
+
+        // Wait for the *shrunk* payload specifically, so the store is
+        // known to have seen both messages before the alias reads it.
+        next_matching(&mut events, |ev| {
+            matches!(ev, SessionEvent::Gmcp { package, payload }
+                if package == "Char.Affects"
+                    && payload.as_deref().is_some_and(|p| !p.contains("bless")))
+        })
+        .await;
+
+        commands
+            .send(SessionCommand::SendLine("aff".into()))
+            .await
+            .unwrap();
+        // Index 0 slid down to `haste`; index 1 is gone, and an unknown
+        // name is left as written rather than silently blank (§7.1).
+        assert_eq!(
+            next_sent(&mut sent).await,
+            "tell 0=haste 1=${Char.Affects.1}"
+        );
     }
 
     /// MSDP has no negotiation handshake of its own (unlike GMCP's

@@ -69,22 +69,37 @@ pub fn supports_message() -> GmcpMessage {
     }
 }
 
+/// A flattened GMCP payload.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Flattened {
+    /// Dotted-path `(key, value)` pairs for the server-data store.
+    pub pairs: Vec<(String, String)>,
+    /// `(path, length)` for every array flattened, including empty ones.
+    ///
+    /// Arrays flatten to *positional* keys (`Char.Affects.0`), so a store
+    /// that only merges `pairs` keeps `Char.Affects.1` forever once the
+    /// array shrinks — a dropped buff that never expires. These let the
+    /// store drop the indices the new payload no longer has
+    /// (docs/ARCHITECTURE.md §6.3, §7.5).
+    pub arrays: Vec<(String, usize)>,
+}
+
 /// Flattens a message's JSON payload into dotted-path `(key, value)` pairs
 /// for the server-data store, e.g. `Char.Vitals {"hp":100}` becomes
 /// `("Char.Vitals.hp", "100")`. A non-object/array payload (or one that
 /// fails to parse as JSON) is stored verbatim under the bare package name.
-pub fn flatten(message: &GmcpMessage) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+pub fn flatten(message: &GmcpMessage) -> Flattened {
+    let mut out = Flattened::default();
     if let Some(text) = &message.payload {
         match serde_json::from_str::<serde_json::Value>(text) {
             Ok(value) => flatten_json(&message.package, &value, &mut out),
-            Err(_) => out.push((message.package.clone(), text.clone())),
+            Err(_) => out.pairs.push((message.package.clone(), text.clone())),
         }
     }
     out
 }
 
-fn flatten_json(prefix: &str, value: &serde_json::Value, out: &mut Vec<(String, String)>) {
+fn flatten_json(prefix: &str, value: &serde_json::Value, out: &mut Flattened) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, val) in map {
@@ -92,13 +107,17 @@ fn flatten_json(prefix: &str, value: &serde_json::Value, out: &mut Vec<(String, 
             }
         }
         serde_json::Value::Array(items) => {
+            // Recorded before the recursion, and for an empty array too:
+            // `[]` emits no pairs at all, which is exactly the case where
+            // a stale `….0` would otherwise survive unnoticed.
+            out.arrays.push((prefix.to_string(), items.len()));
             for (index, val) in items.iter().enumerate() {
                 flatten_json(&format!("{prefix}.{index}"), val, out);
             }
         }
-        serde_json::Value::String(s) => out.push((prefix.to_string(), s.clone())),
+        serde_json::Value::String(s) => out.pairs.push((prefix.to_string(), s.clone())),
         serde_json::Value::Null => {}
-        other => out.push((prefix.to_string(), other.to_string())),
+        other => out.pairs.push((prefix.to_string(), other.to_string())),
     }
 }
 
@@ -129,33 +148,46 @@ mod tests {
     fn flattens_nested_object_payload_into_dotted_keys() {
         let msg = parse(br#"Char.Vitals {"hp": 100, "stats": {"str": 18}}"#).unwrap();
         let mut flat = flatten(&msg);
-        flat.sort();
+        flat.pairs.sort();
         assert_eq!(
-            flat,
+            flat.pairs,
             vec![
                 ("Char.Vitals.hp".to_string(), "100".to_string()),
                 ("Char.Vitals.stats.str".to_string(), "18".to_string()),
             ]
         );
+        assert!(flat.arrays.is_empty(), "no arrays in this payload");
     }
 
     #[test]
     fn flattens_array_payload_by_index() {
         let msg = parse(br#"Room.Exits ["north", "south"]"#).unwrap();
+        let flat = flatten(&msg);
         assert_eq!(
-            flatten(&msg),
+            flat.pairs,
             vec![
                 ("Room.Exits.0".to_string(), "north".to_string()),
                 ("Room.Exits.1".to_string(), "south".to_string()),
             ]
         );
+        assert_eq!(flat.arrays, vec![("Room.Exits".to_string(), 2)]);
+    }
+
+    /// An empty array emits no pairs at all, so its length is the only
+    /// signal that everything under it is now gone.
+    #[test]
+    fn an_emptied_array_still_reports_its_length() {
+        let msg = parse(br#"Char.Affects []"#).unwrap();
+        let flat = flatten(&msg);
+        assert!(flat.pairs.is_empty());
+        assert_eq!(flat.arrays, vec![("Char.Affects".to_string(), 0)]);
     }
 
     #[test]
     fn a_non_json_payload_is_stored_verbatim_under_the_package_name() {
         let msg = parse(b"Char.Name Kestrel").unwrap();
         assert_eq!(
-            flatten(&msg),
+            flatten(&msg).pairs,
             vec![("Char.Name".to_string(), "Kestrel".to_string())]
         );
     }
@@ -163,7 +195,8 @@ mod tests {
     #[test]
     fn a_bare_package_with_no_payload_flattens_to_nothing() {
         let msg = parse(b"Core.Ping").unwrap();
-        assert!(flatten(&msg).is_empty());
+        let flat = flatten(&msg);
+        assert!(flat.pairs.is_empty() && flat.arrays.is_empty());
     }
 
     #[test]
