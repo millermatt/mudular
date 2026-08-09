@@ -1467,17 +1467,21 @@ the existing `Action` enum.
 
 Target: a non-technical user installs Mudular on any OS in one step.
 
-- **Artifact:** one static binary per platform (Linux x86_64/aarch64 via
-  `musl`, macOS universal, Windows). `rustls` + pure-Rust deps ⇒ no OpenSSL,
-  no zlib, no VC++ redistributable, no interpreter.
-- **Release automation:** `cargo-dist` in CI builds/signs/uploads binaries
-  and generates installers per tag: shell one-liner + Homebrew tap
-  (macOS/Linux), MSI + `winget`/Scoop (Windows), plus plain tarballs.
-  Effort is one config file, so it was scheduled early (M3, first "someone
-  else could install this" milestone) rather than last. Not yet set up;
-  the client is still built from source (tracked as
-  [#24](https://github.com/millermatt/mudular/issues/24), which covers
-  M9's self-update check too — self-update needs this first).
+- **Artifact:** one static binary per platform: Linux x86_64/aarch64 via
+  `musl`, macOS x86_64/aarch64 (separate Intel and Apple Silicon builds —
+  `cargo-dist` doesn't merge them into a universal binary, so the installer
+  picks the right one instead), Windows. `rustls` + pure-Rust deps ⇒ no
+  OpenSSL, no zlib, no VC++ redistributable, no interpreter.
+- **Release automation:** `cargo-dist` (`.github/workflows/release.yml`,
+  generated, not hand-edited — `dist generate` after any `dist-workspace.toml`
+  change) builds/signs/uploads binaries and generates installers on any tag
+  matching `[0-9]+.[0-9]+.[0-9]+*`: a shell/PowerShell one-liner, a Homebrew
+  formula (not yet published to a tap — that needs a separate `homebrew-tap`
+  repo, unconfigured), an MSI, and plain tarballs. Effort is one config file,
+  which is why it was scheduled early (M3) rather than last. The self-update
+  check M9 called for still needs this to exist first, and does not itself
+  exist yet — tracked as
+  [#24](https://github.com/millermatt/mudular/issues/24).
 - **First run (M9):** launched with no profile, no `--host`, and no
   profile already saved (`config::has_profiles`), Mudular shows an in-TUI
   "new profile" form instead of an empty shell — no hand-editing YAML

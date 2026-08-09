@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 description = "A modern, keyboard-centric terminal MUD client"
 license = "MIT"
+authors = ["Matt Miller"]
+repository = "https://github.com/millermatt/mudular"
+homepage = "https://github.com/millermatt/mudular"
+
+[package.metadata.wix]
+upgrade-guid = "858D8C4D-AFE3-4DED-B302-5FA86883CF1F"
+path-guid = "E5C33D50-20BC-489D-ACFC-7671E451F4A1"
+license = false
+eula = false
 
 [dependencies]
 ansi-to-tui = "7"
@@ -72,3 +81,8 @@ rcgen = "0.14"
 default = ["lua"]
 lua = ["dep:mlua"]
 js = ["dep:rquickjs"]
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
