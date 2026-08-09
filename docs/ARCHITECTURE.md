@@ -177,16 +177,20 @@ times ever demand it.
 src/
   main.rs        CLI entry (clap), tracing init, runtime setup
   app.rs         UI event loop: terminal setup, select! over input + sessions
-  ui/            ratatui widgets: pane grid, status bar, input line, tabs
+  ui/            ratatui widgets: pane layout, status bar, input line, tabs,
+                 help overlay, config_editor.rs (in-client profile editor)
   scrollback.rs  RetainedLine: what a pane keeps (text + arrival + origin)
   session/       Session task: pipeline assembly, SessionEvent/Command types
   net/           Transport: TCP / TLS connect, unified AsyncRead+Write
   proto/
     telnet.rs    sans-IO Telnet state machine + option negotiation
-    mccp.rs      MCCP2/3 inflate stage
+    mccp.rs      MCCP2 inflate stage (MCCP3 not implemented, §6.4)
     gmcp.rs      GMCP subnegotiation codec (package + JSON payload)
     msdp.rs      MSDP subnegotiation codec (typed VAR/VAL/ARRAY/TABLE)
+    charset.rs   CHARSET negotiation + decode with legacy fallback (§9)
   engine/        Triggers, aliases, variables; YAML module loading; scoping
+    condition.rs `when:` parser + evaluator (§7.6)
+    script/      ScriptHost abstraction, Lua and JS hosts (§7.4)
   config/        YAML config + profiles: schema structs, discovery, merge
 ```
 
@@ -261,7 +265,13 @@ assembler (§8) uses prompt boundaries to distinguish "prompt" from
 - **GMCP (option 201):** subneg payload is `Package.SubPackage <json>`.
   Codec splits package path and parses JSON lazily (`serde_json::Value`).
   Client sends `Core.Hello {"client":"Mudular","version":…}` and
-  `Core.Supports.Set` after negotiation. Events surface to the engine
+  `Core.Supports.Set` after negotiation. The supported list is currently
+  hardcoded to `["Char 1", "Room 1"]` (`gmcp::supports_message`), with no
+  way for a profile, module, or script to add a package — so a server that
+  gates pushes on `Core.Supports.Set` will never send `Group`,
+  `Comm.Channel`, or `Client.Media`. That has to become declarable before
+  any feature that needs those packages (`ARCH_REVIEW.md`), and it becomes
+  a compatibility surface the moment it does. Events surface to the engine
   (triggers can match on GMCP packages, M7) and to UI consumers (vitals,
   room info) via `SessionEvent::Gmcp`.
 - **MSDP (option 69):** typed parser for `VAR`/`VAL`/`TABLE_OPEN/CLOSE`/
@@ -290,7 +300,10 @@ assembler (§8) uses prompt boundaries to distinguish "prompt" from
   Telnet machine emits when it sees the MCCP2 subneg. Pipeline handles the
   mid-buffer switchover (bytes after the SE in the same read are compressed).
 - **MCCP3 (87):** same, mirrored for client→server writes (compress after we
-  send our subneg). Low priority (M6, optional) — outbound volume is tiny.
+  send our subneg). **Not implemented, and not planned** — outbound volume
+  is a few bytes per keystroke, and server-side adoption of option 87 is
+  thin enough that the option is never offered in practice. The option
+  constant exists in `telnet.rs`; nothing negotiates it.
 - Zlib stream end (`Z_STREAM_END`) cleanly returns the pipeline to
   passthrough, per spec, letting servers disable compression.
 
@@ -1098,13 +1111,19 @@ spam — and conversely, so slow conversations stay visible.
 - **Move vs copy:** `keep_in_main: false` gags the line from the source
   session's main scrollback (the WoW-like default); `true` mirrors it to
   both.
-- **Layout:** channel panes dock into the same pane grid as session panes
-  (e.g. a slim comms column beside two character panes) and are
-  hotkey-toggleable, focusable, and scrollable like any other pane.
+- **Layout:** channel panes dock as a fixed-width column beside the
+  session area — a slim comms column next to two character panes — and are
+  hotkey-toggleable, focusable, and scrollable like any other pane. There
+  is no general pane grid: `ui::layout` splits the body into
+  `[main | channel column]` and nothing else, which is the constraint every
+  later feature wanting a new region runs into (`ARCH_REVIEW.md`,
+  "Boundaries"). A grid is what that would need first; it is not built.
 - **Input routing:** focusing a channel pane keeps the input line bound to
   the *last focused session*, shown in the input border — reading comms
   must never silently change which character your commands go to. A
-  per-channel `reply_prefix` (e.g. `reply `) can prefill responses (M9).
+  per-channel `reply_prefix` (e.g. `reply `) to prefill responses was
+  sketched for M9 and did not ship: the `Channel` schema has no such field.
+  Still wanted, unscheduled.
 - Rendering is diff-based via ratatui and we redraw on every event batch
   rather than tracking damage manually. That is only affordable because a
   pane renders its *viewport*, not its buffer: `ui::visible_window` walks
@@ -1140,8 +1159,8 @@ command is behind a key.
 - **Contents:** the configurable bindings grouped by purpose (session
   focus, layout, views, quit), the built-in ones (`Alt+1..9`, `Up`/`Down`
   history, `PgUp`/`PgDn`/`Home`/`End` scrollback, §11.5), and the client-side commands
-  (`/reload`, `/help`) — which are otherwise just as invisible as the
-  keys.
+  (`/reload`, `/help`, `/config`) — which are otherwise just as invisible
+  as the keys.
 - **`/help` prints the same content** into the focused pane, so the
   overlay is reachable without already knowing a key. Client commands are
   matched before the line is sent (§7.1), as `/reload` already is.
@@ -1256,30 +1275,33 @@ against the game text is the ratio that actually bites.
 
 Every pane above (§11's own bullets, §11.1, §11.3) already talks about a
 scrollback viewport as if it existed — "`PgUp`/`PgDn`, `End` to tail",
-"scrollable like any other pane." It doesn't yet: `render_scrollback`
-always pins to the newest content, there is no stored notion of "how far
-up" a pane is, and neither key has a handler. This is the gap "scrollback
-search" quietly assumed was already closed; it wasn't, and search can't
-be specced on top of a viewport that can't move yet. Navigation ships in
-M9; search (scrollback and the `Up` prefix search §11.3 already defers)
-stays a later addition on top of it.
+"scrollable like any other pane." For most of the build they didn't:
+`render_scrollback` always pinned to the newest content, no pane stored
+how far up it was, and neither key had a handler. That was the gap
+"scrollback search" quietly assumed was already closed; it wasn't, and
+search can't be specced on top of a viewport that can't move. Navigation
+shipped in M9; search (scrollback and the `Up` prefix search §11.3
+already defers) stays a later addition on top of it.
 
-- **Per-pane scroll offset, in `AppState`.** Not per rendered widget —
-  the same "state, not layout" split §11.4 already uses for the channel
-  column: the offset is a number the event loop changes, and
-  `render_scrollback` computes the viewport from it every frame. Every
-  pane with a scrollback gets one, session panes and channel panes alike
-  — §11.1's "scrollable like any other pane" is this section.
+- **Per-pane scroll offset (`back_offset`), in `AppState`.** Not per
+  rendered widget — the same "state, not layout" split §11.4 already uses
+  for the channel column: the offset is a number the event loop changes,
+  and `ui::visible_window` computes the viewport from it every frame.
+  Every pane with a scrollback gets one, session panes and channel panes
+  alike — §11.1's "scrollable like any other pane" is this section.
 - **Measured in wrapped rows, not logical lines, and clamped to
-  `[0, wrapped_rows.saturating_sub(viewport)]`** — the same
-  `wrapped_rows` `render_scrollback` already computes by running
-  ratatui's real wrap algorithm rather than a second estimate. A resize
-  changes the wrap and therefore the clamp; the offset re-clamps on
-  every `Resize` event, the same as the channel column's width does
-  (§11.4).
-- **Keys: `PgUp`/`PgDn` move one viewport height; `Home`/`End` jump to
-  the oldest and newest line.** Built-in and unremappable, like
-  `Alt+1..9` and `Up`/`Down` (§11.3) — none of them have a competing
+  `[0, wrapped_rows.saturating_sub(viewport)]`** — using
+  `wrapped_rows`, which runs ratatui's real wrap algorithm rather than a
+  second estimate. The clamp is applied at render rather than stored: a
+  resize changes the wrap and therefore the bound, so `visible_window`
+  clamps against the width it is actually drawing at, and only when its
+  newest-first walk reached the top of the buffer and therefore knows the
+  true total. An offset past the top pins to the top; nothing has to be
+  re-clamped on `Resize`, unlike the channel column's width (§11.4).
+- **Keys: `PgUp`/`PgDn` move a fixed page (`SCROLL_PAGE`, 10 rows);
+  `Home`/`End` jump to the oldest and newest line.** Built-in and
+  unremappable, like `Alt+1..9` and `Up`/`Down` (§11.3) — none of them
+  have a competing
   meaning on a scrollback pane, and making them configurable would
   invite someone to break the one behaviour every pager and terminal has
   already taught them to expect.
@@ -1364,11 +1386,15 @@ defaulting to off, and not as a resize handle bolted onto the layout.
     scripted to exercise negotiation, compression switchover, and TLS.
   - UI: ratatui `TestBackend` snapshot tests for layout/indicators.
   - Fuzzing: `cargo-fuzz` targets for the Telnet FSM, MCCP switchover, and
-    charset decode — server bytes are attacker-controlled input.
+    charset decode — server bytes are attacker-controlled input. **Not yet
+    written**; there is no `fuzz/` directory. The hand-written byte
+    fixtures and the MCCP inflate cap (§6.4, §13) are what currently stand
+    in for it. Outstanding as of end-of-M9.
   - Fixtures: `--record` (M1) captures raw inbound bytes with timing, so
     any real-MUD quirk becomes a replayable regression test.
-- **CI gate per milestone:** `cargo fmt --check`, `clippy -D warnings`,
-  `cargo test`.
+- **Gate per milestone:** `cargo fmt --check`, `clippy -D warnings`,
+  `cargo test` — run locally before each commit. There is no CI workflow
+  in the repository yet; the gate is a discipline, not an enforcement.
 
 ## 13. Security Considerations
 
@@ -1423,11 +1449,18 @@ exist from M0, even where a stage is a passthrough).
 | **M2** | STelnet | TLS transport (`--tls`), verify full/pinned/insecure, cert TOFU store | Connects to a TLS MUD and to a self-signed one via pinning |
 | **M3** | Config & profiles | YAML config dir, profiles (`mudular <profile>`), keybind remap, per-profile charset + CHARSET negotiation with legacy fallback | Daily driver launches from a profile; CP437 MUD renders correctly |
 | **M4** | Automation engine | Aliases, triggers, variables, timers; global/module/profile scope merge; `;`-separated command input; `/reload` | Rule modules shared across two profiles behave per scope rules |
-| **M5** | MCCP | MCCP2 inflate with mid-buffer switchover (MCCP3 optional) | Compressed MUD session byte-identical to uncompressed fixture |
+| **M5** | MCCP | MCCP2 inflate with mid-buffer switchover (MCCP3 was optional here; dropped, §6.4) | Compressed MUD session byte-identical to uncompressed fixture |
 | **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
 | **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), keyring-backed auto-login (§10.1), and rule highlights (§7.7) — all built early, as soon as they were useful; scrollback navigation with a configurable buffer size (§8, §11.5), disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), resizable channel column (§11.4), in-TUI new-profile form, self-update check; scrollback search and `Up` prefix search are deliberately deferred past M9 (§11.3, §11.5) | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either; the channel column can be widened from the keyboard and the sessions beside it are told their new size; `PgUp`/`PgDn`/`Home`/`End` move a pane's scrollback without losing new output that arrives while scrolled up, and a scrolled pane is visibly distinguishable from a live one |
+
+**Status (end-of-M9):** M0–M9 are delivered and their "done when" criteria
+hold. Two items listed under M9 did not ship with it and are still open —
+the **self-update check** (and the `cargo-dist` release automation it
+depends on, §15) and the **`cargo-fuzz` targets** §12 calls for. Both are
+release/QA infrastructure rather than client behaviour; nothing in the
+client is waiting on either.
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
@@ -1445,8 +1478,11 @@ Target: a non-technical user installs Mudular on any OS in one step.
 - **Release automation:** `cargo-dist` in CI builds/signs/uploads binaries
   and generates installers per tag: shell one-liner + Homebrew tap
   (macOS/Linux), MSI + `winget`/Scoop (Windows), plus plain tarballs.
-  Effort is one config file, so this lands early (M3, first "someone else
-  could install this" milestone) rather than last.
+  Effort is one config file, so it was scheduled early (M3, first "someone
+  else could install this" milestone) rather than last. **Not yet set up**:
+  no `cargo-dist` config, no release workflow, and M9's self-update check
+  is the other half of the same gap — both are outstanding at end-of-M9,
+  and the client is still built from source.
 - **First run (M9):** launched with no profile, no `--host`, and no
   profile already saved (`config::has_profiles`), Mudular shows an in-TUI
   "new profile" form instead of an empty shell — no hand-editing YAML

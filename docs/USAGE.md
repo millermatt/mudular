@@ -182,6 +182,36 @@ connection itself is new, so `on_connect` hooks run and timers restart
 just as they do on `/reload`. An address that never answered in the first
 place is reported rather than retried.
 
+## Scrolling back
+
+`PgUp` and `PgDn` move the focused pane back and forward through what it
+has already shown; `Home` jumps to the oldest line it still has, `End`
+returns to the newest. This works on comms panes too — whichever pane has
+focus is the one that scrolls.
+
+A pane that isn't sitting at the newest line says so in its title, with an
+`↑ scrolled` marker. That's deliberately not the same signal as the unread
+dot: unread means you haven't looked at that character yet, scrolled means
+you're reading something old right now, and the marker shows even on the
+pane you're focused on.
+
+New output never yanks you back. A line that arrives while you're scrolled
+up is added to the buffer and left there, so you can finish reading; press
+`End` when you want to catch up. A pane already at the newest line keeps
+following along as usual.
+
+How much each pane keeps is `scrollback_size` in `mudular.yaml` — 10,000
+lines by default, counted per pane, oldest discarded first:
+
+```yaml
+scrollback_size: 10000
+```
+
+Nothing is written to disk unless you turn on `log:` for the profile, so
+raising this costs memory and lowers it again when you quit. Scrollback
+search isn't in yet — for now, `--record` or a transcript log is how you
+go looking through an old evening.
+
 ## Playing several characters at once
 
 Name more than one profile and each gets its own session, with its own
@@ -835,6 +865,9 @@ starting point:
 ```yaml
 channel_width: 28
 ```
+
+`scrollback_size:` (default 10,000) sets how many lines each pane keeps —
+see [Scrolling back](#scrolling-back).
 
 Keybindings are written as `modifier+modifier+key` — modifiers are
 `ctrl`, `alt`, and `shift`; keys are a single character (`c`), a function
