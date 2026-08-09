@@ -51,6 +51,33 @@ fn plays_from_a_profile_with_its_rules_and_quits() {
     app.expect_exit("the default quit key should quit");
 }
 
+/// The client has to stay reachable while it is busy drawing: a burst of
+/// server output must not cost the player the one key they need most.
+/// This is also the regression guard for `expect_exit` — waiting for the
+/// process without draining its pty blocks it mid-`draw`, and the failure
+/// looks exactly like a client that ignored the quit key.
+#[test]
+fn quits_on_the_key_even_while_output_is_flooding_in() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the screen");
+
+    // Enough to overrun the pty's buffer several times over.
+    for i in 0..20_000 {
+        mud.send_line(&format!("flood line {i} ................................"));
+    }
+    // Deliberately not draining: the point is to let the buffer fill before
+    // the key is sent, which is what makes this deterministic rather than a
+    // race the suite loses once in a hundred runs.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    app.send(CTRL_C);
+    app.expect_exit("the quit key should work under a flood of output");
+}
+
 #[test]
 fn honours_a_remapped_quit_key() {
     let mud = FakeMud::start();
@@ -451,14 +478,29 @@ impl App {
     }
 
     fn still_running(&mut self) -> bool {
-        // Give a quit that should not happen time to happen anyway.
-        std::thread::sleep(Duration::from_millis(500));
+        // Give a quit that should not happen time to happen anyway, and keep
+        // draining while waiting — see `expect_exit`. A client wedged on a
+        // full pty is "still running" for the wrong reason, which would let
+        // this assertion pass over a client that had actually stopped
+        // responding.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            self.pump();
+            std::thread::sleep(Duration::from_millis(50));
+        }
         matches!(self.child.try_wait(), Ok(None))
     }
 
     fn expect_exit(&mut self, why: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
+            // Drain while waiting. The client is writing frames to this pty
+            // the whole time; a test that stops reading fills the buffer and
+            // blocks the client mid-`draw`, where it never polls for the key
+            // it is being asked to react to. That reads as "the process was
+            // still running" — a harness deadlock wearing a product bug's
+            // clothes.
+            self.pump();
             if let Ok(Some(status)) = self.child.try_wait() {
                 assert!(status.success(), "{why}: exited with {status}");
                 return;

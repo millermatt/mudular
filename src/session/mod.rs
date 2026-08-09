@@ -1198,14 +1198,20 @@ mod tests {
             // The greeting closes the round trip the connect-time NAWS
             // offer started, so the next one is the typed line's alone.
             sock.write_all(b"Welcome.\r\n").await.unwrap();
-            let mut buf = vec![0u8; 64];
-            let _typed = sock.read(&mut buf).await.unwrap();
+            // Must be the typed line, not merely the next bytes to arrive:
+            // a raw read is satisfied by the client's connect-time Telnet
+            // offer, which starts this delay before the command was ever
+            // sent and measures a round trip shorter than the wait.
+            assert_eq!(read_command(&mut sock).await, "north");
             tokio::time::sleep(Duration::from_millis(20)).await;
             sock.write_all(b"You go north.\r\n").await.unwrap();
             std::future::pending::<()>().await;
         });
 
         next_latency(&mut events).await;
+        // Deliberate: it makes a regression to a raw server-side read fail
+        // every time rather than once in a hundred runs.
+        tokio::time::sleep(Duration::from_millis(10)).await;
         commands
             .send(SessionCommand::SendLine("north".into()))
             .await
