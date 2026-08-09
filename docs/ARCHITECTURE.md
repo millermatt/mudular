@@ -444,10 +444,12 @@ trait ScriptHost {
 - **Sandboxed by default:** no filesystem, network, or process access
   unless the profile grants it explicitly — shared community modules may
   carry scripts, and untrusted-by-default is the safe posture. The Lua host
-  loads only the table, string, math, coroutine, and utf8 libraries — `io`,
-  `os`, `package`, and `debug` are never created rather than deleted
-  afterwards — and drops `load`/`dofile`/`require` so a script cannot
-  fetch more code, and `print` so it cannot write through the TUI.
+  loads only the table, string, math, and utf8 libraries — `io`, `os`,
+  `package`, `debug`, and `coroutine` are never created rather than deleted
+  afterwards (coroutine would dodge the time budget below, since mlua's
+  instruction hook doesn't propagate to coroutine threads) — and drops
+  `load`/`dofile`/`require` so a script cannot fetch more code, and `print`
+  so it cannot write through the TUI.
 
 ### 7.5 Cross-session automation (M7/M8)
 

@@ -32,13 +32,21 @@ pub enum MsdpError {
     Unterminated,
     #[error("MSDP message has trailing bytes after its VAR/VAL pairs")]
     TrailingBytes,
+    #[error("MSDP array/table nesting exceeds the maximum depth")]
+    TooDeep,
 }
+
+/// Recursion cap for nested `ARRAY_OPEN`/`TABLE_OPEN` values. Nesting costs
+/// as little as two bytes per level on the wire, so an unbounded depth lets
+/// a small malicious payload overflow the stack; no legitimate MUD payload
+/// needs anywhere near this deep.
+const MAX_DEPTH: usize = 32;
 
 /// Parses a complete MSDP subnegotiation payload into its top-level
 /// `VAR`/`VAL` pairs.
 pub fn parse(data: &[u8]) -> Result<Vec<(String, MsdpValue)>, MsdpError> {
     let mut cursor = Cursor { data, pos: 0 };
-    let pairs = parse_pairs(&mut cursor)?;
+    let pairs = parse_pairs(&mut cursor, 0)?;
     if cursor.pos != cursor.data.len() {
         return Err(MsdpError::TrailingBytes);
     }
@@ -103,7 +111,7 @@ fn is_control(byte: u8) -> bool {
     )
 }
 
-fn parse_pairs(cursor: &mut Cursor) -> Result<Vec<(String, MsdpValue)>, MsdpError> {
+fn parse_pairs(cursor: &mut Cursor, depth: usize) -> Result<Vec<(String, MsdpValue)>, MsdpError> {
     let mut pairs = Vec::new();
     while cursor.peek() == Some(VAR) {
         cursor.next();
@@ -111,20 +119,21 @@ fn parse_pairs(cursor: &mut Cursor) -> Result<Vec<(String, MsdpValue)>, MsdpErro
         if cursor.next() != Some(VAL) {
             return Err(MsdpError::ExpectedVal);
         }
-        let value = parse_value(cursor)?;
+        let value = parse_value(cursor, depth)?;
         pairs.push((name, value));
     }
     Ok(pairs)
 }
 
-fn parse_value(cursor: &mut Cursor) -> Result<MsdpValue, MsdpError> {
+fn parse_value(cursor: &mut Cursor, depth: usize) -> Result<MsdpValue, MsdpError> {
     match cursor.peek() {
+        Some(ARRAY_OPEN | TABLE_OPEN) if depth >= MAX_DEPTH => Err(MsdpError::TooDeep),
         Some(ARRAY_OPEN) => {
             cursor.next();
             let mut items = Vec::new();
             while cursor.peek() == Some(VAL) {
                 cursor.next();
-                items.push(parse_value(cursor)?);
+                items.push(parse_value(cursor, depth + 1)?);
             }
             if cursor.next() != Some(ARRAY_CLOSE) {
                 return Err(MsdpError::Unterminated);
@@ -133,7 +142,7 @@ fn parse_value(cursor: &mut Cursor) -> Result<MsdpValue, MsdpError> {
         }
         Some(TABLE_OPEN) => {
             cursor.next();
-            let pairs = parse_pairs(cursor)?;
+            let pairs = parse_pairs(cursor, depth + 1)?;
             if cursor.next() != Some(TABLE_CLOSE) {
                 return Err(MsdpError::Unterminated);
             }
@@ -278,6 +287,34 @@ mod tests {
         bytes.push(TABLE_CLOSE); // stray, never opened
 
         assert_eq!(parse(&bytes), Err(MsdpError::TrailingBytes));
+    }
+
+    #[test]
+    fn nesting_past_the_depth_cap_is_an_error_not_a_stack_overflow() {
+        let mut bytes = msg(&[VAR]);
+        bytes.extend_from_slice(b"X");
+        bytes.push(VAL);
+        for _ in 0..(MAX_DEPTH + 1) {
+            bytes.push(ARRAY_OPEN);
+            bytes.push(VAL);
+        }
+
+        assert_eq!(parse(&bytes), Err(MsdpError::TooDeep));
+    }
+
+    #[test]
+    fn nesting_up_to_the_depth_cap_still_parses() {
+        let mut bytes = msg(&[VAR]);
+        bytes.extend_from_slice(b"X");
+        bytes.push(VAL);
+        for _ in 0..MAX_DEPTH {
+            bytes.push(ARRAY_OPEN);
+            bytes.push(VAL);
+        }
+        bytes.extend_from_slice(b"leaf");
+        bytes.extend(std::iter::repeat_n(ARRAY_CLOSE, MAX_DEPTH));
+
+        assert!(parse(&bytes).is_ok());
     }
 
     #[test]

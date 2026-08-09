@@ -50,9 +50,13 @@ struct Budget {
 
 impl LuaHost {
     pub fn new() -> Result<Self, ScriptError> {
-        // No IO, OS, PACKAGE, or DEBUG: untrusted by default (§7.4).
+        // No IO, OS, PACKAGE, or DEBUG: untrusted by default (§7.4). No
+        // COROUTINE either: `install_budget` only hooks the main thread
+        // (mlua hooks don't propagate to coroutines), so a script could
+        // otherwise run `coroutine.wrap(function() while true do end end)()`
+        // to spin forever with the time budget never checked.
         let lua = Lua::new_with(
-            StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
+            StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
             LuaOptions::default(),
         )
         .map_err(|err| load_error("<init>", err))?;
@@ -639,6 +643,21 @@ mod tests {
                 .expect("expression evaluates");
             assert!(value.is_nil(), "`{expression}` is reachable from a script");
         }
+    }
+
+    /// `coroutine.wrap`/`coroutine.create` would let a script dodge the time
+    /// budget entirely: `install_budget` only arms the instruction hook on
+    /// the main thread, and mlua does not propagate hooks to coroutines. So
+    /// `coroutine` must not be reachable at all, not just politely unused.
+    #[test]
+    fn the_sandbox_has_no_coroutine_library() {
+        let host = host_with("");
+        let value: mlua::Value = host
+            .lua
+            .load("return coroutine")
+            .eval()
+            .expect("expression evaluates");
+        assert!(value.is_nil(), "`coroutine` is reachable from a script");
     }
 
     /// Registered hooks live in the registry, so a script cannot unregister
