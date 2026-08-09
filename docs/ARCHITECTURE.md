@@ -6,6 +6,9 @@ Mudular is a modern, terminal-based MUD client: a lightweight, high-performance,
 keyboard-centric alternative to desktop clients like Mudlet, supporting multiple
 concurrent character sessions in a single TUI.
 
+Who these decisions are made for, and which actor wins when two conflict:
+`docs/ACTORS.md`.
+
 ---
 
 ## 1. Goals and Non-Goals
