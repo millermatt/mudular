@@ -787,9 +787,14 @@ home; .2s1w → whatever `home` sends, then s, s, w
   prompt boundaries and emits one `SessionEvent::Line`/`Prompt` per
   completed line, still carrying the server's raw ANSI. Triggers match
   against a stripped projection computed separately (`strip_ansi`, §7.1)
-  rather than a second stored copy — stripping is cheap enough to redo
-  than to cache, and it leaves one string per line to keep in sync, not
-  two.
+  rather than a second stored copy: **inside the pipeline** the line is
+  still in flux — a `highlight:` splice or a `mud.substitute` rewrites it
+  after the engine has matched — so a projection cached there would be one
+  more thing to invalidate, and stripping is cheaper to redo than to keep
+  in step. That reasoning stops at the end of the pipeline: what
+  `push_line` retains is final and never edited again, so the projection it
+  caches (below) cannot drift from the text it describes. Recompute while
+  the line can still change; cache once it can't.
 - Rule highlights (§7.7) are spliced into that raw text before it reaches
   scrollback, so a highlighted line is an ordinary ANSI line by the time
   it's stored — nothing downstream (rendering, channel routing) knows the
