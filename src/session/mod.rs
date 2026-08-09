@@ -236,6 +236,7 @@ async fn run(
     // Consecutive failures since the last connection came up.
     let mut attempt: u32 = 0;
     let mut established = false;
+    let mut hints = FirstUseHints::default();
 
     let reason = loop {
         let lost = match net::connect(&host, port, tls.as_ref()).await {
@@ -252,6 +253,7 @@ async fn run(
                     &publish_to,
                     &mut recorder,
                     &mut window,
+                    &mut hints,
                     &events,
                     &mut commands,
                 )
@@ -340,6 +342,16 @@ async fn wait_to_retry(
     }
 }
 
+/// One-time UX hints, shown at most once per *play session* rather than per
+/// connection or per `Engine` (UX_REVIEW.md G): a reconnect or `/reload`
+/// replaces the transport or the rule set, but the player hasn't started a
+/// new session, so this lives in `run`'s scope and outlives both.
+#[derive(Default)]
+struct FirstUseHints {
+    speedwalk_shown: bool,
+    trigger_shown: bool,
+}
+
 /// Runs one connection to completion: everything from the Telnet handshake
 /// to the disconnect hook. All the protocol state is created here, so each
 /// reconnect starts from a clean machine (§6.5); the engine is not, so
@@ -356,6 +368,7 @@ async fn run_connection(
     publish_to: &Option<watch::Sender<PeerSnapshot>>,
     recorder: &mut Option<Recorder>,
     window: &mut Option<(u16, u16)>,
+    hints: &mut FirstUseHints,
     events: &mpsc::Sender<SessionEvent>,
     commands: &mut mpsc::Receiver<SessionCommand>,
 ) -> Outcome {
@@ -597,6 +610,19 @@ async fn run_connection(
                                             if outcome.bell {
                                                 emit.push(SessionEvent::Bell);
                                             }
+                                            // The one-time nudge that
+                                            // automation is live (UX_REVIEW.md
+                                            // G) — independent of gag too, so
+                                            // even a silently-hidden trigger
+                                            // still counts as the moment it
+                                            // proved itself.
+                                            if !hints.trigger_shown && outcome.fired {
+                                                hints.trigger_shown = true;
+                                                emit.push(SessionEvent::client(
+                                                    "a trigger just fired — automation is live for this character"
+                                                        .to_string(),
+                                                ));
+                                            }
                                             // Echoes follow the line that
                                             // provoked them.
                                             emit.extend(
@@ -759,6 +785,20 @@ async fn run_connection(
                         publish(engine, publish_to);
                         if send_lines(&mut writer, &outcome.sends, &mut sent_at).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
+                        }
+                        // The one-time nudge that speedwalking actually
+                        // did something (UX_REVIEW.md G) — only what the
+                        // player typed, not an injected command, so the
+                        // wording can say "speedwalk" without hedging
+                        // about who typed it.
+                        if !hints.speedwalk_shown
+                            && let Some((path, steps)) = outcome.speedwalks.first()
+                        {
+                            hints.speedwalk_shown = true;
+                            let text = format!("speedwalk: {path} → {}", steps.join(", "));
+                            if events.send(SessionEvent::client(text)).await.is_err() {
+                                return Outcome::Gone;
+                            }
                         }
                         for text in outcome.echoes {
                             if events.send(SessionEvent::rule(text)).await.is_err() {
@@ -1509,11 +1549,46 @@ mod tests {
             ),
         );
 
+        // The gagged line still fired a trigger, so the one-time hint
+        // (UX_REVIEW.md G) still shows — gag hides the *line*, not the
+        // fact that automation ran.
+        let (hint, origin) = next_line_with_origin(&mut events).await;
+        assert_eq!(origin, Origin::Client);
+        assert!(hint.contains("trigger"));
+
         assert_eq!(
             next_line(&mut events).await,
             "something real",
             "the gagged line must not be delivered"
         );
+    }
+
+    /// The hint fires once, not on every trigger — "a running commentary is
+    /// exactly what this is deliberately not" (UX_REVIEW.md G).
+    #[tokio::test]
+    async fn a_trigger_firing_shows_the_hint_only_once() {
+        let (mut events, _commands) = serve_with_rules(
+            |mut sock| async move {
+                sock.write_all(b"spam one\r\nspam two\r\nreal line\r\n")
+                    .await
+                    .unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'spam'
+                    gag: true
+                "#,
+            ),
+        );
+
+        let (hint, origin) = next_line_with_origin(&mut events).await;
+        assert_eq!(origin, Origin::Client);
+        assert!(hint.contains("trigger"));
+
+        // Second gagged fire: straight to the next real line, no second hint.
+        assert_eq!(next_line(&mut events).await, "real line");
     }
 
     /// A `bell:` trigger emits its own event, separate from the line it
@@ -1541,6 +1616,48 @@ mod tests {
             "You have been slain by a rat."
         );
         next_matching(&mut events, |ev| matches!(ev, SessionEvent::Bell)).await;
+    }
+
+    /// The first speedwalk expansion this session shows a one-time hint
+    /// explaining what it did (UX_REVIEW.md G); a second one stays quiet.
+    #[tokio::test]
+    async fn a_speedwalk_expansion_shows_a_one_time_hint() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (mut events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                let mut reader = CommandReader::default();
+                for _ in 0..7 {
+                    tx.send(reader.next(&mut sock).await).await.unwrap();
+                }
+                // Stay connected: closing here would read as a dropped
+                // connection and add a spurious Reconnecting event to what
+                // `drain` collects below.
+                std::future::pending::<()>().await;
+            },
+            rules("name: test"),
+        );
+
+        commands
+            .send(SessionCommand::SendLine(".3n2e".into()))
+            .await
+            .unwrap();
+        for expected in ["n", "n", "n", "e", "e"] {
+            assert_eq!(next_sent(&mut sent).await, expected);
+        }
+
+        let (hint, origin) = next_line_with_origin(&mut events).await;
+        assert_eq!(origin, Origin::Client);
+        assert_eq!(hint, "speedwalk: .3n2e → n, n, n, e, e");
+
+        // A second speedwalk still sends fine, but shows no second hint.
+        commands
+            .send(SessionCommand::SendLine(".2n".into()))
+            .await
+            .unwrap();
+        assert_eq!(next_sent(&mut sent).await, "n");
+        assert_eq!(next_sent(&mut sent).await, "n");
+        let seen = drain((events, commands)).await;
+        assert!(seen.is_empty(), "no second hint expected, got {seen:?}");
     }
 
     /// Typed input is expanded by the session, not the UI: one line can
@@ -2637,8 +2754,13 @@ mod tests {
             }
             other => panic!("expected Route, got {other:?}"),
         }
-        // The next line the pane sees is the un-routed one: the tell was
-        // moved, not copied.
+        // The routed trigger was also this session's first fire, so the
+        // one-time hint (UX_REVIEW.md G) lands next.
+        let (hint, origin) = next_line_with_origin(&mut events).await;
+        assert_eq!(origin, Origin::Client);
+        assert!(hint.contains("trigger"));
+        // The next real line the pane sees is the un-routed one: the tell
+        // was moved, not copied.
         assert_eq!(next_line(&mut events).await, "You see a rat.");
     }
 

@@ -272,6 +272,12 @@ pub struct LineOutcome {
     /// (§14 M9). The session doesn't know its own focus state, so it only
     /// reports the request; the hub decides whether to ring it.
     pub bell: bool,
+    /// Whether any trigger's pattern *and* guard held on this line — true
+    /// even if its only action was silent (a bare `set:`), false if no
+    /// rule matched at all. Used for the one-time "a trigger just fired"
+    /// hint (UX_REVIEW.md G); not a count, since a running commentary is
+    /// exactly what that hint is deliberately not.
+    pub fired: bool,
 }
 
 /// What a typed input line expands to.
@@ -285,6 +291,12 @@ pub struct InputOutcome {
     pub echoes: Vec<String>,
     /// Text for another session's pane (§7.5).
     pub echo_to: Vec<(String, String)>,
+    /// Speedwalk paths this input expanded, original text paired with the
+    /// steps it became — including one expanded from an alias's `send:`
+    /// output, not just what was typed directly. The engine reports every
+    /// expansion every call; it's the session that decides whether this is
+    /// the first one worth telling the player about (UX_REVIEW.md G).
+    pub speedwalks: Vec<(String, Vec<String>)>,
 }
 
 /// What one session publishes about itself for the others to read (§7.5):
@@ -621,6 +633,7 @@ impl Engine {
             if !rule.guard_holds(&scope) {
                 continue;
             }
+            outcome.fired = true;
             for template in &rule.sends {
                 outcome.sends.push(expand(template, &scope));
             }
@@ -814,7 +827,7 @@ impl Engine {
                         peers: &self.peers,
                     };
                     for template in &rule.sends {
-                        push_send(&mut out.sends, expand(template, &scope));
+                        push_send(&mut out, expand(template, &scope));
                     }
                     for (target, templates) in &rule.send_to {
                         out.send_to.push(CrossSend {
@@ -837,7 +850,7 @@ impl Engine {
                         ));
                     }
                 }
-                None => push_send(&mut out.sends, part.to_string()),
+                None => push_send(&mut out, part.to_string()),
             }
         }
 
@@ -1561,10 +1574,13 @@ const MAX_SPEEDWALK_STEPS: usize = 999;
 /// TinTin++/zMUD notation, with no room graph behind it (§16). A path that
 /// doesn't parse as one is queued as typed, so `.` remains an ordinary
 /// character everywhere else in a command.
-fn push_send(sends: &mut Vec<String>, text: String) {
+fn push_send(out: &mut InputOutcome, text: String) {
     match expand_speedwalk(&text) {
-        Some(steps) => sends.extend(steps),
-        None => sends.push(text),
+        Some(steps) => {
+            out.sends.extend(steps.clone());
+            out.speedwalks.push((text, steps));
+        }
+        None => out.sends.push(text),
     }
 }
 
@@ -1691,6 +1707,23 @@ mod tests {
             vec!["look Ærlend"]
         );
         assert!(engine.process_line("nothing here").sends.is_empty());
+    }
+
+    /// `fired` is true whenever a rule's pattern *and* guard both held —
+    /// even with no visible action — and false otherwise. What the
+    /// session's one-time "a trigger fired" hint (UX_REVIEW.md G) reads.
+    #[test]
+    fn process_line_reports_whether_a_trigger_fired() {
+        let mut engine = engine(
+            r#"
+            name: test
+            triggers:
+              - pattern: 'spam'
+                set: {seen: "yes"}
+            "#,
+        );
+        assert!(engine.process_line("spam here").fired);
+        assert!(!engine.process_line("nothing here").fired);
     }
 
     #[test]
@@ -1838,6 +1871,28 @@ mod tests {
             engine.expand_input(".3n2e").sends,
             vec!["n", "n", "n", "e", "e"]
         );
+    }
+
+    /// The `speedwalks` field is what the session's one-time hint
+    /// (UX_REVIEW.md G) is built from: the original path text paired with
+    /// what it became. Empty when nothing in the input was a speedwalk.
+    #[test]
+    fn expand_input_reports_what_it_expanded_as_a_speedwalk() {
+        let mut engine = engine("name: test");
+        assert_eq!(
+            engine.expand_input(".3n2e").speedwalks,
+            vec![(
+                ".3n2e".to_string(),
+                vec![
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "e".to_string(),
+                    "e".to_string()
+                ]
+            )]
+        );
+        assert_eq!(engine.expand_input("look").speedwalks, vec![]);
     }
 
     /// Two-letter diagonals are greedy: `ne` is one move, not `n` then `e`.
