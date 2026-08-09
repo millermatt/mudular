@@ -267,11 +267,8 @@ assembler (§8) uses prompt boundaries to distinguish "prompt" from
   Client sends `Core.Hello {"client":"Mudular","version":…}` and
   `Core.Supports.Set` after negotiation. The supported list is currently
   hardcoded to `["Char 1", "Room 1"]` (`gmcp::supports_message`), with no
-  way for a profile, module, or script to add a package — so a server that
-  gates pushes on `Core.Supports.Set` will never send `Group`,
-  `Comm.Channel`, or `Client.Media`. That has to become declarable before
-  any feature that needs those packages (`ARCH_REVIEW.md`), and it becomes
-  a compatibility surface the moment it does. Events surface to the engine
+  way for a profile, module, or script to add a package (tracked as
+  [#25](https://github.com/millermatt/mudular/issues/25)). Events surface to the engine
   (triggers can match on GMCP packages, M7) and to UI consumers (vitals,
   room info) via `SessionEvent::Gmcp`.
 - **MSDP (option 69):** typed parser for `VAR`/`VAL`/`TABLE_OPEN/CLOSE`/
@@ -1122,8 +1119,8 @@ spam — and conversely, so slow conversations stay visible.
   the *last focused session*, shown in the input border — reading comms
   must never silently change which character your commands go to. A
   per-channel `reply_prefix` (e.g. `reply `) to prefill responses was
-  sketched for M9 and did not ship: the `Channel` schema has no such field.
-  Still wanted, unscheduled.
+  sketched for M9 and did not ship: the `Channel` schema has no such field
+  (tracked as [#26](https://github.com/millermatt/mudular/issues/26)).
 - Rendering is diff-based via ratatui and we redraw on every event batch
   rather than tracking damage manually. That is only affordable because a
   pane renders its *viewport*, not its buffer: `ui::visible_window` walks
@@ -1386,10 +1383,11 @@ defaulting to off, and not as a resize handle bolted onto the layout.
     scripted to exercise negotiation, compression switchover, and TLS.
   - UI: ratatui `TestBackend` snapshot tests for layout/indicators.
   - Fuzzing: `cargo-fuzz` targets for the Telnet FSM, MCCP switchover, and
-    charset decode — server bytes are attacker-controlled input. **Not yet
-    written**; there is no `fuzz/` directory. The hand-written byte
-    fixtures and the MCCP inflate cap (§6.4, §13) are what currently stand
-    in for it. Outstanding as of end-of-M9.
+    charset decode — server bytes are attacker-controlled input. Not yet
+    written (tracked as
+    [#1](https://github.com/millermatt/mudular/issues/1)); the hand-written
+    byte fixtures and the MCCP inflate cap (§6.4, §13) currently stand in
+    for it.
   - Fixtures: `--record` (M1) captures raw inbound bytes with timing, so
     any real-MUD quirk becomes a replayable regression test.
 - **Gate per milestone:** `cargo fmt --check`, `clippy -D warnings`,
@@ -1456,11 +1454,8 @@ exist from M0, even where a stage is a passthrough).
 | **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), keyring-backed auto-login (§10.1), and rule highlights (§7.7) — all built early, as soon as they were useful; scrollback navigation with a configurable buffer size (§8, §11.5), disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), resizable channel column (§11.4), in-TUI new-profile form, self-update check; scrollback search and `Up` prefix search are deliberately deferred past M9 (§11.3, §11.5) | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either; the channel column can be widened from the keyboard and the sessions beside it are told their new size; `PgUp`/`PgDn`/`Home`/`End` move a pane's scrollback without losing new output that arrives while scrolled up, and a scrolled pane is visibly distinguishable from a live one |
 
 **Status (end-of-M9):** M0–M9 are delivered and their "done when" criteria
-hold. Two items listed under M9 did not ship with it and are still open —
-the **self-update check** (and the `cargo-dist` release automation it
-depends on, §15) and the **`cargo-fuzz` targets** §12 calls for. Both are
-release/QA infrastructure rather than client behaviour; nothing in the
-client is waiting on either.
+hold. Open follow-on work is tracked on
+[GitHub Issues](https://github.com/millermatt/mudular/issues), not here.
 
 Milestones map to the module layout directly: M0 exercises `net`+`ui`+a
 passthrough `session`; M1–M6 each fill in one `proto`/`engine` module
@@ -1479,10 +1474,10 @@ Target: a non-technical user installs Mudular on any OS in one step.
   and generates installers per tag: shell one-liner + Homebrew tap
   (macOS/Linux), MSI + `winget`/Scoop (Windows), plus plain tarballs.
   Effort is one config file, so it was scheduled early (M3, first "someone
-  else could install this" milestone) rather than last. **Not yet set up**:
-  no `cargo-dist` config, no release workflow, and M9's self-update check
-  is the other half of the same gap — both are outstanding at end-of-M9,
-  and the client is still built from source.
+  else could install this" milestone) rather than last. Not yet set up;
+  the client is still built from source (tracked as
+  [#24](https://github.com/millermatt/mudular/issues/24), which covers
+  M9's self-update check too — self-update needs this first).
 - **First run (M9):** launched with no profile, no `--host`, and no
   profile already saved (`config::has_profiles`), Mudular shows an in-TUI
   "new profile" form instead of an empty shell — no hand-editing YAML
