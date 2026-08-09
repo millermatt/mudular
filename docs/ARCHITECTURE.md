@@ -826,6 +826,16 @@ home; .2s1w → whatever `home` sends, then s, s, w
   each have to parse their way back out of. `push_line` is the one funnel
   every line passes, so the buffer records what it knows and the renderer
   composes — rather than the reverse.
+- A retained line also carries its **plain-text projection** — `text` with
+  escapes removed, the same `strip_ansi` projection triggers match against
+  (§7.1) — computed once on the way in and read through `RetainedLine::plain`.
+  Scrollback search (§11.5) matches against it; deriving it per keystroke
+  would re-strip the whole buffer on every character typed. It is stored
+  only when `text` actually contains escapes, since otherwise the text
+  already is the projection. `strip_ansi` lives in `scrollback` for this
+  reason — it is a property of a retained line, not of the session
+  pipeline, and keeping it there leaves the module a dependency-free leaf
+  (§4, §16).
 - **Disk logging** (M9): a profile's `log: true` appends every line that
   reaches `push_line` — the same choke point scrollback fills from — to
   `<config dir>/logs/<session name>.log`, opened once at connect and kept

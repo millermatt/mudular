@@ -63,9 +63,14 @@ pre-parsed retained lines — which entangles it with the next finding.
 > alone: **which rule fired** needs the engine to report it through
 > `LineOutcome` (`Origin::Rule` is the seam, and today carries no id), and
 > **per-line identity** for the screen-reader diff would be a sequence
-> number this does not yet assign. Search also still re-strips ANSI per
-> keystroke — a cached plain projection is a field behind the same funnel,
-> deliberately not added ahead of the feature that needs it.
+> number this does not yet assign.
+>
+> The plain-text projection is now cached on the line (stored only when the
+> text has escapes in it), so search will not re-strip the buffer per
+> keystroke. Consolidating on it also removed a second, disagreeing
+> implementation: `Alt+V` built its pattern via the render path's parser,
+> which keeps `ESC M` as a literal `M` where `strip_ansi` drops it — so a
+> pattern picked from such a line could not match the line it came from.
 
 Scrollback is `VecDeque<String>` (`SessionPane.scrollback`,
 `ChannelPane.lines`). By the time a line arrives there it has been

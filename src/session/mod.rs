@@ -25,8 +25,8 @@ use crate::proto::gmcp;
 use crate::proto::mccp::MccpDecoder;
 use crate::proto::msdp;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, encode_subnegotiation, option};
-use crate::scrollback::Origin;
-use line::{LineAssembler, apply_highlights, strip_ansi};
+use crate::scrollback::{Origin, strip_ansi};
+use line::{LineAssembler, apply_highlights};
 use login::{Autologin, LoginAction};
 
 /// Session → UI.

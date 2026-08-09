@@ -664,22 +664,6 @@ fn ansi_lines(raw: &str) -> Vec<Line<'static>> {
     }
 }
 
-/// Strips SGR/ANSI escapes down to the text a player actually reads — used
-/// by the scrollback line-cursor (§10.2/§11.5) to turn a picked line into a
-/// sane starting pattern, rather than one with escape bytes baked in.
-pub(crate) fn plain_text(raw: &str) -> String {
-    ansi_lines(raw)
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

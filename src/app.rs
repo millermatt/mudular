@@ -795,7 +795,7 @@ fn open_new_trigger_from_line(state: &mut AppState, channels: &[Channel], back_o
     else {
         return;
     };
-    let pattern = regex::escape(&ui::plain_text(&raw.text));
+    let pattern = regex::escape(raw.plain());
     let (dir, profile) = session.rules.clone();
     let Some(name) = profile else {
         if let Some(session) = state.bound_mut() {
@@ -2913,6 +2913,37 @@ mod tests {
         let (mut state, receivers) = app(&["tank"]);
         state.sessions[0].rules = (dir.to_path_buf(), Some("tank".to_string()));
         (state, receivers)
+    }
+
+    /// `Alt+V` builds a trigger pattern out of a picked line, so it has to
+    /// use the projection triggers actually match against (§7.1). It used a
+    /// second implementation, over the render path's parser, which disagrees
+    /// with that one about escapes a MUD really sends — an `ESC M` here — and
+    /// so prefilled a pattern that could never match the line it came from.
+    #[test]
+    fn a_picked_line_prefills_the_pattern_a_trigger_would_match() {
+        let dir = config_with_alias("old");
+        let (mut state, _rx) = app_with_rules(dir.path());
+        let line = "The kobold\x1bM is DEAD!";
+        state.sessions[0]
+            .scrollback
+            .push_back(RetainedLine::server(line));
+
+        open_new_trigger_from_line(&mut state, &[], 0);
+
+        let editor = state.config_editor.as_ref().expect("the editor opened");
+        let pattern = editor
+            .draft()
+            .triggers
+            .last()
+            .and_then(|trigger| trigger.pattern.clone())
+            .expect("a new trigger was added, with a pattern");
+        assert_eq!(
+            pattern,
+            regex::escape(&crate::scrollback::strip_ansi(line)),
+            "the pattern must be built from the projection triggers match"
+        );
+        assert_eq!(pattern, regex::escape("The kobold is DEAD!"));
     }
 
     #[tokio::test]
