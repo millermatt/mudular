@@ -908,6 +908,67 @@ is shaped by what must never happen rather than by convenience.
   the pane — the server echoes the name itself, and the password must not
   be echoed anywhere (§13).
 
+### 10.2 In-client profile editor
+
+`F5` or typing `/config` while a profile session is focused opens a
+full-screen editor (`ui::config_editor`) over that profile's own
+`profiles/<name>.yaml` — connection settings, variables, aliases, triggers,
+and timers, with add/edit/delete for each. It is the one place this client
+rewrites a config file the player didn't hand-edit themselves, and that
+exception is carved narrowly: one profile file, only ever on an explicit
+save, and never global.yaml or a shared module — those stay hand-edited, as
+does a profile's `scripts:`/`cross_session:` and its password, which stays
+keyring-only (§10.1) and never grows a field here.
+
+- **The rewrite is lossy in exactly one way, and it's surfaced, not
+  buried:** YAML comments and hand-formatting don't survive a serde
+  round-trip. A profile with any `#` line gets a banner saying so the
+  moment the editor opens, and a backup (below) is taken before every save
+  regardless, so the commented original is never actually gone.
+- **Fields the mini-forms don't expose** — a rule's `send_to:`, `set:`,
+  `script:`, `highlight:`, and a profile's `scripts:`/`cross_session:` —
+  round-trip untouched: the editor edits the real `Profile`/`Alias`/
+  `Trigger`/`Timer` structs (all `Serialize` for exactly this reason), only
+  ever mutating the fields it shows. A rule carrying one of these is
+  marked in its list row and shown read-only at the bottom of its form, and
+  naming it again in its delete confirmation — a field the player can't see
+  is a field they'll recreate the rule to "fix", losing it for good.
+- **`enabled`/`gag`/`bell` are tri-state, not checkboxes.** `None` means
+  "let a lower scope layer decide" (§7.3); `Space` cycles
+  inherit → yes → no → inherit. A checkbox would silently pin
+  `enabled: false` over a rule a shared module already turned on.
+- **Safe save** is three things, always in this order: (1) the previous
+  version of the file is copied to
+  `<config dir>/backups/profiles/<name>/<UTC timestamp>.yaml` — a top-level
+  `backups/` dir rather than nested inside `profiles/`, so nothing that
+  globs the documented `profiles/*.yaml` namespace has to learn to skip a
+  subdirectory; the newest 20 are kept per profile. (2) the write itself is
+  atomic — a same-directory temp file, `fsync`, then `rename`, so a crash
+  mid-write never leaves a truncated file. (3) a file that changed on disk
+  since the editor loaded it (a hand-edit, or another `mudular` process) is
+  reported rather than clobbered, with the choice to overwrite it — which
+  still backs up the version being overwritten, so nothing is ever lost
+  either way. Every save is validated first through the same
+  `Engine::compile` a session actually loads (`config::validate_profile_rules`),
+  so "valid" here can never drift from what the session would load.
+- **Saving reloads every session bound to that profile live**, the same
+  path `/reload` uses, no reconnect — except `host`/`port`/`tls`/`charset`/
+  `login`, which only take effect on the next connection, and the editor
+  says so rather than implying they applied.
+- **A keyboard line-cursor over the scrollback** (`Alt+V`, building on the
+  scroll state in §11.5) turns something a player just saw into a trigger:
+  `↑`/`↓` move a highlighted line, `Enter` opens the editor straight into a
+  new trigger with that line's text — regex-escaped verbatim, not
+  auto-detected into capture groups, since a wrong guess there produces a
+  pattern that looks plausible but doesn't reliably match — as its starting
+  `pattern:`, ready to hand-edit into a real one.
+- **Deferred**, deliberately: editing `global.yaml` or a shared module from
+  here, git-backed history (a plain backup directory covers "I broke it
+  earlier" without a repository's worth of machinery), renaming a profile
+  (touches the file, the keyring account, and the log file name together —
+  a manual operation), and anything that would put a password in this
+  editor rather than the keyring.
+
 ---
 
 ## 11. UI Architecture (`ui`, `app`)

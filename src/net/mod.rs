@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -30,7 +30,7 @@ use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, S
 use pins::PinStore;
 
 /// How much we trust the server's certificate.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifyMode {
     /// Full webpki validation against the system/webpki roots.

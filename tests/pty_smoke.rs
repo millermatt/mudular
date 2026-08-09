@@ -27,6 +27,9 @@ const BANNER: &str = "MUDULAR-SMOKE-BANNER";
 
 const CTRL_C: &[u8] = b"\x03";
 const CTRL_Q: &[u8] = b"\x11";
+const CTRL_S: &[u8] = b"\x13";
+const DOWN: &[u8] = b"\x1b[B";
+const ESC: &[u8] = b"\x1b";
 
 #[test]
 fn plays_from_a_profile_with_its_rules_and_quits() {
@@ -65,6 +68,95 @@ fn honours_a_remapped_quit_key() {
 
     app.send(CTRL_Q);
     app.expect_exit("the remapped quit key should quit");
+}
+
+/// §10.2's acceptance bar, end to end: `/config` opens the in-client
+/// profile editor, a new trigger is added entirely through the keyboard,
+/// `Ctrl+S` saves it, and — without a reconnect — the live session reacts
+/// to it and a backup of the pre-edit file appears on disk.
+#[test]
+fn adds_a_trigger_through_the_config_editor_and_saves_it_live() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the screen");
+
+    app.type_line("/config");
+    app.wait_for("BROWSE", "the editor should open");
+
+    app.send(b"4"); // jump to the Triggers section
+    app.send(b"a"); // add a new trigger, opening its form on `id`
+    app.send(DOWN); // -> pattern
+    app.send(b"\r"); // begin editing it
+    app.send(b"^zap$");
+    app.send(b"\r"); // commit the pattern
+    app.send(DOWN); // -> when
+    app.send(DOWN); // -> send
+    app.send(b"\r"); // begin editing it
+    app.send(b"say ouch");
+    app.send(b"\r"); // commit the send list
+
+    app.send(CTRL_S); // save
+    app.wait_for(
+        "backed up",
+        "saving should report success and where the backup went",
+    );
+
+    // Two bare `Esc` presses sent back to back can be read by crossterm as
+    // one Alt-modified key rather than two separate ones; a short pause
+    // between them keeps the pty's raw bytes unambiguous.
+    app.send(ESC); // form -> browse (the rule is no longer blank)
+    std::thread::sleep(Duration::from_millis(100));
+    app.send(ESC); // browse -> close (nothing left unsaved)
+
+    app.wait_for("reloaded", "saving should reload the live session's rules");
+
+    mud.send_line("zap");
+    mud.wait_for_command("say ouch", "the trigger just added should already be live");
+
+    let backups = std::fs::read_dir(config.path().join("backups/profiles/tank"))
+        .expect("a backup directory should exist")
+        .count();
+    assert_eq!(
+        backups, 1,
+        "the pre-edit version should have been backed up exactly once"
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// The scrollback line-cursor (§10.2/§11.5): `Alt+V` picks a line, `Enter`
+/// opens the profile editor straight into a new trigger with that line's
+/// text, regex-escaped, as its starting pattern.
+#[test]
+fn picks_a_scrollback_line_into_a_new_trigger_pattern() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the screen");
+
+    mud.send_line("A rat scurries by.");
+    app.wait_for("scurries", "the server's line should reach the pane");
+
+    app.send(b"\x1bv"); // Alt+V: enter the line-cursor
+    app.send(b"\r"); // pick the last line
+
+    app.wait_for(
+        "scurries",
+        "the picked line's text should prefill the new trigger's pattern",
+    );
+    app.wait_for(
+        "EDIT trigger",
+        "picking a line should open straight into a trigger form",
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
 }
 
 /// First run, §15's acceptance bar: launched with no profile, no `--host`,

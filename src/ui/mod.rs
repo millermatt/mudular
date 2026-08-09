@@ -11,12 +11,14 @@
 use ansi_to_tui::IntoText;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::app::{AppState, ChannelPane, Focus, LayoutMode};
 use crate::config::Keybinds;
+
+pub mod config_editor;
 
 /// Default width of the docked channel column, and the smallest main area
 /// worth keeping beside it — below that the channels are simply not drawn.
@@ -72,10 +74,16 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row(keybinds.channel_narrower, "narrow the comms column"),
         row(keybinds.gmcp_inspector, "raw GMCP inspector"),
         row(keybinds.help, "this help"),
+        row(keybinds.config_editor, "edit this character's profile"),
+        row(
+            keybinds.line_picker,
+            "pick a scrollback line for a new trigger",
+        ),
         String::new(),
         "Commands you can type".to_string(),
         row("/help", "print this help into the pane"),
         row("/reload", "recompile rules and scripts from disk"),
+        row("/config", "edit this character's profile"),
         String::new(),
         "Leaving".to_string(),
         row(keybinds.quit, "quit"),
@@ -228,10 +236,16 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         );
     }
 
-    draw_input(frame, panes.input, state);
+    if state.config_editor.is_none() {
+        draw_input(frame, panes.input, state);
+    }
 
     if state.show_help {
         draw_help(frame, frame.area(), &state.keybinds);
+    }
+
+    if let Some(editor) = &state.config_editor {
+        editor.draw(frame, frame.area());
     }
 }
 
@@ -319,14 +333,32 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     let focused = state.is_focused_session(index);
     let showing_gmcp = state.show_gmcp && focused;
 
+    // The scrollback line-cursor (docs/ARCHITECTURE.md §10.2/§11.5) only
+    // ever picks from the input-bound session, regardless of which pane is
+    // visually focused — same scoping as `Alt+V` itself in `app.rs`.
+    let picked_line = (!showing_gmcp && index == state.input_session)
+        .then_some(state.line_cursor)
+        .flatten()
+        .and_then(|cursor| session.scrollback.len().checked_sub(1 + cursor));
+
     let mut lines: Vec<Line> = Vec::new();
     if showing_gmcp {
         for raw in &session.gmcp_log {
             lines.push(Line::raw(raw.clone()));
         }
     } else {
-        for raw in &session.scrollback {
-            lines.extend(ansi_lines(raw));
+        for (i, raw) in session.scrollback.iter().enumerate() {
+            let rendered = ansi_lines(raw);
+            if Some(i) == picked_line {
+                // `REVERSED` rather than a fixed colour: it reads clearly
+                // over whatever ANSI colours the server's own line already
+                // has, instead of clashing with or hiding them.
+                lines.extend(rendered.into_iter().map(|line| {
+                    line.patch_style(Style::default().add_modifier(Modifier::REVERSED))
+                }));
+            } else {
+                lines.extend(rendered);
+            }
         }
     }
 
@@ -343,11 +375,15 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     let title = if showing_gmcp {
         format!(" {} — GMCP inspector ", session.name)
     } else {
+        let picking = if picked_line.is_some() {
+            " ↑↓ pick a line, Enter for a trigger, Esc to cancel"
+        } else {
+            scroll_indicator(session.back_offset)
+        };
         format!(
-            "{} — {}{security}{latency}{} ",
+            "{} — {}{security}{latency}{picking} ",
             pane_title(&session.name, session.unread),
             session.status,
-            scroll_indicator(session.back_offset)
         )
     };
 
@@ -544,6 +580,22 @@ fn ansi_lines(raw: &str) -> Vec<Line<'static>> {
         Ok(text) => text.lines,
         Err(_) => vec![Line::raw(raw.to_string())],
     }
+}
+
+/// Strips SGR/ANSI escapes down to the text a player actually reads — used
+/// by the scrollback line-cursor (§10.2/§11.5) to turn a picked line into a
+/// sane starting pattern, rather than one with escape bytes baked in.
+pub(crate) fn plain_text(raw: &str) -> String {
+    ansi_lines(raw)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 #[cfg(test)]

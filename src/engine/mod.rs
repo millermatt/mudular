@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use regex::{Captures, Regex};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -40,7 +40,7 @@ pub struct RuleModule {
     #[allow(dead_code)]
     pub description: Option<String>,
     #[serde(default)]
-    pub variables: HashMap<String, String>,
+    pub variables: BTreeMap<String, String>,
     #[serde(default)]
     pub aliases: Vec<Alias>,
     #[serde(default)]
@@ -58,36 +58,36 @@ pub struct RuleModule {
     pub script_sources: Vec<ScriptSource>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Alias {
     /// Stable identity for shadowing across scope layers.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
     /// Guard: the rule fires only if the pattern matches *and* this
     /// evaluates true (§7.6).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send: Option<Vec<String>>,
     /// Commands for *other* sessions, keyed by session name (§7.5).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_to: Option<BTreeMap<String, Vec<String>>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<BTreeMap<String, String>>,
     /// Call a function a script defined (§7.4).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<ScriptAction>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
 
 /// A rule's `script:` action: `{file: combat.lua, fn: on_death}`. The file
 /// picks the engine and must be one the module declared; the function is a
 /// global that file's language defined.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScriptAction {
     pub file: String,
@@ -95,43 +95,43 @@ pub struct ScriptAction {
     pub function: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trigger {
     /// Stable identity for shadowing across scope layers.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
     /// Guard: the rule fires only if the pattern matches *and* this
     /// evaluates true (§7.6).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send: Option<Vec<String>>,
     /// Commands for *other* sessions, keyed by session name (§7.5).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_to: Option<BTreeMap<String, Vec<String>>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<BTreeMap<String, String>>,
     /// Call a function a script defined (§7.4).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<ScriptAction>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gag: Option<bool>,
     /// Send the matched line to this channel pane instead of leaving it to
     /// the main scrollback alone (§11.1).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
     /// Recolour the matched text, or the whole line (§7.7).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlight: Option<HighlightSpec>,
     /// Rings the terminal bell / desktop notification when this fires in a
     /// session that isn't focused (§14 M9). Independent of `gag:` — a line
     /// worth hiding can still be worth an alert.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bell: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
 
@@ -139,45 +139,49 @@ pub struct Trigger {
 /// wrote them until `Engine::compile` turns the block into an SGR string:
 /// deserializing them here would report a bad name without being able to
 /// say which rule it came from.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HighlightSpec {
     /// A colour name, `#rrggbb`, or a 0-255 palette index — the same
     /// vocabulary as a profile's `color:` (§11).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fg: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub bold: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub italic: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub underline: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub reverse: bool,
     /// Restyle the entire line rather than only the matched text.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub whole_line: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Timer {
     /// Stable identity for shadowing across scope layers.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Repeat on this interval, e.g. `60s`, `5m`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every: Option<String>,
     /// Fire once after this delay.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<BTreeMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
 

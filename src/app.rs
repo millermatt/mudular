@@ -9,8 +9,8 @@
 //! [`SessionEvent::SendTo`], which this hub turns into an explicit
 //! [`SessionCommand::Inject`] for the addressed session (§7.5).
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -49,6 +49,8 @@ const RELOAD_COMMAND: &str = "/reload";
 /// The same listing as the overlay, for players who never find the key
 /// (docs/ARCHITECTURE.md §11.2).
 const HELP_COMMAND: &str = "/help";
+/// Opens the in-client profile editor (§10.2) — the same thing `F5` does.
+const CONFIG_COMMAND: &str = "/config";
 
 /// `send_to` address meaning "every other session" (§7.5).
 const ALL_SESSIONS: &str = "*";
@@ -307,6 +309,18 @@ pub struct AppState {
     /// what the event loop actually matches against — never a second copy
     /// that can drift (§11.2).
     pub keybinds: Keybinds,
+    /// The profile editor, when it is open (§10.2). `Some` means it owns
+    /// the keyboard and paints over every pane, like the help overlay —
+    /// but sessions keep running behind it.
+    pub config_editor: Option<ui::config_editor::ConfigEditorState>,
+    /// A save the editor asked for on the last keypress, drained by
+    /// `event_loop` right after `handle_key` returns — saving needs async
+    /// IO that `handle_key` itself, being sync, cannot do.
+    config_editor_save: Option<config::SaveMode>,
+    /// A scrollback line-cursor is active on the focused pane (§10.2/§11.5):
+    /// `Some(back_offset)` is the line it currently highlights, measured the
+    /// same way `SessionPane::back_offset` is — distance from the tail.
+    pub line_cursor: Option<usize>,
 }
 
 /// `PgUp`/`PgDn`/`Home`/`End`, unmodified — built-in and unremappable, like
@@ -700,6 +714,216 @@ async fn reload_rules(state: &AppState, channels: &[Channel]) -> String {
     }
 }
 
+/// Opens the in-client profile editor (§10.2) over the bound session's
+/// profile. Requires a profile session — an ad-hoc `--host` session has no
+/// file to edit — and a profile that at least parses; a broken file is
+/// reported rather than edited from a blank default, which would risk
+/// overwriting whatever is actually wrong with it.
+fn open_config_editor(state: &mut AppState, channels: &[Channel]) {
+    let Some(session) = state.bound() else {
+        return;
+    };
+    let (dir, profile) = session.rules.clone();
+    let Some(name) = profile else {
+        if let Some(session) = state.bound_mut() {
+            session.push_line(
+                "** /config needs a profile session — this one was started with --host".to_string(),
+            );
+        }
+        return;
+    };
+
+    let path = config::profile_path(&dir, &name);
+    let had_comments = std::fs::read_to_string(&path)
+        .map(|text| text.lines().any(|line| line.trim_start().starts_with('#')))
+        .unwrap_or(false);
+
+    match config::load_profile_file(&path) {
+        Ok(file) => {
+            let known_modules = known_module_names(&dir);
+            state.config_editor = Some(ui::config_editor::ConfigEditorState::open(
+                file,
+                dir,
+                name,
+                channels,
+                known_modules,
+                had_comments,
+            ));
+        }
+        Err(err) => {
+            if let Some(session) = state.bound_mut() {
+                session.push_line(format!("** could not open the profile editor: {err:#}"));
+            }
+        }
+    }
+}
+
+/// The module names that actually exist under `modules/`, so the editor can
+/// flag a profile's `modules:` entry that doesn't resolve without treating
+/// it as a hard error — the module may simply not be written yet.
+fn known_module_names(dir: &Path) -> HashSet<String> {
+    std::fs::read_dir(dir.join("modules"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "yaml") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The scrollback line-cursor's `Enter` (§10.2/§11.5): opens the profile
+/// editor straight into a new trigger, its pattern prefilled from the
+/// picked line. `back_offset` counts from the newest line, matching
+/// `SessionPane::back_offset`'s convention.
+fn open_new_trigger_from_line(state: &mut AppState, channels: &[Channel], back_offset: usize) {
+    let Some(session) = state.bound() else {
+        return;
+    };
+    let Some(raw) = session
+        .scrollback
+        .len()
+        .checked_sub(1 + back_offset)
+        .and_then(|index| session.scrollback.get(index))
+    else {
+        return;
+    };
+    let pattern = regex::escape(&ui::plain_text(raw));
+    let (dir, profile) = session.rules.clone();
+    let Some(name) = profile else {
+        if let Some(session) = state.bound_mut() {
+            session.push_line(
+                "** picking a trigger needs a profile session — this one was started with \
+                 --host"
+                    .to_string(),
+            );
+        }
+        return;
+    };
+
+    let path = config::profile_path(&dir, &name);
+    let had_comments = std::fs::read_to_string(&path)
+        .map(|text| text.lines().any(|line| line.trim_start().starts_with('#')))
+        .unwrap_or(false);
+
+    match config::load_profile_file(&path) {
+        Ok(file) => {
+            let known_modules = known_module_names(&dir);
+            state.config_editor =
+                Some(ui::config_editor::ConfigEditorState::open_with_new_trigger(
+                    file,
+                    dir,
+                    name,
+                    channels,
+                    known_modules,
+                    had_comments,
+                    pattern,
+                ));
+        }
+        Err(err) => {
+            if let Some(session) = state.bound_mut() {
+                session.push_line(format!("** could not open the profile editor: {err:#}"));
+            }
+        }
+    }
+}
+
+/// Validates and saves the editor's draft (§10.2), called once `handle_key`
+/// has returned an `EditorAction::Save` — the one piece of the save flow
+/// that needs async IO the editor's own (sync) key handling cannot do.
+/// Every session bound to the saved profile gets its rules reloaded live,
+/// not just the one that opened the editor: two panes can share a profile.
+async fn service_config_save(state: &mut AppState, channels: &[Channel], mode: config::SaveMode) {
+    let Some(editor) = &mut state.config_editor else {
+        return;
+    };
+
+    let dir = editor.dir().to_path_buf();
+    let name = editor.name().to_string();
+    let draft = editor.draft().clone();
+
+    if let Err(err) = config::validate_profile_rules(&dir, &name, &draft, channels) {
+        editor.set_notice_error(format!("{err:#}"));
+        return;
+    }
+
+    let connection_changed = {
+        let before = editor.original_profile();
+        before.host != draft.host
+            || before.port != draft.port
+            || before.tls != draft.tls
+            || before.charset != draft.charset
+            || before.login != draft.login
+    };
+
+    match config::save_profile(editor.file(), &draft, mode) {
+        Ok(saved) => {
+            editor.note_saved();
+            let mut notice = "saved".to_string();
+            if let Some(backup) = &saved.backup {
+                notice.push_str(&format!(
+                    " — previous version backed up to {}",
+                    backup.display()
+                ));
+            }
+            if connection_changed {
+                notice.push_str("; host/port/TLS/charset/login changes apply next connection");
+            }
+            editor.set_notice_info(notice);
+
+            let mut lines_for = Vec::new();
+            for session in &state.sessions {
+                if session.rules.1.as_deref() == Some(name.as_str()) {
+                    lines_for.push(session.name.clone());
+                }
+            }
+            for target_name in lines_for {
+                if let Some(index) = state.sessions.iter().position(|s| s.name == target_name) {
+                    let session = &state.sessions[index];
+                    let (config_dir, profile) = &session.rules;
+                    let text =
+                        match crate::config::load_rules(config_dir, profile.as_deref(), channels)
+                            .and_then(|layers| Ok(Engine::compile(&layers)?))
+                        {
+                            Ok(engine) => {
+                                let _ = session
+                                    .commands
+                                    .send(SessionCommand::SetRules(Box::new(engine)))
+                                    .await;
+                                "** config saved; rules reloaded".to_string()
+                            }
+                            Err(err) => {
+                                format!("** config saved, but rules failed to reload: {err:#}")
+                            }
+                        };
+                    state.sessions[index].push_line(text);
+                }
+            }
+        }
+        Err(config::SaveError::Conflict { .. }) => {
+            let at = std::fs::metadata(&editor.file().path)
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    let secs = t
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    format!("{secs}s since epoch")
+                })
+                .unwrap_or_else(|_| "unknown time".to_string());
+            editor.prompt_conflict(&at);
+        }
+        Err(config::SaveError::Vanished { .. }) => editor.prompt_vanished(),
+        Err(err) => editor.set_notice_error(format!("{err}")),
+    }
+}
+
 /// Which field the new-profile wizard is currently collecting, in the
 /// order it asks them (docs/ARCHITECTURE.md §15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1035,6 +1259,9 @@ async fn event_loop(
         show_gmcp: false,
         show_help: false,
         keybinds: keybinds.clone(),
+        config_editor: None,
+        config_editor_save: None,
+        line_cursor: None,
     };
     // A config value wider than this terminal is clamped before the first
     // frame, the same as a `Resize` clamps it later (§11.4).
@@ -1065,7 +1292,17 @@ async fn event_loop(
                     return Ok(());
                 }
                 let area_width = terminal.get_frame().area().width;
-                if handle_key(&mut state, &keybinds, key.code, key.modifiers, area_width) {
+                if handle_key(
+                    &mut state,
+                    &keybinds,
+                    key.code,
+                    key.modifiers,
+                    area_width,
+                    &channels,
+                ) {
+                    if let Some(mode) = state.config_editor_save.take() {
+                        service_config_save(&mut state, &channels, mode).await;
+                    }
                     report_pane_sizes(&mut state, terminal.get_frame().area()).await;
                 } else if key.code == KeyCode::Enter {
                     submit_input(&mut state, &channels).await;
@@ -1158,6 +1395,7 @@ fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
     area_width: u16,
+    channels: &[Channel],
 ) -> bool {
     // An unanswered save-password offer owns `y` and `n`, and nothing else:
     // any other key drops the held password and goes on to the input line,
@@ -1179,6 +1417,56 @@ fn handle_key(
             _ => session.pending_password = None,
         }
     }
+    // The profile editor owns the keyboard while it's open, same as the
+    // help overlay below — but it routes keys into its own state machine
+    // rather than closing on any key (§10.2).
+    if let Some(editor) = state.config_editor.as_mut() {
+        match editor.handle_key(code, modifiers) {
+            ui::config_editor::EditorAction::Consumed => {}
+            ui::config_editor::EditorAction::Close => state.config_editor = None,
+            ui::config_editor::EditorAction::Save { force } => {
+                state.config_editor_save = Some(if force {
+                    config::SaveMode::Overwrite
+                } else {
+                    config::SaveMode::Guarded
+                });
+            }
+        }
+        return true;
+    }
+    // The scrollback line-cursor also owns the keyboard while active: it is
+    // only a few keys (§10.2/§11.5), so they're handled directly here rather
+    // than through a second state-machine type. `back_offset` is kept in
+    // step with the cursor so the highlighted line (drawn in `ui::draw`)
+    // never scrolls out of view — the two count different things in
+    // general (wrapped rows vs. raw scrollback entries), but line-cursor
+    // moves one raw entry at a time, so pinning `back_offset` to the same
+    // number keeps the picked line on screen for the ordinary case of
+    // unwrapped MUD output.
+    if let Some(cursor) = state.line_cursor {
+        let len = state.bound().map_or(0, |s| s.scrollback.len());
+        let new_cursor = match code {
+            KeyCode::Esc => {
+                state.line_cursor = None;
+                return true;
+            }
+            KeyCode::Up => (cursor + 1).min(len.saturating_sub(1)),
+            KeyCode::Down => cursor.saturating_sub(1),
+            KeyCode::PageUp => (cursor + SCROLL_PAGE).min(len.saturating_sub(1)),
+            KeyCode::PageDown => cursor.saturating_sub(SCROLL_PAGE),
+            KeyCode::Enter => {
+                state.line_cursor = None;
+                open_new_trigger_from_line(state, channels, cursor);
+                return true;
+            }
+            _ => cursor,
+        };
+        state.line_cursor = Some(new_cursor);
+        if let Some(session) = state.bound_mut() {
+            session.back_offset = new_cursor;
+        }
+        return true;
+    }
     // While the overlay is up it owns the keyboard: any key dismisses it and
     // goes no further. Typing blind into an input line hidden behind the
     // help is worse than the extra keystroke to reopen it (§11.2).
@@ -1188,6 +1476,26 @@ fn handle_key(
     }
     if keybinds.help.matches(code, modifiers) {
         state.show_help = true;
+        return true;
+    }
+    if keybinds.config_editor.matches(code, modifiers) {
+        open_config_editor(state, channels);
+        return true;
+    }
+    if keybinds.line_picker.matches(code, modifiers) {
+        if let Some(session) = state.bound()
+            && !session.scrollback.is_empty()
+        {
+            // Starts wherever the pane is already scrolled to, rather than
+            // always jumping to the newest line — if you scrolled up to
+            // look at something before reaching for this, that's the line
+            // you meant to pick.
+            state.line_cursor = Some(
+                session
+                    .back_offset
+                    .min(session.scrollback.len().saturating_sub(1)),
+            );
+        }
         return true;
     }
     if keybinds.gmcp_inspector.matches(code, modifiers) {
@@ -1315,6 +1623,10 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         }
         return;
     }
+    if line.trim() == CONFIG_COMMAND {
+        open_config_editor(state, channels);
+        return;
+    }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
 }
 
@@ -1382,6 +1694,9 @@ pub(crate) mod test_support {
                 show_gmcp: false,
                 show_help: false,
                 keybinds: Keybinds::default(),
+                config_editor: None,
+                config_editor_save: None,
+                line_cursor: None,
             },
             receivers,
         )
@@ -2418,7 +2733,7 @@ mod tests {
     fn press(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
         // Wide enough that the channel-width clamp never binds by accident;
         // the tests that care about the ceiling pass their own width.
-        handle_key(state, &Keybinds::default(), code, modifiers, 120)
+        handle_key(state, &Keybinds::default(), code, modifiers, 120, &[])
     }
 
     #[test]
@@ -2479,7 +2794,8 @@ mod tests {
             &keybinds,
             KeyCode::Char('='),
             KeyModifiers::ALT,
-            120
+            120,
+            &[],
         ));
         assert_eq!(state.channel_width, ui::MIN_CHANNEL_WIDTH);
 
@@ -2491,7 +2807,8 @@ mod tests {
             &keybinds,
             KeyCode::Char('-'),
             KeyModifiers::ALT,
-            60
+            60,
+            &[],
         ));
         assert_eq!(state.channel_width, 30);
     }

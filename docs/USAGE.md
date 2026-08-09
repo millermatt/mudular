@@ -522,6 +522,57 @@ restart on the same reasoning.
 Note that this reloads *rules and scripts* only. Changing a profile's
 `host`, `port`, `tls`, or `charset` still needs a restart.
 
+## Editing your profile in the client
+
+`F5`, or typing `/config`, opens a full-screen editor over the profile
+you're connected with — no hand-editing YAML required for day-to-day
+changes. It has a tab per thing a profile holds: **Connection**,
+**Variables**, **Aliases**, **Triggers**, **Timers**, **Modules**.
+`Tab`/`Shift+Tab` (or `1`-`6`) switch tabs, `↑`/`↓` move the selection,
+`a` adds, `e`/`Enter` edits, `d` deletes (with a yes/no confirmation —
+deleting a rule that has fields the editor doesn't expose, like
+`script:` or `send_to:`, says so before it lets you). `Ctrl+S` saves;
+`Esc` closes, asking first if there's anything unsaved.
+
+`enabled`, `gag`, and `bell` aren't simple on/off switches: `Space`
+cycles them through *inherit → yes → no → inherit*, since leaving a rule
+at "inherit" is what lets a shared module's own setting take over (see
+"Sharing rules between characters" above) — turning it into a plain
+checkbox would silently force every rule to `false` the moment you
+touched it.
+
+A rule with fields the editor doesn't have a form for — `send_to:`,
+`set:`, `script:`, `highlight:` — keeps them exactly as written; they're
+shown read-only at the bottom of that rule's edit screen (and flagged
+with a `*` in the list) so you can see they're there rather than have
+them quietly vanish.
+
+Saving reloads every session using that profile immediately, the same as
+`/reload` — except `host`, `port`, `tls`, `charset`, and `login`, which
+only take effect on the next connection; the editor tells you when that's
+the case. Every save also:
+
+- backs up the file it's about to overwrite to
+  `<config dir>/backups/profiles/<name>/<timestamp>.yaml` (the newest 20
+  are kept),
+- writes the new version atomically, so a crash mid-save can't leave a
+  half-written file, and
+- refuses to silently overwrite the file if it changed on disk since you
+  opened the editor (someone hand-editing it at the same time, say),
+  offering to overwrite once you've seen that.
+
+One thing to know: saving rewrites the whole file, so any comments in it
+won't survive — the editor warns you about this the moment it opens a
+profile that has any, and the backup above means the commented original
+is never actually gone.
+
+**Picking a trigger straight out of the scrollback:** `Alt+V` turns on a
+line cursor over the focused pane's scrollback; `↑`/`↓` move it, `Enter`
+opens the editor straight into a new trigger with that line's text —
+escaped so it matches literally — already in the pattern field. Turn it
+into a real pattern (add a capture group, etc.) and save, same as any
+other trigger. `Esc` leaves the line cursor without opening anything.
+
 ## Scripting
 
 YAML covers the common cases; a script covers everything else — anything
@@ -727,6 +778,8 @@ fallback.
 | `Alt+-` / `Alt+=` | Widen / narrow the comms column | `channel_wider` / `channel_narrower` |
 | `PgUp` / `PgDn` | Scroll the focused pane back / forward through its scrollback | — (built in) |
 | `Home` / `End` | Jump to the oldest / newest line in the focused pane | — (built in) |
+| `F5` | Edit this character's profile | `config_editor` |
+| `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 
 `F1` shows this same list inside the client, built from your actual
 config — so it stays right even if you remap something. `/help` prints it
@@ -753,6 +806,8 @@ keybinds:
   channel_wider: "alt+-"
   channel_narrower: "alt+="
   help: f1
+  config_editor: f5
+  line_picker: alt+v
 ```
 
 `history_size:` (default 500) sets how many commands each character

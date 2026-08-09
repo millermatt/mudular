@@ -6,16 +6,17 @@
 //! The scope merge (global → modules → profile) lands in M4; schemas use
 //! `deny_unknown_fields` so typos fail loudly with file context.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::style::Color;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
 
 use crate::engine::script::ScriptSource;
-use crate::engine::{Alias, RuleModule, Timer, Trigger};
+use crate::engine::{Alias, Engine, RuleModule, Timer, Trigger};
 use crate::net::VerifyMode;
 
 /// Where the config dir lives: `--config-dir`, or the platform default.
@@ -35,7 +36,7 @@ pub fn log_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("logs")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     /// Part of the on-disk schema: `deny_unknown_fields` means dropping it
@@ -52,52 +53,61 @@ pub struct Profile {
     /// told apart at a glance rather than by reading their titles
     /// (docs/ARCHITECTURE.md §11). A colour name (`cyan`, `light blue`),
     /// `#rrggbb`, or a 0-255 terminal palette index.
-    #[serde(default, deserialize_with = "parse_color")]
+    #[serde(
+        default,
+        deserialize_with = "parse_color",
+        serialize_with = "write_color",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub color: Option<Color>,
     /// Answers the server's opening name/password prompts (§10). There is
     /// deliberately no `password:` field: `deny_unknown_fields` turns an
     /// attempt to put one here into a load error naming it, which is a
     /// better answer than quietly accepting a secret into a plaintext file.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<Login>,
     /// Shared rule modules, applied in order (scope layer 2).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<String>,
     /// Profile-local overrides (scope layer 3).
-    #[serde(default)]
-    pub variables: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variables: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<Alias>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<Trigger>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timers: Vec<Timer>,
     /// Profile-local scripts, loaded from beside the profile file (§7.4).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scripts: Vec<String>,
     /// Overrides the install-wide `cross_session` block for this character
     /// (docs/ARCHITECTURE.md §7.5). Receiver-side by design: only the
     /// profile whose aliases would run can opt into running them.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_session: Option<CrossSessionOverride>,
     /// Appends this character's scrollback to `<config dir>/logs/<name>.log`
     /// (§8, §12). Off by default: a transcript is something a player opts
     /// into per character, not a standing side effect of connecting.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub log: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// Auto-login settings. The password lives in the OS keyring, not here
 /// (docs/ARCHITECTURE.md §13); store it with `mudular --set-password`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Login {
     /// The character name to send at the name prompt.
     pub name: String,
     /// Overrides for MUDs whose prompts the defaults don't recognise.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_prompt: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_prompt: Option<String>,
 }
 
@@ -196,12 +206,12 @@ fn default_max_hops() -> u8 {
 }
 
 /// The same block with every field optional, for the per-profile override.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CrossSessionOverride {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expand_aliases: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_hops: Option<u8>,
 }
 
@@ -237,7 +247,7 @@ pub struct Channel {
     pub session: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsSettings {
     #[serde(default)]
@@ -262,6 +272,21 @@ where
             "unknown color {name:?}: use a name (cyan, light blue), #rrggbb, or 0-255"
         ))
     })
+}
+
+/// The inverse of `parse_color`: writes back through `Color`'s `Display`
+/// impl (`Cyan`, `#ff0000`, `12`), which `Color::from_str` accepts, so a
+/// saved profile loads back to the same colour. Not derived through
+/// ratatui's own `serde` feature — pulling in a whole extra feature for one
+/// field's write side isn't worth it next to twenty lines here.
+fn write_color<S>(color: &Option<Color>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match color {
+        Some(color) => serializer.serialize_str(&color.to_string()),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn default_charset() -> String {
@@ -357,6 +382,13 @@ pub struct Keybinds {
     /// Opens the help overlay listing every binding (§11.2).
     #[serde(default = "default_help")]
     pub help: KeyBinding,
+    /// Opens the in-client profile editor (§10.2).
+    #[serde(default = "default_config_editor")]
+    pub config_editor: KeyBinding,
+    /// Enters the scrollback line-cursor, to turn a line into a new
+    /// trigger's starting pattern (§10.2, §11.5).
+    #[serde(default = "default_line_picker")]
+    pub line_picker: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -370,6 +402,8 @@ impl Default for Keybinds {
             channel_wider: default_channel_wider(),
             channel_narrower: default_channel_narrower(),
             help: default_help(),
+            config_editor: default_config_editor(),
+            line_picker: default_line_picker(),
         }
     }
 }
@@ -414,6 +448,17 @@ fn default_quit() -> KeyBinding {
 
 fn default_gmcp_inspector() -> KeyBinding {
     "f2".parse().expect("built-in default keybinding")
+}
+
+fn default_config_editor() -> KeyBinding {
+    // Next free key in the F1 help / F2 GMCP / F3 layout / F4 channels row.
+    "f5".parse().expect("built-in default keybinding")
+}
+
+fn default_line_picker() -> KeyBinding {
+    // Alt keeps it clear of ordinary typing — a bare `v` would swallow the
+    // letter itself out of every command line.
+    "alt+v".parse().expect("built-in default keybinding")
 }
 
 /// A single key combination, parsed from strings like `ctrl+c` or `f1`.
@@ -546,39 +591,313 @@ pub struct NewProfile {
 }
 
 /// Writes a wizard-built profile to disk, creating `profiles/` if this is
-/// the first one. A small purpose-built shape rather than reusing
-/// `Profile` (which only derives `Deserialize` — nothing in the schema
-/// needs to round-trip) serialized through `serde_yaml`, so a host or name
-/// with YAML-special characters comes out correctly quoted rather than
-/// hand-formatted and hoping.
+/// the first one. Builds a real `Profile` with everything past
+/// name/host/port/TLS left at its schema default, and serializes that
+/// (rather than a hand-formatted string) so a host or name with
+/// YAML-special characters comes out correctly quoted. Goes through
+/// `atomic_write` like every other profile write, though there is nothing
+/// to conflict with yet — this is always a brand-new file.
 pub fn save_new_profile(dir: &Path, profile: &NewProfile) -> Result<()> {
-    #[derive(serde::Serialize)]
-    struct Tls {
-        enabled: bool,
-    }
-    #[derive(serde::Serialize)]
-    struct OnDisk<'a> {
-        name: &'a str,
-        host: &'a str,
-        port: u16,
-        tls: Tls,
+    let full = Profile {
+        name: profile.name.clone(),
+        host: profile.host.clone(),
+        port: profile.port,
+        tls: TlsSettings {
+            enabled: profile.tls,
+            verify: VerifyMode::default(),
+        },
+        charset: default_charset(),
+        color: None,
+        login: None,
+        modules: Vec::new(),
+        variables: BTreeMap::new(),
+        aliases: Vec::new(),
+        triggers: Vec::new(),
+        timers: Vec::new(),
+        scripts: Vec::new(),
+        cross_session: None,
+        log: false,
+    };
+    let path = profile_path(dir, &profile.name);
+    let yaml = serde_yaml::to_string(&full).context("serializing the new profile")?;
+    atomic_write(&path, yaml.as_bytes())?;
+    Ok(())
+}
+
+/// A loaded profile plus the digest of the exact bytes it came from, so a
+/// later `save_profile` can tell whether the file changed on disk in the
+/// meantime (docs/ARCHITECTURE.md §10.2) — an in-client editor is open for
+/// as long as a player is looking at it, which is long enough for a
+/// hand-edit or another mudular process to land underneath it.
+pub struct ProfileFile {
+    pub path: PathBuf,
+    pub profile: Profile,
+    digest: [u8; 32],
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+
+/// Reads and parses a profile, keeping the digest `save_profile` needs.
+/// `load_profile` (the connect-path loader) stays separate: it doesn't need
+/// the bookkeeping, and reusing it here would mean reading the file twice.
+pub fn load_profile_file(path: &Path) -> Result<ProfileFile> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading profile {}", path.display()))?;
+    let profile: Profile = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing profile {}", path.display()))?;
+    Ok(ProfileFile {
+        path: path.to_path_buf(),
+        profile,
+        digest: sha256(text.as_bytes()),
+    })
+}
+
+#[derive(Debug, Error)]
+pub enum SaveError {
+    #[error("{} changed on disk since it was opened here", .path.display())]
+    Conflict { path: PathBuf },
+    #[error("{} no longer exists", .path.display())]
+    Vanished { path: PathBuf },
+    #[error("serializing the profile: {0}")]
+    Serialize(#[source] serde_yaml::Error),
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+fn io_error(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> SaveError {
+    let context = context.into();
+    move |source| SaveError::Io { context, source }
+}
+
+/// Whether a save must first check the file hasn't moved since it was
+/// loaded (`Guarded`, the normal path) or has already been confirmed by the
+/// player and should proceed regardless (`Overwrite`, after a `Conflict`/
+/// `Vanished` prompt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveMode {
+    Guarded,
+    Overwrite,
+}
+
+#[derive(Debug)]
+pub struct Saved {
+    /// Where the pre-save version of the file was copied, if there was one
+    /// to copy (a brand-new profile has nothing to back up).
+    pub backup: Option<PathBuf>,
+}
+
+/// The newest backups kept per profile before older ones are pruned —
+/// enough to recover from "I broke it earlier this session" without
+/// backups accumulating forever.
+const PROFILE_BACKUPS_KEPT: usize = 20;
+
+/// Saves an edited profile back to `file.path`, safely (docs/ARCHITECTURE.md
+/// §10.2): the previous version is backed up before anything is
+/// overwritten, the write itself is atomic (temp file + rename, so a crash
+/// mid-write never leaves a truncated file), and — under `SaveMode::Guarded`
+/// — a file that changed since it was loaded is reported rather than
+/// clobbered. `file` is updated in place on success so a second save in the
+/// same editor session compares against what was *just* written, not the
+/// original load.
+pub fn save_profile(
+    file: &mut ProfileFile,
+    profile: &Profile,
+    mode: SaveMode,
+) -> std::result::Result<Saved, SaveError> {
+    let on_disk = std::fs::read(&file.path);
+    let previous_bytes = match (&on_disk, mode) {
+        (Ok(bytes), SaveMode::Guarded) => {
+            if sha256(bytes) != file.digest {
+                return Err(SaveError::Conflict {
+                    path: file.path.clone(),
+                });
+            }
+            Some(bytes.clone())
+        }
+        (Ok(bytes), SaveMode::Overwrite) => Some(bytes.clone()),
+        (Err(err), SaveMode::Guarded) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SaveError::Vanished {
+                path: file.path.clone(),
+            });
+        }
+        (Err(_), SaveMode::Overwrite) => None,
+        (Err(err), SaveMode::Guarded) => {
+            return Err(io_error(format!("reading {}", file.path.display()))(
+                std::io::Error::new(err.kind(), err.to_string()),
+            ));
+        }
+    };
+
+    let yaml = serde_yaml::to_string(profile).map_err(SaveError::Serialize)?;
+
+    // Back up before touching the target, so the window in which neither
+    // the backup nor the new file exists is zero.
+    let backup = previous_bytes
+        .map(|bytes| write_backup(&file.path, &bytes))
+        .transpose()?;
+
+    atomic_write(&file.path, yaml.as_bytes())?;
+
+    if let Err(err) = prune_backups(&file.path) {
+        tracing::warn!(
+            "could not prune old backups for {}: {err:#}",
+            file.path.display()
+        );
     }
 
-    let path = profile_path(dir, &profile.name);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+    file.digest = sha256(yaml.as_bytes());
+    file.profile = profile.clone();
+
+    Ok(Saved { backup })
+}
+
+/// Writes `bytes` to `path` via a same-directory temp file, `fsync`, then
+/// `rename` — the rename is what makes the write atomic (a reader never
+/// observes a partial file), and same-directory is what makes the rename
+/// itself atomic (rename is only guaranteed atomic within one filesystem).
+/// The parent directory is `fsync`'d too on Unix, since that is the step
+/// that makes the rename durable across a crash, not just the bytes.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::result::Result<(), SaveError> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(io_error(format!("creating {}", dir.display())))?;
+
+    let tmp_name = format!(
+        ".{}.tmp{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("profile"),
+        std::process::id()
+    );
+    let tmp = dir.join(tmp_name);
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(source) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SaveError::Io {
+            context: format!("writing {}", tmp.display()),
+            source,
+        });
     }
-    let yaml = serde_yaml::to_string(&OnDisk {
-        name: &profile.name,
-        host: &profile.host,
-        port: profile.port,
-        tls: Tls {
-            enabled: profile.tls,
-        },
-    })
-    .context("serializing the new profile")?;
-    std::fs::write(&path, yaml).with_context(|| format!("writing {}", path.display()))
+
+    if let Err(source) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SaveError::Io {
+            context: format!("renaming {} to {}", tmp.display(), path.display()),
+            source,
+        });
+    }
+
+    #[cfg(unix)]
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+
+    Ok(())
+}
+
+/// `<config dir>/backups/profiles/<name>/` — a top-level `backups/` dir
+/// rather than nesting inside `profiles/` (§10 documents `profiles/*.yaml`
+/// as one file per character; a subdirectory living inside that namespace
+/// is a foreign object anything that globs it would have to learn to
+/// skip). Returns `None` for a path that doesn't look like
+/// `<dir>/profiles/<name>.yaml` — nothing calls this any other way, but a
+/// `None` is a safer failure than guessing a location.
+fn backup_dir_for(profile_path: &Path) -> Option<PathBuf> {
+    let profiles_dir = profile_path.parent()?;
+    let config_dir = profiles_dir.parent()?;
+    let name = profile_path.file_stem()?.to_str()?;
+    Some(config_dir.join("backups").join("profiles").join(name))
+}
+
+fn write_backup(profile_path: &Path, bytes: &[u8]) -> std::result::Result<PathBuf, SaveError> {
+    let dir = backup_dir_for(profile_path)
+        .unwrap_or_else(|| profile_path.with_extension("backups").join("profiles"));
+    std::fs::create_dir_all(&dir).map_err(io_error(format!("creating {}", dir.display())))?;
+
+    let stamp = utc_stamp(std::time::SystemTime::now());
+    let mut path = dir.join(format!("{stamp}.yaml"));
+    let mut suffix = 2;
+    while path.exists() {
+        path = dir.join(format!("{stamp}-{suffix}.yaml"));
+        suffix += 1;
+    }
+
+    std::fs::write(&path, bytes).map_err(io_error(format!("writing {}", path.display())))?;
+    Ok(path)
+}
+
+/// Deletes all but the newest [`PROFILE_BACKUPS_KEPT`] backups. Best-effort
+/// by design: a prune failure is logged and never fails a save that has
+/// already succeeded (`save_profile` above).
+fn prune_backups(profile_path: &Path) -> Result<()> {
+    let Some(dir) = backup_dir_for(profile_path) else {
+        return Ok(());
+    };
+    let mut backups: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", dir.display())),
+    };
+    // Fixed-width UTC stamps sort lexicographically in chronological order.
+    backups.sort();
+    if backups.len() > PROFILE_BACKUPS_KEPT {
+        for old in &backups[..backups.len() - PROFILE_BACKUPS_KEPT] {
+            std::fs::remove_file(old).with_context(|| format!("removing {}", old.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// A dependency-free `YYYYMMDDTHHMMSSZ` UTC timestamp. Fixed-width so
+/// lexicographic order equals chronological order, which backup pruning
+/// and "which is newest" both depend on — worth the ~20 lines below over
+/// pulling in a date/time crate for one function.
+fn utc_stamp(time: std::time::SystemTime) -> String {
+    let secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86_400) as i64;
+    let time_of_day = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+/// Howard Hinnant's `civil_from_days`: days since the Unix epoch to a
+/// proleptic-Gregorian (year, month, day), valid for any date this client
+/// will ever save a backup on.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
 }
 
 pub fn load_module(path: &Path) -> Result<RuleModule> {
@@ -648,22 +967,67 @@ pub fn load_rules(
             );
         }
 
-        layers.push(RuleModule {
-            name: format!("profile `{name}`"),
-            description: None,
-            variables: profile.variables,
-            aliases: profile.aliases,
-            triggers: profile.triggers,
-            timers: profile.timers,
-            script_sources: load_scripts(&path, &profile.scripts)?,
-            scripts: profile.scripts,
-        });
+        layers.push(profile_layer(name, &path, &profile)?);
     }
 
     for layer in &mut layers {
         apply_channel_defaults(layer, channels)?;
     }
     Ok(layers)
+}
+
+/// Turns a profile's own inline rules into the scope layer §7.3 calls
+/// "profile overrides" — shared by the connect-path loader above and
+/// `validate_profile_rules`, which runs the same construction over an
+/// in-editor draft that may not (yet) be the file on disk.
+fn profile_layer(name: &str, path: &Path, profile: &Profile) -> Result<RuleModule> {
+    Ok(RuleModule {
+        name: format!("profile `{name}`"),
+        description: None,
+        variables: profile.variables.clone(),
+        aliases: profile.aliases.clone(),
+        triggers: profile.triggers.clone(),
+        timers: profile.timers.clone(),
+        script_sources: load_scripts(path, &profile.scripts)?,
+        scripts: profile.scripts.clone(),
+    })
+}
+
+/// Checks that a profile's aliases/triggers/timers would compile — the
+/// same construction `load_rules` uses (global layer, then the profile's
+/// declared modules, then its own rules), run against `draft` rather than
+/// whatever is on disk. Used by the in-client profile editor (§10.2) before
+/// every save, so "valid" can never drift from what the session itself
+/// would load: a second, editor-only validator would be wrong in exactly
+/// the cases that matter.
+pub fn validate_profile_rules(
+    dir: &Path,
+    name: &str,
+    draft: &Profile,
+    channels: &[Channel],
+) -> Result<()> {
+    let mut layers = vec![channel_module(channels, Some(name))];
+
+    let global = dir.join("global.yaml");
+    if global.exists() {
+        layers.push(load_module(&global)?);
+    }
+
+    for module in &draft.modules {
+        let module_path = dir.join("modules").join(format!("{module}.yaml"));
+        layers.push(
+            load_module(&module_path)
+                .with_context(|| format!("module `{module}` listed in profile `{name}`"))?,
+        );
+    }
+
+    layers.push(profile_layer(name, &profile_path(dir, name), draft)?);
+
+    for layer in &mut layers {
+        apply_channel_defaults(layer, channels)?;
+    }
+    Engine::compile(&layers)?;
+    Ok(())
 }
 
 /// Compiles the channels' `match:` sugar into ordinary route triggers
@@ -1447,5 +1811,334 @@ triggers:
             std::fs::read_to_string(dir.join(DECLINED_FILE)).unwrap(),
             "kestrel\ntank\n"
         );
+    }
+
+    // ---- in-client profile editor safe save (§10.2) ----
+
+    fn minimal_profile(name: &str, host: &str) -> Profile {
+        Profile {
+            name: name.to_string(),
+            host: host.to_string(),
+            port: 4000,
+            tls: TlsSettings::default(),
+            charset: default_charset(),
+            color: None,
+            login: None,
+            modules: Vec::new(),
+            variables: BTreeMap::new(),
+            aliases: Vec::new(),
+            triggers: Vec::new(),
+            timers: Vec::new(),
+            scripts: Vec::new(),
+            cross_session: None,
+            log: false,
+        }
+    }
+
+    #[test]
+    fn utc_stamp_matches_known_instants() {
+        assert_eq!(utc_stamp(std::time::UNIX_EPOCH), "19700101T000000Z");
+        // A leap day.
+        assert_eq!(
+            utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_709_164_800)),
+            "20240229T000000Z"
+        );
+        // A year boundary, well into the hour/minute/second fields too.
+        assert_eq!(
+            utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_735_689_599)),
+            "20241231T235959Z"
+        );
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_partial_file() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        atomic_write(&path, b"host: h\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "host: h\n");
+        let leftover = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover, "no temp file should survive a successful write");
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_its_temp_file_on_a_write_failure() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        // A directory where the target file should be turns "create the temp
+        // file" into an error, exercising the cleanup path.
+        let profiles_dir = dir.path().join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        let bad_target = profiles_dir.join("kestrel.yaml");
+        std::fs::create_dir_all(&bad_target).unwrap();
+
+        let err = atomic_write(&bad_target, b"host: h\n").unwrap_err();
+        assert!(matches!(err, SaveError::Io { .. }));
+        let leftover = std::fs::read_dir(&profiles_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(
+            !leftover,
+            "a failed write must not leave its temp file behind"
+        );
+    }
+
+    #[test]
+    fn save_creates_a_timestamped_backup_of_the_previous_version() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        let first = minimal_profile("kestrel", "first.example.org");
+        atomic_write(&path, serde_yaml::to_string(&first).unwrap().as_bytes()).unwrap();
+
+        let mut file = load_profile_file(&path).unwrap();
+        assert!(
+            std::fs::read_dir(dir.path().join("backups")).is_err(),
+            "nothing to back up yet"
+        );
+
+        let second = minimal_profile("kestrel", "second.example.org");
+        let saved = save_profile(&mut file, &second, SaveMode::Guarded).unwrap();
+        let backup = saved.backup.expect("a previous version existed");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            serde_yaml::to_string(&first).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            serde_yaml::to_string(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn prune_keeps_only_the_newest_backups() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        let backup_dir = backup_dir_for(&path).unwrap();
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        for day in 1..=25u32 {
+            std::fs::write(
+                backup_dir.join(format!("202401{day:02}T000000Z.yaml")),
+                b"x",
+            )
+            .unwrap();
+        }
+
+        prune_backups(&path).unwrap();
+
+        let mut remaining: Vec<String> = std::fs::read_dir(&backup_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining.len(), PROFILE_BACKUPS_KEPT);
+        assert_eq!(
+            remaining[0], "20240106T000000Z.yaml",
+            "the oldest 5 were pruned"
+        );
+        assert_eq!(remaining[remaining.len() - 1], "20240125T000000Z.yaml");
+    }
+
+    #[test]
+    fn conflict_is_detected_when_the_file_changed_on_disk() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        let original = minimal_profile("kestrel", "original.example.org");
+        atomic_write(&path, serde_yaml::to_string(&original).unwrap().as_bytes()).unwrap();
+        let mut file = load_profile_file(&path).unwrap();
+
+        // A digest catches this regardless of whether the byte count
+        // happens to match, unlike a size-only or mtime-only check.
+        let interloper = minimal_profile("kestrel", "sneaky.example.org");
+        std::fs::write(&path, serde_yaml::to_string(&interloper).unwrap()).unwrap();
+
+        let edit = minimal_profile("kestrel", "edited.example.org");
+        let err = save_profile(&mut file, &edit, SaveMode::Guarded).unwrap_err();
+        assert!(matches!(err, SaveError::Conflict { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            serde_yaml::to_string(&interloper).unwrap(),
+            "a rejected save must not touch the file"
+        );
+    }
+
+    #[test]
+    fn overwrite_mode_ignores_the_conflict_but_still_backs_up_the_interloper() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        let original = minimal_profile("kestrel", "original.example.org");
+        atomic_write(&path, serde_yaml::to_string(&original).unwrap().as_bytes()).unwrap();
+        let mut file = load_profile_file(&path).unwrap();
+
+        let interloper = minimal_profile("kestrel", "sneaky.example.org");
+        std::fs::write(&path, serde_yaml::to_string(&interloper).unwrap()).unwrap();
+
+        let edit = minimal_profile("kestrel", "edited.example.org");
+        let saved = save_profile(&mut file, &edit, SaveMode::Overwrite).unwrap();
+        let backup = saved
+            .backup
+            .expect("the interloper's version gets backed up");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            serde_yaml::to_string(&interloper).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            serde_yaml::to_string(&edit).unwrap()
+        );
+    }
+
+    #[test]
+    fn two_saves_in_one_editor_session_do_not_self_conflict() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        let original = minimal_profile("kestrel", "one.example.org");
+        atomic_write(&path, serde_yaml::to_string(&original).unwrap().as_bytes()).unwrap();
+        let mut file = load_profile_file(&path).unwrap();
+
+        let edit1 = minimal_profile("kestrel", "two.example.org");
+        save_profile(&mut file, &edit1, SaveMode::Guarded).unwrap();
+        let edit2 = minimal_profile("kestrel", "three.example.org");
+        save_profile(&mut file, &edit2, SaveMode::Guarded).unwrap();
+    }
+
+    #[test]
+    fn missing_file_reports_vanished() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        let original = minimal_profile("kestrel", "one.example.org");
+        atomic_write(&path, serde_yaml::to_string(&original).unwrap().as_bytes()).unwrap();
+        let mut file = load_profile_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let edit = minimal_profile("kestrel", "two.example.org");
+        let err = save_profile(&mut file, &edit, SaveMode::Guarded).unwrap_err();
+        assert!(matches!(err, SaveError::Vanished { .. }));
+    }
+
+    #[test]
+    fn unchanged_profile_saves_are_byte_identical() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        let mut profile = minimal_profile("kestrel", "h.example.org");
+        profile
+            .variables
+            .insert("target".to_string(), "rat".to_string());
+        profile
+            .variables
+            .insert("mode".to_string(), "aggro".to_string());
+        atomic_write(&path, serde_yaml::to_string(&profile).unwrap().as_bytes()).unwrap();
+
+        let mut file = load_profile_file(&path).unwrap();
+        save_profile(&mut file, &profile, SaveMode::Guarded).unwrap();
+        let first_save = std::fs::read_to_string(&path).unwrap();
+        save_profile(&mut file, &profile, SaveMode::Guarded).unwrap();
+        let second_save = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first_save, second_save);
+    }
+
+    #[test]
+    fn round_trips_a_profile_with_every_field_type() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("profiles").join("kestrel.yaml");
+        let mut profile = minimal_profile("kestrel", "underworld.example.org");
+        profile.tls = TlsSettings {
+            enabled: true,
+            verify: crate::net::VerifyMode::Pinned,
+        };
+        profile.color = Some(ratatui::style::Color::Cyan);
+        profile.login = Some(Login {
+            name: "Kestrel".to_string(),
+            name_prompt: Some(r"Name:\s*$".to_string()),
+            password_prompt: None,
+        });
+        profile.modules = vec!["uw-common".to_string()];
+        profile
+            .variables
+            .insert("target".to_string(), "rat".to_string());
+        profile.cross_session = Some(CrossSessionOverride {
+            expand_aliases: Some(true),
+            max_hops: None,
+        });
+        profile.scripts = vec!["combat.lua".to_string()];
+        profile.log = true;
+
+        let mut alias = Alias {
+            id: Some("quicklook".to_string()),
+            pattern: Some("^ll$".to_string()),
+            send: Some(vec!["look".to_string()]),
+            ..Default::default()
+        };
+        let mut send_to = BTreeMap::new();
+        send_to.insert("cleric".to_string(), vec!["heal".to_string()]);
+        alias.send_to = Some(send_to);
+        let mut set = BTreeMap::new();
+        set.insert("last".to_string(), "look".to_string());
+        alias.set = Some(set);
+        alias.script = Some(crate::engine::ScriptAction {
+            file: "combat.lua".to_string(),
+            function: "on_look".to_string(),
+        });
+        alias.when = Some("${target} != \"\"".to_string());
+        profile.aliases = vec![alias];
+
+        let trigger = Trigger {
+            id: Some("greet".to_string()),
+            pattern: Some(r"^(?P<who>\w+) has arrived\.$".to_string()),
+            send: Some(vec!["say welcome ${who}".to_string()]),
+            gag: Some(false),
+            route: Some("chat".to_string()),
+            bell: Some(true),
+            highlight: Some(crate::engine::HighlightSpec {
+                fg: Some("red".to_string()),
+                bold: true,
+                whole_line: true,
+                ..Default::default()
+            }),
+            enabled: None,
+            ..Default::default()
+        };
+        profile.triggers = vec![trigger];
+
+        let timer = Timer {
+            id: Some("tick".to_string()),
+            every: Some("60s".to_string()),
+            set: Some(BTreeMap::from([("ticks".to_string(), "0".to_string())])),
+            ..Default::default()
+        };
+        profile.timers = vec![timer];
+
+        atomic_write(&path, serde_yaml::to_string(&profile).unwrap().as_bytes()).unwrap();
+        let reloaded = load_profile(&path).unwrap();
+        assert_eq!(reloaded, profile);
+
+        // The editor's own output must re-parse through the real,
+        // `deny_unknown_fields` loader without complaint.
+        let mut file = load_profile_file(&path).unwrap();
+        save_profile(&mut file, &profile, SaveMode::Guarded).unwrap();
+        let reloaded_again = load_profile(&path).unwrap();
+        assert_eq!(reloaded_again, profile);
+    }
+
+    #[test]
+    fn unset_options_are_omitted_not_nulled() {
+        let profile = minimal_profile("kestrel", "h.example.org");
+        let yaml = serde_yaml::to_string(&profile).unwrap();
+        assert!(!yaml.contains("color"));
+        assert!(!yaml.contains("login"));
+        assert!(!yaml.contains("cross_session"));
+
+        let trigger = Trigger {
+            id: Some("x".to_string()),
+            pattern: Some("x".to_string()),
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&trigger).unwrap();
+        assert!(yaml.contains("enabled: false"), "{yaml}");
+        assert!(!yaml.contains("gag"));
+        assert!(!yaml.contains("when"));
     }
 }
