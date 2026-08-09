@@ -104,12 +104,15 @@ async fn main() -> Result<()> {
     // line and no profile saved yet, so there is nothing this launch could
     // possibly connect to without either a form or a text editor.
     if cli.profiles.is_empty() && cli.host.is_none() && !config::has_profiles(&dir) {
-        match app::run_new_profile_wizard().await? {
-            Some(new_profile) => {
-                config::save_new_profile(&dir, &new_profile)?;
-                cli.profiles = vec![new_profile.name];
-            }
-            None => return Ok(()),
+        // Esc backs out of the form without saving or connecting
+        // (docs/USAGE.md) — not out of the whole client. `cli.profiles`
+        // stays empty on `None`, so this falls through to the same
+        // "no target" shell §15 shows once a profile already exists and
+        // `mudular` is run bare, rather than exiting the process with
+        // nothing said.
+        if let Some(new_profile) = app::run_new_profile_wizard().await? {
+            config::save_new_profile(&dir, &new_profile)?;
+            cli.profiles = vec![new_profile.name];
         }
     }
 
