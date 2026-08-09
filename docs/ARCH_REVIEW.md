@@ -47,14 +47,25 @@ pre-parsed retained lines — which entangles it with the next finding.
 
 > **Fixed.** `src/scrollback.rs` now holds `RetainedLine { text, at,
 > origin }`, and both panes store it. `push_line` takes one, so every call
-> site states who wrote the line — `Server`, `Client`, `Echo`, or
+> site states who wrote the line — `Server`, `Client`, `Rule`, `Echo`, or
 > `Session(name)` — rather than leaving it to whether someone remembered to
-> type `**`. The channel timestamp and `[character]` tag are no longer
-> spliced into the text: `ui::draw_channel` composes them from `at` and
-> `origin` at render time, so a routed line stores what the MUD sent. Screen
-> output is unchanged. §8 now specifies the type; what it unblocks is
-> unblocked, not built — `/errors` (finding D) and search are still their
-> own work, but neither has to parse a rendered string to get there.
+> type `**`. `SessionEvent::Line` carries the origin as well, since a
+> trigger's echo, an auto-login notice and an injected command all reach a
+> pane by the same event as server text; tagging only at the hub would have
+> recorded all three as things the MUD said. The channel timestamp and
+> `[character]` tag are no longer spliced into the text: `ui::draw_channel`
+> composes them from `at` and `origin` at render time, so a routed line
+> stores what the MUD sent. Screen output is unchanged.
+>
+> §8 now specifies the type. What it unblocks is unblocked, not built —
+> `/errors` (finding D) and search are still their own work. Two of this
+> finding's three named gaps remain open, and neither is closed by the type
+> alone: **which rule fired** needs the engine to report it through
+> `LineOutcome` (`Origin::Rule` is the seam, and today carries no id), and
+> **per-line identity** for the screen-reader diff would be a sequence
+> number this does not yet assign. Search also still re-strips ANSI per
+> keystroke — a cached plain projection is a field behind the same funnel,
+> deliberately not added ahead of the feature that needs it.
 
 Scrollback is `VecDeque<String>` (`SessionPane.scrollback`,
 `ChannelPane.lines`). By the time a line arrives there it has been

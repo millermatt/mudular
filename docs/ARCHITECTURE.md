@@ -806,10 +806,15 @@ home; .2s1w → whatever `home` sends, then s, s, w
   `scrollback_size` setting in `mudular.yaml` (a `usize`, 10,000 default,
   no file persistence), the same shape as `history_size` (§11.3).
 - A `RetainedLine` (`src/scrollback.rs`) is `text` plus `at` (local arrival
-  time) and `origin` — `Server`, `Client` (the client's own notices),
-  `Echo` (a command echoed back as it was sent), or `Session(name)` (a
-  cross-session `echo_to`, §7.5, or a channel route naming the character it
-  arrived in). `text` is the line as it should read — server ANSI with
+  time) and `origin` — `Server`, `Client` (the client's own notices and
+  warnings), `Rule` (the player's automation: a trigger's `echo:`, a
+  `mud.echo()`, a timer, `on_connect`), `Echo` (a command echoed back as it
+  was sent), or `Session(name)` (a cross-session `echo_to`, §7.5, an
+  injected command's local echo, or a channel route naming the character it
+  arrived in). `SessionEvent::Line` carries the origin too: a trigger echo,
+  an auto-login notice and an injected command all reach a pane by the same
+  event as server text, so the session states which it is rather than
+  leaving `app` to assume. `text` is the line as it should read — server ANSI with
   `highlight:` splices already applied (§7.7) — and carries nothing a pane's
   own layout can add back at render time: a channel pane's `HH:MM:SS` and
   `[character]` tag are composed by `ui::draw_channel` from `at` and

@@ -33,9 +33,7 @@ impl LineAssembler {
         let mut events = Vec::new();
         while let Some(idx) = self.pending.find('\n') {
             let line: String = self.pending.drain(..=idx).collect();
-            events.push(SessionEvent::Line(
-                line.trim_end_matches(['\r', '\n']).to_string(),
-            ));
+            events.push(SessionEvent::server(line.trim_end_matches(['\r', '\n'])));
         }
         events.push(SessionEvent::Prompt(self.current_prompt()));
         events
@@ -176,7 +174,7 @@ mod tests {
         events
             .iter()
             .filter_map(|ev| match ev {
-                SessionEvent::Line(line) => Some(line.as_str()),
+                SessionEvent::Line { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect()

@@ -594,9 +594,9 @@ fn apply_session_event(
     }
 
     match ev {
-        SessionEvent::Line(line) => {
+        SessionEvent::Line { text, origin } => {
             let session = &mut state.sessions[index];
-            session.push_line(RetainedLine::server(line));
+            session.push_line(RetainedLine::with_origin(text, origin));
             if !focused {
                 session.unread += 1;
             }
@@ -1749,7 +1749,7 @@ mod tests {
     #[tokio::test]
     async fn a_pane_records_who_wrote_each_line() {
         let (mut state, _rx) = app(&["tank"]);
-        apply_session_event(&mut state, 0, SessionEvent::Line("You see a rat.".into()));
+        apply_session_event(&mut state, 0, SessionEvent::server("You see a rat."));
         state.sessions[0].input = Input::default().with_value("kill rat".into());
         submit_input(&mut state, &[]).await;
         apply_session_event(&mut state, 0, SessionEvent::Ended("host went away".into()));
@@ -1854,11 +1854,7 @@ mod tests {
         assert!(state.is_focused(0));
         assert!(!wants_bell(&state, 0, &SessionEvent::Bell));
         assert!(wants_bell(&state, 1, &SessionEvent::Bell));
-        assert!(!wants_bell(
-            &state,
-            1,
-            &SessionEvent::Line("hi".to_string())
-        ));
+        assert!(!wants_bell(&state, 1, &SessionEvent::server("hi")));
     }
 
     /// A password typed while the server is echoing must not be written to
@@ -2006,7 +2002,7 @@ mod tests {
     fn no_session_state_leaks_into_another_pane() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
 
-        apply_session_event(&mut state, 0, SessionEvent::Line("tank sees this".into()));
+        apply_session_event(&mut state, 0, SessionEvent::server("tank sees this"));
         apply_session_event(&mut state, 0, SessionEvent::Prompt("HP:100>".into()));
         apply_session_event(&mut state, 0, SessionEvent::EchoMask(true));
         apply_session_event(
@@ -2017,7 +2013,7 @@ mod tests {
                 payload: None,
             },
         );
-        apply_session_event(&mut state, 1, SessionEvent::Line("cleric sees this".into()));
+        apply_session_event(&mut state, 1, SessionEvent::server("cleric sees this"));
 
         assert_eq!(scrollback(&state.sessions[0]), "tank sees this");
         assert_eq!(scrollback(&state.sessions[1]), "cleric sees this");
@@ -2060,9 +2056,9 @@ mod tests {
     fn unfocused_sessions_count_unread_lines_until_focused() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
 
-        apply_session_event(&mut state, 1, SessionEvent::Line("a tell arrives".into()));
-        apply_session_event(&mut state, 1, SessionEvent::Line("and another".into()));
-        apply_session_event(&mut state, 0, SessionEvent::Line("focused output".into()));
+        apply_session_event(&mut state, 1, SessionEvent::server("a tell arrives"));
+        apply_session_event(&mut state, 1, SessionEvent::server("and another"));
+        apply_session_event(&mut state, 0, SessionEvent::server("focused output"));
 
         assert_eq!(state.sessions[1].unread, 2);
         assert_eq!(state.sessions[0].unread, 0, "the focused pane is read");
@@ -3134,7 +3130,7 @@ mod tests {
         let offset_before = state.sessions[0].back_offset;
         assert_ne!(offset_before, 0);
 
-        apply_session_event(&mut state, 0, SessionEvent::Line("more output".into()));
+        apply_session_event(&mut state, 0, SessionEvent::server("more output"));
 
         assert_eq!(
             state.sessions[0].back_offset, offset_before,
@@ -3149,7 +3145,7 @@ mod tests {
         let (mut state, _rx) = app(&["tank"]);
         assert_eq!(state.sessions[0].back_offset, 0);
 
-        apply_session_event(&mut state, 0, SessionEvent::Line("more output".into()));
+        apply_session_event(&mut state, 0, SessionEvent::server("more output"));
 
         assert_eq!(state.sessions[0].back_offset, 0);
     }

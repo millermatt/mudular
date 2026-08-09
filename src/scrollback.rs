@@ -32,6 +32,14 @@ pub enum Origin {
     Server,
     /// The client generated it: warnings, confirmations, the help overlay.
     Client,
+    /// The player's own automation said it — a trigger's `echo:`, a
+    /// `mud.echo()` from a script, a timer, `on_connect` (§7.1, §7.4).
+    /// Distinct from `Client` because the two answer different questions:
+    /// "what did the client warn me about" (docs/UX_REVIEW.md D) must not
+    /// be drowned in every line the player's own rules printed. Which rule
+    /// fired is the next thing this should carry, and needs the engine to
+    /// report it (docs/ARCH_REVIEW.md).
+    Rule,
     /// A command of ours, echoed locally as it was sent.
     Echo,
     /// Text that reached this pane from another session — a cross-session
@@ -51,6 +59,10 @@ impl RetainedLine {
 
     pub fn echo(text: impl Into<String>) -> Self {
         Self::new(text, Origin::Echo)
+    }
+
+    pub fn with_origin(text: impl Into<String>, origin: Origin) -> Self {
+        Self::new(text, origin)
     }
 
     pub fn from_session(name: impl Into<String>, text: impl Into<String>) -> Self {

@@ -25,14 +25,19 @@ use crate::proto::gmcp;
 use crate::proto::mccp::MccpDecoder;
 use crate::proto::msdp;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, encode_subnegotiation, option};
+use crate::scrollback::Origin;
 use line::{LineAssembler, apply_highlights, strip_ansi};
 use login::{Autologin, LoginAction};
 
 /// Session → UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
-    /// A completed output line (ANSI styling preserved).
-    Line(String),
+    /// A completed output line (ANSI styling preserved), and who produced
+    /// it. Not every `Line` is the server talking: a trigger's `echo:`, an
+    /// auto-login notice and another session's injected command all reach a
+    /// pane the same way, and the pane cannot tell them apart afterwards
+    /// unless the event says so (docs/ARCHITECTURE.md §8).
+    Line { text: String, origin: Origin },
     /// A line a rule routed to a channel pane (docs/ARCHITECTURE.md §11.1).
     /// Emitted alongside `Line` when the channel keeps lines in main.
     Route { channel: String, text: String },
@@ -81,6 +86,35 @@ pub enum SessionEvent {
     Latency(Duration),
     /// The session terminated; the pane stays up showing the reason.
     Ended(String),
+}
+
+impl SessionEvent {
+    /// The MUD said it.
+    pub fn server(text: impl Into<String>) -> Self {
+        Self::line(text, Origin::Server)
+    }
+
+    /// The player's rules or scripts said it (§7.1, §7.4).
+    pub fn rule(text: impl Into<String>) -> Self {
+        Self::line(text, Origin::Rule)
+    }
+
+    /// The client itself said it — auto-login progress, and the like.
+    pub fn client(text: impl Into<String>) -> Self {
+        Self::line(text, Origin::Client)
+    }
+
+    /// Another character's session put it here (§7.5).
+    pub fn from_session(name: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::line(text, Origin::Session(name.into()))
+    }
+
+    fn line(text: impl Into<String>, origin: Origin) -> Self {
+        Self::Line {
+            text: text.into(),
+            origin,
+        }
+    }
 }
 
 /// UI → session.
@@ -365,7 +399,7 @@ async fn run_connection(
         return Outcome::Lost("write failed".to_string());
     }
     for text in connected.echoes {
-        if events.send(SessionEvent::Line(text)).await.is_err() {
+        if events.send(SessionEvent::rule(text)).await.is_err() {
             return Outcome::Gone;
         }
     }
@@ -500,7 +534,7 @@ async fn run_connection(
                                     // moment the player types (§10).
                                     if let Some(machine) = login.as_mut() {
                                         let action = match &event {
-                                            SessionEvent::Line(text) => {
+                                            SessionEvent::Line { text, .. } => {
                                                 machine.on_line(&strip_ansi(text))
                                             }
                                             SessionEvent::Prompt(text) => {
@@ -524,7 +558,7 @@ async fn run_connection(
                                     // reaches the scrollback at all.
                                     let mut emit: Vec<SessionEvent> = Vec::new();
                                     match event {
-                                        SessionEvent::Line(text) => {
+                                        SessionEvent::Line { text, origin } => {
                                             let outcome = engine.process_line(&strip_ansi(&text));
                                             outbound.extend(outcome.sends);
                                             cross_out.extend(outcome.send_to);
@@ -555,7 +589,7 @@ async fn run_connection(
                                                 });
                                             }
                                             if !outcome.gag {
-                                                emit.push(SessionEvent::Line(text));
+                                                emit.push(SessionEvent::line(text, origin));
                                             }
                                             // Independent of gag: a line
                                             // worth hiding can still be
@@ -566,7 +600,7 @@ async fn run_connection(
                                             // Echoes follow the line that
                                             // provoked them.
                                             emit.extend(
-                                                outcome.echoes.into_iter().map(SessionEvent::Line),
+                                                outcome.echoes.into_iter().map(SessionEvent::rule),
                                             );
                                             emit.extend(cross_echoes(outcome.echo_to));
                                         }
@@ -583,7 +617,7 @@ async fn run_connection(
                                             };
                                             emit.push(SessionEvent::Prompt(text));
                                             emit.extend(
-                                                outcome.echoes.into_iter().map(SessionEvent::Line),
+                                                outcome.echoes.into_iter().map(SessionEvent::rule),
                                             );
                                             emit.extend(cross_echoes(outcome.echo_to));
                                         }
@@ -595,7 +629,7 @@ async fn run_connection(
                                             outbound.extend(outcome.sends);
                                             emit.push(SessionEvent::Gmcp { package, payload });
                                             emit.extend(
-                                                outcome.echoes.into_iter().map(SessionEvent::Line),
+                                                outcome.echoes.into_iter().map(SessionEvent::rule),
                                             );
                                             emit.extend(cross_echoes(outcome.echo_to));
                                         }
@@ -615,7 +649,7 @@ async fn run_connection(
                         publish(engine, publish_to);
 
                         for notice in login_notices.drain(..) {
-                            if events.send(SessionEvent::Line(notice)).await.is_err() {
+                            if events.send(SessionEvent::client(notice)).await.is_err() {
                                 return Outcome::Gone;
                             }
                         }
@@ -650,7 +684,7 @@ async fn run_connection(
                     break Outcome::Lost("write failed".to_string());
                 }
                 for text in outcome.echoes {
-                    if events.send(SessionEvent::Line(text)).await.is_err() {
+                    if events.send(SessionEvent::rule(text)).await.is_err() {
                         return Outcome::Gone;
                     }
                 }
@@ -682,7 +716,7 @@ async fn run_connection(
                     break Outcome::Lost("write failed".to_string());
                 }
                 for text in scripted.echoes {
-                    if events.send(SessionEvent::Line(text)).await.is_err() {
+                    if events.send(SessionEvent::rule(text)).await.is_err() {
                         return Outcome::Gone;
                     }
                 }
@@ -727,7 +761,7 @@ async fn run_connection(
                             break Outcome::Lost("write failed".to_string());
                         }
                         for text in outcome.echoes {
-                            if events.send(SessionEvent::Line(text)).await.is_err() {
+                            if events.send(SessionEvent::rule(text)).await.is_err() {
                                 return Outcome::Gone;
                             }
                         }
@@ -744,7 +778,7 @@ async fn run_connection(
                         // Echo locally first: nothing another session does to
                         // this one may happen invisibly (§7.5).
                         for line in &lines {
-                            let echo = SessionEvent::Line(format!("[from {from}] {line}"));
+                            let echo = SessionEvent::from_session(&from, format!("[from {from}] {line}"));
                             if events.send(echo).await.is_err() {
                                 return Outcome::Gone;
                             }
@@ -757,7 +791,7 @@ async fn run_connection(
                                 sends.extend(outcome.sends);
                                 cross.extend(outcome.send_to);
                                 for text in outcome.echoes {
-                                    if events.send(SessionEvent::Line(text)).await.is_err() {
+                                    if events.send(SessionEvent::rule(text)).await.is_err() {
                                         return Outcome::Gone;
                                     }
                                 }
@@ -787,7 +821,7 @@ async fn run_connection(
                             break Outcome::Lost("write failed".to_string());
                         }
                         for text in reloaded.echoes {
-                            if events.send(SessionEvent::Line(text)).await.is_err() {
+                            if events.send(SessionEvent::rule(text)).await.is_err() {
                                 return Outcome::Gone;
                             }
                         }
@@ -815,7 +849,7 @@ async fn run_connection(
     let closing = engine.on_disconnect();
     let _ = send_lines(&mut writer, &closing.sends, &mut sent_at).await;
     for text in closing.echoes {
-        if events.send(SessionEvent::Line(text)).await.is_err() {
+        if events.send(SessionEvent::rule(text)).await.is_err() {
             return Outcome::Gone;
         }
     }
@@ -1333,8 +1367,16 @@ mod tests {
             ),
         );
 
-        assert_eq!(next_line(&mut events).await, "The kobold is DEAD!");
-        assert_eq!(next_line(&mut events).await, "** looted");
+        // The server's line and the script's echo reach the pane the same
+        // way; only `origin` tells them apart afterwards (§8).
+        assert_eq!(
+            next_line_with_origin(&mut events).await,
+            ("The kobold is DEAD!".to_string(), Origin::Server)
+        );
+        assert_eq!(
+            next_line_with_origin(&mut events).await,
+            ("** looted".to_string(), Origin::Rule)
+        );
         assert_eq!(
             timeout(Duration::from_secs(2), sent.recv())
                 .await
@@ -1978,9 +2020,9 @@ mod tests {
         assert_eq!(
             plain,
             vec![
-                SessionEvent::Line("Welcome".into()),
-                SessionEvent::Line("\x1b[1;33mThe Grand Bazaar\x1b[0m".into()),
-                SessionEvent::Line("A merchant waves.".into()),
+                SessionEvent::server("Welcome"),
+                SessionEvent::server("\x1b[1;33mThe Grand Bazaar\x1b[0m"),
+                SessionEvent::server("A merchant waves."),
                 SessionEvent::EchoMask(true),
                 SessionEvent::Prompt("Password: ".into()),
             ],
@@ -2111,7 +2153,7 @@ mod tests {
     fn transcript(events: &[SessionEvent]) -> Vec<SessionEvent> {
         let mut out: Vec<SessionEvent> = events
             .iter()
-            .filter(|ev| matches!(ev, SessionEvent::Line(_) | SessionEvent::EchoMask(_)))
+            .filter(|ev| matches!(ev, SessionEvent::Line { .. } | SessionEvent::EchoMask(_)))
             .cloned()
             .collect();
         if let Some(prompt) = events
@@ -2312,6 +2354,39 @@ mod tests {
         assert_eq!(received, vec!["Kestrel", "hunter2"]);
     }
 
+    /// Auto-login's own progress notices are the client talking, not the
+    /// MUD. They reach the pane as `Line` events like everything else, so
+    /// only `origin` keeps them distinguishable once they have scrolled
+    /// (§8, docs/UX_REVIEW.md D).
+    #[tokio::test]
+    async fn an_auto_login_notice_is_marked_as_the_clients_own() {
+        let login = Autologin::new("Kestrel".into(), None, None, None).unwrap();
+
+        let (mut events, _commands) = serve_with_login(
+            move |mut sock| async move {
+                sock.write_all(b"By what name are you known?\r\n")
+                    .await
+                    .unwrap();
+                sock.write_all(b"Password:\r\n").await.unwrap();
+                // Hold the connection open so the pane is not cut short.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            },
+            Engine::default(),
+            false,
+            Some(login),
+            PeerLinks::default(),
+        );
+
+        let (text, origin) = loop {
+            let (text, origin) = next_line_with_origin(&mut events).await;
+            if text.starts_with("auto-login:") {
+                break (text, origin);
+            }
+        };
+        assert!(text.contains("no password in the keyring"), "{text}");
+        assert_eq!(origin, Origin::Client);
+    }
+
     /// The empty line bypasses the alias splitter, which drops empty parts
     /// so that `a;;b` sends two commands — that must not swallow the bare
     /// Enter as well.
@@ -2451,8 +2526,16 @@ mod tests {
             "hh",
             "aliases must not run unless this session opted in"
         );
-        // ...and it is echoed locally, so nothing happens invisibly.
-        assert_eq!(next_line(&mut events).await, "[from tank] hh");
+        // ...and it is echoed locally, so nothing happens invisibly — and
+        // the pane records *which* session, not just the `[from tank]` text
+        // that says so (§8).
+        assert_eq!(
+            next_line_with_origin(&mut events).await,
+            (
+                "[from tank] hh".to_string(),
+                Origin::Session("tank".to_string())
+            )
+        );
     }
 
     /// With `expand_aliases: true` the receiver lets the sender use its own
@@ -2854,9 +2937,16 @@ mod tests {
         }
     }
 
+    async fn next_line_with_origin(events: &mut mpsc::Receiver<SessionEvent>) -> (String, Origin) {
+        match next_matching(events, |ev| matches!(ev, SessionEvent::Line { .. })).await {
+            SessionEvent::Line { text, origin } => (text, origin),
+            _ => unreachable!(),
+        }
+    }
+
     async fn next_line(events: &mut mpsc::Receiver<SessionEvent>) -> String {
-        match next_matching(events, |ev| matches!(ev, SessionEvent::Line(_))).await {
-            SessionEvent::Line(line) => line,
+        match next_matching(events, |ev| matches!(ev, SessionEvent::Line { .. })).await {
+            SessionEvent::Line { text, .. } => text,
             _ => unreachable!(),
         }
     }
