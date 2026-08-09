@@ -127,6 +127,9 @@ non-goal) these are small and tasteful — craftsmanship, not decoration. A
 terminal app earns delight by being fast, precise, and quietly clever, not
 by adding motion or noise.
 
+For the wider, unconstrained version of this question — ideas not limited
+to current or planned functionality — see [IDEAS.md](IDEAS.md).
+
 **G. The magic tricks are invisible.** Speedwalking (`.3n2e`), alias
 expansion, and trigger substitution all work by silently rewriting what you
 typed or what the server sent — which is exactly right for steady-state
