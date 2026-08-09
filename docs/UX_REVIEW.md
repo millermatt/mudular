@@ -19,6 +19,15 @@ at any point backs out without saving or connecting" reads as "you're
 returned to the app," not "the app quits." A newcomer backing out to think
 it over gets what looks like a crash.
 
+> **Fixed.** `main.rs`'s wizard-cancel branch fell straight through to
+> `return Ok(())`, exiting the process instead of continuing to the
+> ordinary zero-target startup path (the same "no target — run with a
+> profile name..." shell shown once a profile exists and `mudular` runs
+> bare). It now falls through instead of returning early. Verified live,
+> not just in a unit test — main.rs had none — by driving the actual
+> binary through a pty with the `run` skill both before and after: the
+> process died on `Esc` pre-fix, and stayed up showing the shell post-fix.
+
 **2. Security-conscious player — TLS pin-mismatch reason is truncated to
 illegibility.** When a pinned certificate changes (simulated MITM/rotation),
 the only explanation is the pane's one-line status area, which gets cut off
@@ -26,6 +35,16 @@ mid-word: `disconnected: TLS handshake with 127.0.0.1:5577: unexpected
 error: pinned certificate mi`. Scrollback is empty — no fingerprint
 comparison, no guidance. This is exactly the moment a cautious user most
 needs a complete explanation, and gets a clipped fragment instead.
+
+> **Fixed.** `SessionEvent::Ended` only ever set the one-line status; it now
+> also pushes the full reason to scrollback, matching the pattern §13
+> already uses for security warnings (both status label and scrollback
+> line). Scrollback wraps and never truncates, so the complete reason is
+> always reachable regardless of length. Verified with a unit test built
+> from the review's own reported message (fails without the fix — empty
+> scrollback) and confirmed live via the `run` skill against a real refused
+> connection, where the full reason renders correctly through the actual
+> render/wrap pipeline.
 
 ### Medium
 

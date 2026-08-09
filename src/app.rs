@@ -678,6 +678,14 @@ fn apply_session_event(
         SessionEvent::Ended(reason) => {
             let session = &mut state.sessions[index];
             session.status = format!("disconnected: {reason}");
+            // The status line is one row wide and gets cut off mid-word on
+            // anything longer than a short reason (a TLS pin mismatch's
+            // full fingerprint comparison, say) — exactly the moment a
+            // player most needs the complete explanation, not a fragment.
+            // Scrollback wraps and never truncates, so the full reason
+            // always lands there too, the same way §13 already puts a
+            // security warning in both places.
+            session.push_line(format!("** disconnected: {reason}"));
             session.latency.clear();
             session.masked = false;
             session.connected = false;
@@ -1804,6 +1812,27 @@ mod tests {
 
         apply_session_event(&mut state, 0, SessionEvent::Ended("closed".to_string()));
         assert!(state.sessions[0].latency.is_empty());
+    }
+
+    /// The status line is one row and cuts a long reason off mid-word —
+    /// exactly what a TLS pin mismatch's full fingerprint comparison does
+    /// not survive. Scrollback wraps and never truncates, so the complete
+    /// reason must land there too, the same way a §13 security warning
+    /// already does.
+    #[test]
+    fn a_disconnect_reason_reaches_scrollback_uncut() {
+        let (mut state, _rx) = app(&["tank"]);
+        let reason = "TLS handshake with 127.0.0.1:5577: unexpected error: \
+                       pinned certificate mismatch: expected SHA-256 aaaa, \
+                       server offered bbbb";
+
+        apply_session_event(&mut state, 0, SessionEvent::Ended(reason.to_string()));
+
+        assert!(
+            scrollback(&state.sessions[0]).contains(reason),
+            "full disconnect reason missing from the pane: {:?}",
+            scrollback(&state.sessions[0])
+        );
     }
 
     /// A focused session's own bell is not worth ringing — the player is
