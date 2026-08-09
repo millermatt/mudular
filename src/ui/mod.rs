@@ -762,6 +762,37 @@ mod tests {
         assert!(!row(&buffer, 1).contains("forest"));
     }
 
+    /// §13: server data is untrusted, and the GMCP inspector is the one
+    /// view that shows it verbatim. A payload carrying escape sequences
+    /// must be *shown*, not executed — ratatui writes a cell's symbol to
+    /// the terminal unfiltered, so an ESC that reaches a cell is a real
+    /// escape injection out of a subnegotiation the player only has to
+    /// press a key to look at.
+    #[test]
+    fn the_gmcp_inspector_never_writes_a_control_byte_to_the_terminal() {
+        let mut state = state();
+        state.sessions[0].push_gmcp(
+            "Char.Vitals".to_string(),
+            Some("{\"hp\":\x1b[2J\x1b]0;pwned\x07100}".to_string()),
+        );
+        state.show_gmcp = true;
+
+        let buffer = render(&state);
+        let offenders: Vec<&str> = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .filter(|symbol| symbol.chars().any(|c| c.is_control()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "control bytes reached the terminal: {offenders:?}"
+        );
+        // Shown, not silently dropped: the inspector exists to reveal what
+        // the server actually sent.
+        assert!(rows(&buffer).contains("x1b"), "{}", rows(&buffer));
+    }
+
     /// §11: the pane title carries the latency, and carries nothing where
     /// it would be before the first round trip has been measured.
     #[test]

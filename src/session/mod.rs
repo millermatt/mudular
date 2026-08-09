@@ -25,7 +25,7 @@ use crate::proto::gmcp;
 use crate::proto::mccp::MccpDecoder;
 use crate::proto::msdp;
 use crate::proto::telnet::{Side, TelnetEvent, TelnetMachine, encode_subnegotiation, option};
-use crate::scrollback::{Origin, strip_ansi};
+use crate::scrollback::{Origin, strip_ansi, strip_unsafe_controls};
 use line::{LineAssembler, apply_highlights};
 use login::{Autologin, LoginAction};
 
@@ -959,18 +959,6 @@ where
 /// the clock and reporting only the tail of the wait.
 fn start_round_trip(sent_at: &mut Option<Instant>) {
     sent_at.get_or_insert_with(Instant::now);
-}
-
-/// Drops C0 control bytes other than `\n` (line boundary) and ESC (needed
-/// for the ANSI/SGR sequences `ansi-to-tui` renders). Server data is
-/// untrusted (docs/ARCHITECTURE.md §13): a bare, unescaped control byte
-/// like `\r` reaching the terminal executes as a real cursor command
-/// instead of being treated as plain text — some CircleMUD/DikuMUD-lineage
-/// servers do send a bare mid-line `\r` this way.
-fn strip_unsafe_controls(text: &str) -> String {
-    text.chars()
-        .filter(|&c| c == '\n' || c == '\x1b' || !c.is_control())
-        .collect()
 }
 
 /// Raw inbound capture (`--record`). One line per socket read:

@@ -9,6 +9,11 @@
 //!
 //! So the buffer stores what it knows and the renderer composes: `at` is
 //! the timestamp a channel pane formats, `origin` is why a line is there.
+//!
+//! It is also where text is made safe to show. Ratatui writes a cell's
+//! symbol to the terminal unfiltered, so any control byte that reaches a
+//! retained line reaches the terminal as a command — which §13 forbids for
+//! data the client did not author.
 
 use chrono::{DateTime, Local};
 
@@ -79,7 +84,12 @@ impl RetainedLine {
     }
 
     fn new(text: impl Into<String>, origin: Origin) -> Self {
-        let text = text.into();
+        // Every line, whoever wrote it. `session` strips server text on the
+        // way in (its triggers match the result), but a client notice, a
+        // script's `mud.echo`, and a peer's relayed line never passed
+        // through that — and a community module's script is untrusted
+        // (docs/ACTORS.md §2).
+        let text = strip_unsafe_controls(&text.into());
         // `strip_ansi` walks the line either way; keeping the result only
         // when it differs is what makes the cache free for the uncoloured
         // majority of a buffer.
@@ -99,6 +109,40 @@ impl RetainedLine {
     pub fn plain(&self) -> &str {
         self.plain.as_deref().unwrap_or(&self.text)
     }
+}
+
+/// Drops the control bytes a terminal would obey, keeping the two a pane
+/// needs: `\n`, which separates rendered rows, and `ESC`, which carries the
+/// SGR colour that is the whole point of a MUD pane — `ansi-to-tui` consumes
+/// escape sequences at render time, so an `ESC` never reaches a cell.
+///
+/// A tab becomes a space rather than disappearing: dropping it welds the
+/// words either side together, which is how a Lua traceback's `in\tfunction`
+/// reached the screen as `infunction` (docs/UX_REVIEW.md 4).
+pub fn strip_unsafe_controls(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\t' => Some(' '),
+            '\n' | '\x1b' => Some(c),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// The same bytes, shown rather than removed — for the raw GMCP inspector
+/// (§14 M6), whose whole purpose is to reveal what the server actually sent.
+/// Stripping there would hide the one thing a player opened it to see, so a
+/// control byte renders as its own escape (`\x1b`) and executes nothing.
+pub fn escape_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The plain-text projection of a line (docs/ARCHITECTURE.md §8): the text
@@ -163,6 +207,12 @@ mod plain_tests {
     /// stored copy that drifts from `strip_ansi` would make a trigger built
     /// from a picked line match something other than the line it was picked
     /// from (§7.1).
+    /// The invariant is between the line and *its own* text: `plain()` is
+    /// the projection of what was stored, after sanitising, not of the
+    /// argument that went in. (They differ where sanitising removes a
+    /// `BEL` that was terminating an OSC — the sequence then runs to the
+    /// end of the line. A server sending OSC is trying to drive the
+    /// terminal, so losing the rest of that line is the right way to lose.)
     #[test]
     fn the_cached_projection_matches_strip_ansi() {
         for text in [
@@ -174,12 +224,47 @@ mod plain_tests {
             "Ærlend has arrived.",
             "text\x1b[",
         ] {
-            assert_eq!(
-                RetainedLine::server(text).plain(),
-                strip_ansi(text),
-                "{text:?}"
-            );
+            let line = RetainedLine::server(text);
+            assert_eq!(line.plain(), strip_ansi(&line.text), "{text:?}");
         }
+    }
+
+    /// §13 again, on the other side of the funnel. `strip_unsafe_controls`
+    /// only ever ran on decoded *server* text, so a line the client or a
+    /// script wrote reached the screen with whatever control bytes it
+    /// carried — and a community module's script (docs/ACTORS.md §2) is
+    /// untrusted by the same reasoning the §7.4 sandbox exists for.
+    /// A retained line is safe by construction instead.
+    #[test]
+    fn a_retained_line_never_carries_a_raw_control_byte() {
+        let line = RetainedLine::client("a\rb\x07c");
+        assert!(
+            !line
+                .text
+                .chars()
+                .any(|c| c.is_control() && c != '\x1b' && c != '\n'),
+            "{:?}",
+            line.text
+        );
+    }
+
+    /// A tab is dropped rather than kept, which welds words together: a Lua
+    /// traceback's `in\tfunction` became `infunction` (docs/UX_REVIEW.md 4).
+    /// A space keeps them apart without letting the tab move the cursor.
+    #[test]
+    fn a_tab_becomes_a_space_rather_than_vanishing() {
+        assert_eq!(
+            RetainedLine::client("in\tfunction 'error'").text,
+            "in function 'error'"
+        );
+    }
+
+    /// SGR has to survive: colour is the one escape a pane is *for*.
+    #[test]
+    fn colour_escapes_survive_sanitising() {
+        let line = RetainedLine::server("\x1b[1;33mgold\x1b[0m");
+        assert_eq!(line.text, "\x1b[1;33mgold\x1b[0m");
+        assert_eq!(line.plain(), "gold");
     }
 
     /// A buffer is mostly uncoloured lines, and on those the projection *is*

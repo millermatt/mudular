@@ -240,11 +240,18 @@ impl SessionPane {
         true
     }
 
-    fn push_gmcp(&mut self, package: String, payload: Option<String>) {
+    pub(crate) fn push_gmcp(&mut self, package: String, payload: Option<String>) {
         let line = match payload {
             Some(payload) => format!("{package} {payload}"),
             None => package,
         };
+        // Straight from the wire: a GMCP subnegotiation never passed
+        // through the line pipeline's control-byte filter, and the
+        // inspector renders it with `Line::raw` rather than through the
+        // ANSI parser — so nothing else stands between a server's escape
+        // sequence and the terminal (§13). Shown, not stripped: this view
+        // exists to reveal exactly what arrived.
+        let line = crate::scrollback::escape_controls(&line);
         self.gmcp_log.push_back(line);
         if self.gmcp_log.len() > GMCP_LOG_LIMIT {
             self.gmcp_log.pop_front();

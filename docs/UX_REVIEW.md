@@ -55,6 +55,15 @@ does nothing, easy to create by accident and confusing to debug later. The
 editor validates regex syntax and missing `id`/`pattern` but not
 exact-duplicate patterns or an empty `send:`.
 
+> **Partly fixed.** The tab half: `strip_unsafe_controls` dropped tabs
+> outright, welding `in\tfunction` into `infunction` — and it only ever ran
+> on server text, so a script's traceback reached the screen with its raw
+> tabs intact, which ratatui writes to the terminal as real cursor
+> commands. Every retained line is now sanitised (§13), and a tab becomes a
+> space rather than vanishing. The stray leading `s` on
+> `[string "bad.lua"]:3` is not explained by this and has not been
+> reproduced; it is still open.
+
 **4. Power-user scripter — Lua runtime-error tracebacks render garbled.**
 The headline error (`bad.lua:3: kaboom from script`) is clear and has file/
 line, which is good — but the traceback underneath is corrupted on screen:

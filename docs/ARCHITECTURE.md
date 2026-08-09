@@ -1358,9 +1358,28 @@ defaulting to off, and not as a resize handle bolted onto the layout.
 
 ## 13. Security Considerations
 
-- Server data is untrusted: linear-time regex only; ANSI parser drops
-  unknown escape sequences (terminal escape injection); paths from
-  config are never taken from server data.
+- Server data is untrusted: linear-time regex only; paths from config are
+  never taken from server data.
+- **Nothing the client did not author reaches a terminal cell as a control
+  byte.** Ratatui writes a cell's symbol to the backend unfiltered and
+  crossterm's `Print` does no escaping, so a control byte that reaches a
+  retained line reaches the terminal as a *command* — cursor movement,
+  screen erase, an OSC title change. Two funnels enforce this rather than
+  one rule stated in prose:
+  - `RetainedLine::new` runs `strip_unsafe_controls` over every line a pane
+    keeps, whoever wrote it. `\n` and `ESC` survive (rows, and the SGR
+    colour a pane exists for — `ansi-to-tui` consumes escape sequences at
+    render time, so an `ESC` never reaches a cell); a tab becomes a space;
+    everything else goes. `session` runs the same function earlier, over
+    decoded server text, because its triggers match that text — but that
+    pass alone covered only the server, and a client notice, a script's
+    `mud.echo`, and a relayed peer line all reached the screen without it.
+  - The raw GMCP inspector (§14 M6) is the exception that proves the rule:
+    it renders with `Line::raw`, deliberately bypassing the ANSI parser,
+    over a payload that never went through the line pipeline at all. It
+    escapes control bytes into visible text (`\x1b`) instead of stripping
+    them — a view whose purpose is to show what the server sent must not
+    hide the interesting part of it.
 - MCCP inflate is capped per read (§6.4): deflate reaches ~1032:1, so an
   unbounded decoder turns one 4 KiB read into gigabytes of allocation.
   Past the cap the session ends rather than buffering.

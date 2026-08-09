@@ -155,6 +155,36 @@ own — so §7.5's headline example ("rebuff the tank when his blessing
 drops") does not work as documented. Fix is subtree-replace semantics per
 GMCP package, or a length key on arrays.
 
+## Found while closing the retained-line item
+
+Not part of the original review — turned up reading §13 against the code
+after the line type landed, and recorded here because it is the same
+question ("who is allowed to put bytes on the terminal") one layer down.
+
+**§13's escape-injection guarantee held for one path, not every path.**
+The scrollback path is sound: server text loses its control bytes before
+line assembly, and `ansi-to-tui` reliably consumes escape sequences —
+`ansi_lines`'s `Err(_)` fallback, which would have put the raw string with
+its escapes into a `Line`, turns out to be unreachable, since the crate's
+parser swallows its own failures and always returns `Ok`.
+
+The **raw GMCP inspector** was not. A GMCP payload arrives as a
+subnegotiation, so it never meets the line pipeline's filter, and
+`ui::draw_session` renders `gmcp_log` with `Line::raw` rather than through
+the ANSI parser — and ratatui writes a cell's symbol to crossterm's
+`Print` unfiltered. A server sending `Char.Vitals {"hp":<ESC>[2J...}` had
+its escape sequences executed by the player's terminal the moment they
+pressed `F2`. No script, no config, no cooperation from the player beyond
+looking at a debugging view.
+
+Fixed by escaping rather than stripping there (the inspector exists to
+show what arrived), and by moving the control-byte filter to
+`RetainedLine::new` so it covers every line a pane keeps rather than only
+the ones that came off a socket. The narrower lesson is the one worth
+keeping: a guarantee written as a property of *a parser* ("the ANSI parser
+drops unknown sequences") only holds where that parser is actually in the
+path. Stated as a property of the funnel, it holds everywhere.
+
 ## Boundaries
 
 The sans-IO core is real, not aspirational: `src/proto/*` references no
