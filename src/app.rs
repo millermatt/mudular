@@ -751,6 +751,7 @@ fn apply_session_event(
             session.latency.clear();
             session.masked = false;
             session.connected = false;
+            save_session_map(session);
             (true, Vec::new())
         }
     }
@@ -1326,6 +1327,12 @@ fn connect(
         target.login,
         peers,
     );
+    // A `--host` session has no profile and so no file to load from —
+    // consistent with `/config` and disk logging, which need one too.
+    let map = match &profile {
+        Some(name) => config::load_map(&config_dir, name),
+        None => crate::map::Map::default(),
+    };
     SessionPane {
         name: target.name,
         scrollback: VecDeque::new(),
@@ -1354,8 +1361,21 @@ fn connect(
         scrollback_limit,
         log: target.log_path.as_deref().and_then(open_log),
         back_offset: 0,
-        map: crate::map::Map::default(),
+        map,
         current_room: None,
+    }
+}
+
+/// Saves a session's map to its profile, merged with whatever is already on
+/// disk (`config::save_map`). An ad-hoc `--host` session has no profile and
+/// so nothing to save to — the same rule `/config` and disk logging already
+/// apply. Best-effort: a save failure must never block whatever the player
+/// was already doing when it happened.
+fn save_session_map(session: &SessionPane) {
+    let (config_dir, profile) = &session.rules;
+    let Some(profile) = profile else { return };
+    if let Err(err) = config::save_map(config_dir, profile, &session.map) {
+        tracing::warn!("could not save map for {profile}: {err:#}");
     }
 }
 
@@ -1551,6 +1571,9 @@ async fn event_loop(
         match wake {
             Wake::Terminal(Some(Ok(Event::Key(key)))) if key.kind == KeyEventKind::Press => {
                 if keybinds.quit.matches(key.code, key.modifiers) {
+                    for session in &state.sessions {
+                        save_session_map(session);
+                    }
                     return Ok(());
                 }
                 let area_width = terminal.get_frame().area().width;
@@ -3802,6 +3825,44 @@ mod tests {
             session.map.rooms
         );
         assert_eq!(session.map.rooms.len(), 4, "but the rooms are still known");
+    }
+
+    /// A `--host` session has no profile to key a map on, the same reason
+    /// it gets no `/config` and no disk log. It must leave nothing behind
+    /// rather than inventing a name to save the world under.
+    #[test]
+    fn an_ad_hoc_session_saves_no_map() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["adhoc"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), None);
+        apply_session_event(&mut state, 0, room(1, None));
+
+        save_session_map(&state.sessions[0]);
+
+        assert!(
+            !dir.path().join("maps").exists(),
+            "a session with no profile must not invent one to save under"
+        );
+    }
+
+    /// The other half: a profile session's exploration outlives it, which
+    /// is the whole point of keeping the graph on disk.
+    #[test]
+    fn a_profile_session_saves_its_map_where_it_can_be_loaded_again() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        apply_session_event(&mut state, 0, room(1, None));
+        apply_session_event(&mut state, 0, room(2, Some("n")));
+
+        save_session_map(&state.sessions[0]);
+
+        let reloaded = config::load_map(dir.path(), "tank");
+        assert_eq!(
+            reloaded.path(crate::map::RoomId(1), crate::map::RoomId(2)),
+            Some(vec!["n".to_string()]),
+            "the walked edge should survive the round trip, not just the rooms"
+        );
     }
 
     /// The complementary case, so the conservatism above is not mistaken

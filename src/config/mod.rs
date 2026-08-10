@@ -36,6 +36,56 @@ pub fn log_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("logs")
 }
 
+/// Where a profile's room graph is saved (§16) — a subdirectory of the
+/// config dir, the same layout `log_dir` uses.
+pub fn map_path(dir: &Path, profile: &str) -> PathBuf {
+    dir.join("maps").join(format!("{profile}.json"))
+}
+
+/// Loads a profile's saved map, or an empty one if there is nothing to
+/// load. Everything short of a valid file reads as "start empty" rather
+/// than an error: a map is exploration a player can always redo, so a
+/// missing, unreadable, or corrupt file must never be the reason a session
+/// can't be played (docs/ARCHITECTURE.md §16).
+pub fn load_map(dir: &Path, profile: &str) -> crate::map::Map {
+    let path = map_path(dir, profile);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return crate::map::Map::default();
+        }
+        Err(err) => {
+            tracing::warn!("could not read map {}: {err}", path.display());
+            return crate::map::Map::default();
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::warn!(
+                "could not parse map {}: {err}; starting with an empty map",
+                path.display()
+            );
+            crate::map::Map::default()
+        }
+    }
+}
+
+/// Saves a profile's map, merged with whatever is already on disk rather
+/// than overwritten — two sessions open on the same profile explore
+/// independently, and a plain overwrite would let whichever saves last
+/// silently discard the other's half of the map. JSON, not YAML like the
+/// rest of this directory: unlike everything else in the config dir, this
+/// file is only ever machine-written and machine-read, never hand-edited.
+pub fn save_map(dir: &Path, profile: &str, map: &crate::map::Map) -> Result<()> {
+    let mut on_disk = load_map(dir, profile);
+    on_disk.merge(map.clone());
+    let path = map_path(dir, profile);
+    let json = serde_json::to_string_pretty(&on_disk).context("serializing the map")?;
+    atomic_write(&path, json.as_bytes()).context("writing the map")?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -776,7 +826,7 @@ pub fn save_profile(
 /// itself atomic (rename is only guaranteed atomic within one filesystem).
 /// The parent directory is `fsync`'d too on Unix, since that is the step
 /// that makes the rename durable across a crash, not just the bytes.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::result::Result<(), SaveError> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::result::Result<(), SaveError> {
     use std::io::Write;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1407,6 +1457,88 @@ mod tests {
     fn profile_path_lives_under_profiles_subdir() {
         let path = profile_path(Path::new("/cfg"), "kestrel");
         assert_eq!(path, Path::new("/cfg/profiles/kestrel.yaml"));
+    }
+
+    // ---- map persistence (§16) ----
+
+    #[test]
+    fn map_path_lives_under_maps_subdir() {
+        let path = map_path(Path::new("/cfg"), "kestrel");
+        assert_eq!(path, Path::new("/cfg/maps/kestrel.json"));
+    }
+
+    #[test]
+    fn a_missing_map_file_loads_as_empty() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        assert_eq!(load_map(dir.path(), "kestrel"), crate::map::Map::default());
+    }
+
+    /// Garbage on disk must lose exploration, not the session — the same
+    /// reasoning `load_app_config`'s defaults-on-absence gets, but for a
+    /// file that can also be *present and broken*, not just missing.
+    #[test]
+    fn a_corrupt_map_file_loads_as_empty_rather_than_panicking() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = map_path(dir.path(), "kestrel");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json at all").unwrap();
+
+        assert_eq!(load_map(dir.path(), "kestrel"), crate::map::Map::default());
+    }
+
+    fn sample_room(id: i64, name: &str) -> crate::map::RoomInfo {
+        crate::map::RoomInfo {
+            id: crate::map::RoomId(id),
+            name: Some(name.to_string()),
+            area: Some("Test".to_string()),
+            exits: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_saved_map_round_trips_through_load_map() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut map = crate::map::Map::default();
+        map.observe(&sample_room(1, "Temple Square"));
+        map.connect(crate::map::RoomId(1), "n", crate::map::RoomId(2));
+
+        save_map(dir.path(), "kestrel", &map).unwrap();
+        let loaded = load_map(dir.path(), "kestrel");
+
+        assert_eq!(loaded, map);
+    }
+
+    /// Two sessions on the same profile each learn something the other
+    /// doesn't; saving one must not blank out what the other already
+    /// wrote to disk.
+    #[test]
+    fn save_map_merges_with_what_is_already_on_disk() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+
+        let mut first = crate::map::Map::default();
+        first.observe(&sample_room(1, "Temple Square"));
+        save_map(dir.path(), "kestrel", &first).unwrap();
+
+        let mut second = crate::map::Map::default();
+        second.observe(&sample_room(2, "The Docks"));
+        save_map(dir.path(), "kestrel", &second).unwrap();
+
+        let loaded = load_map(dir.path(), "kestrel");
+        assert_eq!(
+            loaded
+                .rooms
+                .get(&crate::map::RoomId(1))
+                .map(|r| r.name.as_deref()),
+            Some(Some("Temple Square")),
+            "the first session's room must survive the second session's save"
+        );
+        assert_eq!(
+            loaded
+                .rooms
+                .get(&crate::map::RoomId(2))
+                .map(|r| r.name.as_deref()),
+            Some(Some("The Docks"))
+        );
     }
 
     // ---- first-run wizard (§15) ----

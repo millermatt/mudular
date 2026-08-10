@@ -23,10 +23,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 /// A room's identity: the server's own vnum. Not a synthesized id — two
 /// runs, two characters, and a reloaded map file all have to agree on what
 /// "that room" means, and only the server can say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct RoomId(pub i64);
 
 /// The directions the map understands, longest first so `ne` is preferred
@@ -184,7 +187,7 @@ impl RoomInfo {
 
 /// One room as the map knows it — the accumulation of every update and
 /// every walked edge, not just the latest sighting.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Room {
     pub id: RoomId,
     pub name: Option<String>,
@@ -193,9 +196,60 @@ pub struct Room {
 }
 
 /// Everywhere the client has been, and how those places connect.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "MapFile", into = "MapFile")]
 pub struct Map {
     pub rooms: BTreeMap<RoomId, Room>,
+}
+
+/// The shape `Map` actually (de)serializes as. JSON object keys must be
+/// strings, so the natural `BTreeMap<RoomId, Room>` cannot go straight to
+/// disk as an object keyed by id — and a `Room` already carries its own
+/// `id` field, so keying by it again out here would just be a second,
+/// possibly-disagreeing copy of the same fact. A flat list sidesteps both.
+#[derive(Serialize, Deserialize)]
+struct MapFile {
+    rooms: Vec<Room>,
+}
+
+impl From<Map> for MapFile {
+    fn from(map: Map) -> Self {
+        MapFile {
+            rooms: map.rooms.into_values().collect(),
+        }
+    }
+}
+
+impl From<MapFile> for Map {
+    fn from(file: MapFile) -> Self {
+        Map {
+            rooms: file.rooms.into_iter().map(|room| (room.id, room)).collect(),
+        }
+    }
+}
+
+/// The merge rule shared by `observe` (one freshly-parsed sighting) and
+/// `merge` (a whole other map's room): a `None` never erases a fact this
+/// room already holds, and a known exit destination is never overwritten by
+/// an unknown one.
+fn merge_room_facts(
+    room: &mut Room,
+    name: Option<&str>,
+    area: Option<&str>,
+    exits: &BTreeMap<String, Option<RoomId>>,
+) {
+    if let Some(name) = name {
+        room.name = Some(name.to_string());
+    }
+    if let Some(area) = area {
+        room.area = Some(area.to_string());
+    }
+    for (direction, dest) in exits {
+        let existing = room.exits.entry(direction.clone()).or_insert(None);
+        if dest.is_some() {
+            *existing = *dest;
+        }
+    }
 }
 
 impl Map {
@@ -209,17 +263,33 @@ impl Map {
             area: None,
             exits: BTreeMap::new(),
         });
-        if info.name.is_some() {
-            room.name = info.name.clone();
-        }
-        if info.area.is_some() {
-            room.area = info.area.clone();
-        }
-        for (direction, dest) in &info.exits {
-            let existing = room.exits.entry(direction.clone()).or_insert(None);
-            if dest.is_some() {
-                *existing = *dest;
-            }
+        merge_room_facts(
+            room,
+            info.name.as_deref(),
+            info.area.as_deref(),
+            &info.exits,
+        );
+    }
+
+    /// Unions another map's rooms into this one, room by room, under the
+    /// same never-erase rule `observe` uses — the case this exists for is
+    /// two sessions on one profile exploring in parallel, where either
+    /// side's facts are worth keeping and neither should be able to blank
+    /// out the other's.
+    pub fn merge(&mut self, other: Map) {
+        for (id, other_room) in other.rooms {
+            let room = self.rooms.entry(id).or_insert_with(|| Room {
+                id,
+                name: None,
+                area: None,
+                exits: BTreeMap::new(),
+            });
+            merge_room_facts(
+                room,
+                other_room.name.as_deref(),
+                other_room.area.as_deref(),
+                &other_room.exits,
+            );
         }
     }
 
@@ -464,6 +534,68 @@ mod tests {
             Some(&Some(RoomId(12346))),
             "a walked edge must survive a sparser sighting"
         );
+    }
+
+    /// `merge` unions two maps room-by-room under the same never-erase rule
+    /// as `observe`: a room known to both sides keeps every fact either side
+    /// had, and a room known to only one side comes across whole.
+    #[test]
+    fn merge_unions_rooms_without_erasing_either_sides_facts() {
+        let mut mine = Map::default();
+        mine.observe(&RoomInfo::from_server_data(&gmcp_ire()).unwrap());
+        mine.connect(RoomId(12345), "n", RoomId(12346));
+
+        let mut theirs = Map::default();
+        // Same room, sparser — must not blank out what `mine` already has.
+        theirs.observe(&RoomInfo {
+            id: RoomId(12345),
+            name: None,
+            area: None,
+            exits: BTreeMap::new(),
+        });
+        theirs.connect(RoomId(12345), "e", RoomId(12350));
+        // A room `mine` has never seen at all.
+        theirs.observe(&RoomInfo {
+            id: RoomId(999),
+            name: Some("Elsewhere".to_string()),
+            area: None,
+            exits: BTreeMap::new(),
+        });
+
+        mine.merge(theirs);
+
+        let room = mine.rooms.get(&RoomId(12345)).expect("still there");
+        assert_eq!(
+            room.name.as_deref(),
+            Some("Temple Square"),
+            "the incoming side's None must not erase the existing name"
+        );
+        assert_eq!(room.exits.get("n"), Some(&Some(RoomId(12346))));
+        assert_eq!(
+            room.exits.get("e"),
+            Some(&Some(RoomId(12350))),
+            "a new exit from the incoming side is added"
+        );
+        assert_eq!(
+            mine.rooms.get(&RoomId(999)).map(|r| r.name.as_deref()),
+            Some(Some("Elsewhere")),
+            "a room known only to the other side comes across whole"
+        );
+    }
+
+    /// The file shape is a flat list, not an id-keyed object — this proves
+    /// the round trip actually goes through it and lands back on an
+    /// equivalent map, ids included.
+    #[test]
+    fn map_round_trips_through_json() {
+        let map = line_of_three();
+        let json = serde_json::to_string(&map).unwrap();
+        assert!(
+            json.starts_with(r#"{"rooms":["#),
+            "the file shape is a list under `rooms`, not an id-keyed object"
+        );
+        let restored: Map = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, map);
     }
 
     /// Three rooms in a row: the path is the directions, in order.
