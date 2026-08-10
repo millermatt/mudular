@@ -1006,7 +1006,12 @@ pub fn load_rules(
 /// in-editor draft that may not (yet) be the file on disk.
 fn profile_layer(name: &str, path: &Path, profile: &Profile) -> Result<RuleModule> {
     Ok(RuleModule {
-        name: format!("profile `{name}`"),
+        // Plain text, not pre-wrapped in backticks: every `engine::mod.rs`
+        // error template that reports `{module}` wraps it in backticks
+        // itself, the same as a loaded module's plain filename — a label
+        // that quotes itself here doubles up into `` `profile `tank`` ``
+        // (docs/UX_REVIEW.md, Adversarial findings, Low #5).
+        name: format!("profile {name}"),
         description: None,
         variables: profile.variables.clone(),
         aliases: profile.aliases.clone(),
@@ -1773,6 +1778,37 @@ triggers:
 
         let err = validate_profile_rules(dir, "tank", &draft, &[]).unwrap_err();
         assert!(format!("{err:#}").contains("no action"), "{err:#}");
+    }
+
+    /// A profile-level rule missing both `id` and `pattern` used to read
+    /// as `` rule in `profile `tank`` needs an `id` or a `pattern` `` —
+    /// the profile layer's own label pre-wrapped itself in backticks, and
+    /// the error template wrapped it again (docs/UX_REVIEW.md, Adversarial
+    /// findings, Low #5).
+    #[test]
+    fn validate_profile_rules_does_not_double_the_backticks_around_a_profile_name() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+
+        let mut draft = minimal_profile("tank", "h");
+        // An action but no id/pattern: passes trigger-hygiene, so
+        // `Engine::compile` is what rejects it, for lacking identity.
+        draft.triggers = vec![Trigger {
+            send: Some(vec!["look".to_string()]),
+            ..Trigger::default()
+        }];
+
+        let err = validate_profile_rules(dir, "tank", &draft, &[]).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("in `profile tank`"),
+            "expected a single-quoted label: {message}"
+        );
+        assert!(
+            !message.contains("`profile `tank`"),
+            "backticks must not double up: {message}"
+        );
     }
 
     /// The shipped examples are documentation: if they stop loading, the
