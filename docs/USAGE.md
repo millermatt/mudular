@@ -312,11 +312,40 @@ anything that doesn't parse as a path (no leading `.`, or a token that
 isn't a digit run followed by a known direction) is sent exactly as
 typed, so `.` stays an ordinary character everywhere else.
 
-## Mapping and `/goto`
+## Mapping, `/map` and `/goto`
 
 On a MUD that sends GMCP or MSDP room data, the client quietly builds a
 graph of rooms and exits as you explore, and saves it alongside the
 profile so it's still there next session.
+
+A MUD that sends neither gets no map at all — not a partial one. The
+client doesn't try to guess rooms out of the text the way some clients
+do, because a guessed map is wrong in ways that look exactly like a real
+one. If `F2` shows no `Room.Info` or `ROOM_*` coming in, mapping on that
+MUD isn't going to work, and `/map` will say it doesn't know where you
+are.
+
+`/map`, or `F7`, shows or hides the map column beside your session, and
+**also prints where you are into the pane**:
+
+```
+Middle of village street (#40606), New: Ofcol Village
+Exits: north to North end of village street, east (unexplored)
+```
+
+Both forms every time — the drawn column and the written description are
+two views of the same thing, not a display and a fallback. The written
+one scrolls, copies, and goes into your log; it's also the one that
+works with a screen reader, which a grid of glyphs does not. `(unexplored)`
+means the MUD named that exit but you haven't walked it yet, so the map
+doesn't know where it goes.
+
+The column draws the area you're in, with your room in the middle and
+`u`/`d` on a room's glyph where it also leads up or down. Rooms in other
+areas aren't drawn — MUD geography isn't a grid, and coordinates carried
+across a whole world stop meaning anything. Occasionally two rooms want
+the same spot, and the one that loses simply isn't drawn; it's still on
+the map and `/goto` still walks to it.
 
 ```
 /goto 12345
@@ -855,6 +884,8 @@ fallback.
 | `Home` / `End` | Jump to the oldest / newest line in the focused pane | — (built in) |
 | `F5` | Edit this character's profile | `config_editor` |
 | `F6` | Recompile rules and scripts from disk — the same thing `/reload` does | `reload` |
+| `F7` | Show or hide the map column, and print where you are — the same thing `/map` does | `toggle_map` |
+| `Alt+]` / `Alt+[` | Widen / narrow the map column | `map_wider` / `map_narrower` |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 
 `F1` shows this same list inside the client, built from your actual
@@ -909,6 +940,11 @@ starting point:
 ```yaml
 channel_width: 28
 ```
+
+`map_width:` (default 24) does the same for the map column, resized live
+with `Alt+]`/`Alt+[`. On a terminal too narrow for both columns the comms
+column keeps its place and the map simply isn't drawn — it was there
+first, and it comes back the moment there's room.
 
 `scrollback_size:` (default 10,000) sets how many lines each pane keeps —
 see [Scrolling back](#scrolling-back).

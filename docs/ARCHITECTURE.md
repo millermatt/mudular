@@ -1142,10 +1142,12 @@ spam — and conversely, so slow conversations stay visible.
 - **Layout:** channel panes dock as a fixed-width column beside the
   session area — a slim comms column next to two character panes — and are
   hotkey-toggleable, focusable, and scrollable like any other pane. There
-  is no general pane grid: `ui::layout` splits the body into
-  `[main | channel column]` and nothing else, which is the constraint every
-  later feature wanting a new region runs into (`ARCH_REVIEW.md`,
-  "Boundaries"). A grid is what that would need first; it is not built.
+  is no general pane grid: `ui::layout` assembles the body split by hand,
+  which is the constraint every later feature wanting a new region runs
+  into (`ARCH_REVIEW.md`, "Boundaries"). The map column (§16) is the
+  second feature to pay it, making the body `[main | comms | map]` — each
+  region hardcoded, each with its own width, clamp, and resize keys. A
+  grid is what would end that; it is not built.
 - **Input routing:** focusing a channel pane keeps the input line bound to
   the *last focused session*, shown in the input border — reading comms
   must never silently change which character your commands go to. A
@@ -1550,14 +1552,138 @@ Target: a non-technical user installs Mudular on any OS in one step.
   profile already on disk, caught at the same step as an empty name rather
   than silently overwriting it.
 
-## 16. Designed-For Extensions
+## 16. Auto-Mapper (`map`)
+
+A room graph learned from what the server already tells us, a pane that
+draws it, and `/goto` to walk it. `map` is a dependency-free leaf like
+`scrollback` (§4): it takes the flattened server-data map as a plain
+`HashMap` and does no I/O, so persistence lives in `config` and the pane
+lives in `ui`, and neither is visible from inside it.
+
+- **Room identity is the server's vnum**, not a synthesized id. Two runs,
+  two characters on one profile, and a reloaded map file all have to agree
+  on what "that room" means, and only the server can say. Vnum `0` is
+  rejected outright: the DikuMUD family reserves it, and MUDs use it to
+  declare that a room has *no* stable identity — a maze built to defeat
+  mapping, where every room reports the same nothing. Believing it
+  collapses the whole maze into one room and hangs the real rooms around it
+  off that. A room the server refuses to identify is a room the map does
+  not have, and `/goto` will not route through it.
+- **Extraction is protocol-agnostic and reads the merged store.** Rooms
+  come from GMCP *or* MSDP, and the reader does not know which: after
+  either protocol branch updates the server-data store (§6.3),
+  `RoomInfo::from_server_data` re-reads the room out of that merged map.
+  This is the principle §7.5 states for peer snapshots — name a dotted key
+  prefix, never a protocol — for the same reason: a server that switched
+  protocols without changing its data would otherwise break everything
+  downstream. It also inherits §6.3's GMCP-wins-over-MSDP precedence for
+  free instead of reimplementing it. An earlier draft fed the map from
+  `SessionEvent::Gmcp` and would have produced no map at all on an
+  MSDP-only MUD.
+
+  A small alias table absorbs server variation, matched case-insensitively
+  and ordered GMCP-first (§6.3 only settles keys that collide *exactly*,
+  and `Room.Info.num` vs `ROOM.VNUM` are different keys carrying the same
+  fact, so ordering the lookup is where that precedence actually lives):
+
+  | field | GMCP | MSDP (table) | MSDP (flat) |
+  |---|---|---|---|
+  | vnum | `Room.Info.num` | `ROOM.VNUM` | `ROOM_VNUM` |
+  | name | `Room.Info.name` | `ROOM.NAME` | `ROOM_NAME` |
+  | area | `Room.Info.area` / `.zone` | `ROOM.AREA` | `ROOM_AREA` |
+  | exits | `Room.Info.exits.<dir>` | `ROOM.EXITS.<dir>` | `ROOM_EXITS.<dir>` |
+
+  Tolerant by design: the vnum is required, everything else optional, and
+  an exit's value may be a destination vnum or a bare direction (many
+  servers list directions without saying where they lead) — hence
+  `Option<RoomId>`. Unknown keys are ignored. This is someone else's wire
+  format, not our file format, so §10's `deny_unknown_fields` strictness
+  is exactly wrong here.
+
+  **MSDP is a subscription.** The widely deployed implementation sends a
+  variable only after the client has `REPORT`ed it, so negotiating the
+  option and staying quiet leaves a working server silent and the mapper
+  inert. The client subscribes (`REPORT ROOM`) when the option comes up —
+  and only *after* its `IAC DO` has gone out, because a server is entitled
+  to discard a subnegotiation for an option it does not yet consider
+  enabled.
+- **Edges are learned by walking them.** Most servers name an exit without
+  naming its destination, so the graph is built by pairing movement with
+  room changes: the session reports every movement command it actually
+  sent as `SessionEvent::Moved` — typed, alias-expanded, a speedwalk step,
+  or a trigger's `send:`, since the hub sees the typed line but expansion
+  happens inside the session task — and the next `SessionEvent::Room`
+  resolves it into `connect(previous, direction, new)`. A movement not
+  followed by a room change is superseded by the next one rather than
+  inventing an edge, which is what keeps a summon, a recall, or an
+  auto-flee from teaching the map a corridor that does not exist.
+- **Coordinates are for drawing only, and are allowed to fail.**
+  `layout_area` BFS-walks out from the current room applying direction
+  vectors (n = `(0,-1)`, e = `(+1,0)`, ne = `(+1,-1)`, …), scoped to the
+  origin's own area — MUD geography is not Euclidean and coordinates
+  accumulated across a world diverge into nonsense. `u`/`d`/`in`/`out` get
+  no vector: they are real, pathable exits with no meaning on a flat grid,
+  and are marked on the room they leave instead of drawn as a third axis.
+  Collisions are expected, not a bug: first placement wins, and a room that
+  loses drops out of the *rendered layout only*. It stays in the graph and
+  stays pathable, which is why the pane is never what `/goto` consults.
+- **Persistence:** `<config dir>/maps/<profile>.json`, written through
+  `config::atomic_write` so a crash mid-save cannot truncate a map. JSON
+  rather than YAML deliberately — machine-written data, never hand-edited,
+  unlike every other file in the config dir. Saves **merge** rather than
+  overwrite: load, union the rooms, write, under the same never-erase rule
+  `observe` uses, because two sessions on one profile would otherwise
+  silently discard each other's exploration. Loaded at connect.
+  `--host` sessions get no persistence, consistent with `/config` and disk
+  logging both requiring a profile.
+- **`/goto <vnum | name substring>`** resolves a target, paths to it with
+  BFS (every edge is one movement command, so all edges weigh the same),
+  and walks it **one step at a time** — never the whole route in a burst.
+  Only the step in flight is ever on the wire, so a route that turns out to
+  be wrong is caught after one step instead of all of them; anything the
+  player types cancels the walk. It reports plainly when it cannot help —
+  no current room, unknown target, ambiguous name, no known path — because
+  a silent no-op is the frustrating case. This is also the seam a corpse
+  run plugs into: a remembered death room plus this path-and-walk call.
+- **The map pane** is a third body region, `[main | comms | map]`, toggled
+  by F7 or `/map`. `map_width` takes the same clamp/resize discipline
+  `channel_width` has (§11.4) — an `AppState` field, recomputed into rects
+  by `ui::layout` every frame, with keys that only move the number. It
+  yields to comms when only one column fits: comms was already on screen,
+  and dropping it to make room for a column the player just asked for would
+  move furniture they never touched. The current room is centred and
+  highlighted so walking scrolls the world past a fixed marker rather than
+  sliding a dot toward an edge it falls off.
+
+  This is a third *hardcoded* region, which `ARCH_REVIEW.md` "Boundaries"
+  already flags: `ui::layout` hard-codes the body split and there is no
+  pane grid. It is the pragmatic choice and it makes that refactor more
+  valuable, not less.
+- **The description seam.** What the map knows how to *say* about a room —
+  `Map::describe`, "Middle of village street (#40606), New: Ofcol Village
+  / Exits: north to North end of village street, east (unexplored)" —
+  lives in `map`, beside `path` and `layout_area`, not in the draw code.
+  `/map` prints it into the scrollback every time, in both directions, and
+  the renderer is one consumer of that knowledge rather than the only place
+  it exists.
+
+  The pane is glyphs at coordinates in the alternate screen, which is a
+  shape only a sighted reader can use: screen readers read lines, not
+  redraws. So the printed form is not a fallback for having the pane off —
+  it is the form of the map everyone can reach, and it also scrolls,
+  copies, and lands in the disk log, which the pane does none of. The
+  wider question of speech in a full-screen TUI is deliberately left open;
+  see `ARCH_REVIEW.md`.
+- **No text inference.** A MUD that sends neither GMCP `Room.Info` nor MSDP
+  `ROOM_*` gets no map, and is told so rather than half-mapped. Inferring
+  rooms from prose is MUD-specific guesswork; this is structured data the
+  server already vouches for, and mixing the two would make every mapping
+  bug indistinguishable from a parsing bug.
+
+## 17. Designed-For Extensions
 - **More scripting engines:** anything embeddable and statically linkable
   implements `ScriptHost` (§7.4); WASM (`wasmtime`) is the designated
   universal target — one sandboxed ABI, plugins in any compiled language.
-- **Auto-mapper:** a map pane driven by GMCP `Room.*` data (falling back to
-  movement/exit-line inference), with pathfinding speedwalk-to-room that
-  supersedes M9's macro speedwalks. Deliberately post-1.0: it is a large
-  feature and the GMCP plumbing it needs is M6.
 - **Module sharing:** install community YAML/script modules from a URL or
   registry; sandboxing (§7.4) is the prerequisite and lands first.
 - **More protocols:** MXP, MSP, NEW-ENVIRON slot in as `proto` modules +

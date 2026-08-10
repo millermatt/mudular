@@ -1,7 +1,7 @@
 # Architecture Review — 2026-08-08
 
 An adversarial structural review taken at end-of-M9, with `ARCHITECTURE.md`
-§16, `IDEAS.md`, and `UX_REVIEW.md` all treated as the load the current
+§17, `IDEAS.md`, and `UX_REVIEW.md` all treated as the load the current
 design has to carry. Not a correctness or security review — those were done
 separately. Subject here is structure: module boundaries, coupling, the
 state/concurrency model, and what the architecture forecloses.
@@ -190,7 +190,7 @@ Three small drifts, all pointing the same way — `config` and `ui` have
 become peers of `app` rather than layers beneath it (`config` reads
 `crate::ui::CHANNEL_WIDTH`, `ui` imports `AppState`/`Focus`/`LayoutMode`
 from `app`, `ui::config_editor` pulls `VerifyMode` from `net`). All three
-are trivial moves, and all three block §16's workspace split until made —
+are trivial moves, and all three block §17's workspace split until made —
 filed as #6.
 
 > **Fixed (doc only).** §11.1 claimed channel panes dock "into the same
@@ -198,6 +198,40 @@ filed as #6.
 > body → `[main | fixed-width channel column]`, and every feature wanting
 > a new region pays for that. §11.1 now states the real layout instead of
 > the aspirational one.
+
+> **Paid once, as predicted.** The map pane (§16) is now a *third*
+> hardcoded region: `ui::layout` builds `[main | comms | map]` from a
+> constraint list assembled by hand, and the column carries its own
+> `map_width`, clamp function, and resize keys duplicating the comms
+> column's. That is the second feature to pay the same toll, which is the
+> argument for the pane-grid refactor (#10) rather than against it — it
+> was taken knowingly, not slipped in. A third column is where the
+> duplication stops being cheap.
+
+### The open accessibility question
+
+Recorded here rather than decided, because it is an architecture decision
+and not a config flag.
+
+Blind MUD players' defining ask — consistent across the clients they name
+(r/MUD, Aug 2026) — is speech that reads incoming text continuously and
+**interrupts, skipping to the new lines, the moment a command is sent**.
+Mudular already holds both facts that rule needs: the line assembler with
+its prompt boundaries, and the moment an outbound line is written. It
+would sit in the §6.5 pipeline, where triggers already run.
+
+What it does *not* have is a surface. Mudular is a full-screen `ratatui`
+app in the alternate screen, and screen readers work against line-oriented
+output, not full redraws — so "make the TUI screen-reader friendly" is
+likely the wrong path. The real options are a line-oriented output mode
+that bypasses the panes, or the client speaking directly. Both are larger
+than any pane.
+
+Nothing here is scheduled. The one thing done in advance is §16's
+description seam: `Map::describe` keeps the map's knowledge in prose form
+in `map`, so whichever way the surface question goes, the map is not the
+part that has to be rewritten. The same seam is worth asking for from any
+future feature whose only output is drawn.
 
 ## One-way doors, ranked by cost if deferred
 
@@ -229,7 +263,7 @@ issues rather than restated here:
 - `UX_REVIEW.md` suggestion A (`/connect`, #2) is ranked as a nicety but is
   architecturally the largest item in either doc. Suggestion B
   (`/newprofile`, #16) is genuinely small and correctly ranked.
-- §16 says module sharing's prerequisite is sandboxing. True for scripts,
+- §17 says module sharing's prerequisite is sandboxing. True for scripts,
   but the unaddressed prerequisite is distribution integrity — nothing
   covers module provenance or update, and `deny_unknown_fields` means a
   module written against a later version fails to load with no
