@@ -1045,12 +1045,59 @@ pub fn validate_profile_rules(
         );
     }
 
+    check_trigger_hygiene(&draft.triggers)?;
+
     layers.push(profile_layer(name, &profile_path(dir, name), draft)?);
 
     for layer in &mut layers {
         apply_channel_defaults(layer, channels)?;
     }
     Engine::compile(&layers)?;
+    Ok(())
+}
+
+/// Two accident classes `Engine::compile` above doesn't catch, because both
+/// are legitimate *across* scope layers (a module and a profile shadowing
+/// the same pattern, say) and wrong only within one profile's own list
+/// (docs/UX_REVIEW.md, Adversarial findings, Medium #3) — so this checks
+/// `draft.triggers` alone, not the merged layers `Engine::compile` sees.
+///
+/// - **Two triggers sharing the exact same pattern.** Both fire on every
+///   matching line — triggers aren't first-match-wins the way aliases are
+///   (§7.1) — so this is redundant matching at best and, in the case that
+///   prompted this check, one of the two silently doing nothing at worst.
+/// - **A trigger with no action at all.** Matches, and does nothing —
+///   easy to create by accident (an empty `send:` left behind while
+///   editing) and confusing to debug later, since nothing in the editor
+///   flags it as inert.
+fn check_trigger_hygiene(triggers: &[Trigger]) -> Result<()> {
+    let mut seen_patterns = std::collections::HashSet::new();
+    for trigger in triggers {
+        if let Some(pattern) = &trigger.pattern
+            && !seen_patterns.insert(pattern.as_str())
+        {
+            bail!("two triggers share the pattern `{pattern}`");
+        }
+        let no_action = trigger.send.is_none()
+            && trigger.send_to.is_none()
+            && trigger.set.is_none()
+            && trigger.script.is_none()
+            && trigger.gag != Some(true)
+            && trigger.route.is_none()
+            && trigger.highlight.is_none()
+            && trigger.bell != Some(true);
+        if no_action {
+            let label = trigger
+                .id
+                .as_deref()
+                .or(trigger.pattern.as_deref())
+                .unwrap_or("(unnamed)");
+            bail!(
+                "trigger `{label}` matches but has no action — nothing to \
+                 send, gag, route, or set"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1633,6 +1680,99 @@ triggers:
         let err = validate_profile_rules(dir, "tank", &draft, &[]).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("../secret"), "{message}");
+    }
+
+    // ---- trigger hygiene (§10.2, UX_REVIEW.md finding 3) ----
+
+    fn trigger(pattern: &str) -> Trigger {
+        Trigger {
+            pattern: Some(pattern.to_string()),
+            ..Trigger::default()
+        }
+    }
+
+    #[test]
+    fn check_trigger_hygiene_allows_distinct_patterns_with_actions() {
+        let triggers = vec![
+            Trigger {
+                send: Some(vec!["cast heal".to_string()]),
+                ..trigger("hp low")
+            },
+            Trigger {
+                gag: Some(true),
+                ..trigger("spam")
+            },
+        ];
+        assert!(check_trigger_hygiene(&triggers).is_ok());
+    }
+
+    #[test]
+    fn check_trigger_hygiene_rejects_a_duplicate_pattern() {
+        let triggers = vec![
+            Trigger {
+                send: Some(vec!["look".to_string()]),
+                ..trigger("rat")
+            },
+            Trigger {
+                gag: Some(true),
+                ..trigger("rat")
+            },
+        ];
+        let err = check_trigger_hygiene(&triggers).unwrap_err();
+        assert!(format!("{err:#}").contains("rat"), "{err:#}");
+    }
+
+    #[test]
+    fn check_trigger_hygiene_rejects_a_trigger_with_no_action() {
+        let triggers = vec![trigger("rat")];
+        let err = check_trigger_hygiene(&triggers).unwrap_err();
+        assert!(format!("{err:#}").contains("rat"), "{err:#}");
+    }
+
+    /// `gag:` alone is a real, common action — hiding a line is not
+    /// "nothing," even though it never touches `send:`.
+    #[test]
+    fn check_trigger_hygiene_allows_a_gag_only_trigger() {
+        let triggers = vec![Trigger {
+            gag: Some(true),
+            ..trigger("spam")
+        }];
+        assert!(check_trigger_hygiene(&triggers).is_ok());
+    }
+
+    /// An id-only trigger (matched by `id`, not `pattern` — used for
+    /// shadowing) has no pattern to collide on; two of them must not be
+    /// mistaken for duplicates of each other.
+    #[test]
+    fn check_trigger_hygiene_ignores_id_only_triggers_when_checking_duplicates() {
+        let triggers = vec![
+            Trigger {
+                id: Some("a".to_string()),
+                gag: Some(true),
+                ..Trigger::default()
+            },
+            Trigger {
+                id: Some("b".to_string()),
+                gag: Some(true),
+                ..Trigger::default()
+            },
+        ];
+        assert!(check_trigger_hygiene(&triggers).is_ok());
+    }
+
+    /// Wired into the save-time validator a profile session actually uses,
+    /// not just the standalone function.
+    #[test]
+    fn validate_profile_rules_refuses_a_no_op_trigger() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+
+        let mut draft = minimal_profile("tank", "h");
+        draft.triggers = vec![trigger("rat")];
+
+        let err = validate_profile_rules(dir, "tank", &draft, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("no action"), "{err:#}");
     }
 
     /// The shipped examples are documentation: if they stop loading, the
