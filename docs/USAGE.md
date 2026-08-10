@@ -829,6 +829,7 @@ fallback.
 | `PgUp` / `PgDn` | Scroll the focused pane back / forward through its scrollback | — (built in) |
 | `Home` / `End` | Jump to the oldest / newest line in the focused pane | — (built in) |
 | `F5` | Edit this character's profile | `config_editor` |
+| `F6` | Recompile rules and scripts from disk — the same thing `/reload` does | `reload` |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 
 `F1` shows this same list inside the client, built from your actual
@@ -857,6 +858,7 @@ keybinds:
   channel_narrower: "alt+="
   help: f1
   config_editor: f5
+  reload: f6
   line_picker: alt+v
 ```
 

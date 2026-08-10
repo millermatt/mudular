@@ -335,6 +335,11 @@ pub struct AppState {
     /// `event_loop` right after `handle_key` returns — saving needs async
     /// IO that `handle_key` itself, being sync, cannot do.
     config_editor_save: Option<config::SaveMode>,
+    /// The reload keybind was pressed, drained the same way: `reload_rules`
+    /// sends a `SessionCommand` over an async channel, which `handle_key`
+    /// cannot do either (UX_REVIEW.md F — the same gap `/reload` typed as
+    /// a command doesn't have, since `submit_input` is already async).
+    reload_requested: bool,
     /// A scrollback line-cursor is active on the focused pane (§10.2/§11.5):
     /// `Some(back_offset)` is the line it currently highlights, measured the
     /// same way `SessionPane::back_offset` is — distance from the tail.
@@ -1481,6 +1486,7 @@ async fn event_loop(
         keybinds: keybinds.clone(),
         config_editor: None,
         config_editor_save: None,
+        reload_requested: false,
         line_cursor: None,
         config_dir,
         new_profile_wizard: None,
@@ -1528,6 +1534,13 @@ async fn event_loop(
                 ) {
                     if let Some(mode) = state.config_editor_save.take() {
                         service_config_save(&mut state, &channels, mode).await;
+                    }
+                    if state.reload_requested {
+                        state.reload_requested = false;
+                        let notice = reload_rules(&state, &channels).await;
+                        if let Some(session) = state.bound_mut() {
+                            session.push_line(RetainedLine::client(notice));
+                        }
                     }
                     report_pane_sizes(&mut state, terminal.get_frame().area()).await;
                 } else if key.code == KeyCode::Enter {
@@ -1739,6 +1752,10 @@ fn handle_key(
     }
     if keybinds.config_editor.matches(code, modifiers) {
         open_config_editor(state, channels);
+        return true;
+    }
+    if keybinds.reload.matches(code, modifiers) {
+        state.reload_requested = true;
         return true;
     }
     if keybinds.line_picker.matches(code, modifiers) {
@@ -2042,6 +2059,7 @@ pub(crate) mod test_support {
                 keybinds: Keybinds::default(),
                 config_editor: None,
                 config_editor_save: None,
+                reload_requested: false,
                 line_cursor: None,
                 config_dir: PathBuf::from("/cfg"),
                 new_profile_wizard: None,
@@ -3230,6 +3248,18 @@ mod tests {
         assert!(press(&mut state, KeyCode::F(4), KeyModifiers::NONE));
         assert!(!state.show_channels);
         assert_eq!(state.focus, Focus::Session(0));
+    }
+
+    /// The default binding (F6, UX_REVIEW.md F) sets the deferred flag
+    /// `event_loop` drains — `handle_key` is sync and `reload_rules` needs
+    /// async IO, the same reason `config_editor_save` is deferred rather
+    /// than run inline.
+    #[test]
+    fn the_reload_keybind_requests_a_reload() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        assert!(press(&mut state, KeyCode::F(6), KeyModifiers::NONE));
+        assert!(state.reload_requested);
     }
 
     // ---- /reload (docs/ARCHITECTURE.md §7.3) ----

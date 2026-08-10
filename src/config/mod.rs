@@ -389,6 +389,11 @@ pub struct Keybinds {
     /// trigger's starting pattern (§10.2, §11.5).
     #[serde(default = "default_line_picker")]
     pub line_picker: KeyBinding,
+    /// Recompiles rules and scripts from disk — the same thing typing
+    /// `/reload` does. Every other frequent action has a default binding;
+    /// this one didn't (UX_REVIEW.md F).
+    #[serde(default = "default_reload")]
+    pub reload: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -404,6 +409,7 @@ impl Default for Keybinds {
             help: default_help(),
             config_editor: default_config_editor(),
             line_picker: default_line_picker(),
+            reload: default_reload(),
         }
     }
 }
@@ -459,6 +465,12 @@ fn default_line_picker() -> KeyBinding {
     // Alt keeps it clear of ordinary typing — a bare `v` would swallow the
     // letter itself out of every command line.
     "alt+v".parse().expect("built-in default keybinding")
+}
+
+fn default_reload() -> KeyBinding {
+    // Next free key in the F1 help / F2 GMCP / F3 layout / F4 channels /
+    // F5 config editor row.
+    "f6".parse().expect("built-in default keybinding")
 }
 
 /// A single key combination, parsed from strings like `ctrl+c` or `f1`.
