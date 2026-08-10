@@ -1522,7 +1522,13 @@ Target: a non-technical user installs Mudular on any OS in one step.
   state grafted onto the session-management loop. On success it's saved
   to `profiles/<name>.yaml` via `serde_yaml` (quoting whatever the player
   typed correctly, rather than hand-formatting the file and hoping) and
-  connected immediately, in the same launch.
+  connected immediately, in the same launch. That connected session's
+  first screen carries one client notice — "press F1 for the full key
+  list" (UX_REVIEW.md C) — since a newcomer who just answered the wizard
+  has no other way to know the help overlay exists; `main.rs` sets a flag
+  the wizard's own success already threads down to `event_loop`, which
+  pushes it once, into the one session the wizard could ever have
+  produced.
 - **`/newprofile`:** the same form, reachable any time after — not just at
   zero-profile startup (UX_REVIEW.md B). Here there *is* a session (usually
   several) for the form to belong to, so it's the opposite shape from

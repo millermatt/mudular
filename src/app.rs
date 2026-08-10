@@ -1169,6 +1169,7 @@ pub async fn run(
     scrollback_size: usize,
     channel_width: u16,
     cross_session_default: CrossSession,
+    first_run_hint: bool,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let result = event_loop(
@@ -1181,6 +1182,7 @@ pub async fn run(
         scrollback_size,
         channel_width,
         cross_session_default,
+        first_run_hint,
     )
     .await;
     ratatui::restore();
@@ -1422,6 +1424,7 @@ async fn event_loop(
     scrollback_size: usize,
     channel_width: u16,
     cross_session_default: CrossSession,
+    first_run_hint: bool,
 ) -> Result<()> {
     // Every session publishes a snapshot of its state and reads every
     // other session's (§7.5). The channels are made up front, so a session
@@ -1504,6 +1507,13 @@ async fn event_loop(
         // Nothing to drive the loop but the terminal; the empty-state help
         // lives in the UI, which has no pane to draw it in otherwise.
         state.show_channels = false;
+    }
+
+    // The wizard always connects exactly one character, so it's this one
+    // (UX_REVIEW.md C) — a newcomer who just answered it has no other way
+    // to know F1 exists.
+    if first_run_hint && let Some(session) = state.sessions.first_mut() {
+        session.push_line(RetainedLine::client("press F1 for the full key list"));
     }
 
     report_pane_sizes(&mut state, terminal.get_frame().area()).await;

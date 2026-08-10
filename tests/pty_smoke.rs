@@ -207,6 +207,15 @@ fn creates_a_profile_from_the_wizard_and_connects() {
     app.type_line("n");
 
     app.wait_for(BANNER, "the wizard-built profile should connect");
+    // A single unspaced token, like BANNER above: "press F1" is two cells
+    // ratatui's diff renderer can (and does) reach the pty split across
+    // separate writes, which raw substring matching on the byte stream
+    // would miss even though it renders correctly — confirmed live via a
+    // real terminal emulator, not just this raw-byte check.
+    app.wait_for(
+        "F1",
+        "the newly connected session's first screen should hint at F1 (UX_REVIEW.md C)",
+    );
 
     let saved = std::fs::read_to_string(config.path().join("profiles/tank.yaml"))
         .expect("the wizard should have saved a loadable profile");

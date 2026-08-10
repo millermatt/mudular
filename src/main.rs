@@ -101,6 +101,12 @@ async fn main() -> Result<()> {
 
     let dir = config::config_dir(cli.config_dir.clone())?;
 
+    // Shown on the new session's first screen once it connects
+    // (UX_REVIEW.md C) — a newcomer who just answered the wizard has no
+    // other way to know F1 exists, and it's the single biggest "what do I
+    // do now" gap for a first-time player.
+    let mut first_run_hint = false;
+
     // First run (docs/ARCHITECTURE.md §15): nothing named on the command
     // line and no profile saved yet, so there is nothing this launch could
     // possibly connect to without either a form or a text editor.
@@ -114,6 +120,7 @@ async fn main() -> Result<()> {
         if let Some(new_profile) = app::run_new_profile_wizard(&dir).await? {
             config::save_new_profile(&dir, &new_profile)?;
             cli.profiles = vec![new_profile.name];
+            first_run_hint = true;
         }
     }
 
@@ -172,6 +179,7 @@ async fn main() -> Result<()> {
         app_config.scrollback_size,
         app_config.channel_width,
         app_config.cross_session,
+        first_run_hint,
     )
     .await
 }
