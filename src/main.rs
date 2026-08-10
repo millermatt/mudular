@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod engine;
+mod map;
 mod net;
 mod proto;
 mod scrollback;
