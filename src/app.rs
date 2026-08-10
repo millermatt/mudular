@@ -4447,6 +4447,40 @@ mod tests {
         );
     }
 
+    /// Walking a step of your own mid-`/goto` — impatience, or spotting
+    /// something the route did not know about. Two things have to hold:
+    /// the walk is off, and the step it already put on the wire must not
+    /// quietly resume it when its room lands a moment later. A route that
+    /// carries on after the player has taken the wheel is the same failure
+    /// as one that carries on through a locked gate (§16).
+    #[tokio::test]
+    async fn a_typed_step_mid_walk_cancels_it_and_a_late_arrival_does_not_resume_it() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].walk = Some(Walk {
+            remaining: VecDeque::from(["e".to_string()]),
+            expecting: crate::map::RoomId(2),
+            destination: crate::map::RoomId(3),
+        });
+
+        submit(&mut state, "w").await;
+
+        assert!(state.sessions[0].walk.is_none(), "the walk is off");
+        assert!(
+            matches!(receivers[0].try_recv(), Ok(SessionCommand::SendLine(line)) if line == "w"),
+            "and the step the player typed still reaches the server"
+        );
+
+        // The walk's own last step lands now, after the cancellation.
+        let (_, out) = apply_session_event(&mut state, 0, room(2, Some("n")));
+
+        assert!(
+            out.is_empty(),
+            "a cancelled walk must not send another step: {out:?}"
+        );
+        assert!(state.sessions[0].walk.is_none());
+    }
+
     // ---- /connect (§7.5, ARCH_REVIEW.md "Features that would break the architecture") ----
 
     fn write_profile(dir: &std::path::Path, name: &str) {
