@@ -60,6 +60,9 @@ const NEWPROFILE_COMMAND: &str = "/newprofile";
 /// `ARCH_REVIEW.md` "Features that would break the architecture") — a
 /// name follows, not a fixed string like the commands above.
 const CONNECT_COMMAND: &str = "/connect";
+/// Walks toward a room already on the map, one step at a time (§16) — a
+/// vnum, or a case-insensitive substring of a room name.
+const GOTO_COMMAND: &str = "/goto";
 
 /// `send_to` address meaning "every other session" (§7.5).
 const ALL_SESSIONS: &str = "*";
@@ -185,6 +188,23 @@ pub struct SessionPane {
     /// structural (§3).
     pub map: crate::map::Map,
     pub current_room: Option<crate::map::RoomId>,
+    /// A `/goto` walk in progress (§16). `None` when nothing is walking.
+    pub walk: Option<Walk>,
+}
+
+/// One `/goto` walk in progress. Exactly one step is ever in flight: the
+/// rest of `remaining` waits for `expecting` to be confirmed before the next
+/// one is sent, because a route learned earlier can be stale by the time it
+/// is walked — a gate open when the path was found can be locked now, and
+/// firing the rest of the path from wherever a failed step actually lands
+/// would walk the character somewhere they never asked to go.
+pub struct Walk {
+    /// Directions still to send once the step in flight is confirmed.
+    remaining: VecDeque<String>,
+    /// The room the step currently in flight should land in.
+    expecting: crate::map::RoomId,
+    /// Where the walk is headed, for the arrival message.
+    destination: crate::map::RoomId,
 }
 
 impl SessionPane {
@@ -740,12 +760,56 @@ fn apply_session_event(
             // Only the hub can close an edge: the session knows which way
             // the character went, and the hub is what remembers where they
             // were when they went.
-            if let (Some(from), Some(direction)) = (session.current_room, arrived_via) {
-                session.map.connect(from, &direction, info.id);
+            if let (Some(from), Some(direction)) = (session.current_room, arrived_via.as_deref()) {
+                session.map.connect(from, direction, info.id);
             }
             session.map.observe(&info);
             session.current_room = Some(info.id);
-            (false, Vec::new())
+
+            // `/goto` (§16) never has more than one step outstanding, so a
+            // room change while it is running is always the answer to that
+            // step — the same fact that let the `connect` above overwrite a
+            // stale edge with the truth as the walk just crossed it.
+            let Some(expecting) = session.walk.as_ref().map(|walk| walk.expecting) else {
+                return (false, Vec::new());
+            };
+            if info.id != expecting {
+                // The route was learned earlier and the world has since
+                // changed underneath it — a locked gate, a closed door,
+                // anything that turns one step into a different room than
+                // the map predicted. Guessing the rest of the path from
+                // here could walk the character further from where they
+                // meant to go, so the walk stops rather than continuing on
+                // a route that has just been proven wrong.
+                session.walk = None;
+                let via = arrived_via.as_deref().unwrap_or("an unrecognised step");
+                session.push_line(RetainedLine::client(format!(
+                    "** walk stopped: `{via}` led to #{}, not the #{} the map expected",
+                    info.id.0, expecting.0
+                )));
+                return (false, Vec::new());
+            }
+
+            let destination = session.walk.as_ref().unwrap().destination;
+            match session.walk.as_mut().unwrap().remaining.pop_front() {
+                None => {
+                    session.walk = None;
+                    session.push_line(RetainedLine::client(format!(
+                        "** arrived at #{}",
+                        destination.0
+                    )));
+                    (false, Vec::new())
+                }
+                Some(direction) => {
+                    // The path this direction came from (`Map::path`) only
+                    // ever follows edges with a known destination, so this
+                    // lookup cannot come up empty.
+                    let next_expecting = session.map.rooms[&info.id].exits[&direction]
+                        .expect("map.path only follows edges with a known destination");
+                    session.walk.as_mut().unwrap().expecting = next_expecting;
+                    (false, vec![(index, SessionCommand::SendLine(direction))])
+                }
+            }
         }
         SessionEvent::Security(security) => {
             let session = &mut state.sessions[index];
@@ -791,6 +855,10 @@ fn apply_session_event(
             session.latency.clear();
             session.masked = false;
             session.connected = false;
+            // Nothing will confirm the outstanding step now — leaving it set
+            // would have the next `/goto` compare against a room from a
+            // connection that no longer exists.
+            session.walk = None;
             save_session_map(session);
             (true, Vec::new())
         }
@@ -1405,6 +1473,7 @@ fn connect(
         back_offset: 0,
         map,
         current_room: None,
+        walk: None,
     }
 }
 
@@ -1956,6 +2025,14 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     };
     let line = session.input.value().to_string();
     session.input.reset();
+    // Player intervention always wins over an in-flight `/goto` (§16): a
+    // gate the walk hasn't discovered yet, or the player simply changing
+    // their mind, is their call, not a queued route's — checked before the
+    // line is otherwise handled so nothing below can race an outstanding
+    // step against a fresh command.
+    if session.walk.take().is_some() {
+        session.push_line(RetainedLine::client("** walk cancelled"));
+    }
     session.push_history(&line);
     // A bare Enter is a keystroke in its own right — MUD login flows and
     // pagers ask for one ("press return to continue") — so it goes to the
@@ -2019,7 +2096,115 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         connect_new_session(state, channels, name).await;
         return;
     }
+    if trimmed == GOTO_COMMAND || trimmed.starts_with("/goto ") {
+        let arg = trimmed.strip_prefix(GOTO_COMMAND).unwrap_or("").trim();
+        start_goto(state, arg).await;
+        return;
+    }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
+}
+
+/// `/goto <vnum | name substring>` (§16): walks toward a room the map
+/// already knows, one direction at a time. Never the whole path in one
+/// burst — see `Walk`'s doc comment for why a mid-route surprise has to stop
+/// the walk rather than keep firing steps planned for a world that has since
+/// changed.
+async fn start_goto(state: &mut AppState, arg: &str) {
+    let Some(session) = state.bound_mut() else {
+        return;
+    };
+    let Some(current) = session.current_room else {
+        session.push_line(RetainedLine::client(
+            "** /goto doesn't know where you are yet",
+        ));
+        return;
+    };
+
+    let target = if let Ok(vnum) = arg.parse::<i64>() {
+        let id = crate::map::RoomId(vnum);
+        if !session.map.rooms.contains_key(&id) {
+            session.push_line(RetainedLine::client(format!(
+                "** /goto: no room #{vnum} on the map"
+            )));
+            return;
+        }
+        id
+    } else {
+        let needle = arg.to_ascii_lowercase();
+        let matches: Vec<&crate::map::Room> = session
+            .map
+            .rooms
+            .values()
+            .filter(|room| {
+                room.name
+                    .as_deref()
+                    .is_some_and(|name| name.to_ascii_lowercase().contains(&needle))
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => {
+                session.push_line(RetainedLine::client(format!(
+                    "** /goto: no room matches `{arg}`"
+                )));
+                return;
+            }
+            [room] => room.id,
+            many => {
+                // Silently picking one would walk the character somewhere
+                // they did not ask for — a vnum is unambiguous, so that is
+                // what the player is asked to name instead.
+                let mut candidates: Vec<String> = many
+                    .iter()
+                    .take(5)
+                    .map(|room| format!("#{} {}", room.id.0, room.name.as_deref().unwrap_or("")))
+                    .collect();
+                if many.len() > 5 {
+                    candidates.push("…".to_string());
+                }
+                session.push_line(RetainedLine::client(format!(
+                    "** /goto: `{arg}` matches more than one room, say which vnum: {}",
+                    candidates.join(", ")
+                )));
+                return;
+            }
+        }
+    };
+
+    if target == current {
+        session.push_line(RetainedLine::client("** /goto: already there"));
+        return;
+    }
+
+    let Some(path) = session.map.path(current, target) else {
+        session.push_line(RetainedLine::client("** /goto: no known route there"));
+        return;
+    };
+
+    let mut remaining: VecDeque<String> = path.into();
+    // `path` never returns an empty list when `current != target` — it
+    // returns `None` instead when there's no route — so this is always one
+    // real direction, not a placeholder.
+    let direction = remaining.pop_front().expect("path is non-empty here");
+    // `path` only ever follows edges with a known destination, so this
+    // lookup cannot come up empty either.
+    let expecting = session.map.rooms[&current].exits[&direction]
+        .expect("map.path only follows edges with a known destination");
+
+    let steps = remaining.len() + 1;
+    session.walk = Some(Walk {
+        remaining,
+        expecting,
+        destination: target,
+    });
+    session.push_line(RetainedLine::client(format!(
+        "** walking to #{} ({steps} step{})",
+        target.0,
+        if steps == 1 { "" } else { "s" }
+    )));
+    let _ = session
+        .commands
+        .send(SessionCommand::SendLine(direction))
+        .await;
 }
 
 /// `/connect <profile>` (§7.5, `ARCH_REVIEW.md` "Features that would break
@@ -2129,6 +2314,7 @@ pub(crate) mod test_support {
                 back_offset: 0,
                 map: crate::map::Map::default(),
                 current_room: None,
+                walk: None,
             },
             rx,
         )
@@ -4014,6 +4200,250 @@ mod tests {
                 .map
                 .path(crate::map::RoomId(1), crate::map::RoomId(2)),
             Some(vec!["n".to_string()])
+        );
+    }
+
+    // ---- /goto (§16) ----
+
+    /// Drops a room straight into the map, bypassing `SessionEvent::Room`
+    /// (and so `arrived_via`'s single-outstanding-move rule) — `/goto`'s
+    /// tests are about walking a route the map already claims to know, not
+    /// about how that route was learned.
+    fn put_room(map: &mut crate::map::Map, id: i64, name: Option<&str>, exits: &[(&str, i64)]) {
+        map.rooms.insert(
+            crate::map::RoomId(id),
+            crate::map::Room {
+                id: crate::map::RoomId(id),
+                name: name.map(str::to_string),
+                area: None,
+                exits: exits
+                    .iter()
+                    .map(|(dir, dest)| (dir.to_string(), Some(crate::map::RoomId(*dest))))
+                    .collect(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn goto_without_a_known_position_says_so() {
+        let (mut state, _receivers) = app(&["tank"]);
+
+        submit(&mut state, "/goto 1").await;
+
+        assert!(
+            scrollback(&state.sessions[0]).contains("doesn't know where you are"),
+            "{}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    /// The property the whole design hinges on: only the step in flight is
+    /// ever on the wire, so a route that turns out to be wrong is caught
+    /// after one step, not after all of them.
+    #[tokio::test]
+    async fn goto_by_vnum_walks_one_step_at_a_time() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[("n", 2)]);
+        put_room(&mut state.sessions[0].map, 2, None, &[("n", 3)]);
+        put_room(&mut state.sessions[0].map, 3, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/goto 3").await;
+
+        assert!(
+            matches!(receivers[0].try_recv(), Ok(SessionCommand::SendLine(line)) if line == "n"),
+            "the first step should be sent immediately"
+        );
+        assert!(
+            receivers[0].try_recv().is_err(),
+            "the second step must wait for the first to be confirmed, not fire alongside it"
+        );
+        let walk = state.sessions[0]
+            .walk
+            .as_ref()
+            .expect("a walk should be running");
+        assert_eq!(walk.remaining, VecDeque::from(["n".to_string()]));
+        assert_eq!(walk.expecting, crate::map::RoomId(2));
+        assert!(
+            scrollback(&state.sessions[0]).contains("2 steps"),
+            "{}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    #[tokio::test]
+    async fn goto_by_name_substring() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        put_room(
+            &mut state.sessions[0].map,
+            1,
+            Some("Town Square"),
+            &[("e", 2)],
+        );
+        put_room(
+            &mut state.sessions[0].map,
+            2,
+            Some("Temple of the Sun"),
+            &[],
+        );
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/goto temple").await;
+
+        assert!(
+            matches!(receivers[0].try_recv(), Ok(SessionCommand::SendLine(line)) if line == "e")
+        );
+        assert_eq!(
+            state.sessions[0].walk.as_ref().map(|w| w.destination),
+            Some(crate::map::RoomId(2))
+        );
+    }
+
+    /// Silently picking one of several matches would walk the character
+    /// somewhere they never named — a vnum is unambiguous, so that is what
+    /// the player is asked for instead.
+    #[tokio::test]
+    async fn goto_ambiguous_name_lists_candidates_and_starts_no_walk() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, Some("Start"), &[]);
+        put_room(&mut state.sessions[0].map, 10, Some("North Gate"), &[]);
+        put_room(&mut state.sessions[0].map, 11, Some("South Gate"), &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/goto gate").await;
+
+        assert!(state.sessions[0].walk.is_none());
+        assert!(
+            receivers[0].try_recv().is_err(),
+            "nothing should be sent while the match is still ambiguous"
+        );
+        let text = scrollback(&state.sessions[0]);
+        assert!(text.contains("#10") && text.contains("#11"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn goto_reports_a_name_with_no_match() {
+        let (mut state, _receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, Some("Start"), &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/goto nowhere").await;
+
+        assert!(state.sessions[0].walk.is_none());
+        assert!(scrollback(&state.sessions[0]).contains("no room matches"));
+    }
+
+    #[tokio::test]
+    async fn goto_reports_an_unknown_vnum() {
+        let (mut state, _receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/goto 999").await;
+
+        assert!(state.sessions[0].walk.is_none());
+        assert!(scrollback(&state.sessions[0]).contains("no room #999"));
+    }
+
+    #[tokio::test]
+    async fn goto_reports_no_known_route() {
+        let (mut state, _receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(&mut state.sessions[0].map, 2, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/goto 2").await;
+
+        assert!(state.sessions[0].walk.is_none());
+        assert!(scrollback(&state.sessions[0]).contains("no known route"));
+    }
+
+    #[tokio::test]
+    async fn goto_reports_already_there() {
+        let (mut state, _receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/goto 1").await;
+
+        assert!(scrollback(&state.sessions[0]).contains("already there"));
+    }
+
+    /// A step that lands anywhere other than the room the map predicted
+    /// means the route is stale — the walk has to stop rather than guess
+    /// the remaining steps from an unplanned-for room.
+    #[test]
+    fn a_step_landing_somewhere_unexpected_stops_the_walk() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].walk = Some(Walk {
+            remaining: VecDeque::new(),
+            expecting: crate::map::RoomId(2),
+            destination: crate::map::RoomId(5),
+        });
+
+        let (_, injections) = apply_session_event(&mut state, 0, room(99, Some("n")));
+
+        assert!(injections.is_empty(), "a broken walk sends nothing further");
+        assert!(state.sessions[0].walk.is_none());
+        let text = scrollback(&state.sessions[0]);
+        assert!(
+            text.contains("walk stopped") && text.contains("#99") && text.contains("#2"),
+            "{text}"
+        );
+    }
+
+    /// Because `/goto` never has more than one step outstanding, every room
+    /// update it causes has exactly one credited movement — so a wrong edge
+    /// the walk crosses gets overwritten with the truth by the very same
+    /// `SessionEvent::Room` handling that stops the walk. Walking repairs
+    /// the map.
+    #[test]
+    fn walking_a_wrong_edge_repairs_it() {
+        let (mut state, _rx) = app(&["tank"]);
+        let session = &mut state.sessions[0];
+        session.current_room = Some(crate::map::RoomId(1));
+        // Room 1 believes `n` leads to room 99 — wrong, as the walk is
+        // about to discover.
+        put_room(&mut session.map, 1, None, &[("n", 99)]);
+        session.walk = Some(Walk {
+            remaining: VecDeque::new(),
+            expecting: crate::map::RoomId(99),
+            destination: crate::map::RoomId(99),
+        });
+
+        // The step actually lands in room 2, credited as a single `n`.
+        apply_session_event(&mut state, 0, room(2, Some("n")));
+
+        let session = &state.sessions[0];
+        assert!(
+            session.walk.is_none(),
+            "arriving somewhere the map didn't predict must still stop the walk"
+        );
+        assert_eq!(
+            session.map.rooms[&crate::map::RoomId(1)].exits.get("n"),
+            Some(&Some(crate::map::RoomId(2))),
+            "the credited step must overwrite the wrong destination with the truth"
+        );
+    }
+
+    /// Player intervention wins over a route in progress: a gate the walk
+    /// hasn't discovered yet, or a change of mind, is the player's call.
+    #[tokio::test]
+    async fn a_typed_line_cancels_an_active_walk() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        state.sessions[0].walk = Some(Walk {
+            remaining: VecDeque::from(["n".to_string()]),
+            expecting: crate::map::RoomId(2),
+            destination: crate::map::RoomId(3),
+        });
+
+        submit(&mut state, "look").await;
+
+        assert!(state.sessions[0].walk.is_none());
+        assert!(scrollback(&state.sessions[0]).contains("cancelled"));
+        assert!(
+            matches!(receivers[0].try_recv(), Ok(SessionCommand::SendLine(line)) if line == "look")
         );
     }
 

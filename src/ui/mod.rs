@@ -93,6 +93,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/config", "edit this character's profile"),
         row("/newprofile", "create another character's profile"),
         row("/connect", "add a character to this running instance"),
+        row("/goto", "walk to a known room, one step at a time"),
         String::new(),
         "Leaving".to_string(),
         row(keybinds.quit, "quit"),

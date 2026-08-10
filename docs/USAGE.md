@@ -312,6 +312,31 @@ anything that doesn't parse as a path (no leading `.`, or a token that
 isn't a digit run followed by a known direction) is sent exactly as
 typed, so `.` stays an ordinary character everywhere else.
 
+## Mapping and `/goto`
+
+On a MUD that sends GMCP or MSDP room data, the client quietly builds a
+graph of rooms and exits as you explore, and saves it alongside the
+profile so it's still there next session.
+
+```
+/goto 12345
+/goto temple
+```
+
+names a destination — either its vnum, or a case-insensitive substring of
+a room name — and walks there if a route is known. If more than one room
+matches a name, `/goto` lists a few candidates and asks for a vnum
+instead of guessing which one you meant.
+
+Unlike speedwalking, this **does** use the room graph, but it still walks
+one direction at a time rather than firing the whole route at once: a
+gate that was open when the route was learned can be locked by the time
+it's walked, and a movement command can simply be refused. If a step
+lands somewhere other than where the map expected, `/goto` stops right
+there and says so, rather than guessing the rest of the way from a room
+it didn't plan for — leaving that character somewhere unexpected would be
+worse than leaving them in place.
+
 ## Automation: aliases, triggers, timers
 
 Rules can go directly in a profile, or in a shared module that several
