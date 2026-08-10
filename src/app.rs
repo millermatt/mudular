@@ -52,6 +52,9 @@ const RELOAD_COMMAND: &str = "/reload";
 const HELP_COMMAND: &str = "/help";
 /// Opens the in-client profile editor (§10.2) — the same thing `F5` does.
 const CONFIG_COMMAND: &str = "/config";
+/// Opens the same form the first-run screen shows, reachable any time
+/// rather than only at zero-profile startup (§15, UX_REVIEW.md B).
+const NEWPROFILE_COMMAND: &str = "/newprofile";
 
 /// `send_to` address meaning "every other session" (§7.5).
 const ALL_SESSIONS: &str = "*";
@@ -332,6 +335,14 @@ pub struct AppState {
     /// `Some(back_offset)` is the line it currently highlights, measured the
     /// same way `SessionPane::back_offset` is — distance from the tail.
     pub line_cursor: Option<usize>,
+    /// Where profiles live, so `/newprofile` knows where to save one
+    /// without depending on which session happens to be bound (§15).
+    config_dir: PathBuf,
+    /// `/newprofile`'s form, when it is open — reachable any time, not
+    /// just at first run (§15, UX_REVIEW.md B). `Some` owns the keyboard
+    /// and paints over every pane, like the config editor, and sessions
+    /// keep running behind it the same way.
+    pub new_profile_wizard: Option<NewProfileWizard>,
 }
 
 /// `PgUp`/`PgDn`/`Home`/`End`, unmodified — built-in and unremappable, like
@@ -936,7 +947,7 @@ async fn service_config_save(state: &mut AppState, channels: &[Channel], mode: c
 /// Which field the new-profile wizard is currently collecting, in the
 /// order it asks them (docs/ARCHITECTURE.md §15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WizardStep {
+pub enum WizardStep {
     Name,
     Host,
     Port,
@@ -944,13 +955,120 @@ enum WizardStep {
 }
 
 impl WizardStep {
-    fn prompt(self) -> &'static str {
+    pub fn prompt(self) -> &'static str {
         match self {
             WizardStep::Name => "Character/profile name",
             WizardStep::Host => "Host",
             WizardStep::Port => "Port (blank for 23)",
             WizardStep::Tls => "Use TLS? (y/N)",
         }
+    }
+}
+
+/// What one key did to a [`NewProfileWizard`] in progress.
+#[derive(Debug)]
+enum WizardOutcome {
+    /// More fields to go, or the last answer was rejected — the wizard's
+    /// own state (`error`, in particular) says which.
+    Continue,
+    Cancelled,
+    Done(config::NewProfile),
+}
+
+/// The "create a profile" form's state machine (docs/ARCHITECTURE.md §15),
+/// shared by two homes: the first-run screen (`run_new_profile_wizard`,
+/// which still needs its own terminal session, since there is no live
+/// session yet for the form to overlay) and `/newprofile` reachable any
+/// time after (an `AppState` field, drawn over the panes and keeping
+/// sessions running behind it — the same "state, not layout" split the
+/// config editor already uses).
+pub struct NewProfileWizard {
+    pub step: WizardStep,
+    name: String,
+    host: String,
+    port: u16,
+    pub answered: Vec<(&'static str, String)>,
+    pub input: Input,
+    pub error: Option<String>,
+    config_dir: PathBuf,
+}
+
+impl NewProfileWizard {
+    fn new(config_dir: PathBuf) -> Self {
+        Self {
+            step: WizardStep::Name,
+            name: String::new(),
+            host: String::new(),
+            port: 23,
+            answered: Vec::new(),
+            input: Input::default(),
+            error: None,
+            config_dir,
+        }
+    }
+
+    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> WizardOutcome {
+        if code == KeyCode::Esc {
+            return WizardOutcome::Cancelled;
+        }
+        if code != KeyCode::Enter {
+            self.input
+                .handle_event(&Event::Key(crossterm::event::KeyEvent::new(
+                    code, modifiers,
+                )));
+            return WizardOutcome::Continue;
+        }
+
+        let value = self.input.value().trim().to_string();
+        self.error = match self.step {
+            WizardStep::Name if value.is_empty() || value.contains(['/', '\\']) => {
+                Some("a profile name can't be empty or contain a slash".to_string())
+            }
+            // Only reachable from `/newprofile`: the first-run form only
+            // ever shows with zero profiles saved, so no name can collide
+            // there.
+            WizardStep::Name if config::profile_path(&self.config_dir, &value).exists() => {
+                Some(format!("a profile named `{value}` already exists"))
+            }
+            WizardStep::Name => {
+                self.name = value.clone();
+                self.answered.push(("Name", value));
+                self.step = WizardStep::Host;
+                None
+            }
+            WizardStep::Host if value.is_empty() => Some("a host is required".to_string()),
+            WizardStep::Host => {
+                self.host = value.clone();
+                self.answered.push(("Host", value));
+                self.step = WizardStep::Port;
+                None
+            }
+            WizardStep::Port if value.is_empty() => {
+                self.answered.push(("Port", "23".to_string()));
+                self.step = WizardStep::Tls;
+                None
+            }
+            WizardStep::Port => match value.parse() {
+                Ok(parsed) => {
+                    self.port = parsed;
+                    self.answered.push(("Port", value));
+                    self.step = WizardStep::Tls;
+                    None
+                }
+                Err(_) => Some("port must be a number from 1-65535".to_string()),
+            },
+            WizardStep::Tls => {
+                let tls = matches!(value.to_ascii_lowercase().as_str(), "y" | "yes");
+                return WizardOutcome::Done(config::NewProfile {
+                    name: self.name.clone(),
+                    host: self.host.clone(),
+                    port: self.port,
+                    tls,
+                });
+            }
+        };
+        self.input = Input::default();
+        WizardOutcome::Continue
     }
 }
 
@@ -961,34 +1079,31 @@ impl WizardStep {
 /// yet, and threading a would-be session through a loop built to manage
 /// live ones would be the tail wagging the dog. `Ok(None)` means the
 /// player cancelled with Esc.
-pub async fn run_new_profile_wizard() -> Result<Option<config::NewProfile>> {
+pub async fn run_new_profile_wizard(
+    config_dir: &std::path::Path,
+) -> Result<Option<config::NewProfile>> {
     let mut terminal = ratatui::init();
-    let result = new_profile_event_loop(&mut terminal).await;
+    let result = new_profile_event_loop(&mut terminal, config_dir).await;
     ratatui::restore();
     result
 }
 
 async fn new_profile_event_loop(
     terminal: &mut DefaultTerminal,
+    config_dir: &std::path::Path,
 ) -> Result<Option<config::NewProfile>> {
-    let mut step = WizardStep::Name;
-    let mut name = String::new();
-    let mut host = String::new();
-    let mut port: u16 = 23;
-    let mut answered: Vec<(&str, String)> = Vec::new();
-    let mut input = Input::default();
-    let mut error: Option<String> = None;
+    let mut wizard = NewProfileWizard::new(config_dir.to_path_buf());
     let mut term_events = EventStream::new();
 
     loop {
         terminal.draw(|frame| {
             ui::draw_new_profile_wizard(
                 frame,
-                &answered,
-                step.prompt(),
-                input.value(),
-                input.visual_cursor(),
-                error.as_deref(),
+                &wizard.answered,
+                wizard.step.prompt(),
+                wizard.input.value(),
+                wizard.input.visual_cursor(),
+                wizard.error.as_deref(),
             )
         })?;
 
@@ -998,61 +1113,17 @@ async fn new_profile_event_loop(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if key.code == KeyCode::Esc {
-            return Ok(None);
+        match wizard.handle_key(key.code, key.modifiers) {
+            WizardOutcome::Continue => {}
+            WizardOutcome::Cancelled => return Ok(None),
+            WizardOutcome::Done(profile) => return Ok(Some(profile)),
         }
-        if key.code != KeyCode::Enter {
-            input.handle_event(&Event::Key(key));
-            continue;
-        }
-
-        let value = input.value().trim().to_string();
-        error = match step {
-            WizardStep::Name if value.is_empty() || value.contains(['/', '\\']) => {
-                Some("a profile name can't be empty or contain a slash".to_string())
-            }
-            WizardStep::Name => {
-                name = value.clone();
-                answered.push(("Name", value));
-                step = WizardStep::Host;
-                None
-            }
-            WizardStep::Host if value.is_empty() => Some("a host is required".to_string()),
-            WizardStep::Host => {
-                host = value.clone();
-                answered.push(("Host", value));
-                step = WizardStep::Port;
-                None
-            }
-            WizardStep::Port if value.is_empty() => {
-                answered.push(("Port", "23".to_string()));
-                step = WizardStep::Tls;
-                None
-            }
-            WizardStep::Port => match value.parse() {
-                Ok(parsed) => {
-                    port = parsed;
-                    answered.push(("Port", value));
-                    step = WizardStep::Tls;
-                    None
-                }
-                Err(_) => Some("port must be a number from 1-65535".to_string()),
-            },
-            WizardStep::Tls => {
-                let tls = matches!(value.to_ascii_lowercase().as_str(), "y" | "yes");
-                return Ok(Some(config::NewProfile {
-                    name,
-                    host,
-                    port,
-                    tls,
-                }));
-            }
-        };
-        input = Input::default();
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
+    config_dir: PathBuf,
     targets: Vec<ConnectTarget>,
     keybinds: Keybinds,
     channels: Vec<Channel>,
@@ -1063,6 +1134,7 @@ pub async fn run(
     let mut terminal = ratatui::init();
     let result = event_loop(
         &mut terminal,
+        config_dir,
         targets,
         keybinds,
         channels,
@@ -1204,8 +1276,10 @@ enum Wake {
     Session(usize, Option<SessionEvent>),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn event_loop(
     terminal: &mut DefaultTerminal,
+    config_dir: PathBuf,
     targets: Vec<ConnectTarget>,
     keybinds: Keybinds,
     channels: Vec<Channel>,
@@ -1277,6 +1351,8 @@ async fn event_loop(
         config_editor: None,
         config_editor_save: None,
         line_cursor: None,
+        config_dir,
+        new_profile_wizard: None,
     };
     // A config value wider than this terminal is clamped before the first
     // frame, the same as a `Resize` clamps it later (§11.4).
@@ -1445,6 +1521,33 @@ fn handle_key(
                 } else {
                     config::SaveMode::Guarded
                 });
+            }
+        }
+        return true;
+    }
+    // The new-profile form owns the keyboard while it's open, same as the
+    // config editor above — reachable any time via `/newprofile`, not just
+    // at first run (§15, UX_REVIEW.md B). It only ever writes the file:
+    // connecting it live would need the dynamic peer registry `/connect`
+    // does (tracked separately), so the confirmation says how to use it
+    // next launch rather than pretending it joined this one.
+    if let Some(wizard) = state.new_profile_wizard.as_mut() {
+        match wizard.handle_key(code, modifiers) {
+            WizardOutcome::Continue => {}
+            WizardOutcome::Cancelled => state.new_profile_wizard = None,
+            WizardOutcome::Done(profile) => {
+                state.new_profile_wizard = None;
+                let notice = match config::save_new_profile(&state.config_dir, &profile) {
+                    Ok(()) => format!(
+                        "** saved profiles/{}.yaml — run `mudular {}` alongside \
+                         this session next time to play it too",
+                        profile.name, profile.name
+                    ),
+                    Err(err) => format!("** could not save the new profile: {err:#}"),
+                };
+                if let Some(session) = state.bound_mut() {
+                    session.push_line(RetainedLine::client(notice));
+                }
             }
         }
         return true;
@@ -1642,6 +1745,10 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         open_config_editor(state, channels);
         return;
     }
+    if line.trim() == NEWPROFILE_COMMAND {
+        state.new_profile_wizard = Some(NewProfileWizard::new(state.config_dir.clone()));
+        return;
+    }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
 }
 
@@ -1712,6 +1819,8 @@ pub(crate) mod test_support {
                 config_editor: None,
                 config_editor_save: None,
                 line_cursor: None,
+                config_dir: PathBuf::from("/cfg"),
+                new_profile_wizard: None,
             },
             receivers,
         )
@@ -3186,5 +3295,149 @@ mod tests {
         apply_session_event(&mut state, 0, SessionEvent::server("more output"));
 
         assert_eq!(state.sessions[0].back_offset, 0);
+    }
+
+    // ---- /newprofile (§15, UX_REVIEW.md B) ----
+
+    fn fill_wizard(wizard: &mut NewProfileWizard, value: &str) -> WizardOutcome {
+        for c in value.chars() {
+            assert!(matches!(
+                wizard.handle_key(KeyCode::Char(c), KeyModifiers::NONE),
+                WizardOutcome::Continue
+            ));
+        }
+        wizard.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_wizard_collects_all_four_fields_then_reports_done() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut wizard = NewProfileWizard::new(dir.path().to_path_buf());
+
+        assert!(matches!(
+            fill_wizard(&mut wizard, "kestrel"),
+            WizardOutcome::Continue
+        ));
+        assert!(matches!(
+            fill_wizard(&mut wizard, "mud.example.org"),
+            WizardOutcome::Continue
+        ));
+        assert!(matches!(
+            fill_wizard(&mut wizard, "4000"),
+            WizardOutcome::Continue
+        ));
+        match fill_wizard(&mut wizard, "y") {
+            WizardOutcome::Done(profile) => {
+                assert_eq!(profile.name, "kestrel");
+                assert_eq!(profile.host, "mud.example.org");
+                assert_eq!(profile.port, 4000);
+                assert!(profile.tls);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// Reusing the wizard mid-session (unlike first-run, where zero
+    /// profiles are guaranteed) means a name can collide with one already
+    /// on disk — caught at the same step as an empty name, not left to
+    /// silently overwrite the existing file.
+    #[test]
+    fn the_wizard_rejects_a_name_that_already_exists() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        config::save_new_profile(
+            dir.path(),
+            &config::NewProfile {
+                name: "kestrel".to_string(),
+                host: "old.example.org".to_string(),
+                port: 23,
+                tls: false,
+            },
+        )
+        .unwrap();
+
+        let mut wizard = NewProfileWizard::new(dir.path().to_path_buf());
+        assert!(matches!(
+            fill_wizard(&mut wizard, "kestrel"),
+            WizardOutcome::Continue
+        ));
+        assert_eq!(
+            wizard.error.as_deref(),
+            Some("a profile named `kestrel` already exists")
+        );
+        assert_eq!(
+            wizard.step,
+            WizardStep::Name,
+            "must not advance past the collision"
+        );
+    }
+
+    #[tokio::test]
+    async fn newprofile_command_opens_the_form_and_saving_writes_the_file() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.config_dir = dir.path().to_path_buf();
+
+        submit(&mut state, "/newprofile").await;
+        assert!(state.new_profile_wizard.is_some());
+
+        for c in "kestrel".chars() {
+            press(&mut state, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        for c in "mud.example.org".chars() {
+            press(&mut state, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE); // blank port -> 23
+        press(&mut state, KeyCode::Char('n'), KeyModifiers::NONE);
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(state.new_profile_wizard.is_none());
+        assert!(config::has_profiles(dir.path()));
+        assert!(
+            scrollback(&state.sessions[0]).contains("saved profiles/kestrel.yaml"),
+            "{:?}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_cancels_the_newprofile_form_without_saving() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.config_dir = dir.path().to_path_buf();
+
+        submit(&mut state, "/newprofile").await;
+        for c in "kestrel".chars() {
+            press(&mut state, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(press(&mut state, KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(state.new_profile_wizard.is_none());
+        assert!(!config::has_profiles(dir.path()));
+    }
+
+    /// The whole point of putting this in `AppState` instead of a second
+    /// blocking terminal loop, like the first-run wizard's own: other
+    /// sessions keep receiving and rendering while the form is up (§15).
+    #[tokio::test]
+    async fn other_sessions_keep_running_while_the_form_is_open() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        state.config_dir = dir.path().to_path_buf();
+
+        submit(&mut state, "/newprofile").await;
+        assert!(state.new_profile_wizard.is_some());
+
+        apply_session_event(&mut state, 1, SessionEvent::server("a rat scurries past"));
+
+        assert!(
+            scrollback(&state.sessions[1]).contains("a rat scurries past"),
+            "the other session must keep updating while the form is open"
+        );
+        assert!(
+            state.new_profile_wizard.is_some(),
+            "the form must still be open"
+        );
     }
 }

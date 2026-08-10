@@ -87,6 +87,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/help", "print this help into the pane"),
         row("/reload", "recompile rules and scripts from disk"),
         row("/config", "edit this character's profile"),
+        row("/newprofile", "create another character's profile"),
         String::new(),
         "Leaving".to_string(),
         row(keybinds.quit, "quit"),
@@ -250,6 +251,17 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     if let Some(editor) = &state.config_editor {
         editor.draw(frame, frame.area());
     }
+
+    if let Some(wizard) = &state.new_profile_wizard {
+        draw_new_profile_wizard(
+            frame,
+            &wizard.answered,
+            wizard.step.prompt(),
+            wizard.input.value(),
+            wizard.input.visual_cursor(),
+            wizard.error.as_deref(),
+        );
+    }
 }
 
 /// The help overlay: a box centred over the layout, sized to its content and
@@ -275,11 +287,13 @@ fn draw_help(frame: &mut Frame, area: Rect, keybinds: &Keybinds) {
     frame.render_widget(Paragraph::new(text).block(block), overlay);
 }
 
-/// The first-run "new profile" wizard (docs/ARCHITECTURE.md §15): one field
-/// at a time, with what's already been answered shown above it, so filling
-/// it in never risks fat-fingering a form whose other fields are out of
-/// sight. Runs before any session exists, so it draws over an empty
-/// terminal rather than over panes.
+/// The "new profile" wizard (docs/ARCHITECTURE.md §15): one field at a
+/// time, with what's already been answered shown above it, so filling it
+/// in never risks fat-fingering a form whose other fields are out of
+/// sight. Shared by two callers — the first-run screen, which draws over
+/// an empty terminal since no session exists yet, and `/newprofile`
+/// (`AppState::new_profile_wizard`), which draws this same overlay on top
+/// of live panes via `ratatui::widgets::Clear`.
 pub fn draw_new_profile_wizard(
     frame: &mut Frame,
     answered: &[(&str, String)],

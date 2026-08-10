@@ -69,6 +69,14 @@ mudular kestrel
 See [`examples/config/profiles/kestrel.yaml`](../examples/config/profiles/kestrel.yaml)
 for a fuller example.
 
+Typing `/newprofile` opens a small form instead — name, host, port, TLS,
+one field at a time — and writes the YAML for you. It only saves the
+file; connect the new character next time you launch (`mudular kestrel
+tank`, alongside whoever you're already playing), the same as any other
+profile. Nothing else a profile can do (`login:`, `modules:`, `color:`,
+…) is asked here — hand-edit the file afterward for that, same as if
+you'd written it yourself.
+
 ### Logging in automatically
 
 Add a `login:` block naming your character, and Mudular answers the

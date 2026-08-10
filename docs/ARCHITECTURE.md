@@ -1497,6 +1497,20 @@ Target: a non-technical user installs Mudular on any OS in one step.
   to `profiles/<name>.yaml` via `serde_yaml` (quoting whatever the player
   typed correctly, rather than hand-formatting the file and hoping) and
   connected immediately, in the same launch.
+- **`/newprofile`:** the same form, reachable any time after — not just at
+  zero-profile startup (UX_REVIEW.md B). Here there *is* a session (usually
+  several) for the form to belong to, so it's the opposite shape from
+  first-run: an `AppState` field (`new_profile_wizard`, sharing the same
+  step machine via `NewProfileWizard`) drawn as an overlay over the live
+  panes, the same "state, not layout" split the config editor already uses
+  — sessions keep receiving and rendering while it's open, rather than
+  freezing behind a second blocking terminal loop. It only ever writes the
+  file: connecting the new profile live would need the dynamic peer
+  registry `/connect` does (§14, tracked separately), so success reports
+  where the file went and how to use it next launch, not a live session.
+  The one validation first-run doesn't need: a name can now collide with a
+  profile already on disk, caught at the same step as an empty name rather
+  than silently overwriting it.
 
 ## 16. Designed-For Extensions
 - **More scripting engines:** anything embeddable and statically linkable

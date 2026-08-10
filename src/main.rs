@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
         // "no target" shell §15 shows once a profile already exists and
         // `mudular` is run bare, rather than exiting the process with
         // nothing said.
-        if let Some(new_profile) = app::run_new_profile_wizard().await? {
+        if let Some(new_profile) = app::run_new_profile_wizard(&dir).await? {
             config::save_new_profile(&dir, &new_profile)?;
             cli.profiles = vec![new_profile.name];
         }
@@ -193,6 +193,7 @@ async fn main() -> Result<()> {
     }
 
     app::run(
+        dir,
         targets,
         app_config.keybinds,
         channels,
