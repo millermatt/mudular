@@ -63,6 +63,7 @@ const CONNECT_COMMAND: &str = "/connect";
 /// Walks toward a room already on the map, one step at a time (§16) — a
 /// vnum, or a case-insensitive substring of a room name.
 const GOTO_COMMAND: &str = "/goto";
+const MAP_COMMAND: &str = "/map";
 
 /// `send_to` address meaning "every other session" (§7.5).
 const ALL_SESSIONS: &str = "*";
@@ -380,6 +381,10 @@ pub struct AppState {
     /// `ui::layout` recomputes every rect from it each frame, and the keys
     /// only move this number (docs/ARCHITECTURE.md §11.4).
     pub channel_width: u16,
+    /// Whether the docked map column is up (§16).
+    pub show_map: bool,
+    /// Live width of the map column, on the same terms as `channel_width`.
+    pub map_width: u16,
     /// Whether the focused session's pane shows `inspector_log` instead of
     /// its scrollback.
     pub show_inspector: bool,
@@ -1651,6 +1656,11 @@ async fn event_loop(
         layout: LayoutMode::Tabs,
         show_channels: !channels.is_empty(),
         channel_width,
+        // Off until asked for: on a MUD that sends no room data it would
+        // be a permanently empty column, and the player has not said yet
+        // whether they want it.
+        show_map: false,
+        map_width: crate::ui::MAP_WIDTH,
         show_inspector: false,
         show_help: false,
         keybinds: keybinds.clone(),
@@ -1669,6 +1679,7 @@ async fn event_loop(
     // frame, the same as a `Resize` clamps it later (§11.4).
     state.channel_width =
         ui::clamp_channel_width(state.channel_width, terminal.get_frame().area().width);
+    state.map_width = ui::clamp_map_width(state.map_width, terminal.get_frame().area().width);
 
     if !has_sessions {
         // Nothing to drive the loop but the terminal; the empty-state help
@@ -1759,6 +1770,7 @@ async fn event_loop(
                 // session area can spare, so the width re-clamps on every
                 // resize before the sizes are reported (§11.4).
                 state.channel_width = ui::clamp_channel_width(state.channel_width, area.width);
+                state.map_width = ui::clamp_map_width(state.map_width, area.width);
                 report_pane_sizes(&mut state, area).await;
             }
             Wake::Terminal(Some(Ok(_))) => {}
@@ -1934,6 +1946,11 @@ fn handle_key(
         open_config_editor(state, channels);
         return true;
     }
+    if keybinds.toggle_map.matches(code, modifiers) {
+        state.show_map = !state.show_map;
+        describe_current_room(state);
+        return true;
+    }
     if keybinds.reload.matches(code, modifiers) {
         state.reload_requested = true;
         return true;
@@ -1990,6 +2007,20 @@ fn handle_key(
     if keybinds.channel_narrower.matches(code, modifiers) {
         state.channel_width = ui::clamp_channel_width(
             state.channel_width.saturating_sub(CHANNEL_WIDTH_STEP),
+            area_width,
+        );
+        return true;
+    }
+    if keybinds.map_wider.matches(code, modifiers) {
+        state.map_width = ui::clamp_map_width(
+            state.map_width.saturating_add(CHANNEL_WIDTH_STEP),
+            area_width,
+        );
+        return true;
+    }
+    if keybinds.map_narrower.matches(code, modifiers) {
+        state.map_width = ui::clamp_map_width(
+            state.map_width.saturating_sub(CHANNEL_WIDTH_STEP),
             area_width,
         );
         return true;
@@ -2112,12 +2143,50 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         connect_new_session(state, channels, name).await;
         return;
     }
+    if trimmed == MAP_COMMAND {
+        state.show_map = !state.show_map;
+        describe_current_room(state);
+        return;
+    }
     if trimmed == GOTO_COMMAND || trimmed.starts_with("/goto ") {
         let arg = trimmed.strip_prefix(GOTO_COMMAND).unwrap_or("").trim();
         start_goto(state, arg).await;
         return;
     }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
+}
+
+/// Prints where the character is standing and what leads out of it, as
+/// ordinary scrollback lines (§16).
+///
+/// Runs on every `/map` and every toggle key, in both directions, rather
+/// than only when the column is coming up. The drawn column is glyphs at
+/// coordinates in the alternate screen, which a screen reader cannot read
+/// at all; these lines are the form of the map that everyone can reach, so
+/// they are not a consolation for having the pane off. They also scroll,
+/// copy, and land in the disk log, which the pane does none of.
+fn describe_current_room(state: &mut AppState) {
+    let described = state.bound().and_then(|session| {
+        session
+            .current_room
+            .map(|at| session.map.describe(at))
+            .filter(|lines| !lines.is_empty())
+    });
+    let Some(session) = state.bound_mut() else {
+        return;
+    };
+    match described {
+        Some(lines) => {
+            for line in lines {
+                session.push_line(RetainedLine::client(line));
+            }
+        }
+        // Same plain report `/goto` gives: a command that answers nothing
+        // reads as a broken command.
+        None => session.push_line(RetainedLine::client(
+            "** the map doesn't know where you are yet",
+        )),
+    }
 }
 
 /// `/goto <vnum | name substring>` (§16): walks toward a room the map
@@ -2355,6 +2424,8 @@ pub(crate) mod test_support {
                 layout: LayoutMode::Tabs,
                 show_channels: false,
                 channel_width: crate::ui::CHANNEL_WIDTH,
+                show_map: false,
+                map_width: crate::ui::MAP_WIDTH,
                 show_inspector: false,
                 show_help: false,
                 keybinds: Keybinds::default(),
@@ -4312,6 +4383,64 @@ mod tests {
         assert_eq!(
             state.sessions[0].walk.as_ref().map(|w| w.destination),
             Some(crate::map::RoomId(2))
+        );
+    }
+
+    /// `/map` does two things on purpose (§16): it toggles the column, and
+    /// it prints the description into the scrollback. The printed form is
+    /// the only one a screen reader can read — a grid of glyphs in the
+    /// alternate screen is not — so it is not a fallback for when the pane
+    /// is off, it happens every time.
+    #[tokio::test]
+    async fn map_toggles_the_column_and_always_prints_the_description() {
+        let (mut state, _receivers) = app(&["tank"]);
+        put_room(
+            &mut state.sessions[0].map,
+            1,
+            Some("Town Square"),
+            &[("e", 2)],
+        );
+        put_room(
+            &mut state.sessions[0].map,
+            2,
+            Some("Temple of the Sun"),
+            &[],
+        );
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/map").await;
+        assert!(state.show_map, "the column comes up");
+        let printed = scrollback(&state.sessions[0]);
+        assert!(printed.contains("Town Square (#1)"), "{printed}");
+        assert!(
+            printed.contains("east to Temple of the Sun"),
+            "the description names where exits lead: {printed}"
+        );
+
+        submit(&mut state, "/map").await;
+        assert!(!state.show_map, "and goes back down");
+        let printed = scrollback(&state.sessions[0]);
+        assert_eq!(
+            printed.matches("Town Square (#1)").count(),
+            2,
+            "printed on the way down too, not only on the way up: {printed}"
+        );
+    }
+
+    /// The map has nothing to say before the server has placed you, and
+    /// saying nothing at all reads as a broken command (§16's plain-report
+    /// rule, as `/goto` already follows).
+    #[tokio::test]
+    async fn map_says_so_when_it_does_not_know_where_you_are() {
+        let (mut state, _receivers) = app(&["tank"]);
+
+        submit(&mut state, "/map").await;
+
+        assert!(state.show_map, "the column still toggles");
+        assert!(
+            scrollback(&state.sessions[0]).contains("doesn't know where you are"),
+            "{}",
+            scrollback(&state.sessions[0])
         );
     }
 

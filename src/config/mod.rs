@@ -446,6 +446,16 @@ pub struct Keybinds {
     /// this one didn't (UX_REVIEW.md F).
     #[serde(default = "default_reload")]
     pub reload: KeyBinding,
+    /// Shows or hides the docked map column — the same thing typing `/map`
+    /// does (§16).
+    #[serde(default = "default_toggle_map")]
+    pub toggle_map: KeyBinding,
+    /// Widens the map column (§11.4, §16).
+    #[serde(default = "default_map_wider")]
+    pub map_wider: KeyBinding,
+    /// Narrows the map column (§11.4, §16).
+    #[serde(default = "default_map_narrower")]
+    pub map_narrower: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -462,6 +472,9 @@ impl Default for Keybinds {
             config_editor: default_config_editor(),
             line_picker: default_line_picker(),
             reload: default_reload(),
+            toggle_map: default_toggle_map(),
+            map_wider: default_map_wider(),
+            map_narrower: default_map_narrower(),
         }
     }
 }
@@ -523,6 +536,22 @@ fn default_reload() -> KeyBinding {
     // Next free key in the F1 help / F2 GMCP / F3 layout / F4 channels /
     // F5 config editor row.
     "f6".parse().expect("built-in default keybinding")
+}
+
+fn default_toggle_map() -> KeyBinding {
+    // Next free after F6 reload, continuing the same row.
+    "f7".parse().expect("built-in default keybinding")
+}
+
+// The bracket pair, beside the comms column's `alt+-` / `alt+=`: two
+// columns need two pairs, and reusing one pair for both would depend on a
+// focus the map column does not have.
+fn default_map_wider() -> KeyBinding {
+    "alt+]".parse().expect("built-in default keybinding")
+}
+
+fn default_map_narrower() -> KeyBinding {
+    "alt+[".parse().expect("built-in default keybinding")
 }
 
 /// A single key combination, parsed from strings like `ctrl+c` or `f1`.

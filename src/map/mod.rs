@@ -15,12 +15,6 @@
 //! deliberately out of scope: it is MUD-specific guesswork, where this is
 //! structured data the server already vouches for.
 
-// The graph lands before anything consumes it: `session` feeds it and `ui`
-// draws it, and until they do its public surface is exercised only by this
-// module's own tests. Comes out as soon as they call in — a module-wide
-// allow that outlives its reason is how genuinely dead code hides.
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
@@ -393,6 +387,86 @@ impl Map {
         }
         coords
     }
+
+    /// What is here and where it leads, in prose, as scrollback lines.
+    /// Empty if the map has never seen `at` — "nowhere" and "a room with
+    /// nothing in it" are different answers and the caller has to be able
+    /// to tell them apart.
+    ///
+    /// This is the description seam (§16). The map pane draws glyphs at
+    /// coordinates, which is a shape only a sighted reader can use: a
+    /// screen reader reads lines, not a redrawn grid in the alternate
+    /// screen. So the knowledge of how to say what a room *is* lives here,
+    /// beside `path` and `layout_area`, and the renderer is one consumer of
+    /// it rather than the only place it exists. `/map` prints these lines,
+    /// which also makes the map scrollable, copyable, and loggable.
+    pub fn describe(&self, at: RoomId) -> Vec<String> {
+        let Some(room) = self.rooms.get(&at) else {
+            return Vec::new();
+        };
+
+        // The vnum stays visible even when the room has a name: it is what
+        // `/goto` takes, and a name can be shared by ninety-nine maze rooms.
+        let mut heading = match &room.name {
+            Some(name) => format!("{name} (#{})", at.0),
+            None => format!("#{}", at.0),
+        };
+        if let Some(area) = &room.area {
+            heading.push_str(&format!(", {area}"));
+        }
+
+        let mut exits: Vec<&String> = room.exits.keys().collect();
+        exits.sort_by_key(|direction| compass_rank(direction));
+        let described: Vec<String> = exits
+            .into_iter()
+            .map(|direction| {
+                let spelled = spell_direction(direction);
+                match room.exits[direction] {
+                    // A destination the map has never seen is still a
+                    // destination — name it by vnum rather than calling a
+                    // walked exit unexplored.
+                    Some(dest) => match self.rooms.get(&dest).and_then(|room| room.name.as_deref())
+                    {
+                        Some(name) => format!("{spelled} to {name}"),
+                        None => format!("{spelled} to #{}", dest.0),
+                    },
+                    None => format!("{spelled} (unexplored)"),
+                }
+            })
+            .collect();
+
+        let exit_line = if described.is_empty() {
+            "Exits: none".to_string()
+        } else {
+            format!("Exits: {}", described.join(", "))
+        };
+        vec![heading, exit_line]
+    }
+}
+
+/// Reading order for exits: round the compass, then the exits that are not
+/// compass points at all. Alphabetical is what `BTreeMap` gives for free and
+/// it reads as noise — "east, north, northeast, south" is not how anyone
+/// holds a room in their head.
+fn compass_rank(direction: &str) -> (usize, String) {
+    const ORDER: &[&str] = &[
+        "n", "ne", "e", "se", "s", "sw", "w", "nw", "u", "d", "in", "out",
+    ];
+    match ORDER.iter().position(|known| *known == direction) {
+        Some(rank) => (rank, String::new()),
+        None => (ORDER.len(), direction.to_string()),
+    }
+}
+
+/// The long spelling of a canonical direction, for prose. Falls back to the
+/// direction as stored: a server is free to name an exit `portal`, and an
+/// exit we cannot spell is still an exit worth listing.
+fn spell_direction(direction: &str) -> &str {
+    DIRECTIONS
+        .iter()
+        .find(|(spelling, canonical)| *canonical == direction && spelling.len() > canonical.len())
+        .map(|(spelling, _)| *spelling)
+        .unwrap_or(direction)
 }
 
 #[cfg(test)]
@@ -773,5 +847,77 @@ mod tests {
         assert_eq!(canonical_direction(" ne "), Some("ne"));
         assert_eq!(canonical_direction("southwest"), Some("sw"));
         assert_eq!(canonical_direction("look"), None);
+    }
+
+    /// The description seam (§16): what the map knows how to *say* lives
+    /// here, not in the renderer, so the map has a form that survives
+    /// without a grid to draw it on. Named neighbours are named — a bare
+    /// list of compass points is a much worse answer to "where can I go".
+    #[test]
+    fn describes_a_room_and_names_where_its_exits_lead() {
+        let mut map = Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(40606),
+            name: Some("Middle of village street".to_string()),
+            area: Some("New: Ofcol Village".to_string()),
+            exits: BTreeMap::from([
+                ("n".to_string(), Some(RoomId(40605))),
+                ("e".to_string(), None),
+            ]),
+        });
+        map.observe(&RoomInfo {
+            id: RoomId(40605),
+            name: Some("North end of village street".to_string()),
+            area: Some("New: Ofcol Village".to_string()),
+            exits: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            map.describe(RoomId(40606)),
+            vec![
+                "Middle of village street (#40606), New: Ofcol Village".to_string(),
+                "Exits: north to North end of village street, east (unexplored)".to_string(),
+            ]
+        );
+    }
+
+    /// Every optional fact is genuinely optional: a server may name no area
+    /// and no room, and an exit may lead to a room walked into but never
+    /// named. None of that may cost the description its shape.
+    #[test]
+    fn describes_a_room_missing_every_optional_fact() {
+        let mut map = Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(7),
+            name: None,
+            area: None,
+            exits: BTreeMap::new(),
+        });
+        map.connect(RoomId(7), "d", RoomId(8));
+
+        assert_eq!(
+            map.describe(RoomId(7)),
+            vec!["#7".to_string(), "Exits: down to #8".to_string(),]
+        );
+    }
+
+    /// A room with no exits says so, rather than trailing an empty list —
+    /// and an unknown room is not describable at all, which the caller has
+    /// to be able to tell apart from a room that is merely bare.
+    #[test]
+    fn describes_a_dead_end_and_declines_an_unknown_room() {
+        let mut map = Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: Some("A sealed vault".to_string()),
+            area: None,
+            exits: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            map.describe(RoomId(1)),
+            vec!["A sealed vault (#1)".to_string(), "Exits: none".to_string(),]
+        );
+        assert!(map.describe(RoomId(99)).is_empty());
     }
 }

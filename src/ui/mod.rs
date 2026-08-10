@@ -46,6 +46,20 @@ pub(crate) fn clamp_channel_width(width: u16, area_width: u16) -> u16 {
     width.clamp(MIN_CHANNEL_WIDTH, max)
 }
 
+/// Default width of the docked map column, and the narrowest it may be
+/// resized to. The live width is `AppState::map_width` (§11.4, §16).
+/// Narrower than the comms floor because a map row is glyphs and
+/// connectors, not words — but not so narrow that the current room can
+/// never be centred with a neighbour either side.
+pub(crate) const MAP_WIDTH: u16 = 24;
+pub(crate) const MIN_MAP_WIDTH: u16 = 12;
+
+/// As `clamp_channel_width`, for the map column.
+pub(crate) fn clamp_map_width(width: u16, area_width: u16) -> u16 {
+    let max = area_width.saturating_sub(MIN_MAIN_WIDTH).max(MIN_MAP_WIDTH);
+    width.clamp(MIN_MAP_WIDTH, max)
+}
+
 /// Column the descriptions start at in the help listing.
 const HELP_KEY_WIDTH: usize = 14;
 
@@ -75,6 +89,9 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row(keybinds.toggle_channels, "show or hide comms"),
         row(keybinds.channel_wider, "widen the comms column"),
         row(keybinds.channel_narrower, "narrow the comms column"),
+        row(keybinds.toggle_map, "show or hide the map column"),
+        row(keybinds.map_wider, "widen the map column"),
+        row(keybinds.map_narrower, "narrow the map column"),
         row(
             keybinds.server_data_inspector,
             "raw server-data inspector (GMCP/MSDP)",
@@ -94,6 +111,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/newprofile", "create another character's profile"),
         row("/connect", "add a character to this running instance"),
         row("/goto", "walk to a known room, one step at a time"),
+        row("/map", "show or hide the map, and describe this room"),
         String::new(),
         "Leaving".to_string(),
         row(keybinds.quit, "quit"),
@@ -111,6 +129,9 @@ pub struct Panes {
     pub sessions: Vec<Rect>,
     pub tab_bar: Option<Rect>,
     pub channels: Vec<Rect>,
+    /// The docked map column, when the player has it on and the terminal
+    /// has room for it beside everything already there (§16).
+    pub map: Option<Rect>,
     pub prompt: Option<Rect>,
     pub input: Rect,
 }
@@ -128,16 +149,27 @@ pub fn layout(area: Rect, state: &AppState) -> Panes {
     let show_channels = state.show_channels
         && !state.channels.is_empty()
         && body.width >= MIN_MAIN_WIDTH + state.channel_width;
-    let (main, channel_column) = if show_channels {
-        let [main, column] = Layout::horizontal([
-            Constraint::Min(MIN_MAIN_WIDTH),
-            Constraint::Length(state.channel_width),
-        ])
-        .areas(body);
-        (main, Some(column))
+    // Comms wins a tie: it was already on screen, and dropping it to make
+    // room for a column the player just asked for would move furniture
+    // they did not touch.
+    let channel_cost = if show_channels {
+        state.channel_width
     } else {
-        (body, None)
+        0
     };
+    let show_map = state.show_map && body.width >= MIN_MAIN_WIDTH + channel_cost + state.map_width;
+
+    let mut constraints = vec![Constraint::Min(MIN_MAIN_WIDTH)];
+    if show_channels {
+        constraints.push(Constraint::Length(state.channel_width));
+    }
+    if show_map {
+        constraints.push(Constraint::Length(state.map_width));
+    }
+    let columns = Layout::horizontal(constraints).split(body);
+    let main = columns[0];
+    let channel_column = show_channels.then(|| columns[1]);
+    let map = show_map.then(|| columns[columns.len() - 1]);
 
     let (tab_bar, session_area) = match state.layout {
         LayoutMode::Tabs if state.sessions.len() > 1 => {
@@ -161,6 +193,7 @@ pub fn layout(area: Rect, state: &AppState) -> Panes {
         sessions,
         tab_bar,
         channels,
+        map,
         prompt: reserve_prompt.then_some(prompt_area),
         input,
     }
@@ -227,6 +260,10 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             &state.channels[index],
             state.focus == Focus::Channel(index),
         );
+    }
+
+    if let Some(rect) = panes.map {
+        draw_map(frame, rect, state);
     }
 
     let bound = state.bound();
@@ -434,6 +471,142 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     };
 
     render_scrollback(frame, area, lines, title, focused, session.color, scroll);
+}
+
+/// Room glyphs are three cells wide and connectors take one, so a room
+/// occupies four columns and two rows of the drawing grid.
+const MAP_CELL_W: u16 = 4;
+const MAP_CELL_H: u16 = 2;
+
+/// Draws the area around the character as a grid, from `Map::layout_area`.
+///
+/// Only a *view* — every fact it shows comes from the graph and the
+/// coordinates, and the prose form of the same knowledge lives in
+/// `Map::describe` (§16). Rooms that lost a coordinate collision, or sit in
+/// another area, are simply not here; they stay in the graph and stay
+/// walkable, which is why this pane is never the thing `/goto` consults.
+fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
+    let session = state.bound();
+    let title = match session.and_then(|session| session.current_room) {
+        Some(at) => session
+            .and_then(|session| session.map.rooms.get(&at))
+            .and_then(|room| room.area.clone())
+            .unwrap_or_else(|| "map".to_string()),
+        None => "map".to_string(),
+    };
+    let block = Block::bordered().title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let (Some(session), Some(current)) = (session, session.and_then(|s| s.current_room)) else {
+        frame.render_widget(
+            Paragraph::new("no room data yet").wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    };
+
+    let coords = session.map.layout_area(current);
+    let mut grid = vec![vec![' '; inner.width as usize]; inner.height as usize];
+    // The current room sits in the middle and everything else is drawn
+    // relative to it, so walking scrolls the world past a fixed marker
+    // rather than moving a dot toward an edge it then falls off.
+    let origin_col = inner.width as i32 / 2 - 1;
+    let origin_row = inner.height as i32 / 2;
+
+    let plot = |col: i32, row: i32, ch: char, grid: &mut Vec<Vec<char>>| {
+        if col < 0 || row < 0 || col >= inner.width as i32 || row >= inner.height as i32 {
+            return;
+        }
+        grid[row as usize][col as usize] = ch;
+    };
+
+    let mut current_cell = None;
+    for (id, (x, y)) in &coords {
+        let col = origin_col + x * MAP_CELL_W as i32;
+        let row = origin_row + y * MAP_CELL_H as i32;
+        let Some(room) = session.map.rooms.get(id) else {
+            continue;
+        };
+
+        // The marker says what the flat grid cannot: this room also leads
+        // somewhere off it.
+        let up = room.exits.contains_key("u");
+        let down = room.exits.contains_key("d");
+        let marker = match (up, down) {
+            (true, true) => 'b',
+            (true, false) => 'u',
+            (false, true) => 'd',
+            (false, false) => '·',
+        };
+        plot(col, row, '[', &mut grid);
+        plot(col + 1, row, marker, &mut grid);
+        plot(col + 2, row, ']', &mut grid);
+        if *id == current {
+            current_cell = Some((col, row));
+        }
+
+        // Connectors are drawn from each room toward its known neighbours,
+        // and only where both ends are on the grid — a corridor drawn to a
+        // room that is not shown reads as an exit into the border.
+        for (direction, dest) in &room.exits {
+            let Some(dest) = dest else { continue };
+            let Some((nx, ny)) = coords.get(dest) else {
+                continue;
+            };
+            let (dx, dy) = (nx - x, ny - y);
+            match (dx, dy) {
+                (1, 0) => plot(col + 3, row, '-', &mut grid),
+                (-1, 0) => plot(col - 1, row, '-', &mut grid),
+                (0, 1) => plot(col + 1, row + 1, '|', &mut grid),
+                (0, -1) => plot(col + 1, row - 1, '|', &mut grid),
+                (1, 1) => plot(col + 3, row + 1, '\\', &mut grid),
+                (-1, -1) => plot(col - 1, row - 1, '\\', &mut grid),
+                (1, -1) => plot(col + 3, row - 1, '/', &mut grid),
+                (-1, 1) => plot(col - 1, row + 1, '/', &mut grid),
+                // A neighbour more than one cell away is a coordinate
+                // collision's leftover, not a corridor worth inventing.
+                _ => {
+                    let _ = direction;
+                }
+            }
+        }
+    }
+
+    let lines: Vec<Line> = grid
+        .into_iter()
+        .enumerate()
+        .map(|(row, cells)| {
+            match current_cell {
+                // Highlight rather than a distinct glyph: the marker slot
+                // is already saying whether there are vertical exits, and
+                // it cannot say two things at once.
+                //
+                // Split on the *char* vector, never the assembled string:
+                // these are grid columns, and `·` is two bytes, so a room
+                // drawn to the left of this one puts every byte index out
+                // of step with the column it is meant to name.
+                Some((col, marked_row)) if marked_row == row as i32 => {
+                    let start = (col.max(0) as usize).min(cells.len());
+                    let end = (start + 3).min(cells.len());
+                    let take = |range: &[char]| range.iter().collect::<String>();
+                    Line::from(vec![
+                        Span::raw(take(&cells[..start])),
+                        Span::styled(
+                            take(&cells[start..end]),
+                            Style::default().add_modifier(Modifier::REVERSED),
+                        ),
+                        Span::raw(take(&cells[end..])),
+                    ])
+                }
+                _ => Line::from(cells.into_iter().collect::<String>()),
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: bool) {
@@ -1300,6 +1473,171 @@ mod tests {
             &state,
         );
         assert!(narrow.channels.is_empty(), "channels are not drawn at all");
+    }
+
+    /// The map column gets the same discipline as the comms column (§11.4)
+    /// and yields to it: comms was there first and the player did not ask
+    /// for it to move, so a terminal with room for only one column keeps
+    /// the one already on screen.
+    #[test]
+    fn the_map_width_clamps_and_the_column_yields_to_comms() {
+        assert_eq!(clamp_map_width(2, 200), MIN_MAP_WIDTH);
+        assert_eq!(clamp_map_width(500, 100), 100 - MIN_MAIN_WIDTH);
+        assert_eq!(
+            clamp_map_width(24, 100),
+            24,
+            "a fitting width is left alone"
+        );
+        assert_eq!(clamp_map_width(24, 20), MIN_MAP_WIDTH);
+
+        let mut state = state();
+        state.show_map = true;
+        state.map_width = MIN_MAP_WIDTH;
+
+        let wide = layout(Rect::new(0, 0, MIN_MAIN_WIDTH + MIN_MAP_WIDTH, 12), &state);
+        assert!(wide.map.is_some());
+        let narrow = layout(
+            Rect::new(0, 0, MIN_MAIN_WIDTH + MIN_MAP_WIDTH - 1, 12),
+            &state,
+        );
+        assert!(narrow.map.is_none(), "the map is not drawn at all");
+
+        // Both columns asked for, only one fits: comms keeps its place.
+        state.channels.push(ChannelPane {
+            config: test_support::channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        });
+        state.show_channels = true;
+        state.channel_width = MIN_CHANNEL_WIDTH;
+        let cramped = layout(
+            Rect::new(
+                0,
+                0,
+                MIN_MAIN_WIDTH + MIN_CHANNEL_WIDTH + MIN_MAP_WIDTH - 1,
+                12,
+            ),
+            &state,
+        );
+        assert_eq!(cramped.channels.len(), 1);
+        assert!(cramped.map.is_none());
+
+        let roomy = layout(
+            Rect::new(0, 0, MIN_MAIN_WIDTH + MIN_CHANNEL_WIDTH + MIN_MAP_WIDTH, 12),
+            &state,
+        );
+        assert_eq!(roomy.channels.len(), 1);
+        let map = roomy.map.expect("both columns fit");
+        assert_eq!(map.width, MIN_MAP_WIDTH);
+        assert!(
+            map.x > roomy.channels[0].x,
+            "map sits outboard of comms: [main | comms | map]"
+        );
+    }
+
+    /// The pane draws the area around the character: the current room in
+    /// the middle, its mapped neighbours placed by `layout_area`, and a
+    /// connector only where both ends are actually on screen (§16).
+    #[test]
+    fn the_map_pane_draws_the_area_around_the_current_room() {
+        use crate::map::{RoomId, RoomInfo};
+        use std::collections::BTreeMap;
+
+        let mut state = state();
+        let mut map = crate::map::Map::default();
+        for (id, name) in [(1, "Town Square"), (2, "North Road"), (3, "East Gate")] {
+            map.observe(&RoomInfo {
+                id: RoomId(id),
+                name: Some(name.to_string()),
+                area: Some("Midgaard".to_string()),
+                exits: BTreeMap::new(),
+            });
+        }
+        map.connect(RoomId(1), "n", RoomId(2));
+        map.connect(RoomId(2), "s", RoomId(1));
+        map.connect(RoomId(1), "e", RoomId(3));
+        map.connect(RoomId(3), "w", RoomId(1));
+        // A vertical exit the flat grid cannot place, so the glyph says so.
+        map.connect(RoomId(1), "d", RoomId(9));
+
+        state.sessions[0].map = map;
+        state.sessions[0].current_room = Some(RoomId(1));
+        state.show_map = true;
+        state.map_width = MAP_WIDTH;
+
+        let drawn = render_sized(&state, 80, 20);
+        let screen = rows(&drawn);
+        assert!(
+            screen.contains("Midgaard"),
+            "the column is titled with the area: {screen}"
+        );
+        assert!(
+            screen.contains("[d]"),
+            "the current room marks its vertical exit: {screen}"
+        );
+        assert!(
+            screen.contains("[·]-") || screen.contains("-[·]"),
+            "the east neighbour is connected: {screen}"
+        );
+        assert!(
+            (0..drawn.area.height).any(|y| row(&drawn, y).contains('|')),
+            "the north neighbour is connected: {screen}"
+        );
+
+        // With the column off, none of it is on screen — the description
+        // is what remains, and that goes to the scrollback, not here.
+        state.show_map = false;
+        let hidden = rows(&render_sized(&state, 80, 20));
+        assert!(!hidden.contains("Midgaard"), "{hidden}");
+    }
+
+    /// The room glyph's default marker is `·`, which is two bytes wide and
+    /// one column wide. Highlighting the current room by byte-slicing the
+    /// assembled row therefore panicked the moment any room was drawn to
+    /// its *left* — found live on the first westward walk, not by any
+    /// buffer assertion (§13: never index text by byte offsets you derived
+    /// from columns).
+    #[test]
+    fn a_room_west_of_the_current_one_does_not_panic_the_highlight() {
+        use crate::map::{RoomId, RoomInfo};
+        use std::collections::BTreeMap;
+
+        let mut state = state();
+        let mut map = crate::map::Map::default();
+        for id in [1, 2] {
+            map.observe(&RoomInfo {
+                id: RoomId(id),
+                name: Some(format!("Room {id}")),
+                area: Some("Midgaard".to_string()),
+                exits: BTreeMap::new(),
+            });
+        }
+        // The current room is the *east* one, so the neighbour's `·` sits
+        // ahead of it in the row.
+        map.connect(RoomId(2), "w", RoomId(1));
+        map.connect(RoomId(1), "e", RoomId(2));
+
+        state.sessions[0].map = map;
+        state.sessions[0].current_room = Some(RoomId(2));
+        state.show_map = true;
+        state.map_width = MAP_WIDTH;
+
+        let screen = rows(&render_sized(&state, 80, 20));
+        assert!(screen.contains("[·]-[·]"), "both rooms drawn: {screen}");
+    }
+
+    /// Before the server has placed the character there is nothing to draw,
+    /// and an empty bordered box reads as a broken pane.
+    #[test]
+    fn the_map_pane_says_when_it_has_no_room_data() {
+        let mut state = state();
+        state.show_map = true;
+        state.map_width = MAP_WIDTH;
+
+        let screen = rows(&render_sized(&state, 80, 20));
+        assert!(screen.contains("no room data yet"), "{screen}");
     }
 
     /// One draw of a static, already-overflowing state: exercises the
