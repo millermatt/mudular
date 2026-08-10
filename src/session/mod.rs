@@ -65,12 +65,18 @@ pub enum SessionEvent {
     Bell,
     /// What the transport is trusting, once connected.
     Security(net::Security),
-    /// A raw GMCP message, for the inspector view (§14 M6). MSDP data feeds
-    /// the same server-data store silently, with no raw view of its own.
+    /// A raw GMCP message, for the inspector view (§14 M6, §6.3).
     Gmcp {
         package: String,
         payload: Option<String>,
     },
+    /// The MSDP twin of [`SessionEvent::Gmcp`], for the same inspector view
+    /// (§6.3). MSDP's wire form is `VAR`/`VAL` control-byte framing, not
+    /// text, so there is no literal payload worth showing raw — the
+    /// flattened key/value pairs are shown instead, which are both
+    /// readable and exactly what `update_server_data_from_msdp` stored, so
+    /// the inspector shows what a trigger could actually read.
+    Msdp { pairs: Vec<(String, String)> },
     /// The character is somewhere new (§16). Raised for whichever protocol
     /// supplied it — the room is read back out of the merged server-data
     /// store, not out of a GMCP message, so an MSDP-only MUD maps just as
@@ -583,6 +589,10 @@ async fn run_connection(
                                             for (name, value) in &pairs {
                                                 msdp::flatten(name, value, &mut flat);
                                             }
+                                            // Cloned for the inspector event below:
+                                            // the loop right after this one consumes
+                                            // `flat.pairs` feeding the engine.
+                                            let inspector_pairs = flat.pairs.clone();
                                             for (key, value) in flat.pairs {
                                                 engine.update_server_data_from_msdp(&key, value);
                                             }
@@ -592,8 +602,10 @@ async fn run_connection(
                                             for (path, len) in flat.arrays {
                                                 engine.prune_msdp_array(&path, len);
                                             }
+                                            vec![SessionEvent::Msdp { pairs: inspector_pairs }]
+                                        } else {
+                                            Vec::new()
                                         }
-                                        Vec::new()
                                     }
                                     // Other options are handled inside the
                                     // Telnet machine.
@@ -2124,10 +2136,11 @@ mod tests {
     /// MSDP has no negotiation handshake of its own (unlike GMCP's
     /// Core.Hello/Supports) — a server can push data as soon as the option
     /// is enabled. This exercises that path end to end: negotiation, an
-    /// MSDP VAR/VAL pair, and an alias's `${...}` template reading it
-    /// straight from the server-data store.
+    /// MSDP VAR/VAL pair surfacing as a raw inspector event with the
+    /// flattened pairs (§6.3, §14 M6), and an alias's `${...}` template
+    /// reading the same value straight from the server-data store.
     #[tokio::test]
-    async fn msdp_negotiates_and_feeds_the_engine() {
+    async fn msdp_negotiates_surfaces_an_inspector_event_and_feeds_the_engine() {
         let (tx, mut sent) = mpsc::channel(8);
         let (mut events, commands) = serve_with_rules(
             move |mut sock| async move {
@@ -2139,14 +2152,7 @@ mod tests {
                 payload.push(msdp::VAL);
                 payload.extend_from_slice(b"The Bazaar");
                 let msg = encode_subnegotiation(option::MSDP, &payload);
-                // MSDP raises no SessionEvent of its own to synchronize on
-                // (unlike GMCP's inspector event): a plain line right after
-                // it does the job instead, since the session processes
-                // events in stream order — by the time this line reaches
-                // the test, the MSDP update has already landed.
-                let mut combined = msg.to_vec();
-                combined.extend_from_slice(b"msdp applied\r\n");
-                sock.write_all(&combined).await.unwrap();
+                sock.write_all(&msg).await.unwrap();
 
                 tx.send(read_command(&mut sock).await).await.unwrap();
             },
@@ -2160,7 +2166,12 @@ mod tests {
             ),
         );
 
-        assert_eq!(next_line(&mut events).await, "msdp applied");
+        assert_eq!(
+            next_matching(&mut events, |ev| matches!(ev, SessionEvent::Msdp { .. })).await,
+            SessionEvent::Msdp {
+                pairs: vec![("ROOM_NAME".to_string(), "The Bazaar".to_string())],
+            }
+        );
 
         commands
             .send(SessionCommand::SendLine("look".into()))

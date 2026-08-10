@@ -75,7 +75,10 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row(keybinds.toggle_channels, "show or hide comms"),
         row(keybinds.channel_wider, "widen the comms column"),
         row(keybinds.channel_narrower, "narrow the comms column"),
-        row(keybinds.gmcp_inspector, "raw GMCP inspector"),
+        row(
+            keybinds.server_data_inspector,
+            "raw server-data inspector (GMCP/MSDP)",
+        ),
         row(keybinds.help, "this help"),
         row(keybinds.config_editor, "edit this character's profile"),
         row(keybinds.reload, "recompile rules and scripts from disk"),
@@ -350,12 +353,12 @@ pub fn draw_new_profile_wizard(
 fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     let session = &state.sessions[index];
     let focused = state.is_focused_session(index);
-    let showing_gmcp = state.show_gmcp && focused;
+    let showing_inspector = state.show_inspector && focused;
 
     // The scrollback line-cursor (docs/ARCHITECTURE.md §10.2/§11.5) only
     // ever picks from the input-bound session, regardless of which pane is
     // visually focused — same scoping as `Alt+V` itself in `app.rs`.
-    let picked_line = (!showing_gmcp && index == state.input_session)
+    let picked_line = (!showing_inspector && index == state.input_session)
         .then_some(state.line_cursor)
         .flatten()
         .and_then(|cursor| session.scrollback.len().checked_sub(1 + cursor));
@@ -372,8 +375,8 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         true => String::new(),
         false => format!(" {}", session.latency),
     };
-    let title = if showing_gmcp {
-        format!(" {} — GMCP inspector ", session.name)
+    let title = if showing_inspector {
+        format!(" {} — {} ", session.name, session.inspector_title())
     } else {
         let picking = if picked_line.is_some() {
             " ↑↓ pick a line, Enter for a trigger, Esc to cancel"
@@ -387,16 +390,21 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         )
     };
 
-    // The inspector is a different buffer (`gmcp_log`, not `scrollback`) —
-    // a scroll position set for one has nothing to say about the other, so
-    // toggling into it always shows its own tail rather than silently
-    // inheriting an offset that would land somewhere unrelated with no
-    // indicator to explain why (§11.5 scopes navigation to scrollback).
-    let back_offset = if showing_gmcp { 0 } else { session.back_offset };
+    // The inspector is a different buffer (`inspector_log`, not
+    // `scrollback`) — a scroll position set for one has nothing to say
+    // about the other, so toggling into it always shows its own tail
+    // rather than silently inheriting an offset that would land somewhere
+    // unrelated with no indicator to explain why (§11.5 scopes navigation
+    // to scrollback).
+    let back_offset = if showing_inspector {
+        0
+    } else {
+        session.back_offset
+    };
 
-    let (lines, scroll) = if showing_gmcp {
+    let (lines, scroll) = if showing_inspector {
         visible_window(
-            &session.gmcp_log,
+            &session.inspector_log,
             area.height,
             content_width,
             back_offset,
@@ -761,29 +769,29 @@ mod tests {
     }
 
     /// The inspector view (§14 M6) replaces the scrollback with the raw
-    /// GMCP log while toggled on.
+    /// server-data log while toggled on.
     #[test]
-    fn shows_the_gmcp_log_instead_of_scrollback_when_toggled() {
+    fn shows_the_inspector_log_instead_of_scrollback_when_toggled() {
         let mut state = state();
         state.sessions[0]
             .scrollback
             .push_back(RetainedLine::server("You are in a forest."));
         state.sessions[0]
-            .gmcp_log
-            .push_back(r#"Char.Vitals {"hp":100}"#.to_string());
-        state.show_gmcp = true;
+            .inspector_log
+            .push_back(r#"[GMCP] Char.Vitals {"hp":100}"#.to_string());
+        state.show_inspector = true;
 
         let buffer = render(&state);
         assert!(row(&buffer, 1).contains("Char.Vitals"));
         assert!(!row(&buffer, 1).contains("forest"));
     }
 
-    /// §13: server data is untrusted, and the GMCP inspector is the one
-    /// view that shows it verbatim. A payload carrying escape sequences
-    /// must be *shown*, not executed — ratatui writes a cell's symbol to
-    /// the terminal unfiltered, so an ESC that reaches a cell is a real
-    /// escape injection out of a subnegotiation the player only has to
-    /// press a key to look at.
+    /// §13: server data is untrusted, and the inspector is the one view
+    /// that shows it verbatim, for both protocols. A payload carrying
+    /// escape sequences must be *shown*, not executed — ratatui writes a
+    /// cell's symbol to the terminal unfiltered, so an ESC that reaches a
+    /// cell is a real escape injection out of a subnegotiation the player
+    /// only has to press a key to look at.
     #[test]
     fn the_gmcp_inspector_never_writes_a_control_byte_to_the_terminal() {
         let mut state = state();
@@ -791,7 +799,7 @@ mod tests {
             "Char.Vitals".to_string(),
             Some("{\"hp\":\x1b[2J\x1b]0;pwned\x07100}".to_string()),
         );
-        state.show_gmcp = true;
+        state.show_inspector = true;
 
         let buffer = render(&state);
         let offenders: Vec<&str> = buffer
@@ -806,6 +814,31 @@ mod tests {
         );
         // Shown, not silently dropped: the inspector exists to reveal what
         // the server actually sent.
+        assert!(rows(&buffer).contains("x1b"), "{}", rows(&buffer));
+    }
+
+    /// The MSDP twin of the test above: MSDP keys and values are just as
+    /// untrusted as a GMCP payload, and share the same render path (§13).
+    #[test]
+    fn the_msdp_inspector_never_writes_a_control_byte_to_the_terminal() {
+        let mut state = state();
+        state.sessions[0].push_msdp(vec![(
+            "hp".to_string(),
+            "\x1b[2J\x1b]0;pwned\x07100".to_string(),
+        )]);
+        state.show_inspector = true;
+
+        let buffer = render(&state);
+        let offenders: Vec<&str> = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .filter(|symbol| symbol.chars().any(|c| c.is_control()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "control bytes reached the terminal: {offenders:?}"
+        );
         assert!(rows(&buffer).contains("x1b"), "{}", rows(&buffer));
     }
 
@@ -1485,28 +1518,64 @@ mod tests {
         );
     }
 
-    /// The GMCP inspector (§14 M6) is a different buffer from the
-    /// scrollback a `back_offset` was set against — toggling into it must
-    /// always show its own tail, not silently inherit an offset that
-    /// belongs to unrelated content with no indicator to explain why.
+    /// The inspector (§14 M6) is a different buffer from the scrollback a
+    /// `back_offset` was set against — toggling into it must always show
+    /// its own tail, not silently inherit an offset that belongs to
+    /// unrelated content with no indicator to explain why.
     #[test]
-    fn toggling_the_gmcp_inspector_ignores_the_scrollbacks_scroll_position() {
+    fn toggling_the_server_data_inspector_ignores_the_scrollbacks_scroll_position() {
         let mut state = state();
         // More entries than the 4 content rows `render` gives (see
         // `CONTENT_ROWS`), so a wrongly-applied offset would visibly hide
         // the tail rather than just failing to matter.
         for i in 0..8 {
-            state.sessions[0].gmcp_log.push_back(format!("gmcp-{i}"));
+            state.sessions[0]
+                .inspector_log
+                .push_back(format!("gmcp-{i}"));
         }
         // A large offset set while looking at the scrollback, carried
         // along when the player then hits F2.
         state.sessions[0].back_offset = usize::MAX;
-        state.show_gmcp = true;
+        state.show_inspector = true;
 
         let buffer = render(&state);
         assert!(
             rows(&buffer).contains("gmcp-7"),
             "the inspector must show its own tail: {}",
+            rows(&buffer)
+        );
+    }
+
+    /// The inspector title (§6.3) says what has actually been seen, in each
+    /// of the three states — including the empty one, which must read as
+    /// self-explanatory rather than as a broken GMCP-only view.
+    #[test]
+    fn the_inspector_title_reflects_what_has_been_seen() {
+        let mut state = state();
+        state.show_inspector = true;
+
+        // Wide enough for the longest title ("GMCP + MSDP inspector"),
+        // unlike the default 30-column `render`.
+        let buffer = render_sized(&state, 60, 10);
+        assert!(
+            rows(&buffer).contains("server data — nothing received yet"),
+            "{}",
+            rows(&buffer)
+        );
+
+        state.sessions[0].push_gmcp("Char.Vitals".to_string(), None);
+        let buffer = render_sized(&state, 60, 10);
+        assert!(
+            rows(&buffer).contains("GMCP inspector"),
+            "{}",
+            rows(&buffer)
+        );
+
+        state.sessions[0].push_msdp(vec![("hp".to_string(), "100".to_string())]);
+        let buffer = render_sized(&state, 60, 10);
+        assert!(
+            rows(&buffer).contains("GMCP + MSDP inspector"),
+            "{}",
             rows(&buffer)
         );
     }

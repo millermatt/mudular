@@ -409,9 +409,11 @@ fn default_channel_width() -> u16 {
 pub struct Keybinds {
     #[serde(default = "default_quit")]
     pub quit: KeyBinding,
-    /// Toggles the raw GMCP inspector view (docs/ARCHITECTURE.md §14 M6).
-    #[serde(default = "default_gmcp_inspector")]
-    pub gmcp_inspector: KeyBinding,
+    /// Toggles the raw server-data inspector view — GMCP and/or MSDP,
+    /// whichever the server actually sent (docs/ARCHITECTURE.md §6.3, §14
+    /// M6).
+    #[serde(default = "default_server_data_inspector")]
+    pub server_data_inspector: KeyBinding,
     /// Cycles focus to the next pane. Terminals vary in whether they
     /// deliver Ctrl+Tab at all — remap to `alt+tab` if yours does not
     /// (docs/ARCHITECTURE.md §11).
@@ -450,7 +452,7 @@ impl Default for Keybinds {
     fn default() -> Self {
         Self {
             quit: default_quit(),
-            gmcp_inspector: default_gmcp_inspector(),
+            server_data_inspector: default_server_data_inspector(),
             focus_next: default_focus_next(),
             cycle_layout: default_cycle_layout(),
             toggle_channels: default_toggle_channels(),
@@ -502,7 +504,7 @@ fn default_quit() -> KeyBinding {
     "ctrl+c".parse().expect("built-in default keybinding")
 }
 
-fn default_gmcp_inspector() -> KeyBinding {
+fn default_server_data_inspector() -> KeyBinding {
     "f2".parse().expect("built-in default keybinding")
 }
 
@@ -1335,7 +1337,7 @@ mod tests {
         assert!(
             config
                 .keybinds
-                .gmcp_inspector
+                .server_data_inspector
                 .matches(KeyCode::F(2), KeyModifiers::NONE)
         );
     }

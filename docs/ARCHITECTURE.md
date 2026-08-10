@@ -270,11 +270,16 @@ assembler (§8) uses prompt boundaries to distinguish "prompt" from
   way for a profile, module, or script to add a package (tracked as
   [#25](https://github.com/millermatt/mudular/issues/25)). Events surface to the engine
   (triggers can match on GMCP packages, M7) and to UI consumers (vitals,
-  room info) via `SessionEvent::Gmcp`.
+  room info) via `SessionEvent::Gmcp`, which also feeds the raw inspector
+  view (F2, §14 M6).
 - **MSDP (option 69):** typed parser for `VAR`/`VAL`/`TABLE_OPEN/CLOSE`/
   `ARRAY_OPEN/CLOSE` into a recursive `MsdpValue` enum. Where a server
   offers both, GMCP is preferred; MSDP values are normalized into the same
-  internal "server data" map so the engine sees one namespace.
+  internal "server data" map so the engine sees one namespace. MSDP has no
+  literal payload worth showing raw — its wire form is `VAR`/`VAL`
+  control-byte framing, not text — so its inspector event
+  (`SessionEvent::Msdp`) carries the same flattened key/value pairs the
+  store was fed, tagged `[MSDP]` in the same log GMCP lines share.
 - **Store semantics:** payloads *merge* into the server-data map key by
   key, so a server sending a partial object update (`Char.Vitals {"hp":90}`
   after a fuller one) does not blank the keys it omitted. Arrays are the
@@ -1438,9 +1443,10 @@ defaulting to off, and not as a resize handle bolted onto the layout.
     decoded server text, because its triggers match that text — but that
     pass alone covered only the server, and a client notice, a script's
     `mud.echo`, and a relayed peer line all reached the screen without it.
-  - The raw GMCP inspector (§14 M6) is the exception that proves the rule:
-    it renders with `Line::raw`, deliberately bypassing the ANSI parser,
-    over a payload that never went through the line pipeline at all. It
+  - The raw server-data inspector (§14 M6, GMCP and/or MSDP) is the
+    exception that proves the rule: it renders with `Line::raw`,
+    deliberately bypassing the ANSI parser, over a payload that never went
+    through the line pipeline at all. It
     escapes control bytes into visible text (`\x1b`) instead of stripping
     them — a view whose purpose is to show what the server sent must not
     hide the interesting part of it.
@@ -1474,7 +1480,7 @@ exist from M0, even where a stage is a passthrough).
 | **M3** | Config & profiles | YAML config dir, profiles (`mudular <profile>`), keybind remap, per-profile charset + CHARSET negotiation with legacy fallback | Daily driver launches from a profile; CP437 MUD renders correctly |
 | **M4** | Automation engine | Aliases, triggers, variables, timers; global/module/profile scope merge; `;`-separated command input; `/reload` | Rule modules shared across two profiles behave per scope rules |
 | **M5** | MCCP | MCCP2 inflate with mid-buffer switchover (MCCP3 was optional here; dropped, §6.4) | Compressed MUD session byte-identical to uncompressed fixture |
-| **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP inspector view | GMCP vitals visible; triggers can react to server data |
+| **M6** | GMCP + MSDP | Codecs, `Core.Hello`/`Supports`, server-data store, engine access to server data, raw GMCP + MSDP inspector view | GMCP vitals visible; triggers can react to server data |
 | **M7** | Multi-character | Session manager, tabs + splits, Alt+N/Ctrl+Tab focus, unread indicators, per-session isolation audit, per-pane NAWS, cross-session `send_to` actions (§7.5), channel panes (§11.1) | Two characters played simultaneously without cross-talk; a tank trigger fires a heal in the cleric session; tells land in a comms pane, not the main scrollback |
 | **M8** | Scripting | Rule conditions (`when:`, §7.6) — first, since it sets where YAML stops and scripts start; `ScriptHost` abstraction (§7.4) + Lua (`mlua`) with the full `mud.*` API; JavaScript (`rquickjs`) behind a feature flag proving the abstraction; script actions callable from YAML rules; peer snapshots + cross-session API (`${@peer.var}`, `mud.session`, `on_peer`, §7.5) | A `when:` guard reads a GMCP vital and a variable to gate a trigger, and a malformed one fails at load; the same test script, ported to both languages, passes an identical hook-API conformance suite; cleric script rebuffs off the tank's GMCP affects |
 | **M9** | Polish | In-client help overlay + `/help` (§11.2), `Up`/`Down` command history (§11.3), keyring-backed auto-login (§10.1), and rule highlights (§7.7) — all built early, as soon as they were useful; scrollback navigation with a configurable buffer size (§8, §11.5), disk logging, reconnect/backoff, latency display, desktop notifications (bell/OSC) for triggers in unfocused sessions, speedwalk macros (stored/`.3n2e` paths — no room graph, see §16), resizable channel column (§11.4), in-TUI new-profile form, self-update check; scrollback search and `Up` prefix search are deliberately deferred past M9 (§11.3, §11.5) | Every binding the client has is discoverable from inside it, including remapped ones; `Up` recalls the focused character's last command and never another character's, and a masked password is not in either; the channel column can be widened from the keyboard and the sessions beside it are told their new size; `PgUp`/`PgDn`/`Home`/`End` move a pane's scrollback without losing new output that arrives while scrolled up, and a scrolled pane is visibly distinguishable from a live one |

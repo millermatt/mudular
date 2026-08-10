@@ -822,7 +822,7 @@ fallback.
 | `Ctrl+C` | Quit | `quit` |
 | `Alt+1` … `Alt+9` | Jump straight to session 1–9 | — (built in) |
 | `Ctrl+Tab` | Cycle focus to the next pane, including comms panes | `focus_next` |
-| `F2` | Toggle the raw GMCP inspector for the focused session — the messages the server is sending behind the scenes | `gmcp_inspector` |
+| `F2` | Toggle the raw server-data inspector for the focused session — the GMCP and/or MSDP the server is sending behind the scenes, whichever it actually speaks | `server_data_inspector` |
 | `F3` | Switch between the tabbed and side-by-side layouts | `cycle_layout` |
 | `F4` | Show or hide comms | `toggle_channels` |
 | `Alt+-` / `Alt+=` | Widen / narrow the comms column | `channel_wider` / `channel_narrower` |
@@ -851,7 +851,7 @@ in the table above with a name in the last column can be remapped there:
 keybinds:
   quit: ctrl+q
   focus_next: alt+tab
-  gmcp_inspector: f2
+  server_data_inspector: f2
   cycle_layout: f3
   toggle_channels: f4
   channel_wider: "alt+-"

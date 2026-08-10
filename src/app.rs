@@ -29,9 +29,10 @@ use crate::scrollback::RetainedLine;
 use crate::session::{self, PeerLinks, SessionCommand, SessionEvent};
 use crate::ui;
 
-/// Same rationale as `scrollback_size` (§8), for the raw GMCP inspector log:
-/// bounded so a chatty MUD can't grow it without limit.
-const GMCP_LOG_LIMIT: usize = 1_000;
+/// Same rationale as `scrollback_size` (§8), for the raw server-data
+/// inspector log (GMCP and/or MSDP, §6.3): bounded so a chatty MUD can't
+/// grow it without limit.
+const INSPECTOR_LOG_LIMIT: usize = 1_000;
 
 /// Columns the channel column grows or shrinks per press (§11.4). One column
 /// a press makes a real adjustment a dozen keystrokes; two lands on a usable
@@ -119,9 +120,16 @@ pub struct SessionPane {
     /// the whole session keeps the layout — and so the NAWS pane size —
     /// stable as prompts come and go.
     pub connected: bool,
-    /// Raw `Package payload` lines, newest last — the GMCP inspector view
-    /// (docs/ARCHITECTURE.md §14 M6).
-    pub gmcp_log: VecDeque<String>,
+    /// Raw server-data lines, newest last, each tagged `[GMCP]` or `[MSDP]`
+    /// by origin — the inspector view (docs/ARCHITECTURE.md §6.3, §14 M6).
+    pub inspector_log: VecDeque<String>,
+    /// Whether a GMCP message has reached this session — drives the
+    /// inspector's title (§6.3): a client that only ever names GMCP would
+    /// look broken on an MSDP-only MUD, so the title says what actually
+    /// showed up rather than what the client merely supports.
+    gmcp_seen: bool,
+    /// The MSDP twin of `gmcp_seen`.
+    msdp_seen: bool,
     /// Lines that arrived while the pane was not focused (§11).
     pub unread: usize,
     /// The profile's `color:`, if it set one — the pane border and this
@@ -258,16 +266,44 @@ impl SessionPane {
             Some(payload) => format!("{package} {payload}"),
             None => package,
         };
-        // Straight from the wire: a GMCP subnegotiation never passed
+        self.push_inspector_line("GMCP", &line);
+        self.gmcp_seen = true;
+    }
+
+    /// One line per flattened key/value pair, mirroring GMCP's one
+    /// package-per-line grain — MSDP's own wire form has no equivalent of
+    /// a package payload to show as a single line (§6.3).
+    pub(crate) fn push_msdp(&mut self, pairs: Vec<(String, String)>) {
+        for (key, value) in pairs {
+            self.push_inspector_line("MSDP", &format!("{key} {value}"));
+        }
+        self.msdp_seen = true;
+    }
+
+    fn push_inspector_line(&mut self, tag: &str, line: &str) {
+        // Straight from the wire: neither protocol's raw value passed
         // through the line pipeline's control-byte filter, and the
         // inspector renders it with `Line::raw` rather than through the
         // ANSI parser — so nothing else stands between a server's escape
         // sequence and the terminal (§13). Shown, not stripped: this view
         // exists to reveal exactly what arrived.
-        let line = crate::scrollback::escape_controls(&line);
-        self.gmcp_log.push_back(line);
-        if self.gmcp_log.len() > GMCP_LOG_LIMIT {
-            self.gmcp_log.pop_front();
+        let line = crate::scrollback::escape_controls(&format!("[{tag}] {line}"));
+        self.inspector_log.push_back(line);
+        if self.inspector_log.len() > INSPECTOR_LOG_LIMIT {
+            self.inspector_log.pop_front();
+        }
+    }
+
+    /// The inspector title's protocol descriptor: says which protocol(s)
+    /// actually produced data, not which the client merely supports, so an
+    /// MSDP-only MUD doesn't leave the pane looking like a broken GMCP view
+    /// (§6.3).
+    pub(crate) fn inspector_title(&self) -> &'static str {
+        match (self.gmcp_seen, self.msdp_seen) {
+            (true, true) => "GMCP + MSDP inspector",
+            (true, false) => "GMCP inspector",
+            (false, true) => "MSDP inspector",
+            (false, false) => "server data — nothing received yet",
         }
     }
 }
@@ -324,9 +360,9 @@ pub struct AppState {
     /// `ui::layout` recomputes every rect from it each frame, and the keys
     /// only move this number (docs/ARCHITECTURE.md §11.4).
     pub channel_width: u16,
-    /// Whether the focused session's pane shows `gmcp_log` instead of its
-    /// scrollback.
-    pub show_gmcp: bool,
+    /// Whether the focused session's pane shows `inspector_log` instead of
+    /// its scrollback.
+    pub show_inspector: bool,
     /// Whether the help overlay is up (§11.2).
     pub show_help: bool,
     /// The live bindings, so the input hint and the help overlay both read
@@ -693,6 +729,10 @@ fn apply_session_event(
         SessionEvent::Bell => (false, Vec::new()),
         SessionEvent::Gmcp { package, payload } => {
             state.sessions[index].push_gmcp(package, payload);
+            (false, Vec::new())
+        }
+        SessionEvent::Msdp { pairs } => {
+            state.sessions[index].push_msdp(pairs);
             (false, Vec::new())
         }
         SessionEvent::Room { info, arrived_via } => {
@@ -1343,7 +1383,9 @@ fn connect(
         security: String::new(),
         latency: String::new(),
         connected: true,
-        gmcp_log: VecDeque::new(),
+        inspector_log: VecDeque::new(),
+        gmcp_seen: false,
+        msdp_seen: false,
         unread: 0,
         color: target.color,
         history: VecDeque::new(),
@@ -1524,7 +1566,7 @@ async fn event_loop(
         layout: LayoutMode::Tabs,
         show_channels: !channels.is_empty(),
         channel_width,
-        show_gmcp: false,
+        show_inspector: false,
         show_help: false,
         keybinds: keybinds.clone(),
         config_editor: None,
@@ -1827,8 +1869,8 @@ fn handle_key(
         }
         return true;
     }
-    if keybinds.gmcp_inspector.matches(code, modifiers) {
-        state.show_gmcp = !state.show_gmcp;
+    if keybinds.server_data_inspector.matches(code, modifiers) {
+        state.show_inspector = !state.show_inspector;
         return true;
     }
     if keybinds.focus_next.matches(code, modifiers) {
@@ -2065,7 +2107,9 @@ pub(crate) mod test_support {
                 security: String::new(),
                 latency: String::new(),
                 connected: true,
-                gmcp_log: VecDeque::new(),
+                inspector_log: VecDeque::new(),
+                gmcp_seen: false,
+                msdp_seen: false,
                 unread: 0,
                 color: None,
                 history: VecDeque::new(),
@@ -2109,7 +2153,7 @@ pub(crate) mod test_support {
                 layout: LayoutMode::Tabs,
                 show_channels: false,
                 channel_width: crate::ui::CHANNEL_WIDTH,
-                show_gmcp: false,
+                show_inspector: false,
                 show_help: false,
                 keybinds: Keybinds::default(),
                 config_editor: None,
@@ -2383,12 +2427,97 @@ mod tests {
                 payload: Some(r#"{"hp":100}"#.to_string()),
             },
         );
-        assert_eq!(state.sessions[0].gmcp_log.len(), 1);
-        assert_eq!(state.sessions[0].gmcp_log[0], r#"Char.Vitals {"hp":100}"#);
+        assert_eq!(state.sessions[0].inspector_log.len(), 1);
+        assert_eq!(
+            state.sessions[0].inspector_log[0],
+            r#"[GMCP] Char.Vitals {"hp":100}"#
+        );
         assert!(
             state.sessions[0].scrollback.is_empty(),
             "GMCP must not reach scrollback"
         );
+    }
+
+    /// The MSDP twin of `a_gmcp_message_is_logged_for_the_inspector_view`:
+    /// both protocols share one log, tagged so a line's origin is never
+    /// ambiguous (§6.3).
+    #[test]
+    fn an_msdp_update_is_logged_for_the_inspector_view() {
+        let (mut state, _rx) = app(&["tank"]);
+        apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::Msdp {
+                pairs: vec![("HP".to_string(), "100".to_string())],
+            },
+        );
+        assert_eq!(state.sessions[0].inspector_log.len(), 1);
+        assert_eq!(state.sessions[0].inspector_log[0], "[MSDP] HP 100");
+        assert!(
+            state.sessions[0].scrollback.is_empty(),
+            "MSDP must not reach scrollback"
+        );
+    }
+
+    /// A server that speaks both protocols interleaves both tags in the one
+    /// log, in arrival order (§6.3) — the whole point of tagging lines
+    /// rather than keeping separate buffers.
+    #[test]
+    fn gmcp_and_msdp_lines_share_one_tagged_log() {
+        let (mut state, _rx) = app(&["tank"]);
+        apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::Gmcp {
+                package: "Char.Vitals".to_string(),
+                payload: Some(r#"{"hp":100}"#.to_string()),
+            },
+        );
+        apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::Msdp {
+                pairs: vec![("HP".to_string(), "100".to_string())],
+            },
+        );
+        let log = &state.sessions[0].inspector_log;
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0], r#"[GMCP] Char.Vitals {"hp":100}"#);
+        assert_eq!(log[1], "[MSDP] HP 100");
+    }
+
+    /// Control bytes in MSDP keys/values must be escaped before they reach
+    /// the log, the same as GMCP's — the inspector renders with `Line::raw`,
+    /// bypassing the ANSI parser that would otherwise interpret them (§13).
+    #[test]
+    fn msdp_control_bytes_are_escaped_in_the_inspector_log() {
+        let (mut session, _rx) = test_support::pane("tank");
+        session.push_msdp(vec![("K\x1b[31mEY".to_string(), "V\x07AL".to_string())]);
+        let line = &session.inspector_log[0];
+        assert!(!line.contains('\x1b'));
+        assert!(!line.contains('\x07'));
+    }
+
+    /// The inspector title tells the player which protocol(s) actually
+    /// showed up, not which the client merely supports (§6.3) — an
+    /// MSDP-only MUD must not look like a broken GMCP view.
+    #[test]
+    fn inspector_title_reflects_which_protocols_have_produced_data() {
+        let (mut session, _rx) = test_support::pane("tank");
+        assert_eq!(
+            session.inspector_title(),
+            "server data — nothing received yet"
+        );
+
+        session.push_gmcp("Char.Vitals".to_string(), None);
+        assert_eq!(session.inspector_title(), "GMCP inspector");
+
+        session.push_msdp(vec![("HP".to_string(), "100".to_string())]);
+        assert_eq!(session.inspector_title(), "GMCP + MSDP inspector");
+
+        let (mut msdp_only, _rx2) = test_support::pane("cleric");
+        msdp_only.push_msdp(vec![("HP".to_string(), "100".to_string())]);
+        assert_eq!(msdp_only.inspector_title(), "MSDP inspector");
     }
 
     #[test]
@@ -2438,8 +2567,8 @@ mod tests {
         assert!(state.sessions[1].prompt.is_empty());
         assert!(state.sessions[0].masked);
         assert!(!state.sessions[1].masked, "echo masking must not spread");
-        assert_eq!(state.sessions[0].gmcp_log.len(), 1);
-        assert!(state.sessions[1].gmcp_log.is_empty());
+        assert_eq!(state.sessions[0].inspector_log.len(), 1);
+        assert!(state.sessions[1].inspector_log.is_empty());
     }
 
     /// Input buffers are per-session: switching focus never mixes them
@@ -2868,7 +2997,7 @@ mod tests {
 
         for binding in [
             &keybinds.quit,
-            &keybinds.gmcp_inspector,
+            &keybinds.server_data_inspector,
             &keybinds.focus_next,
             &keybinds.cycle_layout,
             &keybinds.toggle_channels,
