@@ -126,8 +126,13 @@ impl RoomInfo {
             })
         }
 
+        // Zero is not a room. The DikuMUD family reserves the vnum, and
+        // servers use it to say outright that a room has no stable
+        // identity — a maze built to defeat mapping, where every room
+        // reports the same nothing. Believing it collapses the whole maze
+        // into one room and hangs the real rooms around it off that.
         let vnum = find_ci(data, &["Room.Info.num", "ROOM.VNUM", "ROOM_VNUM"])?;
-        let id = RoomId(vnum.parse().ok()?);
+        let id = RoomId(vnum.parse::<i64>().ok().filter(|num| *num != 0)?);
 
         let name = find_ci(data, &["Room.Info.name", "ROOM.NAME", "ROOM_NAME"]).map(str::to_string);
         let area = find_ci(
@@ -164,8 +169,11 @@ impl RoomInfo {
             for (key, value) in matches {
                 let suffix = &key[prefix.len()..];
                 if let Some(direction) = canonical_direction(suffix) {
-                    // key is the direction; value is the destination, if known.
-                    exits.insert(direction.to_string(), value.parse().ok().map(RoomId));
+                    // key is the direction; value is the destination, if
+                    // known. Zero means the same here as above — the exit
+                    // is real, where it leads is not something to record.
+                    let destination = value.parse::<i64>().ok().filter(|num| *num != 0);
+                    exits.insert(direction.to_string(), destination.map(RoomId));
                 } else if suffix.parse::<usize>().is_ok() {
                     // GMCP array form: key is the index, value is the direction.
                     if let Some(direction) = canonical_direction(value) {
@@ -513,6 +521,22 @@ mod tests {
     #[test]
     fn no_room_data_at_all_is_none() {
         let data = HashMap::from([("Char.Vitals.hp".to_string(), "90".to_string())]);
+        assert_eq!(RoomInfo::from_server_data(&data), None);
+    }
+
+    /// A vnum of zero is not a room. The DikuMUD family reserves it, and
+    /// servers use it as an explicit "this room has no stable identity"
+    /// signal for areas built to defeat mapping — identical names, one-way
+    /// exits — where reporting them honestly would corrupt a map rather
+    /// than fill it in. Taken at face value it collapses every such room
+    /// into one and wires the real rooms around it to that fiction.
+    #[test]
+    fn a_zero_vnum_is_not_a_room() {
+        let data = HashMap::from([
+            ("ROOM.VNUM".to_string(), "0".to_string()),
+            ("ROOM.NAME".to_string(), "A twisty passage".to_string()),
+            ("ROOM.EXITS.n".to_string(), "0".to_string()),
+        ]);
         assert_eq!(RoomInfo::from_server_data(&data), None);
     }
 
