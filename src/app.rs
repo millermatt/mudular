@@ -975,6 +975,11 @@ enum WizardOutcome {
     Done(config::NewProfile),
 }
 
+/// A character name a person would actually type, not paste — long past
+/// this the wizard's dialog box would grow to fill the terminal and break
+/// its own centered layout (UX_REVIEW.md, Adversarial findings, Low #6).
+const MAX_PROFILE_NAME_LEN: usize = 32;
+
 /// The "create a profile" form's state machine (docs/ARCHITECTURE.md §15),
 /// shared by two homes: the first-run screen (`run_new_profile_wizard`,
 /// which still needs its own terminal session, since there is no live
@@ -1024,6 +1029,9 @@ impl NewProfileWizard {
             WizardStep::Name if value.is_empty() || value.contains(['/', '\\']) => {
                 Some("a profile name can't be empty or contain a slash".to_string())
             }
+            WizardStep::Name if value.chars().count() > MAX_PROFILE_NAME_LEN => Some(format!(
+                "a profile name can't be longer than {MAX_PROFILE_NAME_LEN} characters"
+            )),
             // Only reachable from `/newprofile`: the first-run form only
             // ever shows with zero profiles saved, so no name can collide
             // there.
@@ -3369,6 +3377,33 @@ mod tests {
             WizardStep::Name,
             "must not advance past the collision"
         );
+    }
+
+    /// A name well past what anyone would actually type is rejected rather
+    /// than saved and left to grow the wizard's own dialog box to the
+    /// terminal's full width (UX_REVIEW.md, Adversarial findings, Low #6).
+    #[test]
+    fn the_wizard_rejects_a_name_longer_than_the_cap() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut wizard = NewProfileWizard::new(dir.path().to_path_buf());
+
+        let too_long = "x".repeat(MAX_PROFILE_NAME_LEN + 1);
+        assert!(matches!(
+            fill_wizard(&mut wizard, &too_long),
+            WizardOutcome::Continue
+        ));
+        assert_eq!(
+            wizard.error.as_deref(),
+            Some("a profile name can't be longer than 32 characters")
+        );
+        assert_eq!(wizard.step, WizardStep::Name);
+
+        // Exactly at the cap is fine.
+        assert!(matches!(
+            fill_wizard(&mut wizard, &"x".repeat(MAX_PROFILE_NAME_LEN)),
+            WizardOutcome::Continue
+        ));
+        assert_eq!(wizard.step, WizardStep::Host);
     }
 
     #[tokio::test]
