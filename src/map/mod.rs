@@ -516,6 +516,23 @@ mod tests {
         assert_eq!(RoomInfo::from_server_data(&data), None);
     }
 
+    /// Some MUDs withhold the vnum for maze rooms on purpose, to stop
+    /// exactly this. A room with a name and exits but no number is
+    /// therefore not half a room to be salvaged — it is the server
+    /// declining to be mapped, and the answer is to leave it unmapped.
+    /// Guessing an identity from the description would be inferring around
+    /// a decision the MUD's author made deliberately, and §16 rules that
+    /// out for the same reason it rules out text-inferred mapping.
+    #[test]
+    fn a_room_with_no_vnum_is_not_mapped() {
+        let data = HashMap::from([
+            ("Room.Info.name".to_string(), "A Twisty Passage".to_string()),
+            ("Room.Info.exits.n".to_string(), "".to_string()),
+            ("Room.Info.exits.s".to_string(), "".to_string()),
+        ]);
+        assert_eq!(RoomInfo::from_server_data(&data), None);
+    }
+
     /// A later sighting that omits what an earlier one knew must not erase
     /// it — servers routinely send a sparser update than the first.
     #[test]

@@ -757,19 +757,35 @@ fn apply_session_event(
         }
         SessionEvent::Room { info, arrived_via } => {
             let session = &mut state.sessions[index];
+            // A walk carries the room each step should reach, so an arrival
+            // that is not that room is unattributable: it may be something
+            // that moved the character without asking (a summon, a wimpy
+            // auto-flee), or an exit that simply does not lead where it led
+            // last time, as in a maze that reshuffles. The client cannot
+            // tell those apart, and both make the arrival a bad teacher —
+            // so a surprise during a walk teaches nothing. Exploring on
+            // foot is unaffected: with no walk running there is no
+            // prediction to contradict, and edges are learned as before.
+            let surprising = session
+                .walk
+                .as_ref()
+                .is_some_and(|walk| walk.expecting != info.id);
             // Only the hub can close an edge: the session knows which way
             // the character went, and the hub is what remembers where they
             // were when they went.
-            if let (Some(from), Some(direction)) = (session.current_room, arrived_via.as_deref()) {
+            if !surprising
+                && let (Some(from), Some(direction)) =
+                    (session.current_room, arrived_via.as_deref())
+            {
                 session.map.connect(from, direction, info.id);
             }
             session.map.observe(&info);
             session.current_room = Some(info.id);
 
             // `/goto` (§16) never has more than one step outstanding, so a
-            // room change while it is running is always the answer to that
-            // step — the same fact that let the `connect` above overwrite a
-            // stale edge with the truth as the walk just crossed it.
+            // room change while it is running is the answer to that step —
+            // whether it landed where the route predicted or somewhere the
+            // route knows nothing about.
             let Some(expecting) = session.walk.as_ref().map(|walk| walk.expecting) else {
                 return (false, Vec::new());
             };
@@ -4399,12 +4415,11 @@ mod tests {
     /// `SessionEvent::Room` handling that stops the walk. Walking repairs
     /// the map.
     #[test]
-    fn walking_a_wrong_edge_repairs_it() {
+    fn a_surprise_during_a_walk_teaches_the_map_nothing() {
         let (mut state, _rx) = app(&["tank"]);
         let session = &mut state.sessions[0];
         session.current_room = Some(crate::map::RoomId(1));
-        // Room 1 believes `n` leads to room 99 — wrong, as the walk is
-        // about to discover.
+        // The route believes `n` from room 1 reaches room 99.
         put_room(&mut session.map, 1, None, &[("n", 99)]);
         session.walk = Some(Walk {
             remaining: VecDeque::new(),
@@ -4412,18 +4427,50 @@ mod tests {
             destination: crate::map::RoomId(99),
         });
 
-        // The step actually lands in room 2, credited as a single `n`.
+        // Room 2 turns up instead. That could be a summon, a wimpy
+        // auto-flee, or an exit that simply does not lead where it did last
+        // time — nothing here can tell those apart, so none of them get to
+        // rewrite the map.
         apply_session_event(&mut state, 0, room(2, Some("n")));
 
         let session = &state.sessions[0];
         assert!(
             session.walk.is_none(),
-            "arriving somewhere the map didn't predict must still stop the walk"
+            "arriving somewhere the route didn't predict must stop the walk"
         );
         assert_eq!(
             session.map.rooms[&crate::map::RoomId(1)].exits.get("n"),
+            Some(&Some(crate::map::RoomId(99))),
+            "and must not overwrite the edge with an arrival it cannot attribute"
+        );
+        assert_eq!(
+            session.current_room,
+            Some(crate::map::RoomId(2)),
+            "where the character actually is is never in doubt: the server said so"
+        );
+    }
+
+    /// The capability that guard costs us, kept where it is safe. Walking
+    /// on foot has no route to contradict, so a step still teaches the map
+    /// — including correcting an edge that has gone stale. Noticing a
+    /// `/goto` stop and walking the leg by hand is how a changed world gets
+    /// written back (§16).
+    #[test]
+    fn walking_on_foot_still_corrects_a_stale_edge() {
+        let (mut state, _rx) = app(&["tank"]);
+        let session = &mut state.sessions[0];
+        session.current_room = Some(crate::map::RoomId(1));
+        put_room(&mut session.map, 1, None, &[("n", 99)]);
+        assert!(session.walk.is_none(), "no route running");
+
+        apply_session_event(&mut state, 0, room(2, Some("n")));
+
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+                .exits
+                .get("n"),
             Some(&Some(crate::map::RoomId(2))),
-            "the credited step must overwrite the wrong destination with the truth"
+            "an unprompted step is attributable, so it may correct the map"
         );
     }
 
