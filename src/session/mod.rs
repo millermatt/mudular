@@ -439,7 +439,7 @@ async fn run_connection(
     // reconnect can land the character somewhere else entirely, and
     // carrying the old room across would invent an edge between wherever
     // they were and wherever they came back.
-    let mut outstanding_moves: Vec<String> = Vec::new();
+    let mut outstanding_moves: Vec<(String, Instant)> = Vec::new();
     let mut last_room: Option<crate::map::RoomId> = None;
     // Inflate output, reused across reads.
     let mut plain: Vec<u8> = Vec::new();
@@ -625,6 +625,7 @@ async fn run_connection(
                                         info,
                                         &mut last_room,
                                         &mut outstanding_moves,
+                                        Instant::now(),
                                     )
                                 {
                                     emitted.push(room);
@@ -995,6 +996,14 @@ async fn run_connection(
     outcome
 }
 
+/// How long a step may stay unresolved and still be believed to be what
+/// moved the character (§16). A step either resolves in about a round trip
+/// or did not happen: past this, something else is the likelier cause of a
+/// room change — a summon, a wimpy auto-flee, a portal — and crediting the
+/// step would write an edge the world does not have. Generous next to a
+/// real round trip, so ordinary lag never costs a legitimate edge.
+const MOVEMENT_SETTLE: Duration = Duration::from_secs(5);
+
 /// Records what an outbound command means for room tracking (§16).
 ///
 /// Movement accumulates; anything else clears it. The clearing is the
@@ -1002,9 +1011,9 @@ async fn run_connection(
 /// explanation for a room change right after it — a recall, a portal, a
 /// trigger's teleport — so crediting that change to a movement sent earlier
 /// would invent an edge the world does not have.
-fn note_outbound(outstanding: &mut Vec<String>, line: &str) {
+fn note_outbound(outstanding: &mut Vec<(String, Instant)>, line: &str, now: Instant) {
     match crate::map::canonical_direction(line) {
-        Some(direction) => outstanding.push(direction.to_string()),
+        Some(direction) => outstanding.push((direction.to_string(), now)),
         None => outstanding.clear(),
     }
 }
@@ -1021,7 +1030,8 @@ fn note_outbound(outstanding: &mut Vec<String>, line: &str) {
 fn room_event(
     info: crate::map::RoomInfo,
     last_room: &mut Option<crate::map::RoomId>,
-    outstanding: &mut Vec<String>,
+    outstanding: &mut Vec<(String, Instant)>,
+    now: Instant,
 ) -> Option<SessionEvent> {
     if *last_room == Some(info.id) {
         // Still here. Whatever is outstanding has not resolved yet — the
@@ -1029,8 +1039,14 @@ fn room_event(
         // than being spent on a room we never left.
         return None;
     }
-    let arrived_via = match outstanding.len() {
-        1 => Some(outstanding[0].clone()),
+    // Unambiguous *and* recent. One outstanding step says the client knows
+    // which one it was; the settle window says it is still plausibly the
+    // reason the room changed, rather than a step that was refused minutes
+    // ago and has been waiting while something else did the moving.
+    let arrived_via = match outstanding.as_slice() {
+        [(direction, sent)] if now.duration_since(*sent) < MOVEMENT_SETTLE => {
+            Some(direction.clone())
+        }
         _ => None,
     };
     outstanding.clear();
@@ -1108,7 +1124,7 @@ async fn send_lines<W>(
     writer: &mut W,
     lines: &[String],
     sent_at: &mut Option<Instant>,
-    outstanding: &mut Vec<String>,
+    outstanding: &mut Vec<(String, Instant)>,
 ) -> std::io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -1120,7 +1136,7 @@ where
         // Every outbound command passes here, whoever wrote it — typed,
         // alias-expanded, a speedwalk step, a trigger's `send:` — so this
         // is the one place room tracking can see movement at all (§16).
-        note_outbound(outstanding, line);
+        note_outbound(outstanding, line, Instant::now());
     }
     Ok(())
 }
@@ -3368,10 +3384,12 @@ mod tests {
     /// here to line up with it later.
     #[test]
     fn note_outbound_pushes_canonicalised_movements_and_accumulates_them() {
+        let now = Instant::now();
         let mut outstanding = Vec::new();
-        note_outbound(&mut outstanding, "north");
-        note_outbound(&mut outstanding, "e");
-        assert_eq!(outstanding, vec!["n".to_string(), "e".to_string()]);
+        note_outbound(&mut outstanding, "north", now);
+        note_outbound(&mut outstanding, "e", now);
+        let directions: Vec<&str> = outstanding.iter().map(|(d, _)| d.as_str()).collect();
+        assert_eq!(directions, vec!["n", "e"]);
     }
 
     /// A command that is *not* a step is the likeliest explanation for a
@@ -3381,12 +3399,13 @@ mod tests {
     /// is cleared instead.
     #[test]
     fn note_outbound_clears_on_a_non_movement() {
-        let mut outstanding = vec!["n".to_string()];
-        note_outbound(&mut outstanding, "look");
+        let now = Instant::now();
+        let mut outstanding = vec![("n".to_string(), now)];
+        note_outbound(&mut outstanding, "look", now);
         assert!(outstanding.is_empty());
 
-        let mut outstanding = vec!["n".to_string()];
-        note_outbound(&mut outstanding, "");
+        let mut outstanding = vec![("n".to_string(), now)];
+        note_outbound(&mut outstanding, "", now);
         assert!(outstanding.is_empty());
     }
 
@@ -3402,9 +3421,13 @@ mod tests {
             exits: Default::default(),
         };
         let mut last_room = Some(crate::map::RoomId(1));
-        let mut outstanding = vec!["n".to_string()];
-        assert_eq!(room_event(info, &mut last_room, &mut outstanding), None);
-        assert_eq!(outstanding, vec!["n".to_string()]);
+        let now = Instant::now();
+        let mut outstanding = vec![("n".to_string(), now)];
+        assert_eq!(
+            room_event(info, &mut last_room, &mut outstanding, now),
+            None
+        );
+        assert_eq!(outstanding, vec![("n".to_string(), now)]);
     }
 
     /// Exactly one outstanding movement is the only case honest enough to
@@ -3418,8 +3441,9 @@ mod tests {
             exits: Default::default(),
         };
         let mut last_room = Some(crate::map::RoomId(1));
-        let mut outstanding = vec!["n".to_string()];
-        let event = room_event(info.clone(), &mut last_room, &mut outstanding);
+        let now = Instant::now();
+        let mut outstanding = vec![("n".to_string(), now)];
+        let event = room_event(info.clone(), &mut last_room, &mut outstanding, now);
         assert_eq!(
             event,
             Some(SessionEvent::Room {
@@ -3429,6 +3453,46 @@ mod tests {
         );
         assert!(outstanding.is_empty());
         assert_eq!(last_room, Some(crate::map::RoomId(2)));
+    }
+
+    /// Something else moved the character while a step was outstanding —
+    /// a summon, a wimpy auto-flee, a portal. The step never resolved, so
+    /// crediting it with the room that turned up writes an edge the world
+    /// does not have. Time is the only signal available without the server
+    /// saying so: a step resolves in about a round trip, or it did not
+    /// happen (§16).
+    #[test]
+    fn a_step_that_never_resolved_is_not_credited_to_a_later_arrival() {
+        let sent = Instant::now();
+        let mut outstanding = vec![("n".to_string(), sent)];
+        let mut last_room = Some(crate::map::RoomId(1));
+        let info = crate::map::RoomInfo {
+            id: crate::map::RoomId(500),
+            name: None,
+            area: None,
+            exits: Default::default(),
+        };
+
+        let event = room_event(
+            info,
+            &mut last_room,
+            &mut outstanding,
+            sent + MOVEMENT_SETTLE + Duration::from_secs(1),
+        )
+        .expect("the room still changed, so it is still reported");
+
+        match event {
+            SessionEvent::Room { arrived_via, .. } => assert_eq!(
+                arrived_via, None,
+                "a step this stale cannot be what moved the character"
+            ),
+            other => panic!("expected Room, got {other:?}"),
+        }
+        assert_eq!(
+            last_room,
+            Some(crate::map::RoomId(500)),
+            "but where they now are is still tracked"
+        );
     }
 
     /// Zero or several outstanding movements are both too ambiguous to
@@ -3446,9 +3510,10 @@ mod tests {
             exits: Default::default(),
         };
 
+        let now = Instant::now();
         let mut last_room = Some(crate::map::RoomId(1));
-        let mut outstanding: Vec<String> = Vec::new();
-        let event = room_event(info.clone(), &mut last_room, &mut outstanding);
+        let mut outstanding: Vec<(String, Instant)> = Vec::new();
+        let event = room_event(info.clone(), &mut last_room, &mut outstanding, now);
         assert!(matches!(
             event,
             Some(SessionEvent::Room {
@@ -3459,8 +3524,8 @@ mod tests {
         assert!(outstanding.is_empty());
 
         let mut last_room = Some(crate::map::RoomId(1));
-        let mut outstanding = vec!["n".to_string(), "n".to_string()];
-        let event = room_event(info, &mut last_room, &mut outstanding);
+        let mut outstanding = vec![("n".to_string(), now), ("n".to_string(), now)];
+        let event = room_event(info, &mut last_room, &mut outstanding, now);
         assert!(matches!(
             event,
             Some(SessionEvent::Room {
