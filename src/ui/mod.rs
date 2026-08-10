@@ -844,6 +844,46 @@ mod tests {
         assert_eq!(buffer.cell((0, 1)).unwrap().fg, Color::Magenta);
     }
 
+    /// The unread badge is the one place the eye jumps to first when
+    /// something happens elsewhere — it should carry the same
+    /// per-character colour identity the rest of the tab does, not a
+    /// fixed colour layered on top of it (UX_REVIEW.md H).
+    #[test]
+    fn the_unread_badge_matches_the_pane_color() {
+        let mut state = test_support::app(&["tank", "cleric"]);
+        state.sessions[1].color = Some(Color::Magenta);
+        state.sessions[1].unread = 3;
+
+        let buffer = render_sized(&state, 40, 12);
+        let badge = buffer
+            .content()
+            .iter()
+            .take(40)
+            .find(|cell| cell.symbol() == "●")
+            .expect("the unread badge should render in the tab bar");
+        assert_eq!(badge.fg, Color::Magenta);
+    }
+
+    /// The tab bar only exists in Tabs mode (`>1` session). In Splits, an
+    /// unfocused pane's own unread badge is the only place the count shows
+    /// at all — it should carry the same colour identity, for the same
+    /// reason (UX_REVIEW.md H).
+    #[test]
+    fn splits_mode_unread_badge_matches_the_pane_color() {
+        let mut state = test_support::app(&["tank", "cleric"]);
+        state.layout = LayoutMode::Splits;
+        state.sessions[1].color = Some(Color::Magenta);
+        state.sessions[1].unread = 3;
+
+        let buffer = render_sized(&state, 60, 12);
+        let badge = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "●")
+            .expect("the unread badge should render in cleric's own border title");
+        assert_eq!(badge.fg, Color::Magenta);
+    }
+
     /// Focus is shown by brightness and colour by profile, so an unfocused
     /// coloured pane must keep both signals rather than losing one.
     #[test]
