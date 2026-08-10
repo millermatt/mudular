@@ -246,6 +246,15 @@ mudular tank cleric
 - Opening the same profile twice gives the second one a `-2` suffix
   (`cleric-2`), which is how rules address it.
 
+Decided to duo an hour after your first character logged in? You don't
+have to quit and relaunch with both names — `/connect cleric` adds a
+character to the session you're already in, built the same way one named
+on the command line is (same rules, same `-2` suffix if you already have
+one open). It's focused immediately, and every existing character can
+already see it — `${@cleric.hp}` and `send_to: {cleric: [...]}` work from
+the moment it connects, in both directions. Nothing else's scrollback is
+touched.
+
 ### Channel panes
 
 Tells and chat can be pulled out of the main scrollback into their own

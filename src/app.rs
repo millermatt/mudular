@@ -12,7 +12,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
@@ -55,6 +55,10 @@ const CONFIG_COMMAND: &str = "/config";
 /// Opens the same form the first-run screen shows, reachable any time
 /// rather than only at zero-profile startup (§15, UX_REVIEW.md B).
 const NEWPROFILE_COMMAND: &str = "/newprofile";
+/// Adds a character to this running instance (§7.5,
+/// `ARCH_REVIEW.md` "Features that would break the architecture") — a
+/// name follows, not a fixed string like the commands above.
+const CONNECT_COMMAND: &str = "/connect";
 
 /// `send_to` address meaning "every other session" (§7.5).
 const ALL_SESSIONS: &str = "*";
@@ -343,6 +347,27 @@ pub struct AppState {
     /// and paints over every pane, like the config editor, and sessions
     /// keep running behind it the same way.
     pub new_profile_wizard: Option<NewProfileWizard>,
+    /// Every live session's own publish receiver, by name — the hub's half
+    /// of the peer mesh (§7.5). Built once at startup from the same
+    /// channels each session gets, and grown by `/connect`: a session
+    /// added later hands its receiver here so the *next* `/connect` (or
+    /// this one, reciprocally) can find it, and broadcasts it to every
+    /// session already running via `SessionCommand::AddPeer` — the gap
+    /// `ARCH_REVIEW.md` "Features that would break the architecture"
+    /// named (a session added after startup was invisible to every
+    /// existing one and vice versa, since the mesh was built once before
+    /// `event_loop` and never revisited).
+    peer_registry: crate::engine::Peers,
+    /// Per-session limits new sessions need too, not just the ones spawned
+    /// at startup (§8, §11.3) — `/connect` builds a session the same way
+    /// `main.rs` does, so it needs the same numbers `event_loop` was
+    /// handed once at launch.
+    history_size: usize,
+    scrollback_size: usize,
+    /// The install-wide `cross_session:` default, before a profile's own
+    /// override — `/connect` needs it for the same reason it needs
+    /// `history_size`/`scrollback_size`.
+    cross_session_default: CrossSession,
 }
 
 /// `PgUp`/`PgDn`/`Home`/`End`, unmodified — built-in and unremappable, like
@@ -1138,6 +1163,7 @@ pub async fn run(
     history_size: usize,
     scrollback_size: usize,
     channel_width: u16,
+    cross_session_default: CrossSession,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let result = event_loop(
@@ -1149,10 +1175,106 @@ pub async fn run(
         history_size,
         scrollback_size,
         channel_width,
+        cross_session_default,
     )
     .await;
     ratatui::restore();
     result
+}
+
+/// Builds everything one profile needs to connect, shared by the CLI
+/// startup path and `/connect <profile>` (§7.5, ARCH_REVIEW.md "Features
+/// that would break the architecture") — the same construction either way,
+/// so a session added later behaves identically to one named on the
+/// command line. `taken` is the names already in use (so a repeated
+/// profile still gets its `-2` suffix); `record` is `None` for `/connect`,
+/// since `--record` is a startup-only flag with no session to apply to
+/// after the fact.
+pub fn build_profile_target(
+    dir: &Path,
+    name: &str,
+    taken: &mut Vec<String>,
+    channels: &[Channel],
+    cross_default: CrossSession,
+    record: Option<PathBuf>,
+) -> Result<ConnectTarget> {
+    let path = config::profile_path(dir, name);
+    let profile = config::load_profile(&path)?;
+    let tls = profile.tls.enabled.then(|| crate::net::TlsConfig {
+        verify: profile.tls.verify,
+        pin_store: crate::net::pins::PinStore::new(dir.join("known_certs")),
+    });
+    let charset: Charset = profile
+        .charset
+        .parse()
+        .map_err(|err: String| anyhow::anyhow!(err))
+        .with_context(|| format!("charset in {}", path.display()))?;
+    let layers = config::load_rules(dir, Some(name), channels)?;
+    let (login, offer_password_save) = autologin(profile.login.as_ref(), name, dir)?;
+    let session_name_str = session_name(name, taken);
+    let log_path = profile
+        .log
+        .then(|| config::log_dir(dir).join(format!("{session_name_str}.log")));
+    Ok(ConnectTarget {
+        name: session_name_str,
+        host: profile.host,
+        port: profile.port,
+        tls,
+        record,
+        charset,
+        rules: Rules {
+            engine: Engine::compile(&layers)?,
+            config_dir: dir.to_path_buf(),
+            profile: Some(name.to_string()),
+        },
+        cross: cross_default.with_override(profile.cross_session),
+        color: profile.color,
+        login,
+        offer_password_save,
+        log_path,
+    })
+}
+
+/// Builds the auto-login machine for a profile, reading its password from
+/// the OS keyring (docs/ARCHITECTURE.md §10). A profile with no `login:`
+/// block gets `None` and the ordinary hand-typed login.
+///
+/// Also reports whether the session should offer to save the password the
+/// player types: only for a profile that wants auto-login, has nothing
+/// stored, and has not already turned the offer down (§13).
+fn autologin(
+    login: Option<&config::Login>,
+    profile: &str,
+    dir: &Path,
+) -> Result<(Option<session::login::Autologin>, bool)> {
+    let Some(login) = login else {
+        return Ok((None, false));
+    };
+    // Read once, at connect time: the keyring may prompt, and doing that
+    // from inside the session task would block the pipeline mid-connection.
+    let password = config::stored_password(profile)?;
+    let offer_save = password.is_none() && !config::password_save_declined(dir, profile);
+    let machine = session::login::Autologin::new(
+        login.name.clone(),
+        password,
+        login.name_prompt.as_deref(),
+        login.password_prompt.as_deref(),
+    )
+    .with_context(|| format!("auto-login for {profile}"))?;
+    Ok((Some(machine), offer_save))
+}
+
+/// Sessions are addressed by profile name; a second session on the same
+/// profile gets a numeric suffix (`cleric-2`, docs/ARCHITECTURE.md §7.5).
+fn session_name(base: &str, taken: &mut Vec<String>) -> String {
+    let mut name = base.to_string();
+    let mut suffix = 1;
+    while taken.contains(&name) {
+        suffix += 1;
+        name = format!("{base}-{suffix}");
+    }
+    taken.push(name.clone());
+    name
 }
 
 fn connect(
@@ -1294,6 +1416,7 @@ async fn event_loop(
     history_size: usize,
     scrollback_size: usize,
     channel_width: u16,
+    cross_session_default: CrossSession,
 ) -> Result<()> {
     // Every session publishes a snapshot of its state and reads every
     // other session's (§7.5). The channels are made up front, so a session
@@ -1361,6 +1484,10 @@ async fn event_loop(
         line_cursor: None,
         config_dir,
         new_profile_wizard: None,
+        peer_registry: receivers.into_iter().collect(),
+        history_size,
+        scrollback_size,
+        cross_session_default,
     };
     // A config value wider than this terminal is clamped before the first
     // frame, the same as a `Resize` clamps it later (§11.4).
@@ -1405,6 +1532,12 @@ async fn event_loop(
                     report_pane_sizes(&mut state, terminal.get_frame().area()).await;
                 } else if key.code == KeyCode::Enter {
                     submit_input(&mut state, &channels).await;
+                    // Usually a no-op (`report_pane_sizes` only sends a
+                    // session a size it hasn't already been told), but
+                    // `/connect` just changed how many panes there are —
+                    // in Splits layout every existing one just resized,
+                    // and the new one needs telling for the first time.
+                    report_pane_sizes(&mut state, terminal.get_frame().area()).await;
                 } else if is_scroll_key(key.code, key.modifiers) {
                     // Scrollback keys are built-in and unremappable, like
                     // Up/Down below — and they act on the *focused* pane,
@@ -1757,7 +1890,90 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         state.new_profile_wizard = Some(NewProfileWizard::new(state.config_dir.clone()));
         return;
     }
+    let trimmed = line.trim();
+    if trimmed == CONNECT_COMMAND || trimmed.starts_with("/connect ") {
+        // Not `trimmed.strip_prefix(CONNECT_COMMAND_PREFIX)`: trimming the
+        // whole line first already ate a lone trailing space, so
+        // "/connect " (no name) would otherwise miss its own prefix check
+        // and fall through to the server as literal text instead of
+        // reporting the missing name below.
+        let name = trimmed.strip_prefix(CONNECT_COMMAND).unwrap_or("").trim();
+        if name.is_empty() {
+            if let Some(session) = state.bound_mut() {
+                session.push_line(RetainedLine::client("** /connect needs a profile name"));
+            }
+            return;
+        }
+        connect_new_session(state, channels, name).await;
+        return;
+    }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
+}
+
+/// `/connect <profile>` (§7.5, `ARCH_REVIEW.md` "Features that would break
+/// the architecture"): adds a character to this running instance rather
+/// than requiring a relaunch with every profile named up front. Builds the
+/// target the same way `main.rs` does at startup (`build_profile_target`),
+/// then does the two things the peer mesh being built once before
+/// `event_loop` and never revisited had made impossible — hands the new
+/// session everyone else's receivers, and everyone else the new session's,
+/// so `${@name.var}`/`mud.on_peer` work in both directions immediately
+/// rather than only for characters named on the command line. `--record`
+/// never applies here: it is a startup flag with no CLI invocation to read
+/// from at this point.
+async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &str) {
+    let mut taken: Vec<String> = state.sessions.iter().map(|s| s.name.clone()).collect();
+    let target = match build_profile_target(
+        &state.config_dir,
+        name,
+        &mut taken,
+        channels,
+        state.cross_session_default,
+        None,
+    ) {
+        Ok(target) => target,
+        Err(err) => {
+            if let Some(session) = state.bound_mut() {
+                session.push_line(RetainedLine::client(format!(
+                    "** could not connect `{name}`: {err:#}"
+                )));
+            }
+            return;
+        }
+    };
+
+    let (publish_tx, publish_rx) = watch::channel(PeerSnapshot::default());
+    let others = state.peer_registry.clone();
+    for session in &state.sessions {
+        let _ = session
+            .commands
+            .send(SessionCommand::AddPeer {
+                name: target.name.clone(),
+                rx: publish_rx.clone(),
+            })
+            .await;
+    }
+    state.peer_registry.insert(target.name.clone(), publish_rx);
+
+    let connected_name = target.name.clone();
+    let links = PeerLinks {
+        publish: Some(publish_tx),
+        others,
+    };
+    let session = connect(target, state.history_size, state.scrollback_size, links);
+    state.sessions.push(session);
+
+    // Focused immediately, the same as a freshly launched character would
+    // be — the confirmation below lands in the pane it describes.
+    let index = state.sessions.len() - 1;
+    state.focus = Focus::Session(index);
+    state.input_session = index;
+
+    if let Some(session) = state.bound_mut() {
+        session.push_line(RetainedLine::client(format!(
+            "** connected {connected_name}"
+        )));
+    }
 }
 
 /// Panes and app state without live session tasks behind them, so both the
@@ -1829,6 +2045,10 @@ pub(crate) mod test_support {
                 line_cursor: None,
                 config_dir: PathBuf::from("/cfg"),
                 new_profile_wizard: None,
+                peer_registry: crate::engine::Peers::new(),
+                history_size: 500,
+                scrollback_size: 10_000,
+                cross_session_default: CrossSession::default(),
             },
             receivers,
         )
@@ -3473,6 +3693,95 @@ mod tests {
         assert!(
             state.new_profile_wizard.is_some(),
             "the form must still be open"
+        );
+    }
+
+    // ---- /connect (§7.5, ARCH_REVIEW.md "Features that would break the architecture") ----
+
+    fn write_profile(dir: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("profiles").join(format!("{name}.yaml")),
+            format!("name: {name}\nhost: 127.0.0.1\nport: 1\n"),
+        )
+        .unwrap();
+    }
+
+    /// The two directions the peer mesh being built once before
+    /// `event_loop` and never revisited had made impossible: the new
+    /// session is reachable by name (`peer_registry`), and every session
+    /// already running is told about it.
+    #[tokio::test]
+    async fn connect_adds_a_session_and_notifies_existing_ones() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        write_profile(dir.path(), "cleric");
+
+        let (mut state, mut receivers) = app(&["tank"]);
+        state.config_dir = dir.path().to_path_buf();
+
+        submit(&mut state, "/connect cleric").await;
+
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.sessions[1].name, "cleric");
+        assert_eq!(
+            state.focus,
+            Focus::Session(1),
+            "a connected character is focused immediately, like a launched one"
+        );
+        assert_eq!(state.input_session, 1);
+        assert!(state.peer_registry.contains_key("cleric"));
+
+        match receivers[0].try_recv() {
+            Ok(SessionCommand::AddPeer { name, .. }) => assert_eq!(name, "cleric"),
+            other => panic!("expected AddPeer for tank, got {other:?}"),
+        }
+    }
+
+    /// A repeated profile name still gets the same `-2` suffix a second
+    /// `mudular tank tank` on the command line would (§7.5).
+    #[tokio::test]
+    async fn connect_to_a_taken_name_gets_a_suffix() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        write_profile(dir.path(), "tank");
+
+        let (mut state, _rx) = app(&["tank"]);
+        state.config_dir = dir.path().to_path_buf();
+
+        submit(&mut state, "/connect tank").await;
+
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.sessions[1].name, "tank-2");
+    }
+
+    #[tokio::test]
+    async fn connect_to_an_unknown_profile_shows_an_error_and_adds_nothing() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+
+        let (mut state, _rx) = app(&["tank"]);
+        state.config_dir = dir.path().to_path_buf();
+
+        submit(&mut state, "/connect ghost").await;
+
+        assert_eq!(state.sessions.len(), 1, "no session should have been added");
+        assert!(
+            scrollback(&state.sessions[0]).contains("could not connect"),
+            "{:?}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_an_empty_name_shows_an_error() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        submit(&mut state, "/connect ").await;
+
+        assert_eq!(state.sessions.len(), 1);
+        assert!(
+            scrollback(&state.sessions[0]).contains("needs a profile name"),
+            "{:?}",
+            scrollback(&state.sessions[0])
         );
     }
 }

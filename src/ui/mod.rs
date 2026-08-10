@@ -88,6 +88,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/reload", "recompile rules and scripts from disk"),
         row("/config", "edit this character's profile"),
         row("/newprofile", "create another character's profile"),
+        row("/connect", "add a character to this running instance"),
         String::new(),
         "Leaving".to_string(),
         row(keybinds.quit, "quit"),

@@ -136,6 +136,17 @@ pub enum SessionCommand {
     },
     /// Replace the rule set without reconnecting (`/reload`).
     SetRules(Box<Engine>),
+    /// A session added to a running instance after this one, so this
+    /// session's peer mesh — built once at spawn (§7.5) — has no other way
+    /// to learn about it (`/connect`, docs/ARCH_REVIEW.md "One-way doors"
+    /// #2). Handled identically whether it arrives connected or mid-
+    /// reconnect-backoff: both keep a `watching` list, and a peer added
+    /// during a backoff must not be lost by the time the connection comes
+    /// back.
+    AddPeer {
+        name: String,
+        rx: watch::Receiver<PeerSnapshot>,
+    },
     /// Pane was resized; renegotiate NAWS.
     Resize { cols: u16, rows: u16 },
     /// End the session for good, cancelling any pending reconnect. No UI
@@ -280,7 +291,15 @@ async fn run(
         if events.send(notice).await.is_err() {
             return;
         }
-        if !wait_to_retry(delay, &mut engine, &mut window, &mut commands).await {
+        if !wait_to_retry(
+            delay,
+            &mut engine,
+            &mut window,
+            &mut watching,
+            &mut commands,
+        )
+        .await
+        {
             break "disconnected".to_string();
         }
     };
@@ -321,6 +340,7 @@ async fn wait_to_retry(
     delay: Duration,
     engine: &mut Engine,
     window: &mut Option<(u16, u16)>,
+    watching: &mut Vec<(String, watch::Receiver<PeerSnapshot>)>,
     commands: &mut mpsc::Receiver<SessionCommand>,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + delay;
@@ -334,6 +354,12 @@ async fn wait_to_retry(
                 // a live socket does (§7.4).
                 Some(SessionCommand::SetRules(rules)) => *engine = *rules,
                 Some(SessionCommand::Resize { cols, rows }) => *window = Some((cols, rows)),
+                // A peer added while this session is mid-backoff must not
+                // be lost by the time the connection comes back (§7.5).
+                Some(SessionCommand::AddPeer { name, rx }) => {
+                    engine.add_peer(name.clone(), rx.clone());
+                    watching.push((name, rx));
+                }
                 // Nothing to send anything down; the status line already
                 // says why.
                 Some(_) => {}
@@ -364,7 +390,7 @@ async fn run_connection(
     engine: &mut Engine,
     expand_injected: bool,
     login: &mut Option<Autologin>,
-    watching: &mut [(String, watch::Receiver<PeerSnapshot>)],
+    watching: &mut Vec<(String, watch::Receiver<PeerSnapshot>)>,
     publish_to: &Option<watch::Sender<PeerSnapshot>>,
     recorder: &mut Option<Recorder>,
     window: &mut Option<(u16, u16)>,
@@ -873,6 +899,10 @@ async fn run_connection(
                             break Outcome::Lost("write failed".to_string());
                         }
                     }
+                    Some(SessionCommand::AddPeer { name, rx }) => {
+                        engine.add_peer(name.clone(), rx.clone());
+                        watching.push((name, rx));
+                    }
                     Some(SessionCommand::Disconnect) | None => {
                         break Outcome::Ended("disconnected".to_string());
                     }
@@ -1361,6 +1391,110 @@ mod tests {
         assert_eq!(
             snapshots.borrow().vars.get("target").map(String::as_str),
             Some("kobold")
+        );
+    }
+
+    /// `SessionCommand::AddPeer` (`/connect`, §7.5) lets an already-running
+    /// session learn about a character added after it — the gap
+    /// `ARCH_REVIEW.md` "Features that would break the architecture"
+    /// found: the peer mesh was built once before the event loop and never
+    /// revisited.
+    #[tokio::test]
+    async fn add_peer_command_makes_a_new_peer_readable() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                let mut reader = CommandReader::default();
+                tx.send(reader.next(&mut sock).await).await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^check$'
+                    send: ["say ${@cleric.hp}"]
+                "#,
+            ),
+        );
+
+        let (publish, rx) = watch::channel(PeerSnapshot {
+            vars: [("hp".to_string(), "80".to_string())].into(),
+            data: Default::default(),
+        });
+        Box::leak(Box::new(publish));
+
+        commands
+            .send(SessionCommand::AddPeer {
+                name: "cleric".to_string(),
+                rx,
+            })
+            .await
+            .unwrap();
+        commands
+            .send(SessionCommand::SendLine("check".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(next_sent(&mut sent).await, "say 80");
+    }
+
+    /// The same, but the peer arrives while this session is between
+    /// connections — `wait_to_retry` has to keep the same `watching` list
+    /// `run_connection` does, or a peer added during a drop is lost by the
+    /// time the reconnect completes.
+    #[tokio::test]
+    async fn add_peer_survives_a_reconnect_wait() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, commands) = revolving_door_with_rules(
+            move |mut sock| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(read_command(&mut sock).await).await;
+                });
+            },
+            rules(
+                r#"
+                name: test
+                aliases:
+                  - pattern: '^check$'
+                    send: ["say ${@cleric.hp}"]
+                "#,
+            ),
+        );
+
+        // The first connection drops immediately (`revolving_door` never
+        // keeps a socket open), landing the session in its 1s backoff —
+        // this is meant to arrive during that wait, not before it starts.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (publish, rx) = watch::channel(PeerSnapshot {
+            vars: [("hp".to_string(), "80".to_string())].into(),
+            data: Default::default(),
+        });
+        Box::leak(Box::new(publish));
+        commands
+            .send(SessionCommand::AddPeer {
+                name: "cleric".to_string(),
+                rx,
+            })
+            .await
+            .unwrap();
+
+        // `SendLine` while disconnected is a no-op (`wait_to_retry` only
+        // serves `SetRules`/`AddPeer`/`Resize`/`Disconnect`), so wait past
+        // the 1s backoff for the reconnect before asking anything of it.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        commands
+            .send(SessionCommand::SendLine("check".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            timeout(Duration::from_secs(3), sent.recv())
+                .await
+                .expect("timed out waiting for the reconnected session")
+                .unwrap(),
+            "say 80"
         );
     }
 

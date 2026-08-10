@@ -99,13 +99,20 @@ transcript.
 Each of these names an architectural prerequisite, not a UI tweak, which is
 why they're filed as issues rather than left as a feature-request list:
 
-- **`/connect <profile>` into a running instance** (#2) — structurally the
-  largest single item this review found. The peer `watch` mesh is built
-  from `targets` before the event loop starts and never revisited; needs a
-  hub-owned peer registry with a dynamic handle.
-- **Party HUD / "who needs me?" / follow-the-leader** (#3) — inherits #2's
-  blocker, plus `app` has to join the peer mesh as a reader (only session
-  tasks hold receivers today).
+- ~~**`/connect <profile>` into a running instance**~~ (#2) — **Fixed.**
+  `AppState.peer_registry` is the hub-owned dynamic handle: grown by every
+  `/connect`, handed to a new session as its starting peers, and
+  broadcast to every session already running via a new
+  `SessionCommand::AddPeer` (handled identically whether that session is
+  connected or mid-reconnect-backoff, so a peer added during a drop isn't
+  lost). `build_profile_target` is shared with the CLI's own startup path,
+  so a `/connect`ed session is built the same way one named on the command
+  line is. Deliberately scoped to *adding* only — see #3 below and the
+  "worth resolving alongside" note on index-as-identity, which this did
+  not touch.
+- **Party HUD / "who needs me?" / follow-the-leader** (#3) — #2's peer-mesh
+  blocker is resolved; `app` still has to join the mesh as a reader (only
+  session tasks hold receivers today), which is the piece left.
 - **Auto-mapper, sound packs (MSP), tell threading** — all blocked by the
   same gap as the party HUD: `gmcp::supports_message()` hardcodes the
   advertised package list (#25), so `Group`, `Comm.Channel`, and
@@ -200,17 +207,20 @@ issues rather than restated here:
 1. ~~**The scrollback line type.**~~ Closed — see above. One struct now;
    after 1.0 it would have been the log format, the transcript, and eight
    features.
-2. **Dynamic peer mesh and session lifecycle** — #2. Also:
-   `Focus::Session(usize)` / `input_session: usize` bake index-as-identity
-   into `AppState`, `ui`, and the tests, so adding a session is survivable
-   but removing one is not (`SessionCommand::Disconnect` already exists,
-   `#[allow(dead_code)]`) — worth resolving alongside the registry.
+2. ~~**Dynamic peer mesh**~~ — #2. **Fixed**, see above. **Session
+   lifecycle** is the half that wasn't: `Focus::Session(usize)` /
+   `input_session: usize` still bake index-as-identity into `AppState`,
+   `ui`, and the tests, so adding a session is survivable but removing one
+   is not (`SessionCommand::Disconnect` already exists,
+   `#[allow(dead_code)]`). Deliberately left for whenever removal is
+   actually built (§7.5) rather than guessed at ahead of that pressure.
 3. **GMCP subtree semantics and `Core.Supports.Set`** — #25. Once modules
    and scripts depend on the flat merged map, changing what
    `${Char.Affects.0}` means becomes a breaking change.
-4. **Client-command dispatch** — #7. `submit_input` is three hardcoded
-   `line.trim() ==` comparisons; `/connect`, `/newprofile`, `/errors`, and
-   a command palette all want a registry instead.
+4. **Client-command dispatch** — #7. `submit_input` is now four hardcoded
+   `line.trim()`-shaped comparisons (`/connect` and `/newprofile` both
+   landed as one more each, not through a registry); `/errors` and a
+   command palette still want one.
 5. **`VerifyMode` in `net`, `CHANNEL_WIDTH` in `ui`** — #6. Trivial,
    unblocks the workspace split.
 

@@ -536,15 +536,41 @@ and eventually consistent (staleness is one channel hop, microseconds).
 YAML rules reference peer state as `${@tank.hp}`; a `when:` guard (§7.6)
 can combine local and peer values.
 
-The channels are created by the hub before any session connects, so a rule
-may name a peer that is still dialling — it reads that peer's empty
-snapshot until there is something to publish, rather than failing. A
-session publishes only when its own state has moved, so a quiet character
+The channels for every session named at launch are created by the hub
+before any of them connects, so a rule may name a peer that is still
+dialling — it reads that peer's empty snapshot until there is something to
+publish, rather than failing. `/connect <profile>`, below, extends this
+past launch: the hub keeps a `peer_registry` mapping every live session's
+name to its own publish receiver, growing it as each `/connect` adds one.
+A newly connected session is handed the current registry as its own set of
+peers to watch (so it can read `${@tank...}` from the moment it starts);
+every session already running is told about the new one via
+`SessionCommand::AddPeer`, which both live sessions and ones mid-reconnect
+handle identically — a peer added during a backoff is not lost by the time
+the connection comes back. This is what closed the gap the mesh being
+built once before `event_loop` and never revisited had left: a session
+added later used to be invisible to every existing one and vice versa.
+
+A session publishes only when its own state has moved, so a quiet character
 costs its peers nothing, and it never watches itself: its own variables are
 the live ones. `@` is a namespace of its own — a peer name cannot shadow a
 local variable or a GMCP key, and an unknown peer or key resolves to
 nothing, which leaves a template visibly unexpanded and a guard false, just
 as an unknown local name does.
+
+**`/connect <profile>`.** Adds a character to a running instance
+without a relaunch, sharing `build_profile_target` with the CLI's own
+startup path — a session added this way is constructed identically to one
+named on the command line, and gets the same `-2`-suffix handling for a
+repeated profile name (above). Deliberately narrow: it only builds and
+wires the session (peer mesh both directions, focus moves to it); `--record`
+never applies, since it is a startup flag with no CLI invocation to read
+from at this point. Session *removal* is a separate, harder problem this
+does not touch — `Focus::Session(usize)`/`input_session: usize` bake
+index-as-identity into `AppState`, which adding a session is survivable
+under and removing one is not (`SessionCommand::Disconnect` exists,
+unwired). Left for whenever removal is actually built, since fixing it
+without that pressure risks guessing at the wrong shape.
 
 **Scripting API (M8).** The `mud.*` API (§7.4) adds:
 

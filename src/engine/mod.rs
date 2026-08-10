@@ -460,9 +460,19 @@ impl Engine {
     }
 
     /// Hands this session the receivers for every other session's snapshot
-    /// (§7.5). Called once, by the hub that knows what else is open.
+    /// (§7.5). Called once, by the hub that knows what else is open at
+    /// spawn time.
     pub fn set_peers(&mut self, peers: Peers) {
         self.peers = peers;
+    }
+
+    /// Adds one more peer without disturbing the rest — a session added to
+    /// a running instance after this one, whose existence this one has no
+    /// other way to learn (§7.5, `/connect`). Overwrites a same-named
+    /// entry, which only happens if a name was already reused; the newer
+    /// receiver is the live one.
+    pub fn add_peer(&mut self, name: String, rx: watch::Receiver<PeerSnapshot>) {
+        self.peers.insert(name, rx);
     }
 
     /// This session's state to publish, or `None` if nothing has changed
@@ -3157,6 +3167,30 @@ triggers:
         );
 
         assert_eq!(engine.expand_input("both").sends, vec!["say 90 30"]);
+    }
+
+    /// `add_peer` inserts one more without disturbing the rest — the
+    /// mechanism `/connect` uses to tell an already-running session about
+    /// a character added after it (§7.5, `ARCH_REVIEW.md` "Features that
+    /// would break the architecture").
+    #[test]
+    fn add_peer_inserts_without_disturbing_existing_peers() {
+        let mut engine = with_peer(
+            r#"
+            name: test
+            aliases:
+              - pattern: '^both$'
+                send: ["say ${@tank.hp} ${@cleric.hp}"]
+            "#,
+            "tank",
+            snapshot(&[("hp", "30")], &[]),
+        );
+
+        let (tx, rx) = watch::channel(snapshot(&[("hp", "80")], &[]));
+        Box::leak(Box::new(tx));
+        engine.add_peer("cleric".to_string(), rx);
+
+        assert_eq!(engine.expand_input("both").sends, vec!["say 30 80"]);
     }
 
     /// A snapshot is published only when this session's state has actually

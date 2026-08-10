@@ -252,6 +252,77 @@ fn plays_two_characters_and_routes_a_trigger_across_them() {
     app.expect_exit("the default quit key should quit");
 }
 
+/// `/connect` (§7.5, ARCH_REVIEW.md "Features that would break the
+/// architecture"): a session already running learns about one added
+/// after it, not just the reverse — the direction that needed the peer
+/// mesh to stop being built once before the event loop and never
+/// revisited. Only `tank` is named on the command line; `cleric` is
+/// added live, and `tank`'s own trigger reads `cleric`'s peer state to
+/// prove the mesh actually updated rather than just the tab bar.
+#[test]
+fn connects_a_character_into_a_running_instance() {
+    let tank_mud = FakeMud::start();
+    let cleric_mud = FakeMud::start();
+    let config = TempDir::new();
+    write_connect_profiles(config.path(), tank_mud.port, cleric_mud.port);
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+    app.wait_for(
+        BANNER,
+        "the first character's banner should reach the screen",
+    );
+
+    app.type_line("/connect cleric");
+    app.wait_for(
+        "cleric",
+        "the newly connected character should join the tab bar",
+    );
+
+    // cleric connecting, its banner-matching trigger firing, and that
+    // publishing across tank's newly-added receiver are all real async
+    // work with no single event this test can wait on directly — retried
+    // rather than a fixed sleep, so the first attempt racing that
+    // (reading `${@cleric.hp}` before it exists yet) doesn't fail the
+    // test outright.
+    for _ in 0..10 {
+        tank_mud.send_line("check cleric");
+        std::thread::sleep(Duration::from_millis(200));
+        let seen = String::from_utf8_lossy(&tank_mud.received.lock().unwrap()).into_owned();
+        if seen.lines().any(|line| line.trim() == "say 42") {
+            break;
+        }
+    }
+    tank_mud.wait_for_command(
+        "say 42",
+        "tank's trigger should read cleric's peer state, added after tank was already running",
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// One profile named on the command line (`tank`), one meant to be added
+/// with `/connect` (`cleric`) — the second is not in `cli.profiles`.
+fn write_connect_profiles(dir: &Path, tank_port: u16, cleric_port: u16) {
+    std::fs::create_dir_all(dir.join("profiles")).unwrap();
+    std::fs::write(
+        dir.join("profiles/tank.yaml"),
+        format!(
+            "name: tank\nhost: 127.0.0.1\nport: {tank_port}\n\
+             triggers:\n  - pattern: 'check cleric'\n    send: [\"say ${{@cleric.hp}}\"]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("profiles/cleric.yaml"),
+        format!(
+            "name: cleric\nhost: 127.0.0.1\nport: {cleric_port}\n\
+             triggers:\n  - pattern: '{BANNER}'\n    set: {{hp: \"42\"}}\n"
+        ),
+    )
+    .unwrap();
+}
+
 /// Two profiles on their own ports, the first with a cross-session rule.
 fn write_two_profiles(dir: &Path, tank_port: u16, cleric_port: u16) {
     std::fs::create_dir_all(dir.join("profiles")).unwrap();
