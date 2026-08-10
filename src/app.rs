@@ -171,6 +171,12 @@ pub struct SessionPane {
     /// compensation to keep a scrolled reader's view stable — the buffer
     /// grows underneath the same offset (docs/ARCHITECTURE.md §11.5).
     pub back_offset: usize,
+    /// What this character has learned of the world's shape (§16), and
+    /// where on it they are. Per session, not shared: two characters can
+    /// be on different MUDs entirely, and buffer/state isolation is
+    /// structural (§3).
+    pub map: crate::map::Map,
+    pub current_room: Option<crate::map::RoomId>,
 }
 
 impl SessionPane {
@@ -687,6 +693,18 @@ fn apply_session_event(
         SessionEvent::Bell => (false, Vec::new()),
         SessionEvent::Gmcp { package, payload } => {
             state.sessions[index].push_gmcp(package, payload);
+            (false, Vec::new())
+        }
+        SessionEvent::Room { info, arrived_via } => {
+            let session = &mut state.sessions[index];
+            // Only the hub can close an edge: the session knows which way
+            // the character went, and the hub is what remembers where they
+            // were when they went.
+            if let (Some(from), Some(direction)) = (session.current_room, arrived_via) {
+                session.map.connect(from, &direction, info.id);
+            }
+            session.map.observe(&info);
+            session.current_room = Some(info.id);
             (false, Vec::new())
         }
         SessionEvent::Security(security) => {
@@ -1336,6 +1354,8 @@ fn connect(
         scrollback_limit,
         log: target.log_path.as_deref().and_then(open_log),
         back_offset: 0,
+        map: crate::map::Map::default(),
+        current_room: None,
     }
 }
 
@@ -2040,6 +2060,8 @@ pub(crate) mod test_support {
                 scrollback_limit: 10_000,
                 log: None,
                 back_offset: 0,
+                map: crate::map::Map::default(),
+                current_room: None,
             },
             rx,
         )

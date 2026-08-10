@@ -71,6 +71,21 @@ pub enum SessionEvent {
         package: String,
         payload: Option<String>,
     },
+    /// The character is somewhere new (§16). Raised for whichever protocol
+    /// supplied it — the room is read back out of the merged server-data
+    /// store, not out of a GMCP message, so an MSDP-only MUD maps just as
+    /// well as a GMCP one (§6.3, and §7.5's reasoning about naming a key
+    /// and not a protocol).
+    ///
+    /// `arrived_via` is the movement that got us here, when the client can
+    /// be *sure* which one it was — see [`note_outbound`]. `None` means the
+    /// room is known but the edge into it is not, which is the honest
+    /// answer: a wrong edge is a lie the map keeps telling, where a missing
+    /// one is only a gap.
+    Room {
+        info: Box<crate::map::RoomInfo>,
+        arrived_via: Option<String>,
+    },
     /// The connection dropped and the session is waiting to try again
     /// (docs/ARCHITECTURE.md §5). `attempt` counts from 1 and resets once a
     /// connection comes back up.
@@ -414,6 +429,12 @@ async fn run_connection(
     let mut sock_buf = [0u8; 4096];
     // When the round trip currently being timed started, if any (§11).
     let mut sent_at: Option<Instant> = None;
+    // Room tracking (§16), per connection rather than per session: a
+    // reconnect can land the character somewhere else entirely, and
+    // carrying the old room across would invent an edge between wherever
+    // they were and wherever they came back.
+    let mut outstanding_moves: Vec<String> = Vec::new();
+    let mut last_room: Option<crate::map::RoomId> = None;
     // Inflate output, reused across reads.
     let mut plain: Vec<u8> = Vec::new();
 
@@ -431,9 +452,14 @@ async fn run_connection(
     engine.start_timers(Instant::now());
     // Scripts get the same starting gun as the timers (§7.4).
     let connected = engine.on_connect();
-    if send_lines(&mut writer, &connected.sends, &mut sent_at)
-        .await
-        .is_err()
+    if send_lines(
+        &mut writer,
+        &connected.sends,
+        &mut sent_at,
+        &mut outstanding_moves,
+    )
+    .await
+    .is_err()
     {
         return Outcome::Lost("write failed".to_string());
     }
@@ -491,7 +517,12 @@ async fn run_connection(
                             pending = Bytes::new();
 
                             for event in telnet.feed(&plain) {
-                                let emitted = match event {
+                                // Set by whichever protocol wrote to the
+                                // server-data store, so the room is only
+                                // re-read when something could have changed
+                                // it — not on every line of output.
+                                let mut store_touched = false;
+                                let mut emitted = match event {
                                     TelnetEvent::Data(bytes) => {
                                         let text = strip_unsafe_controls(&decoder.decode(&bytes));
                                         assembler.feed(&text)
@@ -530,6 +561,7 @@ async fn run_connection(
                                                 for (key, value) in flat.pairs {
                                                     engine.update_server_data_from_gmcp(&key, value);
                                                 }
+                                                store_touched = true;
                                                 // After the inserts: a shorter
                                                 // array's leftover indices are
                                                 // only stale once the new ones
@@ -554,6 +586,7 @@ async fn run_connection(
                                             for (key, value) in flat.pairs {
                                                 engine.update_server_data_from_msdp(&key, value);
                                             }
+                                            store_touched = true;
                                             // As for GMCP: only stale once
                                             // the new indices are in (§6.3).
                                             for (path, len) in flat.arrays {
@@ -566,6 +599,24 @@ async fn run_connection(
                                     // Telnet machine.
                                     _ => Vec::new(),
                                 };
+
+                                // Whichever protocol just spoke, the room is
+                                // read back out of the merged store rather
+                                // than out of that protocol's own message
+                                // (§6.3, §16) — which is what lets an
+                                // MSDP-only MUD map at all, since MSDP
+                                // raises no event of its own.
+                                if store_touched
+                                    && let Some(info) =
+                                        crate::map::RoomInfo::from_server_data(engine.server_data())
+                                    && let Some(room) = room_event(
+                                        info,
+                                        &mut last_room,
+                                        &mut outstanding_moves,
+                                    )
+                                {
+                                    emitted.push(room);
+                                }
 
                                 for event in emitted {
                                     // Auto-login sees the exchange before the
@@ -707,7 +758,7 @@ async fn run_connection(
                         }
                         // Trigger output is sent verbatim: it is never fed
                         // back through aliases, so rules cannot recurse.
-                        if send_lines(&mut writer, &outbound, &mut sent_at).await.is_err() {
+                        if send_lines(&mut writer, &outbound, &mut sent_at, &mut outstanding_moves).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                         if emit_cross_sends(events, cross_out, FIRST_HOP).await.is_err() {
@@ -732,7 +783,7 @@ async fn run_connection(
             }
             Some(peer) = next_peer_change(watching) => {
                 let outcome = engine.poll_peer(&peer);
-                if send_lines(&mut writer, &outcome.sends, &mut sent_at).await.is_err() {
+                if send_lines(&mut writer, &outcome.sends, &mut sent_at, &mut outstanding_moves).await.is_err() {
                     break Outcome::Lost("write failed".to_string());
                 }
                 for text in outcome.echoes {
@@ -761,10 +812,10 @@ async fn run_connection(
                 // by the same sleep (§7.4).
                 let scripted = engine.fire_due_script_timers(now);
                 publish(engine, publish_to);
-                if send_lines(&mut writer, &due, &mut sent_at).await.is_err() {
+                if send_lines(&mut writer, &due, &mut sent_at, &mut outstanding_moves).await.is_err() {
                     break Outcome::Lost("write failed".to_string());
                 }
-                if send_lines(&mut writer, &scripted.sends, &mut sent_at).await.is_err() {
+                if send_lines(&mut writer, &scripted.sends, &mut sent_at, &mut outstanding_moves).await.is_err() {
                     break Outcome::Lost("write failed".to_string());
                 }
                 for text in scripted.echoes {
@@ -799,7 +850,7 @@ async fn run_connection(
                     // splitter — which drops empty parts, so that `a;;b`
                     // sends two commands rather than three.
                     Some(SessionCommand::SendLine(line)) if line.is_empty() => {
-                        if send_lines(&mut writer, &[String::new()], &mut sent_at)
+                        if send_lines(&mut writer, &[String::new()], &mut sent_at, &mut outstanding_moves)
                             .await
                             .is_err()
                         {
@@ -809,7 +860,7 @@ async fn run_connection(
                     Some(SessionCommand::SendLine(line)) => {
                         let outcome = engine.expand_input(&line);
                         publish(engine, publish_to);
-                        if send_lines(&mut writer, &outcome.sends, &mut sent_at).await.is_err() {
+                        if send_lines(&mut writer, &outcome.sends, &mut sent_at, &mut outstanding_moves).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                         // The one-time nudge that speedwalking actually
@@ -867,7 +918,7 @@ async fn run_connection(
                             (lines, Vec::new())
                         };
                         publish(engine, publish_to);
-                        if send_lines(&mut writer, &sends, &mut sent_at).await.is_err() {
+                        if send_lines(&mut writer, &sends, &mut sent_at, &mut outstanding_moves).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                         // Anything this injection set off is one hop further
@@ -883,7 +934,7 @@ async fn run_connection(
                         // connection come up, so `/reload` is their
                         // `on_connect` — as it is the timers' start.
                         let reloaded = engine.on_connect();
-                        if send_lines(&mut writer, &reloaded.sends, &mut sent_at).await.is_err() {
+                        if send_lines(&mut writer, &reloaded.sends, &mut sent_at, &mut outstanding_moves).await.is_err() {
                             break Outcome::Lost("write failed".to_string());
                         }
                         for text in reloaded.echoes {
@@ -917,13 +968,65 @@ async fn run_connection(
     // never does — but a write failing now says nothing worth printing over
     // the reason we are already leaving.
     let closing = engine.on_disconnect();
-    let _ = send_lines(&mut writer, &closing.sends, &mut sent_at).await;
+    let _ = send_lines(
+        &mut writer,
+        &closing.sends,
+        &mut sent_at,
+        &mut outstanding_moves,
+    )
+    .await;
     for text in closing.echoes {
         if events.send(SessionEvent::rule(text)).await.is_err() {
             return Outcome::Gone;
         }
     }
     outcome
+}
+
+/// Records what an outbound command means for room tracking (§16).
+///
+/// Movement accumulates; anything else clears it. The clearing is the
+/// interesting half: a command that is *not* a step is the likeliest
+/// explanation for a room change right after it — a recall, a portal, a
+/// trigger's teleport — so crediting that change to a movement sent earlier
+/// would invent an edge the world does not have.
+fn note_outbound(outstanding: &mut Vec<String>, line: &str) {
+    match crate::map::canonical_direction(line) {
+        Some(direction) => outstanding.push(direction.to_string()),
+        None => outstanding.clear(),
+    }
+}
+
+/// Turns a room sighting into the event the hub should see, or `None` when
+/// the character has not actually gone anywhere.
+///
+/// The edge is claimed only when exactly one movement is outstanding. A
+/// speedwalk puts every step on the wire before the first room update comes
+/// back, and pairing those in arrival order assumes each one succeeded —
+/// a single wall part-way through would misrecord every edge after it.
+/// Learning nothing from a speedwalk beats learning it wrong, because a
+/// wrong edge is a lie the map keeps telling every time it paths.
+fn room_event(
+    info: crate::map::RoomInfo,
+    last_room: &mut Option<crate::map::RoomId>,
+    outstanding: &mut Vec<String>,
+) -> Option<SessionEvent> {
+    if *last_room == Some(info.id) {
+        // Still here. Whatever is outstanding has not resolved yet — the
+        // step may simply have been refused — so it keeps waiting rather
+        // than being spent on a room we never left.
+        return None;
+    }
+    let arrived_via = match outstanding.len() {
+        1 => Some(outstanding[0].clone()),
+        _ => None,
+    };
+    outstanding.clear();
+    *last_room = Some(info.id);
+    Some(SessionEvent::Room {
+        info: Box::new(info),
+        arrived_via,
+    })
 }
 
 /// A script's cross-session echoes, as events for the hub to place. They
@@ -993,6 +1096,7 @@ async fn send_lines<W>(
     writer: &mut W,
     lines: &[String],
     sent_at: &mut Option<Instant>,
+    outstanding: &mut Vec<String>,
 ) -> std::io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -1001,6 +1105,10 @@ where
         writer.write_all(line.as_bytes()).await?;
         writer.write_all(b"\r\n").await?;
         start_round_trip(sent_at);
+        // Every outbound command passes here, whoever wrote it — typed,
+        // alias-expanded, a speedwalk step, a trigger's `send:` — so this
+        // is the one place room tracking can see movement at all (§16).
+        note_outbound(outstanding, line);
     }
     Ok(())
 }
@@ -3230,5 +3338,268 @@ mod tests {
             SessionEvent::EchoMask(masked) => masked,
             _ => unreachable!(),
         }
+    }
+
+    /// Waits for the next room-change event and unpacks it, for tests that
+    /// only care about the id and how the client says it got there (§16).
+    async fn next_room(
+        events: &mut mpsc::Receiver<SessionEvent>,
+    ) -> (crate::map::RoomId, Option<String>) {
+        match next_matching(events, |ev| matches!(ev, SessionEvent::Room { .. })).await {
+            SessionEvent::Room { info, arrived_via } => (info.id, arrived_via),
+            _ => unreachable!(),
+        }
+    }
+
+    /// A movement, in whatever spelling the player used, accumulates on
+    /// `outstanding` in its canonical short form — `room_event` only ever
+    /// deals in that form, so a server-spelled `north` has to normalise
+    /// here to line up with it later.
+    #[test]
+    fn note_outbound_pushes_canonicalised_movements_and_accumulates_them() {
+        let mut outstanding = Vec::new();
+        note_outbound(&mut outstanding, "north");
+        note_outbound(&mut outstanding, "e");
+        assert_eq!(outstanding, vec!["n".to_string(), "e".to_string()]);
+    }
+
+    /// A command that is *not* a step is the likeliest explanation for a
+    /// room change right after it — a recall, a portal, a trigger's
+    /// teleport — so crediting that change to a movement sent earlier
+    /// would invent an edge the world does not have; the outstanding list
+    /// is cleared instead.
+    #[test]
+    fn note_outbound_clears_on_a_non_movement() {
+        let mut outstanding = vec!["n".to_string()];
+        note_outbound(&mut outstanding, "look");
+        assert!(outstanding.is_empty());
+
+        let mut outstanding = vec!["n".to_string()];
+        note_outbound(&mut outstanding, "");
+        assert!(outstanding.is_empty());
+    }
+
+    /// Still being in the same room is not an arrival, even when a step
+    /// was in flight: a refused step (a wall) leaves it still waiting
+    /// rather than spent on a room the character never left.
+    #[test]
+    fn room_event_is_none_when_the_room_has_not_changed_and_leaves_outstanding_alone() {
+        let info = crate::map::RoomInfo {
+            id: crate::map::RoomId(1),
+            name: None,
+            area: None,
+            exits: Default::default(),
+        };
+        let mut last_room = Some(crate::map::RoomId(1));
+        let mut outstanding = vec!["n".to_string()];
+        assert_eq!(room_event(info, &mut last_room, &mut outstanding), None);
+        assert_eq!(outstanding, vec!["n".to_string()]);
+    }
+
+    /// Exactly one outstanding movement is the only case honest enough to
+    /// name: the client can actually be sure which step led here.
+    #[test]
+    fn room_event_credits_a_single_outstanding_movement() {
+        let info = crate::map::RoomInfo {
+            id: crate::map::RoomId(2),
+            name: None,
+            area: None,
+            exits: Default::default(),
+        };
+        let mut last_room = Some(crate::map::RoomId(1));
+        let mut outstanding = vec!["n".to_string()];
+        let event = room_event(info.clone(), &mut last_room, &mut outstanding);
+        assert_eq!(
+            event,
+            Some(SessionEvent::Room {
+                info: Box::new(info),
+                arrived_via: Some("n".to_string()),
+            })
+        );
+        assert!(outstanding.is_empty());
+        assert_eq!(last_room, Some(crate::map::RoomId(2)));
+    }
+
+    /// Zero or several outstanding movements are both too ambiguous to
+    /// name: a speedwalk puts every step on the wire before the first room
+    /// update comes back, and pairing those in arrival order assumes each
+    /// one succeeded — a wrong edge is a lie the map keeps telling, so
+    /// nothing is claimed either way. Both still clear `outstanding`: it
+    /// was spent on this arrival either way, credited or not.
+    #[test]
+    fn room_event_does_not_credit_zero_or_multiple_outstanding_movements() {
+        let info = crate::map::RoomInfo {
+            id: crate::map::RoomId(2),
+            name: None,
+            area: None,
+            exits: Default::default(),
+        };
+
+        let mut last_room = Some(crate::map::RoomId(1));
+        let mut outstanding: Vec<String> = Vec::new();
+        let event = room_event(info.clone(), &mut last_room, &mut outstanding);
+        assert!(matches!(
+            event,
+            Some(SessionEvent::Room {
+                arrived_via: None,
+                ..
+            })
+        ));
+        assert!(outstanding.is_empty());
+
+        let mut last_room = Some(crate::map::RoomId(1));
+        let mut outstanding = vec!["n".to_string(), "n".to_string()];
+        let event = room_event(info, &mut last_room, &mut outstanding);
+        assert!(matches!(
+            event,
+            Some(SessionEvent::Room {
+                arrived_via: None,
+                ..
+            })
+        ));
+        assert!(outstanding.is_empty());
+    }
+
+    /// The room event is not read out of the GMCP message itself — it's
+    /// read back out of the merged server-data store the message just fed
+    /// (§6.3, §16). Exercises the whole path: negotiation, a `Room.Info`
+    /// payload, and the event the hub actually sees.
+    #[tokio::test]
+    async fn gmcp_room_reaches_the_hub_as_a_room_event() {
+        let (mut events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::GMCP]).await.unwrap();
+
+                let mut subnegs = SubnegReader::default();
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Hello
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Supports.Set
+
+                let room = encode_subnegotiation(
+                    option::GMCP,
+                    br#"Room.Info {"num":12345,"name":"Temple Square","area":"Midgaard"}"#,
+                );
+                sock.write_all(&room).await.unwrap();
+            },
+            rules("name: test"),
+        );
+
+        let (id, arrived_via) = next_room(&mut events).await;
+        assert_eq!(id, crate::map::RoomId(12345));
+        assert_eq!(arrived_via, None);
+    }
+
+    /// The regression guard for a design bug where only GMCP could ever
+    /// produce a map: the room event has to come from the merged
+    /// server-data store rather than a GMCP-specific message, or an
+    /// MSDP-only MUD would raise no `Room` event at all and never map
+    /// (§6.3, §16). MSDP has no negotiation handshake of its own, so a
+    /// server can push room data as soon as the option is enabled.
+    #[tokio::test]
+    async fn msdp_room_reaches_the_hub_as_a_room_event() {
+        let (mut events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::MSDP]).await.unwrap();
+                await_agreement(&mut sock, option::MSDP).await;
+
+                let mut payload = vec![msdp::VAR];
+                payload.extend_from_slice(b"ROOM_VNUM");
+                payload.push(msdp::VAL);
+                payload.extend_from_slice(b"777");
+                payload.push(msdp::VAR);
+                payload.extend_from_slice(b"ROOM_NAME");
+                payload.push(msdp::VAL);
+                payload.extend_from_slice(b"The Vault");
+                let msg = encode_subnegotiation(option::MSDP, &payload);
+                sock.write_all(&msg).await.unwrap();
+            },
+            rules("name: test"),
+        );
+
+        let (id, arrived_via) = next_room(&mut events).await;
+        assert_eq!(id, crate::map::RoomId(777));
+        assert_eq!(arrived_via, None);
+    }
+
+    /// Exactly one command sent between two room sightings is unambiguous:
+    /// the client can be sure which step led here, so the edge is worth
+    /// recording rather than left a gap (§16).
+    #[tokio::test]
+    async fn a_single_step_is_credited_to_the_room_it_leads_to() {
+        let (mut events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::GMCP]).await.unwrap();
+
+                let mut subnegs = SubnegReader::default();
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Hello
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Supports.Set
+
+                let room_a =
+                    encode_subnegotiation(option::GMCP, br#"Room.Info {"num":1,"name":"A"}"#);
+                sock.write_all(&room_a).await.unwrap();
+
+                read_command(&mut sock).await; // "n"
+
+                let room_b =
+                    encode_subnegotiation(option::GMCP, br#"Room.Info {"num":2,"name":"B"}"#);
+                sock.write_all(&room_b).await.unwrap();
+            },
+            rules("name: test"),
+        );
+
+        let (first, _) = next_room(&mut events).await;
+        assert_eq!(first, crate::map::RoomId(1));
+
+        commands
+            .send(SessionCommand::SendLine("n".into()))
+            .await
+            .unwrap();
+
+        let (second, arrived_via) = next_room(&mut events).await;
+        assert_eq!(second, crate::map::RoomId(2));
+        assert_eq!(arrived_via, Some("n".to_string()));
+    }
+
+    /// A speedwalk puts every step on the wire before the first room
+    /// update comes back, so pairing them in arrival order would assume
+    /// each one succeeded — a single wall part-way through would misrecord
+    /// every edge after it. Learning nothing from a speedwalk beats
+    /// learning it wrong, so `arrived_via` stays unset rather than
+    /// guessing (§16).
+    #[tokio::test]
+    async fn an_ambiguous_multi_step_walk_is_not_credited() {
+        let (mut events, commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::GMCP]).await.unwrap();
+
+                let mut subnegs = SubnegReader::default();
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Hello
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Supports.Set
+
+                let room_a =
+                    encode_subnegotiation(option::GMCP, br#"Room.Info {"num":1,"name":"A"}"#);
+                sock.write_all(&room_a).await.unwrap();
+
+                let mut reader = CommandReader::default();
+                reader.next(&mut sock).await; // "n"
+                reader.next(&mut sock).await; // "n"
+
+                let room_b =
+                    encode_subnegotiation(option::GMCP, br#"Room.Info {"num":2,"name":"B"}"#);
+                sock.write_all(&room_b).await.unwrap();
+            },
+            rules("name: test"),
+        );
+
+        let (first, _) = next_room(&mut events).await;
+        assert_eq!(first, crate::map::RoomId(1));
+
+        commands
+            .send(SessionCommand::SendLine(".2n".into()))
+            .await
+            .unwrap();
+
+        let (second, arrived_via) = next_room(&mut events).await;
+        assert_eq!(second, crate::map::RoomId(2));
+        assert_eq!(arrived_via, None);
     }
 }

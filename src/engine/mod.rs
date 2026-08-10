@@ -466,6 +466,14 @@ impl Engine {
         self.peers = peers;
     }
 
+    /// Everything the server has told us about itself, GMCP and MSDP merged
+    /// into one namespace (§6.3). Read by the session to pick the room out
+    /// of it (§16), which is why this is the merged store and not either
+    /// protocol's own message.
+    pub fn server_data(&self) -> &HashMap<String, String> {
+        &self.server_data
+    }
+
     /// Adds one more peer without disturbing the rest — a session added to
     /// a running instance after this one, whose existence this one has no
     /// other way to learn (§7.5, `/connect`). Overwrites a same-named
