@@ -583,6 +583,17 @@ async fn run_connection(
                                             Err(_) => Vec::new(),
                                         }
                                     }
+                                    TelnetEvent::OptionEnabled { option: option::MSDP, side: Side::Remote } => {
+                                        // Ask, or be told nothing at all
+                                        // (§6.3) — see `report_requests`.
+                                        for request in msdp::report_requests() {
+                                            raw_out.push(encode_subnegotiation(
+                                                option::MSDP,
+                                                &request,
+                                            ));
+                                        }
+                                        Vec::new()
+                                    }
                                     TelnetEvent::Subnegotiation { option: option::MSDP, data } => {
                                         if let Ok(pairs) = msdp::parse(&data) {
                                             let mut flat = Flattened::default();
@@ -777,6 +788,16 @@ async fn run_connection(
                         if emit_cross_sends(events, cross_out, FIRST_HOP).await.is_err() {
                             return Outcome::Gone;
                         }
+                        // Negotiation replies first, then anything they
+                        // provoked: `raw_out` holds subnegotiations sent
+                        // *because* an option came up, and a server that
+                        // has not yet seen our DO is entitled to discard a
+                        // subnegotiation for an option it does not consider
+                        // enabled — which is exactly how MSDP `REPORT ROOM`
+                        // went missing against hercmud (§6.3).
+                        if flush_telnet(&mut telnet, &mut writer, &mut sent_at).await.is_err() {
+                            break Outcome::Lost("write failed".to_string());
+                        }
                         for bytes in &raw_out {
                             if writer.write_all(bytes).await.is_err() {
                                 break_reason = Some("write failed".to_string());
@@ -786,9 +807,6 @@ async fn run_connection(
                         }
                         if let Some(reason) = break_reason {
                             break Outcome::Lost(reason);
-                        }
-                        if flush_telnet(&mut telnet, &mut writer, &mut sent_at).await.is_err() {
-                            break Outcome::Lost("write failed".to_string());
                         }
                     }
                     Err(err) => break Outcome::Lost(format!("connection error: {err}")),
@@ -2194,6 +2212,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_sent(&mut sent).await, "you see The Bazaar");
+    }
+
+    /// MSDP is a subscription: the widely deployed implementation sends a
+    /// variable only once the client has `REPORT`ed it, so negotiating the
+    /// option and then staying quiet leaves a perfectly working server
+    /// silent — which reads exactly like a server that does not speak MSDP,
+    /// and leaves the auto-mapper inert on an MSDP-only MUD (observed live
+    /// against hercmud, where `ROOM` never arrived).
+    ///
+    /// Asserted on the raw stream rather than through `SubnegReader`
+    /// because the *order* is half the requirement: the subscription is
+    /// provoked by the option coming up, and a server that has not yet
+    /// seen our `DO` may discard a subnegotiation for an option it does
+    /// not consider enabled. Sending it first is the same silence with the
+    /// bytes present on the wire (§6.3).
+    #[tokio::test]
+    async fn msdp_negotiation_subscribes_to_room_reports_after_agreeing() {
+        let (tx, mut stream) = mpsc::channel(8);
+        let (_events, _commands) = serve(move |mut sock| async move {
+            sock.write_all(&[IAC, WILL, option::MSDP]).await.unwrap();
+
+            let mut seen = Vec::new();
+            let mut buf = vec![0u8; 256];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0, "client closed before subscribing");
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(2).any(|w| w == [IAC, SE]) {
+                    break;
+                }
+            }
+            tx.send(seen).await.unwrap();
+            idle(&mut sock).await;
+        });
+
+        let seen = timeout(Duration::from_secs(2), stream.recv())
+            .await
+            .expect("timed out waiting for the MSDP subscription")
+            .expect("sender dropped");
+
+        let mut subscribe = vec![IAC, SB, option::MSDP, msdp::VAR];
+        subscribe.extend_from_slice(b"REPORT");
+        subscribe.push(msdp::VAL);
+        subscribe.extend_from_slice(b"ROOM");
+        subscribe.extend_from_slice(&[IAC, SE]);
+
+        let agreed = seen
+            .windows(3)
+            .position(|w| w == [IAC, DO, option::MSDP])
+            .expect("client must agree to MSDP");
+        let subscribed = seen
+            .windows(subscribe.len())
+            .position(|w| w == subscribe)
+            .expect("client must subscribe to ROOM");
+        assert!(agreed < subscribed, "DO must precede the REPORT: {seen:?}");
     }
 
     /// The MSDP twin of `a_shrinking_gmcp_array_does_not_leave_a_phantom_entry`:

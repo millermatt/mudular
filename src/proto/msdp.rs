@@ -46,6 +46,36 @@ const MAX_DEPTH: usize = 32;
 
 /// Parses a complete MSDP subnegotiation payload into its top-level
 /// `VAR`/`VAL` pairs.
+/// Encodes a `VAR name VAL value` pair, the whole of what a client needs to
+/// send: MSDP's client half is `REPORT`, `UNREPORT`, `LIST` and `SEND`,
+/// each of which is one variable naming one value.
+pub fn encode_pair(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![VAR];
+    out.extend_from_slice(name.as_bytes());
+    out.push(VAL);
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+/// What the client asks the server to keep it posted about once MSDP is
+/// live (docs/ARCHITECTURE.md §6.3).
+///
+/// **A server sends nothing until asked.** MSDP is subscription-based —
+/// the widely used implementation transmits only variables the client has
+/// `REPORT`ed — so negotiating the option and then staying quiet leaves a
+/// perfectly working server silent, which reads exactly like a server that
+/// does not speak MSDP at all.
+///
+/// Hardcoded, and for the same reason as GMCP's `Core.Supports.Set`
+/// (`gmcp::supports_message`): making either declarable is one change, not
+/// two, and neither is useful to declare until profiles can say so.
+pub fn report_requests() -> Vec<Vec<u8>> {
+    ["ROOM"]
+        .into_iter()
+        .map(|variable| encode_pair("REPORT", variable))
+        .collect()
+}
+
 pub fn parse(data: &[u8]) -> Result<Vec<(String, MsdpValue)>, MsdpError> {
     let mut cursor = Cursor { data, pos: 0 };
     let pairs = parse_pairs(&mut cursor, 0)?;
