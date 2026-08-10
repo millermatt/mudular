@@ -3758,6 +3758,75 @@ mod tests {
         );
     }
 
+    // ---- the room graph (§16) ----
+
+    fn room(id: i64, arrived_via: Option<&str>) -> SessionEvent {
+        SessionEvent::Room {
+            info: Box::new(crate::map::RoomInfo {
+                id: crate::map::RoomId(id),
+                name: None,
+                area: Some("Test".to_string()),
+                exits: std::collections::BTreeMap::new(),
+            }),
+            arrived_via: arrived_via.map(str::to_string),
+        }
+    }
+
+    /// A gate standing open when a route was learned can be locked when it
+    /// is next walked, so a speedwalk's middle step simply fails and every
+    /// room after it is reached by a different step than the one that was
+    /// queued for it. The session reports those rooms with no movement
+    /// credited (§16), and the map must take it at its word: recording
+    /// where the character has been, and inventing no edge between the
+    /// places a failed walk happened to visit.
+    #[test]
+    fn a_walk_broken_part_way_records_rooms_but_invents_no_edges() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        // Four rooms reached during a five-step walk whose third step hit
+        // the locked gate — the session could not tell which step brought
+        // which room, so none of them carry a direction.
+        for id in [2, 3, 4, 5] {
+            apply_session_event(&mut state, 0, room(id, None));
+        }
+
+        let session = &state.sessions[0];
+        assert_eq!(
+            session.current_room,
+            Some(crate::map::RoomId(5)),
+            "position still tracks, even with nothing learned about the way there"
+        );
+        assert!(
+            session.map.rooms.values().all(|r| r.exits.is_empty()),
+            "a broken walk must leave no edge behind: {:?}",
+            session.map.rooms
+        );
+        assert_eq!(session.map.rooms.len(), 4, "but the rooms are still known");
+    }
+
+    /// The complementary case, so the conservatism above is not mistaken
+    /// for the map never learning anything: one step, unambiguously
+    /// credited, is exactly how exploring on foot fills the graph in.
+    #[test]
+    fn a_single_credited_step_records_the_edge() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        apply_session_event(&mut state, 0, room(1, None));
+        apply_session_event(&mut state, 0, room(2, Some("n")));
+
+        let session = &state.sessions[0];
+        assert_eq!(
+            session.map.rooms[&crate::map::RoomId(1)].exits.get("n"),
+            Some(&Some(crate::map::RoomId(2)))
+        );
+        assert_eq!(
+            session
+                .map
+                .path(crate::map::RoomId(1), crate::map::RoomId(2)),
+            Some(vec!["n".to_string()])
+        );
+    }
+
     // ---- /connect (§7.5, ARCH_REVIEW.md "Features that would break the architecture") ----
 
     fn write_profile(dir: &std::path::Path, name: &str) {
