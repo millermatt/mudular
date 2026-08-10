@@ -543,15 +543,21 @@ fn default_toggle_map() -> KeyBinding {
     "f7".parse().expect("built-in default keybinding")
 }
 
-// The bracket pair, beside the comms column's `alt+-` / `alt+=`: two
-// columns need two pairs, and reusing one pair for both would depend on a
-// focus the map column does not have.
+// A second adjacent pair, beside the comms column's `alt+-` / `alt+=`:
+// two columns need two pairs, and reusing one pair for both would depend
+// on a focus the map column does not have. Same orientation as that pair,
+// which is what the docked side makes natural — the left key widens,
+// because widening a right-docked column moves its edge left.
+//
+// Not the brackets, whatever their mnemonic appeal: `alt+[` puts `ESC [`
+// on the wire, which *is* the CSI introducer, so a terminal cannot tell it
+// from the start of an escape sequence and the binding never arrives.
 fn default_map_wider() -> KeyBinding {
-    "alt+]".parse().expect("built-in default keybinding")
+    "alt+,".parse().expect("built-in default keybinding")
 }
 
 fn default_map_narrower() -> KeyBinding {
-    "alt+[".parse().expect("built-in default keybinding")
+    "alt+.".parse().expect("built-in default keybinding")
 }
 
 /// A single key combination, parsed from strings like `ctrl+c` or `f1`.

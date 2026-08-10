@@ -885,7 +885,7 @@ fallback.
 | `F5` | Edit this character's profile | `config_editor` |
 | `F6` | Recompile rules and scripts from disk — the same thing `/reload` does | `reload` |
 | `F7` | Show or hide the map column, and print where you are — the same thing `/map` does | `toggle_map` |
-| `Alt+]` / `Alt+[` | Widen / narrow the map column | `map_wider` / `map_narrower` |
+| `Alt+,` / `Alt+.` | Widen / narrow the map column | `map_wider` / `map_narrower` |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 
 `F1` shows this same list inside the client, built from your actual
@@ -942,7 +942,7 @@ channel_width: 28
 ```
 
 `map_width:` (default 24) does the same for the map column, resized live
-with `Alt+]`/`Alt+[`. On a terminal too narrow for both columns the comms
+with `Alt+,`/`Alt+.`. On a terminal too narrow for both columns the comms
 column keeps its place and the map simply isn't drawn — it was there
 first, and it comes back the moment there's room.
 
