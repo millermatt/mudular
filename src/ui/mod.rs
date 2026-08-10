@@ -78,6 +78,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row(keybinds.gmcp_inspector, "raw GMCP inspector"),
         row(keybinds.help, "this help"),
         row(keybinds.config_editor, "edit this character's profile"),
+        row(keybinds.reload, "recompile rules and scripts from disk"),
         row(
             keybinds.line_picker,
             "pick a scrollback line for a new trigger",
@@ -896,6 +897,19 @@ mod tests {
         let border = buffer.cell((59, 1)).unwrap();
         assert_eq!(border.fg, Color::Green);
         assert!(border.modifier.contains(ratatui::style::Modifier::DIM));
+    }
+
+    /// `help_lines`'s own doc comment promises "every binding" — a
+    /// keybind added without a matching `row(...)` here is exactly the
+    /// gap that let `reload` (§14 M9, UX_REVIEW.md F) ship discoverable
+    /// only by reading the source, not by pressing F1.
+    #[test]
+    fn help_lines_lists_the_reload_keybind() {
+        let lines = help_lines(&Keybinds::default());
+        assert!(
+            lines.iter().any(|line| line.contains("F6")),
+            "the reload keybind must be listed in the help overlay: {lines:?}"
+        );
     }
 
     /// The overlay covers what is under it — a listing rendered over live
