@@ -63,6 +63,12 @@ pub enum SessionEvent {
     /// terminal bell / desktop notification only if the pane isn't
     /// focused — the session has no notion of focus to decide that itself.
     Bell,
+    /// A trigger's `corpse:` fired on this line: the character has just
+    /// died (§16). Carries no room, because the session is not what tracks
+    /// which one the character is in — the hub is, and it takes its answer
+    /// from the room it holds *now*, before the [`SessionEvent::Room`] for
+    /// wherever death sends them arrives behind this in stream order.
+    Corpse,
     /// What the transport is trusting, once connected.
     Security(net::Security),
     /// A raw GMCP message, for the inspector view (§14 M6, §6.3).
@@ -710,6 +716,16 @@ async fn run_connection(
                                             // worth an alert.
                                             if outcome.bell {
                                                 emit.push(SessionEvent::Bell);
+                                            }
+                                            // Ordered ahead of whatever
+                                            // room death drops the
+                                            // character into: the corpse
+                                            // is where they were standing
+                                            // when this line arrived, and
+                                            // the hub reads that off the
+                                            // room it still holds (§16).
+                                            if outcome.corpse {
+                                                emit.push(SessionEvent::Corpse);
                                             }
                                             // The one-time nudge that
                                             // automation is live (UX_REVIEW.md
@@ -1904,6 +1920,28 @@ mod tests {
             "You have been slain by a rat."
         );
         next_matching(&mut events, |ev| matches!(ev, SessionEvent::Bell)).await;
+    }
+
+    /// A `corpse:` trigger emits its own event too (§16). The session says
+    /// only that it happened; the hub is what turns that into a room.
+    #[tokio::test]
+    async fn a_corpse_trigger_emits_a_corpse_event() {
+        let (mut events, _commands) = serve_with_rules(
+            |mut sock| async move {
+                sock.write_all(b"You have been KILLED!!\r\n").await.unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                triggers:
+                  - pattern: 'You have been KILLED'
+                    corpse: true
+                "#,
+            ),
+        );
+
+        assert_eq!(next_line(&mut events).await, "You have been KILLED!!");
+        next_matching(&mut events, |ev| matches!(ev, SessionEvent::Corpse)).await;
     }
 
     /// The first speedwalk expansion this session shows a one-time hint

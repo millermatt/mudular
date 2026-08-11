@@ -366,6 +366,42 @@ there and says so, rather than guessing the rest of the way from a room
 it didn't plan for — leaving that character somewhere unexpected would be
 worse than leaving them in place.
 
+### Corpse runs
+
+The worst part of dying isn't the walk back, it's not remembering where
+you were. Tell the client what death looks like on your MUD and it does
+the remembering:
+
+```yaml
+triggers:
+  - pattern: 'You have been KILLED'
+    corpse: true
+```
+
+When that fires, the room you're standing in at that moment is marked,
+and the client says so:
+
+```
+** corpse marked at #40606 Middle of village street — /corpse walks back
+```
+
+`/corpse` then walks you there, the same one-step-at-a-time way `/goto`
+does, with no vnum to remember. The mark stays put after you arrive, so
+a second trip for the rest of your gear is just `/corpse` again; the next
+death replaces it.
+
+The client won't guess at your death message. Death is prose, and prose
+is exactly what the mapper refuses to infer from — a pattern that
+half-matches would mark the wrong room and send you confidently to it.
+So `/corpse` with no trigger written says so rather than pretending.
+`gag: true` works alongside it if you'd rather not see the message twice.
+
+Pick a pattern from the message your MUD sends *as* you die, not one it
+sends after moving you — otherwise the room that gets marked is the one
+you woke up in. The confirmation line names the room every time, so if
+your pattern is the wrong one you'll see it the first time rather than
+the first time it matters.
+
 ## Automation: aliases, triggers, timers
 
 Rules can go directly in a profile, or in a shared module that several
@@ -638,7 +674,7 @@ deleting a rule that has fields the editor doesn't expose, like
 `script:` or `send_to:`, says so before it lets you). `Ctrl+S` saves;
 `Esc` closes, asking first if there's anything unsaved.
 
-`enabled`, `gag`, and `bell` aren't simple on/off switches: `Space`
+`enabled`, `gag`, `bell`, and `corpse` aren't simple on/off switches: `Space`
 cycles them through *inherit → yes → no → inherit*, since leaving a rule
 at "inherit" is what lets a shared module's own setting take over (see
 "Sharing rules between characters" above) — turning it into a plain

@@ -335,7 +335,8 @@ pinned by integration tests with synthetic compressed captures.
   Actions: send commands, set variables, restyle the matched text or the
   whole line (`highlight:`, §7.7), gag/substitute the line, echo a local
   note, play the terminal bell, call a script (§7.4), send commands to
-  *another* session (§7.5), route the line to a channel pane (§11.1).
+  *another* session (§7.5), route the line to a channel pane (§11.1), mark
+  this as the room the character died in (`corpse:`, §16).
 - **Condition:** an optional `when:` guard on an alias or trigger. The
   pattern decides what matched; the condition decides whether to act on it,
   reading captures, variables, and live server data (§7.6).
@@ -1041,7 +1042,7 @@ keyring-only (§10.1) and never grows a field here.
   marked in its list row and shown read-only at the bottom of its form, and
   naming it again in its delete confirmation — a field the player can't see
   is a field they'll recreate the rule to "fix", losing it for good.
-- **`enabled`/`gag`/`bell` are tri-state, not checkboxes.** `None` means
+- **`enabled`/`gag`/`bell`/`corpse` are tri-state, not checkboxes.** `None` means
   "let a lower scope layer decide" (§7.3); `Space` cycles
   inherit → yes → no → inherit. A checkbox would silently pin
   `enabled: false` over a rule a shared module already turned on.
@@ -1643,8 +1644,44 @@ lives in `ui`, and neither is visible from inside it.
   be wrong is caught after one step instead of all of them; anything the
   player types cancels the walk. It reports plainly when it cannot help —
   no current room, unknown target, ambiguous name, no known path — because
-  a silent no-op is the frustrating case. This is also the seam a corpse
-  run plugs into: a remembered death room plus this path-and-walk call.
+  a silent no-op is the frustrating case.
+- **`/corpse` is that path-and-walk call with the target remembered.** A
+  trigger's `corpse:` (§7.1, the same shape as `bell:`) marks the room the
+  character is standing in when it fires; `/corpse` walks back to it. The
+  client never decides on its own that a character died: death is prose,
+  and this section's last bullet refuses to infer rooms from prose for the
+  reason that applies just as well here — a pattern that half-matches would
+  mark the wrong room and then walk the player confidently to it. The
+  player's own pattern says *when*; the client supplies only the
+  remembering and the walking, which is the half they cannot write
+  themselves.
+
+  The mark needs no notion of "before": `SessionEvent::Corpse` travels the
+  same stream as everything else, so it reaches the hub while
+  `current_room` still holds whatever room the death line arrived in. The
+  session emits no room with the event — it does not track which one the
+  character is in, and inventing a second answer to that question is how
+  the two would drift apart.
+
+  What that leans on is that the death line beats the room update for
+  wherever the body gets dumped, and that is a property of the server, not
+  a guarantee of the design. Measured on a CircleMUD-derived server: a real
+  death marks the right room, but an ordinary walk shows the protocol room
+  variable arriving *ahead* of the room description text — so a `corpse:`
+  pattern matching something the server says only after relocating the
+  character would mark where they landed, not where they fell. There is no
+  honest way for the client to tell those apart (that was the same reason
+  `arrived_via` gives up rather than guessing), so it does not try: it
+  names the room in the confirmation line the moment the mark is taken,
+  which is what makes a badly-chosen pattern visible immediately instead of
+  one death later.
+
+  The mark is per session, in memory, and never cleared: reaching the body
+  leaves it, since a player ferrying loot back in two trips should not have
+  to die again, and the next death overwrites it. It is deliberately not
+  persisted alongside the map — the map is a world, which is worth keeping;
+  a corpse is an incident, and one that has certainly decayed by the next
+  launch.
 - **The map pane** is a third body region, `[main | comms | map]`, toggled
   by F7 or `/map`. `map_width` takes the same clamp/resize discipline
   `channel_width` has (§11.4) — an `AppState` field, recomputed into rects

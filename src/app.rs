@@ -63,6 +63,9 @@ const CONNECT_COMMAND: &str = "/connect";
 /// Walks toward a room already on the map, one step at a time (§16) — a
 /// vnum, or a case-insensitive substring of a room name.
 const GOTO_COMMAND: &str = "/goto";
+/// Walks back to where a `corpse:` trigger last said the character died
+/// (§16) — `/goto` with the target already remembered.
+const CORPSE_COMMAND: &str = "/corpse";
 const MAP_COMMAND: &str = "/map";
 
 /// `send_to` address meaning "every other session" (§7.5).
@@ -189,6 +192,12 @@ pub struct SessionPane {
     /// structural (§3).
     pub map: crate::map::Map,
     pub current_room: Option<crate::map::RoomId>,
+    /// Where this character died last, for `/corpse` (§16). Set by a
+    /// trigger's `corpse:`, never cleared: a corpse run that reaches the
+    /// body leaves the mark behind rather than forgetting a room the
+    /// player may still be walking back and forth to, and the next death
+    /// overwrites it anyway.
+    pub corpse: Option<crate::map::RoomId>,
     /// A `/goto` walk in progress (§16). `None` when nothing is walking.
     pub walk: Option<Walk>,
 }
@@ -752,6 +761,35 @@ fn apply_session_event(
         // The hub decides whether to actually ring it, from the caller's
         // own focus check — this function stays a pure state update.
         SessionEvent::Bell => (false, Vec::new()),
+        SessionEvent::Corpse => {
+            let session = &mut state.sessions[index];
+            // Whatever room the character is in as this arrives is where
+            // they were standing when the server announced their death:
+            // the room they get sent to comes down the same stream, behind
+            // this. A death on a MUD the mapper knows nothing about has no
+            // room to remember, and says so rather than silently recording
+            // nothing for a `/corpse` that will later claim no death ever
+            // happened.
+            match session.current_room {
+                Some(at) => {
+                    session.corpse = Some(at);
+                    let name = session
+                        .map
+                        .rooms
+                        .get(&at)
+                        .and_then(|room| room.name.as_deref())
+                        .unwrap_or("somewhere unnamed");
+                    session.push_line(RetainedLine::client(format!(
+                        "** corpse marked at #{} {name} — /corpse walks back",
+                        at.0
+                    )));
+                }
+                None => session.push_line(RetainedLine::client(
+                    "** corpse: the map doesn't know where you died",
+                )),
+            }
+            (false, Vec::new())
+        }
         SessionEvent::Gmcp { package, payload } => {
             state.sessions[index].push_gmcp(package, payload);
             (false, Vec::new())
@@ -1494,6 +1532,7 @@ fn connect(
         back_offset: 0,
         map,
         current_room: None,
+        corpse: None,
         walk: None,
     }
 }
@@ -2153,6 +2192,10 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         start_goto(state, arg).await;
         return;
     }
+    if trimmed == CORPSE_COMMAND {
+        start_corpse_run(state).await;
+        return;
+    }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
 }
 
@@ -2255,13 +2298,55 @@ async fn start_goto(state: &mut AppState, arg: &str) {
         }
     };
 
+    walk_to(session, current, target, GOTO_COMMAND).await;
+}
+
+/// `/corpse` (§16): retraces the way back to the room a `corpse:` trigger
+/// last marked. The whole feature is `/goto` with the target remembered
+/// for you — the miserable part of a corpse run was never the walking, it
+/// was having to recall where you were when you died.
+async fn start_corpse_run(state: &mut AppState) {
+    let Some(session) = state.bound_mut() else {
+        return;
+    };
+    let Some(corpse) = session.corpse else {
+        // Distinguished from "no route" deliberately: a player whose death
+        // was never marked needs to be told to write the trigger, not to
+        // go explore.
+        session.push_line(RetainedLine::client(
+            "** /corpse: no death recorded — a trigger needs `corpse: true` on this MUD's death message",
+        ));
+        return;
+    };
+    let Some(current) = session.current_room else {
+        session.push_line(RetainedLine::client(
+            "** /corpse doesn't know where you are yet",
+        ));
+        return;
+    };
+    walk_to(session, current, corpse, CORPSE_COMMAND).await;
+}
+
+/// Starts a one-step-at-a-time walk from `current` to `target`, or says
+/// plainly why it can't (§16). Shared by `/goto` and `/corpse`, which
+/// differ only in how they arrive at a target room — `command` is the name
+/// each refusal should blame, since a message naming the wrong command
+/// reads as a bug in whichever one the player actually typed.
+async fn walk_to(
+    session: &mut SessionPane,
+    current: crate::map::RoomId,
+    target: crate::map::RoomId,
+    command: &str,
+) {
     if target == current {
-        session.push_line(RetainedLine::client("** /goto: already there"));
+        session.push_line(RetainedLine::client(format!("** {command}: already there")));
         return;
     }
 
     let Some(path) = session.map.path(current, target) else {
-        session.push_line(RetainedLine::client("** /goto: no known route there"));
+        session.push_line(RetainedLine::client(format!(
+            "** {command}: no known route there"
+        )));
         return;
     };
 
@@ -2399,6 +2484,7 @@ pub(crate) mod test_support {
                 back_offset: 0,
                 map: crate::map::Map::default(),
                 current_room: None,
+                corpse: None,
                 walk: None,
             },
             rx,
@@ -4655,6 +4741,141 @@ mod tests {
             "a cancelled walk must not send another step: {out:?}"
         );
         assert!(state.sessions[0].walk.is_none());
+    }
+
+    // ---- /corpse (§16) ----
+
+    /// The ordering the whole feature rests on: the death line arrives
+    /// while the character is still standing in the room they died in, and
+    /// the room death sends them to comes down the stream *behind* it. So
+    /// the mark is taken from where they are now, and surviving the
+    /// relocation that follows is the point.
+    #[tokio::test]
+    async fn a_corpse_trigger_marks_the_room_the_character_died_in() {
+        let (mut state, _receivers) = app(&["tank"]);
+        apply_session_event(&mut state, 0, room(1, None));
+
+        apply_session_event(&mut state, 0, SessionEvent::Corpse);
+        // Death drops them in the temple, which the mapper records as
+        // usual — an arrival no movement predicted.
+        apply_session_event(&mut state, 0, room(99, None));
+
+        assert_eq!(state.sessions[0].corpse, Some(crate::map::RoomId(1)));
+        assert_eq!(
+            state.sessions[0].current_room,
+            Some(crate::map::RoomId(99)),
+            "the relocation still lands; only the mark is taken from before it"
+        );
+        assert!(
+            scrollback(&state.sessions[0]).contains("corpse marked at #1"),
+            "{}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    /// A death on a MUD with no room data has nothing to remember. Saying
+    /// so beats recording nothing and letting `/corpse` later claim no
+    /// death ever happened.
+    #[tokio::test]
+    async fn a_corpse_trigger_with_no_known_room_says_so() {
+        let (mut state, _receivers) = app(&["tank"]);
+
+        apply_session_event(&mut state, 0, SessionEvent::Corpse);
+
+        assert!(state.sessions[0].corpse.is_none());
+        assert!(
+            scrollback(&state.sessions[0]).contains("doesn't know where you died"),
+            "{}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    /// The payoff: one command, no remembering, and the same one-step-at-a-
+    /// time walk `/goto` does — a corpse run through a world that has moved
+    /// on is exactly where firing a whole route blind goes wrong.
+    #[tokio::test]
+    async fn corpse_walks_back_to_the_marked_room_one_step_at_a_time() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, Some("Dark Alley"), &[]);
+        put_room(&mut state.sessions[0].map, 99, Some("Temple"), &[("s", 2)]);
+        put_room(&mut state.sessions[0].map, 2, Some("Street"), &[("w", 1)]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        apply_session_event(&mut state, 0, SessionEvent::Corpse);
+        state.sessions[0].current_room = Some(crate::map::RoomId(99));
+
+        submit(&mut state, "/corpse").await;
+
+        assert!(
+            matches!(receivers[0].try_recv(), Ok(SessionCommand::SendLine(line)) if line == "s"),
+            "the first step should be sent immediately"
+        );
+        assert!(
+            receivers[0].try_recv().is_err(),
+            "the second step waits for the first to be confirmed"
+        );
+        assert_eq!(
+            state.sessions[0].walk.as_ref().map(|walk| walk.destination),
+            Some(crate::map::RoomId(1))
+        );
+    }
+
+    /// Distinguished from "no known route" on purpose: this player needs to
+    /// be told to write the trigger, not to go explore.
+    #[tokio::test]
+    async fn corpse_without_a_recorded_death_says_no_death_was_recorded() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/corpse").await;
+
+        assert!(state.sessions[0].walk.is_none());
+        assert!(receivers[0].try_recv().is_err());
+        let text = scrollback(&state.sessions[0]);
+        assert!(
+            text.contains("no death recorded") && text.contains("corpse: true"),
+            "{text}"
+        );
+    }
+
+    /// The refusals `walk_to` shares with `/goto` have to blame the command
+    /// the player actually typed.
+    #[tokio::test]
+    async fn corpse_with_no_route_back_blames_corpse_and_not_goto() {
+        let (mut state, _receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(&mut state.sessions[0].map, 99, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        apply_session_event(&mut state, 0, SessionEvent::Corpse);
+        state.sessions[0].current_room = Some(crate::map::RoomId(99));
+
+        submit(&mut state, "/corpse").await;
+
+        assert!(state.sessions[0].walk.is_none());
+        assert!(
+            scrollback(&state.sessions[0]).contains("/corpse: no known route there"),
+            "{}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    /// Reaching the body leaves the mark in place: a player still ferrying
+    /// loot back and forth should not have to die again to get it back.
+    #[tokio::test]
+    async fn walking_back_to_the_corpse_leaves_the_mark_in_place() {
+        let (mut state, _receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        apply_session_event(&mut state, 0, SessionEvent::Corpse);
+
+        submit(&mut state, "/corpse").await;
+
+        assert_eq!(state.sessions[0].corpse, Some(crate::map::RoomId(1)));
+        assert!(
+            scrollback(&state.sessions[0]).contains("/corpse: already there"),
+            "{}",
+            scrollback(&state.sessions[0])
+        );
     }
 
     // ---- /connect (§7.5, ARCH_REVIEW.md "Features that would break the architecture") ----

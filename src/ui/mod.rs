@@ -111,6 +111,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/newprofile", "create another character's profile"),
         row("/connect", "add a character to this running instance"),
         row("/goto", "walk to a known room, one step at a time"),
+        row("/corpse", "walk back to where you last died"),
         row("/map", "show or hide the map, and describe this room"),
         String::new(),
         "Leaving".to_string(),

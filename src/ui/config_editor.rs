@@ -73,7 +73,7 @@ impl RuleKind {
         match self {
             RuleKind::Alias => &["id", "pattern", "when", "send", "enabled"],
             RuleKind::Trigger => &[
-                "id", "pattern", "when", "send", "gag", "route", "bell", "enabled",
+                "id", "pattern", "when", "send", "gag", "route", "bell", "corpse", "enabled",
             ],
             RuleKind::Timer => &["id", "every", "after", "send", "enabled"],
         }
@@ -766,7 +766,7 @@ impl ConfigEditorState {
     }
 
     fn is_toggle_field(&self, kind: RuleKind, field: usize) -> bool {
-        matches!(kind.fields()[field], "enabled" | "gag" | "bell")
+        matches!(kind.fields()[field], "enabled" | "gag" | "bell" | "corpse")
     }
 
     fn cycle_rule_toggle(&mut self, kind: RuleKind, index: usize, field: usize) {
@@ -790,6 +790,11 @@ impl ConfigEditorState {
             (RuleKind::Trigger, "bell") => {
                 if let Some(rule) = self.draft.triggers.get_mut(index) {
                     cycle_tri_state(&mut rule.bell);
+                }
+            }
+            (RuleKind::Trigger, "corpse") => {
+                if let Some(rule) = self.draft.triggers.get_mut(index) {
+                    cycle_tri_state(&mut rule.corpse);
                 }
             }
             (RuleKind::Timer, "enabled") => {

@@ -131,6 +131,13 @@ pub struct Trigger {
     /// worth hiding can still be worth an alert.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bell: Option<bool>,
+    /// Marks the room the character is standing in as where their corpse
+    /// now lies, for `/corpse` to walk back to (§16). The client has no
+    /// idea what death looks like on this MUD — that is prose, and §16
+    /// refuses to guess at prose — so the player's own pattern says when,
+    /// and the client supplies only the remembering and the walking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpse: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
@@ -272,6 +279,10 @@ pub struct LineOutcome {
     /// (§14 M9). The session doesn't know its own focus state, so it only
     /// reports the request; the hub decides whether to ring it.
     pub bell: bool,
+    /// A trigger declared this line to be the character's death (§16). The
+    /// engine has no notion of where they are, so it only reports that it
+    /// happened; the hub is what knows which room to remember.
+    pub corpse: bool,
     /// Whether any trigger's pattern *and* guard held on this line — true
     /// even if its only action was silent (a bare `set:`), false if no
     /// rule matched at all. Used for the one-time "a trigger just fired"
@@ -340,6 +351,7 @@ struct CompiledRule {
     route: Option<String>,
     highlight: Option<CompiledHighlight>,
     bell: bool,
+    corpse: bool,
 }
 
 /// A `highlight:` block reduced to what the hot path needs: the SGR
@@ -703,6 +715,7 @@ impl Engine {
                 }
             }
             outcome.bell |= rule.bell;
+            outcome.corpse |= rule.corpse;
         }
 
         self.changed |= !updates.is_empty();
@@ -1102,6 +1115,7 @@ impl Layered for Trigger {
         self.route = self.route.take().or_else(|| base.route.clone());
         self.highlight = self.highlight.take().or_else(|| base.highlight.clone());
         self.bell = self.bell.or(base.bell);
+        self.corpse = self.corpse.or(base.corpse);
         self.enabled = self.enabled.or(base.enabled);
     }
 }
@@ -1150,6 +1164,7 @@ trait CompilableRule {
     fn route(&self) -> Option<String>;
     fn highlight(&self) -> Option<HighlightSpec>;
     fn bell(&self) -> bool;
+    fn corpse(&self) -> bool;
 }
 
 impl CompilableRule for Alias {
@@ -1196,6 +1211,11 @@ impl CompilableRule for Alias {
     fn bell(&self) -> bool {
         false
     }
+    /// Death is something the server announces, so only a trigger can
+    /// recognise it.
+    fn corpse(&self) -> bool {
+        false
+    }
 }
 
 impl CompilableRule for Trigger {
@@ -1238,6 +1258,9 @@ impl CompilableRule for Trigger {
     }
     fn bell(&self) -> bool {
         self.bell.unwrap_or(false)
+    }
+    fn corpse(&self) -> bool {
+        self.corpse.unwrap_or(false)
     }
 }
 
@@ -1292,6 +1315,7 @@ fn compile_rules<T: CompilableRule>(
                 })
                 .transpose()?,
             bell: rule.bell(),
+            corpse: rule.corpse(),
         });
     }
     Ok(out)
@@ -2805,6 +2829,44 @@ triggers:
 
         assert!(engine.process_line("You have been slain by a rat.").bell);
         assert!(!engine.process_line("You see a rat.").bell);
+    }
+
+    // ---- corpse (§16) ----
+
+    #[test]
+    fn a_corpse_trigger_flags_the_outcome() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'You have been KILLED'
+    corpse: true
+"#,
+        )])
+        .unwrap();
+
+        assert!(engine.process_line("You have been KILLED!!").corpse);
+        assert!(!engine.process_line("A rat has been KILLED").corpse);
+    }
+
+    /// Most death messages are worth hiding behind a highlight or a gag and
+    /// still worth marking — the same independence `bell:` has.
+    #[test]
+    fn a_corpse_trigger_still_marks_when_the_line_is_gagged() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'You have been KILLED'
+    gag: true
+    corpse: true
+"#,
+        )])
+        .unwrap();
+
+        let outcome = engine.process_line("You have been KILLED!!");
+        assert!(outcome.gag);
+        assert!(outcome.corpse);
     }
 
     /// A gagged line can still be worth an alert — `bell:` and `gag:` are
