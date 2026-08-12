@@ -477,9 +477,36 @@ impl Map {
             }
         }
 
+        // The character's own room is the one room the picture is *about*,
+        // so it is the one room the collision rule may not drop. Losing it
+        // used to leave `coords` without the origin at all, and re-centring
+        // then fell back to the anchor's cell — drawing the map centred on
+        // some unrelated room with the player nowhere on it. Where the
+        // origin lost, it takes the cell and the room that beat it drops
+        // instead: exactly one room differs from the pure anchored layout,
+        // and it is never the one being looked at.
+        if !coords.contains_key(&origin) {
+            // Reached, so at least one neighbour was placed — that is how
+            // the traversal got here to reject it. Lowest vnum for a
+            // deterministic choice among several.
+            if let Some((at, step)) = steps
+                .get(&origin)
+                .into_iter()
+                .flatten()
+                .filter_map(|(neighbour, step)| Some((*coords.get(neighbour)?, *step)))
+                .min()
+            {
+                let cell = (at.0 - step.0, at.1 - step.1);
+                coords.retain(|_, spot| *spot != cell);
+                coords.insert(origin, cell);
+            } else {
+                coords.insert(origin, (0, 0));
+            }
+        }
+
         // Re-centre on the character. The picture is already decided; this
         // only chooses where to point the camera.
-        let here = coords.get(&origin).copied().unwrap_or((0, 0));
+        let here = coords[&origin];
         coords
             .into_iter()
             .map(|(id, (x, y))| (id, (x - here.0, y - here.1)))

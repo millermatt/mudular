@@ -288,13 +288,21 @@ mod tests {
             ],
         );
 
-        let baseline = shape(&map, 1);
+        // Rooms drawn from both places must agree on where they lie. Which
+        // rooms get drawn can differ by exactly one — the player's own room
+        // is never dropped, so where it lost a cell it evicts the winner —
+        // but nothing may *move*.
+        let baseline: std::collections::HashMap<RoomId, (i32, i32)> =
+            shape(&map, 1).into_iter().collect();
         for standing_in in [2, 3, 4, 5] {
-            assert_eq!(
-                shape(&map, standing_in),
-                baseline,
-                "the map must not reshape just because the player moved to #{standing_in}"
-            );
+            for (id, at) in shape(&map, standing_in) {
+                if let Some(expected) = baseline.get(&id) {
+                    assert_eq!(
+                        at, *expected,
+                        "#{id:?} moved when the player stood in #{standing_in}"
+                    );
+                }
+            }
         }
     }
 
@@ -326,6 +334,33 @@ mod tests {
                 "every room walked should still be drawn from #{standing_in}"
             );
         }
+    }
+
+    /// The room the player is in may not be the one the collision rule
+    /// drops. An adversarial review found the map drawn centred on an
+    /// unrelated room, with no `@` anywhere, whenever the player's own room
+    /// lost its cell — live on a real saved map for one room in twenty-six.
+    ///
+    /// §16's own collision example: `n` then `s` puts room 3 back on room
+    /// 1's cell.
+    #[test]
+    fn the_player_is_drawn_even_when_their_room_lost_its_cell() {
+        let map = map_of(&[1, 2, 3], &[(1, "n", 2), (2, "s", 3)]);
+
+        let scene = map.scene(RoomId(3), None);
+
+        let here = scene
+            .rooms
+            .iter()
+            .find(|room| room.role == RoomRole::Here)
+            .expect("the player is on their own map");
+        assert_eq!(here.id, RoomId(3));
+        assert_eq!(here.at, (0, 0));
+        assert!(
+            !scene.rooms.iter().any(|room| room.id == RoomId(1)),
+            "and the room that beat it is the one dropped instead: {:?}",
+            scene.rooms
+        );
     }
 
     /// Centring is the only thing standing somewhere else may change.
