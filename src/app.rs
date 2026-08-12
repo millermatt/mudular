@@ -198,6 +198,11 @@ pub struct SessionPane {
     /// player may still be walking back and forth to, and the next death
     /// overwrites it anyway.
     pub corpse: Option<crate::map::RoomId>,
+    /// Whether this session has mapped anything not yet on disk (§16).
+    /// Saving is a merge, so writing often is safe; writing when nothing
+    /// has changed is just disk churn, and a map that never changes should
+    /// never be rewritten.
+    pub map_dirty: bool,
     /// A `/goto` walk in progress (§16). `None` when nothing is walking.
     pub walk: Option<Walk>,
 }
@@ -824,6 +829,7 @@ fn apply_session_event(
             }
             session.map.observe(&info);
             session.current_room = Some(info.id);
+            session.map_dirty = true;
 
             // `/goto` (§16) never has more than one step outstanding, so a
             // room change while it is running is the answer to that step —
@@ -1318,6 +1324,11 @@ async fn new_profile_event_loop(
 ) -> Result<Option<config::NewProfile>> {
     let mut wizard = NewProfileWizard::new(config_dir.to_path_buf());
     let mut term_events = EventStream::new();
+    let mut map_saves = tokio::time::interval(MAP_SAVE_INTERVAL);
+    // `interval` fires once immediately; nothing is dirty yet, so the tick
+    // would be a no-op, but skipping it keeps the first real save a full
+    // period away rather than at startup.
+    map_saves.tick().await;
 
     loop {
         terminal.draw(|frame| {
@@ -1533,6 +1544,7 @@ fn connect(
         map,
         current_room: None,
         corpse: None,
+        map_dirty: false,
         walk: None,
     }
 }
@@ -1542,6 +1554,24 @@ fn connect(
 /// so nothing to save to — the same rule `/config` and disk logging already
 /// apply. Best-effort: a save failure must never block whatever the player
 /// was already doing when it happened.
+/// How often exploration is flushed to disk (§16). The map is only ever
+/// written when it has actually changed, so this is the most recent
+/// exploration a crash can cost, not a fixed write rate.
+const MAP_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Saves every session whose map has learned something since the last
+/// write, and marks it clean.
+///
+/// Kept out of the quit and disconnect paths, which save unconditionally:
+/// those are the last chance to write anything, so "nothing has changed"
+/// is not worth being clever about at the moment the client is going away.
+fn save_dirty_maps(sessions: &mut [SessionPane]) {
+    for session in sessions.iter_mut().filter(|session| session.map_dirty) {
+        save_session_map(session);
+        session.map_dirty = false;
+    }
+}
+
 fn save_session_map(session: &SessionPane) {
     let (config_dir, profile) = &session.rules;
     let Some(profile) = profile else { return };
@@ -1622,6 +1652,8 @@ async fn report_pane_sizes(state: &mut AppState, area: ratatui::layout::Rect) {
 enum Wake {
     Terminal(Option<std::io::Result<Event>>),
     Session(usize, Option<SessionEvent>),
+    /// Time to flush any exploration that isn't on disk yet.
+    SaveMaps,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1736,6 +1768,11 @@ async fn event_loop(
     report_pane_sizes(&mut state, terminal.get_frame().area()).await;
 
     let mut term_events = EventStream::new();
+    let mut map_saves = tokio::time::interval(MAP_SAVE_INTERVAL);
+    // `interval` fires once immediately; nothing is dirty yet, so the tick
+    // would be a no-op, but skipping it keeps the first real save a full
+    // period away rather than at startup.
+    map_saves.tick().await;
 
     loop {
         terminal.draw(|frame| ui::draw(frame, &state))?;
@@ -1743,6 +1780,7 @@ async fn event_loop(
         let wake = tokio::select! {
             ev = term_events.next() => Wake::Terminal(ev),
             (index, ev) = next_session_event(&mut state.sessions) => Wake::Session(index, ev),
+            _ = map_saves.tick() => Wake::SaveMaps,
         };
 
         match wake {
@@ -1815,6 +1853,13 @@ async fn event_loop(
             Wake::Terminal(Some(Ok(_))) => {}
             Wake::Terminal(Some(Err(err))) => return Err(err.into()),
             Wake::Terminal(None) => return Ok(()),
+            Wake::SaveMaps => {
+                // Blocking I/O on the loop thread, as the quit path already
+                // does: a map is a few tens of kilobytes of JSON, and the
+                // alternative is cloning it to hand to a blocking task on a
+                // timer that mostly finds nothing to do.
+                save_dirty_maps(&mut state.sessions);
+            }
             Wake::Session(index, ev) => {
                 let mut injections = Vec::new();
                 let mut ring_bell = false;
@@ -2485,6 +2530,7 @@ pub(crate) mod test_support {
                 map: crate::map::Map::default(),
                 current_room: None,
                 corpse: None,
+                map_dirty: false,
                 walk: None,
             },
             rx,
@@ -4741,6 +4787,78 @@ mod tests {
             "a cancelled walk must not send another step: {out:?}"
         );
         assert!(state.sessions[0].walk.is_none());
+    }
+
+    // ---- periodic map saving (§16) ----
+
+    /// Exploration used to reach disk only on a clean quit or a disconnect,
+    /// so a crash cost the whole session's mapping.
+    #[test]
+    fn arriving_somewhere_new_marks_the_map_for_saving() {
+        let (mut state, _rx) = app(&["tank"]);
+        assert!(!state.sessions[0].map_dirty, "nothing learned yet");
+
+        apply_session_event(&mut state, 0, room(1, None));
+
+        assert!(state.sessions[0].map_dirty);
+    }
+
+    #[test]
+    fn a_periodic_save_writes_the_map_and_marks_it_clean() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        apply_session_event(&mut state, 0, room(1, None));
+        apply_session_event(&mut state, 0, room(2, Some("n")));
+
+        save_dirty_maps(&mut state.sessions);
+
+        assert!(!state.sessions[0].map_dirty, "written, so no longer dirty");
+        let reloaded = config::load_map(dir.path(), "tank");
+        assert_eq!(
+            reloaded.path(crate::map::RoomId(1), crate::map::RoomId(2)),
+            Some(vec!["n".to_string()]),
+            "the walked edge should be on disk without quitting first"
+        );
+    }
+
+    /// The point of the flag: a tick that finds nothing new must not
+    /// rewrite the file. Otherwise idling in one room churns the disk
+    /// every interval, forever.
+    #[test]
+    fn a_periodic_save_with_nothing_new_writes_nothing() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        apply_session_event(&mut state, 0, room(1, None));
+        save_dirty_maps(&mut state.sessions);
+
+        // Overwrite the file behind the client's back: if the next tick
+        // rewrites it, this sentinel is gone.
+        let path = dir.path().join("maps").join("tank.json");
+        std::fs::write(&path, b"{\"rooms\":[]}").unwrap();
+
+        save_dirty_maps(&mut state.sessions);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"rooms\":[]}",
+            "an unchanged map must not be rewritten"
+        );
+    }
+
+    /// A `--host` session has no profile to save under, and must not
+    /// invent one just because the timer fired.
+    #[test]
+    fn a_periodic_save_skips_a_session_with_no_profile() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["adhoc"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), None);
+        apply_session_event(&mut state, 0, room(1, None));
+
+        save_dirty_maps(&mut state.sessions);
+
+        assert!(!dir.path().join("maps").exists());
     }
 
     // ---- /corpse (§16) ----
