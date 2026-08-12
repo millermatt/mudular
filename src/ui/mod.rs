@@ -90,11 +90,23 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         "Views".to_string(),
         row(keybinds.cycle_layout, "tabs / side-by-side layout"),
         row(keybinds.toggle_channels, "show or hide comms"),
-        row(keybinds.channel_wider, "widen the comms column"),
-        row(keybinds.channel_narrower, "narrow the comms column"),
+        // Paired on one row each: the map cursor needed a line and the
+        // listing was already at the height of a small terminal, where two
+        // rows to say "wider" and "narrower" is the cheapest thing to give
+        // back.
+        row(
+            format!("{} / {}", keybinds.channel_wider, keybinds.channel_narrower),
+            "widen / narrow the comms column",
+        ),
         row(keybinds.toggle_map, "show or hide the map column"),
-        row(keybinds.map_wider, "widen the map column"),
-        row(keybinds.map_narrower, "narrow the map column"),
+        row(
+            format!("{} / {}", keybinds.map_wider, keybinds.map_narrower),
+            "widen / narrow the map column",
+        ),
+        row(
+            keybinds.map_cursor,
+            "move a cursor around the map; Enter walks there",
+        ),
         row(
             keybinds.server_data_inspector,
             "raw server-data inspector (GMCP/MSDP)",
@@ -551,7 +563,13 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
             .unwrap_or_else(|| "map".to_string()),
         None => "map".to_string(),
     };
-    let block = Block::bordered().title(format!(" {title} "));
+    // The same three keys the scrollback line picker advertises, for the
+    // same reason: a selection nobody can see how to leave is a trap.
+    let title = match state.map_cursor.is_some() {
+        true => format!(" {title} — ↑↓←→ Enter Esc "),
+        false => format!(" {title} "),
+    };
+    let block = Block::bordered().title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -567,7 +585,44 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let scene = session.map.scene(current, session.corpse);
-    map_render::CharRenderer.draw(frame, inner, &scene);
+
+    // With the cursor up, the bottom of the column says what it is sitting
+    // on — `Map::describe`, the same prose `/map` prints. It goes in the
+    // pane rather than the scrollback because arrowing across a dozen rooms
+    // would otherwise bury the session's own output under a dozen
+    // descriptions nobody asked to keep.
+    let described: Vec<String> = state
+        .map_cursor
+        .map(|at| session.map.describe(at))
+        .unwrap_or_default();
+    let (grid, caption) = match described.is_empty() {
+        true => (inner, None),
+        false => {
+            // Wrapped, so a long room name is not silently cut in half, but
+            // never more than half the column — the map is still the point.
+            let wanted = described
+                .iter()
+                .map(|line| line.len().div_ceil(inner.width.max(1) as usize) as u16)
+                .sum::<u16>();
+            let rows = wanted.clamp(1, inner.height / 2);
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(rows)])
+                .split(inner);
+            (split[0], Some(split[1]))
+        }
+    };
+
+    map_render::CharRenderer.draw(frame, grid, &scene, state.map_cursor);
+
+    if let Some(rect) = caption {
+        frame.render_widget(
+            Paragraph::new(described.join("\n"))
+                .wrap(Wrap { trim: true })
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            rect,
+        );
+    }
 }
 
 fn draw_channel(

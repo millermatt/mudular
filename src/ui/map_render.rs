@@ -14,11 +14,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::map::{RoomRole, Scene};
+use crate::map::{RoomId, RoomRole, Scene};
 
 /// One way of drawing a map scene into a pane.
 pub(crate) trait MapRenderer {
-    fn draw(&self, frame: &mut Frame, area: Rect, scene: &Scene);
+    /// `cursor` is view state, not map knowledge — where the player is
+    /// *looking*, which the map has no opinion about — so it arrives here
+    /// rather than in the [`Scene`].
+    fn draw(&self, frame: &mut Frame, area: Rect, scene: &Scene, cursor: Option<RoomId>);
 }
 
 /// A room occupies three columns and a corridor the gap beside it, so a
@@ -73,7 +76,7 @@ fn marked_style() -> Style {
 pub(crate) struct CharRenderer;
 
 impl MapRenderer for CharRenderer {
-    fn draw(&self, frame: &mut Frame, area: Rect, scene: &Scene) {
+    fn draw(&self, frame: &mut Frame, area: Rect, scene: &Scene, cursor: Option<RoomId>) {
         let width = area.width as i32;
         let height = area.height as i32;
         // The current room sits in the middle, so walking scrolls the world
@@ -144,6 +147,13 @@ impl MapRenderer for CharRenderer {
             // diagonal box-drawing sets, which Ubuntu Mono and Liberation
             // Mono are both missing.
             let elided = if room.hidden_exits { '·' } else { ' ' };
+            // Reversed rather than recoloured: every colour here already
+            // means something — where you are, your corpse, a label — and
+            // the cursor has to read on top of any of them without
+            // pretending to be another kind of room.
+            if cursor == Some(room.id) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             put(col, row, tick, style);
             put(col + 1, row, letter.unwrap_or(' '), style);
             put(col + 2, row, elided, style);
@@ -200,7 +210,7 @@ mod tests {
     fn render(scene: &Scene) -> String {
         let mut terminal = Terminal::new(TestBackend::new(11, 5)).unwrap();
         terminal
-            .draw(|frame| CharRenderer.draw(frame, frame.area(), scene))
+            .draw(|frame| CharRenderer.draw(frame, frame.area(), scene, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)

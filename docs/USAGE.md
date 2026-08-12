@@ -366,6 +366,27 @@ there and says so, rather than guessing the rest of the way from a room
 it didn't plan for — leaving that character somewhere unexpected would be
 worse than leaving them in place.
 
+### Reading the map, and walking to what you see
+
+`F8` puts a cursor on the map column, starting on your own room. The
+arrows move it room to room, the bottom of the column says what it is
+sitting on, and `Enter` walks you there — the same one-step-at-a-time
+walk `/goto` does. `Esc` closes it, and so does any other key, so a
+keystroke meant for the game is never half-swallowed.
+
+```
+ Ofcol Village — ↑↓←→ Enter Esc
+     ▓  ▓
+     │
+  ▓──@──▓
+        Bakers Shop (#40602), New: Ofcol Village [shop]
+        Exits: west to Outside Ofcol
+```
+
+It only steps onto rooms the picture actually shows — the grid is mostly
+empty space, and a cursor that could sit on a blank cell would have you
+steering around gaps. A nudge into nothing leaves it where it is.
+
 ### Marking places you care about
 
 Nothing in the protocols says what a room is *for*. A Diku MUD's MSDP

@@ -1735,6 +1735,22 @@ lives in `ui`, and neither is visible from inside it.
   copies, and lands in the disk log, which the pane does none of. The
   wider question of speech in a full-screen TUI is deliberately left open;
   see `ARCH_REVIEW.md`.
+- **The map cursor (`F8`) makes the pane a control surface**, not just a
+  picture: the arrows move it room to room, `Map::describe` says what it is
+  on, and `Enter` hands the room to the same `walk_to` `/goto` uses. It
+  moves between *drawn rooms* rather than grid cells, because the grid is
+  mostly gaps and steering around them would be tiring; a nudge into empty
+  space leaves the cursor put. The cursor is view state and reaches the
+  renderer as an argument rather than through the `Scene`, which carries
+  what the map knows and has no opinion about where anyone is looking. It
+  is drawn reversed rather than recoloured, since every colour in the pane
+  already means something and the cursor has to read on top of any of them.
+  `Enter` cannot walk from `handle_key`, which is not async, so it sets
+  `walk_requested` for the event loop — the hand-off `reload_requested`
+  already uses. Deliberately keyboard-only: hover would need mouse capture,
+  which takes over selection terminal-wide, and OSC 8 cannot carry it since
+  `ratatui`'s `Cell` has nowhere to hang a URI. A cursor is also the only
+  form of this a screen reader can follow.
 - **`/mark <label>` is the player's own note on a room**, and the only
   source of one. No protocol carries what a place is *for*: a
   Diku-derived server's MSDP variable table is `ROOM`, `ROOM_VNUM`,

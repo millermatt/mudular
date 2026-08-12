@@ -534,6 +534,10 @@ pub struct Keybinds {
     /// Narrows the map column (§11.4, §16).
     #[serde(default = "default_map_narrower")]
     pub map_narrower: KeyBinding,
+    /// Moves a cursor around the map column to read rooms and walk to one
+    /// (docs/ARCHITECTURE.md §16).
+    #[serde(default = "default_map_cursor")]
+    pub map_cursor: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -553,6 +557,7 @@ impl Default for Keybinds {
             toggle_map: default_toggle_map(),
             map_wider: default_map_wider(),
             map_narrower: default_map_narrower(),
+            map_cursor: default_map_cursor(),
         }
     }
 }
@@ -632,6 +637,11 @@ fn default_toggle_map() -> KeyBinding {
 // from the start of an escape sequence and the binding never arrives.
 fn default_map_wider() -> KeyBinding {
     "alt+,".parse().expect("built-in default keybinding")
+}
+
+fn default_map_cursor() -> KeyBinding {
+    // Next free after F7, which shows the column this walks around.
+    "f8".parse().expect("built-in default keybinding")
 }
 
 fn default_map_narrower() -> KeyBinding {

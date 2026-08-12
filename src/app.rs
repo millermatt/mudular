@@ -491,6 +491,15 @@ pub struct AppState {
     /// `Some(back_offset)` is the line it currently highlights, measured the
     /// same way `SessionPane::back_offset` is — distance from the tail.
     pub line_cursor: Option<usize>,
+    /// The room the map cursor is on, when it is up (§16). A room id rather
+    /// than a grid position: the layout is rebuilt every frame, and a
+    /// coordinate would quietly come to mean a different room the moment
+    /// anything moved.
+    pub map_cursor: Option<crate::map::RoomId>,
+    /// A room `Enter` on the map cursor asked to walk to. Serviced by the
+    /// event loop rather than acted on in `handle_key`, which is not async
+    /// — the same hand-off `reload_requested` uses.
+    pub walk_requested: Option<crate::map::RoomId>,
     /// Where profiles live, so `/newprofile` knows where to save one
     /// without depending on which session happens to be bound (§15).
     config_dir: PathBuf,
@@ -1906,6 +1915,8 @@ async fn event_loop(
         config_editor_save: None,
         reload_requested: false,
         line_cursor: None,
+        map_cursor: None,
+        walk_requested: None,
         config_dir,
         mark_menu: None,
         new_profile_wizard: None,
@@ -1993,6 +2004,9 @@ async fn event_loop(
                         if let Some(session) = state.bound_mut() {
                             session.push_line(RetainedLine::client(notice));
                         }
+                    }
+                    if let Some(target) = state.walk_requested.take() {
+                        walk_to_room(&mut state, target).await;
                     }
                     report_pane_sizes(&mut state, terminal.get_frame().area()).await;
                 } else if key.code == KeyCode::Enter {
@@ -2217,6 +2231,54 @@ fn handle_key(
     // moves one raw entry at a time, so pinning `back_offset` to the same
     // number keeps the picked line on screen for the ordinary case of
     // unwrapped MUD output.
+    // The map cursor owns the arrows while it is up, the same way the
+    // scrollback line picker below owns them: one small selection, moved
+    // with the arrows, taken with Enter, dropped with Esc (§11.3).
+    if let Some(cursor) = state.map_cursor {
+        let step = match code {
+            KeyCode::Esc => {
+                state.map_cursor = None;
+                return true;
+            }
+            KeyCode::Enter => {
+                state.map_cursor = None;
+                state.walk_requested = Some(cursor);
+                return true;
+            }
+            KeyCode::Up => (0, -1),
+            KeyCode::Down => (0, 1),
+            KeyCode::Left => (-1, 0),
+            KeyCode::Right => (1, 0),
+            // Anything else closes it rather than falling through to the
+            // input line: a keystroke meant for the game must not be
+            // swallowed, but nor should it land half-read.
+            _ => {
+                state.map_cursor = None;
+                return true;
+            }
+        };
+        // A nudge into empty space leaves the cursor where it is, rather
+        // than dropping it — the map is full of gaps and losing your place
+        // to one would make it tiring to steer.
+        if let Some(next) = map_cursor_step(state, cursor, step) {
+            state.map_cursor = Some(next);
+        }
+        return true;
+    }
+    if keybinds.map_cursor.matches(code, modifiers) {
+        // Starts on the character: the one room they certainly want to
+        // measure everything else against, and the one the pane centres.
+        state.map_cursor = state.bound().and_then(|session| session.current_room);
+        if state.map_cursor.is_some() {
+            // No use steering a map nobody can see.
+            state.show_map = true;
+        } else if let Some(session) = state.bound_mut() {
+            session.push_line(RetainedLine::client(
+                "** the map doesn't know where you are yet",
+            ));
+        }
+        return true;
+    }
     if let Some(cursor) = state.line_cursor {
         let len = state.bound().map_or(0, |s| s.scrollback.len());
         let new_cursor = match code {
@@ -2577,6 +2639,42 @@ async fn start_goto(state: &mut AppState, arg: &str) {
     walk_to(session, current, target, GOTO_COMMAND).await;
 }
 
+/// Walks to a room the map cursor picked, reusing `/goto`'s route and its
+/// one-step-at-a-time walk (§16) — which is the point of the cursor: the
+/// map stops being a picture and becomes somewhere to say "there".
+async fn walk_to_room(state: &mut AppState, target: crate::map::RoomId) {
+    let Some(session) = state.bound_mut() else {
+        return;
+    };
+    let Some(current) = session.current_room else {
+        return;
+    };
+    walk_to(session, current, target, GOTO_COMMAND).await;
+}
+
+/// Where the map cursor lands when nudged one step in `step`, or `None` if
+/// nothing is drawn that way.
+///
+/// Moves room to room rather than cell to cell: the grid is mostly empty
+/// space, and a cursor that could sit on a blank cell would need the player
+/// to steer around gaps to reach a room two along. Only rooms the picture
+/// actually shows are reachable, which is the same rule the pane draws by.
+fn map_cursor_step(
+    state: &AppState,
+    from: crate::map::RoomId,
+    step: (i32, i32),
+) -> Option<crate::map::RoomId> {
+    let session = state.bound()?;
+    let scene = session.map.scene(session.current_room?, session.corpse);
+    let at = scene.rooms.iter().find(|room| room.id == from)?.at;
+    let wanted = (at.0 + step.0, at.1 + step.1);
+    scene
+        .rooms
+        .iter()
+        .find(|room| room.at == wanted)
+        .map(|room| room.id)
+}
+
 /// `/mark <label>` (§16): writes the player's own note onto the room they
 /// are standing in, and `/mark` alone rubs it out again.
 ///
@@ -2898,6 +2996,8 @@ pub(crate) mod test_support {
                 config_editor_save: None,
                 reload_requested: false,
                 line_cursor: None,
+                map_cursor: None,
+                walk_requested: None,
                 config_dir: PathBuf::from("/cfg"),
                 mark_menu: None,
                 new_profile_wizard: None,
@@ -5424,6 +5524,202 @@ mod tests {
         let saved = config::load_ui_state(dir.path()).expect("written on the spot");
         assert_eq!(saved.show_map, state.show_map);
         assert!(saved.show_map, "F7 turned the map column on");
+    }
+
+    // ---- the map cursor (§16) ----
+
+    fn keys() -> crate::config::Keybinds {
+        crate::config::Keybinds::default()
+    }
+
+    /// A three-room row, so left and right have somewhere to go.
+    fn cursor_state() -> (AppState, Vec<mpsc::Receiver<SessionCommand>>) {
+        let (mut state, rx) = app(&["tank"]);
+        put_room(
+            &mut state.sessions[0].map,
+            1,
+            Some("West Gate"),
+            &[("e", 2)],
+        );
+        put_room(
+            &mut state.sessions[0].map,
+            2,
+            Some("Town Square"),
+            &[("e", 3)],
+        );
+        put_room(&mut state.sessions[0].map, 3, Some("East Road"), &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(2));
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn the_cursor_opens_on_the_character_and_shows_the_map() {
+        let (mut state, _rx) = cursor_state();
+        state.show_map = false;
+
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert_eq!(state.map_cursor, Some(crate::map::RoomId(2)));
+        assert!(state.show_map, "no use steering a map nobody can see");
+    }
+
+    #[tokio::test]
+    async fn the_cursor_moves_room_to_room() {
+        let (mut state, _rx) = cursor_state();
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::Left,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+        assert_eq!(state.map_cursor, Some(crate::map::RoomId(1)));
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+        assert_eq!(state.map_cursor, Some(crate::map::RoomId(3)));
+    }
+
+    /// The grid is mostly gaps; losing your place to one would make it
+    /// tiring to steer.
+    #[tokio::test]
+    async fn a_nudge_into_empty_space_leaves_the_cursor_where_it_is() {
+        let (mut state, _rx) = cursor_state();
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::Up,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert_eq!(state.map_cursor, Some(crate::map::RoomId(2)));
+    }
+
+    /// The point of the whole thing: the map stops being a picture and
+    /// becomes somewhere to say "there".
+    #[tokio::test]
+    async fn enter_asks_to_walk_to_the_room_under_the_cursor() {
+        let (mut state, mut receivers) = cursor_state();
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert!(state.map_cursor.is_none(), "and closes behind itself");
+        assert_eq!(state.walk_requested, Some(crate::map::RoomId(3)));
+
+        // The event loop is what services it, being the half that can await.
+        let target = state.walk_requested.take().unwrap();
+        walk_to_room(&mut state, target).await;
+        assert!(
+            matches!(receivers[0].try_recv(), Ok(SessionCommand::SendLine(line)) if line == "e"),
+            "the first step goes out"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_closes_the_cursor_and_walks_nowhere() {
+        let (mut state, mut receivers) = cursor_state();
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert!(state.map_cursor.is_none());
+        assert_eq!(state.walk_requested, None);
+        assert!(receivers[0].try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_cursor_needs_to_know_where_you_are() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        handle_key(
+            &mut state,
+            &keys(),
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert!(state.map_cursor.is_none());
+        assert!(scrollback(&state.sessions[0]).contains("doesn't know where you are"));
     }
 
     // ---- /mark (§16) ----
