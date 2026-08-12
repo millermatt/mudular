@@ -1756,6 +1756,14 @@ fn write_map_image(image: &ui::PendingImage) -> Result<()> {
                 style::SetForegroundColor(style::Color::Rgb { r, g, b })
             )?;
         }
+        // The cell's own colour, because writing the character costs us the
+        // image in that cell on every terminal that keeps images per cell.
+        if let Some(ratatui::style::Color::Rgb(r, g, b)) = glyph_style.bg {
+            queue!(
+                out,
+                style::SetBackgroundColor(style::Color::Rgb { r, g, b })
+            )?;
+        }
         queue!(out, style::Print(ch))?;
     }
     queue!(out, style::ResetColor, cursor::RestorePosition)?;

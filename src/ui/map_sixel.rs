@@ -154,10 +154,16 @@ pub(crate) fn render(
                     area.x + at as u16,
                     area.y + row as u16,
                     ch,
-                    // Background left to the image underneath: painting it
-                    // again as a cell would draw a rectangle over the very
-                    // pixels this renderer exists to produce.
-                    Style::default().fg(style.fg.unwrap_or(palette::INK)),
+                    // The room's colour again, rather than left to the
+                    // image underneath. A terminal that attaches images to
+                    // cells — WezTerm and kitty both — drops the image
+                    // from any cell it writes a character into, so a
+                    // transparent glyph punches a hole in the very room it
+                    // is naming. Painting what the image painted makes the
+                    // two halves indistinguishable.
+                    Style::default()
+                        .fg(style.fg.unwrap_or(palette::INK))
+                        .bg(style.bg.unwrap_or(palette::KNOWN)),
                 ));
             }
         }
@@ -326,6 +332,23 @@ mod tests {
             "{:?}",
             image.glyphs
         );
+    }
+
+    /// A glyph carries the room's own colour as its background, because a
+    /// terminal that attaches images to cells drops the image from any cell
+    /// it writes a character into. Left transparent, the letter punches a
+    /// hole in the room it is naming.
+    #[test]
+    fn a_glyph_repaints_the_room_colour_it_covers() {
+        let image =
+            render(Rect::new(0, 0, 20, 10), &scene_of(&[]), None, (8, 16)).expect("an image");
+
+        let (_, _, _, style) = image
+            .glyphs
+            .iter()
+            .find(|(_, _, ch, _)| *ch == '@')
+            .expect("the here-room's glyph");
+        assert_eq!(style.bg, Some(palette::HERE));
     }
 
     /// A glyph must sit inside the pane it belongs to, or it would be
