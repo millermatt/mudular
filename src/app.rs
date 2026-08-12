@@ -201,6 +201,9 @@ pub struct SessionPane {
     /// player may still be walking back and forth to, and the next death
     /// overwrites it anyway.
     pub corpse: Option<crate::map::RoomId>,
+    /// Whether the player has already been told that saving is failing.
+    /// One notice per run of failures, not one per attempt (§16).
+    pub map_save_failed: bool,
     /// Whether this session has mapped anything not yet on disk (§16).
     /// Saving is a merge, so writing often is safe; writing when nothing
     /// has changed is just disk churn, and a map that never changes should
@@ -1659,6 +1662,7 @@ fn connect(
         current_room: None,
         corpse: None,
         map_dirty: false,
+        map_save_failed: false,
         walk: None,
     }
 }
@@ -1712,11 +1716,33 @@ fn save_dirty_maps(sessions: &mut [SessionPane]) {
     }
 }
 
-fn save_session_map(session: &SessionPane) {
+fn save_session_map(session: &mut SessionPane) {
     let (config_dir, profile) = &session.rules;
     let Some(profile) = profile else { return };
-    if let Err(err) = config::save_map(config_dir, profile, &session.map) {
-        tracing::warn!("could not save map for {profile}: {err:#}");
+    match config::save_map(config_dir, profile, &session.map) {
+        Ok(()) => {
+            // Working again, so a later failure is news once more.
+            session.map_save_failed = false;
+        }
+        Err(err) => {
+            tracing::warn!("could not save map for {profile}: {err:#}");
+            // Said once, not every tick. Saving runs every 30s, and a
+            // problem that persists would otherwise fill the scrollback
+            // with the same line for the rest of the session — which is
+            // worse than silence, and would bury the first one.
+            //
+            // Once is enough because of that same 30s tick: anything that
+            // stops maps reaching disk surfaces within half a minute,
+            // while the player can still act on it. A failure that only
+            // ever happens on the way out has at most the last tick's
+            // exploration to lose, and still reaches the log.
+            if !session.map_save_failed {
+                session.map_save_failed = true;
+                session.push_line(RetainedLine::client(format!(
+                    "** could not save the map: {err:#} — exploration since the last save is not on disk"
+                )));
+            }
+        }
     }
 }
 
@@ -1944,7 +1970,7 @@ async fn event_loop(
                 // window.
                 let layout_before = current_layout(&state);
                 if keybinds.quit.matches(key.code, key.modifiers) {
-                    for session in &state.sessions {
+                    for session in &mut state.sessions {
                         save_session_map(session);
                     }
                     return Ok(());
@@ -2837,6 +2863,7 @@ pub(crate) mod test_support {
                 current_room: None,
                 corpse: None,
                 map_dirty: false,
+                map_save_failed: false,
                 walk: None,
             },
             rx,
@@ -4678,7 +4705,7 @@ mod tests {
         state.sessions[0].rules = (dir.path().to_path_buf(), None);
         apply_session_event(&mut state, 0, room(1, None));
 
-        save_session_map(&state.sessions[0]);
+        save_session_map(&mut state.sessions[0]);
 
         assert!(
             !dir.path().join("maps").exists(),
@@ -4696,7 +4723,7 @@ mod tests {
         apply_session_event(&mut state, 0, room(1, None));
         apply_session_event(&mut state, 0, room(2, Some("n")));
 
-        save_session_map(&state.sessions[0]);
+        save_session_map(&mut state.sessions[0]);
 
         let reloaded = config::load_map(dir.path(), "tank");
         assert_eq!(
@@ -5271,6 +5298,81 @@ mod tests {
 
         assert!(state.sessions[0].walk.is_none());
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    // ---- a failing map save (§16) ----
+
+    /// Saving refuses to overwrite a map file it could not read, which
+    /// stopped one bad file replacing a whole explored world — but the
+    /// refusal only reached the log, so a player could explore for an hour
+    /// with every save failing and find out at quit.
+    #[test]
+    fn a_map_save_that_fails_tells_the_player() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let maps = dir.path().join("maps");
+        std::fs::create_dir_all(&maps).unwrap();
+        std::fs::write(maps.join("tank.json"), b"{ not json").unwrap();
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        apply_session_event(&mut state, 0, room(1, None));
+
+        save_dirty_maps(&mut state.sessions);
+
+        assert!(
+            scrollback(&state.sessions[0]).contains("could not save the map"),
+            "{}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    /// Once, not once every 30s. A problem that persists would otherwise
+    /// fill the scrollback with the same line and bury the first one.
+    #[test]
+    fn a_failing_map_save_says_so_once_not_every_tick() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let maps = dir.path().join("maps");
+        std::fs::create_dir_all(&maps).unwrap();
+        std::fs::write(maps.join("tank.json"), b"{ not json").unwrap();
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+
+        for room_id in 1..=4 {
+            apply_session_event(&mut state, 0, room(room_id, None));
+            save_dirty_maps(&mut state.sessions);
+        }
+
+        let complaints = scrollback(&state.sessions[0])
+            .matches("could not save the map")
+            .count();
+        assert_eq!(complaints, 1, "{}", scrollback(&state.sessions[0]));
+    }
+
+    /// And if it starts working again, a later failure is news once more.
+    #[test]
+    fn a_save_that_recovers_can_complain_again_later() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let maps = dir.path().join("maps");
+        std::fs::create_dir_all(&maps).unwrap();
+        let path = maps.join("tank.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        apply_session_event(&mut state, 0, room(1, None));
+        save_dirty_maps(&mut state.sessions);
+
+        // The file becomes readable, one save succeeds, then it breaks again.
+        std::fs::remove_file(&path).unwrap();
+        apply_session_event(&mut state, 0, room(2, Some("n")));
+        save_dirty_maps(&mut state.sessions);
+        assert!(!state.sessions[0].map_save_failed, "recovered");
+        std::fs::write(&path, b"{ not json either").unwrap();
+        apply_session_event(&mut state, 0, room(3, Some("n")));
+        save_dirty_maps(&mut state.sessions);
+
+        let complaints = scrollback(&state.sessions[0])
+            .matches("could not save the map")
+            .count();
+        assert_eq!(complaints, 2, "{}", scrollback(&state.sessions[0]));
     }
 
     // ---- remembered pane layout (§11.4) ----
