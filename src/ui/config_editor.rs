@@ -806,6 +806,21 @@ impl ConfigEditorState {
         }
     }
 
+    /// Toggle fields are read here rather than through `rule_field_text`,
+    /// which speaks in strings and so can't tell `no` from "not set".
+    fn rule_toggle_value(&self, kind: RuleKind, index: usize, field: usize) -> Option<bool> {
+        let name = kind.fields()[field];
+        match (kind, name) {
+            (RuleKind::Alias, "enabled") => self.draft.aliases.get(index)?.enabled,
+            (RuleKind::Trigger, "enabled") => self.draft.triggers.get(index)?.enabled,
+            (RuleKind::Trigger, "gag") => self.draft.triggers.get(index)?.gag,
+            (RuleKind::Trigger, "bell") => self.draft.triggers.get(index)?.bell,
+            (RuleKind::Trigger, "corpse") => self.draft.triggers.get(index)?.corpse,
+            (RuleKind::Timer, "enabled") => self.draft.timers.get(index)?.enabled,
+            _ => None,
+        }
+    }
+
     fn rule_field_text(&self, kind: RuleKind, index: usize, field: usize) -> String {
         let name = kind.fields()[field];
         match kind {
@@ -1320,11 +1335,10 @@ impl ConfigEditorState {
     fn push_form_lines(&self, lines: &mut Vec<Line>, kind: RuleKind, index: usize, field: usize) {
         for (i, name) in kind.fields().iter().enumerate() {
             let marker = if i == field { "> " } else { "  " };
-            let value = self.rule_field_text(kind, index, i);
             let display = if self.is_toggle_field(kind, i) {
-                tri_state_text(&value)
+                tri_state_text(self.rule_toggle_value(kind, index, i))
             } else {
-                value
+                self.rule_field_text(kind, index, i)
             };
             lines.push(Line::raw(format!("{marker}{name:<10}{display}")));
         }
@@ -1350,10 +1364,11 @@ impl ConfigEditorState {
     }
 }
 
-fn tri_state_text(value: &str) -> String {
+fn tri_state_text(value: Option<bool>) -> String {
     match value {
-        "" => "— (inherit from lower layers)".to_string(),
-        other => other.to_string(),
+        None => "— (inherit from lower layers)".to_string(),
+        Some(true) => "yes".to_string(),
+        Some(false) => "no".to_string(),
     }
 }
 
@@ -1706,5 +1721,41 @@ mod tests {
             state.draft.variables.get("target").map(String::as_str),
             Some("rat")
         );
+    }
+
+    #[test]
+    fn a_trigger_form_shows_each_toggle_state_it_is_actually_in() {
+        let (_dir, state) = {
+            let mut profile = minimal("kestrel");
+            profile.triggers.push(Trigger {
+                gag: Some(true),
+                bell: Some(false),
+                corpse: None,
+                enabled: Some(true),
+                ..Default::default()
+            });
+            open_state(&profile)
+        };
+        let mut lines = Vec::new();
+        state.push_form_lines(&mut lines, RuleKind::Trigger, 0, 0);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let field = |name: &str| {
+            text.iter()
+                .find(|l| l[2..].starts_with(name))
+                .unwrap_or_else(|| panic!("no `{name}` row in {text:?}"))
+                .clone()
+        };
+        assert!(field("gag").ends_with("yes"), "{:?}", field("gag"));
+        assert!(field("bell").ends_with("no"), "{:?}", field("bell"));
+        assert!(field("corpse").contains("inherit"), "{:?}", field("corpse"));
+        assert!(field("enabled").ends_with("yes"), "{:?}", field("enabled"));
     }
 }
