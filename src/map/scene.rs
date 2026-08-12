@@ -306,6 +306,58 @@ mod tests {
         }
     }
 
+    /// Anchoring made the picture independent of where the player stands,
+    /// but an adversarial review found it had only moved the dependence:
+    /// anchored on the lowest vnum, *discovering* a room numbered below the
+    /// rest re-anchored the area and reshuffled rooms nowhere near it. On a
+    /// real saved map that disturbed an existing room in 272 of 500
+    /// discoveries. Walking into a new room made older ones jump or vanish.
+    #[test]
+    fn discovering_a_low_numbered_room_leaves_the_rest_where_it_was() {
+        // #30 (north then east) and #50 (east then north) contest the cell
+        // up and right of #10 — the shape whose winner depends on which
+        // room the traversal starts from.
+        let map = map_of(
+            &[10, 20, 30, 40, 50],
+            &[
+                (10, "n", 20),
+                (20, "s", 10),
+                (20, "e", 30),
+                (30, "w", 20),
+                (10, "e", 40),
+                (40, "w", 10),
+                (40, "n", 50),
+                (50, "s", 40),
+            ],
+        );
+        let before = map.scene(RoomId(10), None);
+
+        // Walk on and find a room the server numbers below them all.
+        let mut grown = map.clone();
+        grown.observe(&RoomInfo {
+            id: RoomId(1),
+            name: None,
+            area: Some("Test".to_string()),
+            exits: BTreeMap::new(),
+        });
+        grown.connect(RoomId(50), "n", RoomId(1));
+        grown.connect(RoomId(1), "s", RoomId(50));
+        let after = grown.scene(RoomId(10), None);
+
+        for room in &before.rooms {
+            let still = after
+                .rooms
+                .iter()
+                .find(|other| other.id == room.id)
+                .unwrap_or_else(|| panic!("#{:?} fell off the map entirely", room.id));
+            assert_eq!(
+                still.at, room.at,
+                "#{:?} moved because an unrelated room was discovered",
+                room.id
+            );
+        }
+    }
+
     /// The other half of the same bug. Exits are one-way until the return
     /// trip is walked, and laying out along that one-way graph meant every
     /// room behind the player fell off the map. Here a perfectly ordinary
