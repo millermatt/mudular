@@ -299,6 +299,10 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         draw_help(frame, frame.area(), &state.keybinds);
     }
 
+    if let Some(menu) = &state.mark_menu {
+        draw_mark_menu(frame, frame.area(), menu);
+    }
+
     if let Some(editor) = &state.config_editor {
         editor.draw(frame, frame.area());
     }
@@ -336,6 +340,56 @@ fn draw_help(frame: &mut Frame, area: Rect, keybinds: &Keybinds) {
     // Clear first: the overlay sits on top of panes that already drew here.
     frame.render_widget(ratatui::widgets::Clear, overlay);
     frame.render_widget(Paragraph::new(text).block(block), overlay);
+}
+
+/// The `/mark` chooser (§16): what is this room *for*?
+///
+/// Offered because nothing on the wire answers that — a Diku MUD's MSDP
+/// carries no shop flag and no terrain — so the label is always the
+/// player's, and the least a client can do is not make them remember what
+/// they called the last one. Numbered, because nine rows is short enough
+/// that counting beats arrowing.
+fn draw_mark_menu(frame: &mut Frame, area: Rect, menu: &crate::app::MarkMenu) {
+    // Typing a label of your own replaces the list: the choice has been
+    // made, and what is left is one field, so the list would only be
+    // something to read past.
+    let lines: Vec<Line> = match &menu.typing {
+        Some(typed) => vec![
+            Line::raw(" what is this room for?"),
+            Line::styled(
+                format!(" {typed}▏"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                " Enter to mark, Esc to go back",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ],
+        None => menu
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let row = format!(" {}  {entry:<16}", i + 1);
+                match i == menu.selected {
+                    true => Line::styled(row, Style::default().add_modifier(Modifier::REVERSED)),
+                    false => Line::raw(row),
+                }
+            })
+            .collect(),
+    };
+
+    let width = 24.min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let overlay = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let block = Block::bordered().title(format!(" mark #{} ", menu.at.0).bold());
+    frame.render_widget(ratatui::widgets::Clear, overlay);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), overlay);
 }
 
 /// The "new profile" wizard (docs/ARCHITECTURE.md §15): one field at a

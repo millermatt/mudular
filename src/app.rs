@@ -210,6 +210,66 @@ pub struct SessionPane {
     pub walk: Option<Walk>,
 }
 
+/// The labels `/mark` offers when asked with no argument (§16).
+///
+/// Not an attempt to cover every MUD — a shortlist of what rooms are
+/// commonly *for*, so the common case is two keystrokes instead of typing.
+/// Anything not here is still `/mark <whatever you like>`; this is a
+/// convenience, not a vocabulary. First letters are kept distinct, since
+/// that letter is what the map has room to draw.
+pub const MARK_SUGGESTIONS: &[&str] = &[
+    "shop", "water", "rent", "bank", "healer", "trainer", "forge", "portal", "quest",
+];
+
+/// What taking the highlighted row of the `/mark` chooser means.
+pub enum MarkChoice {
+    /// Write this label.
+    Label(String),
+    /// Ask for one the list does not have.
+    Custom,
+    /// Take off the label that is there.
+    Remove,
+}
+
+/// The chooser `/mark` opens when it is not told what to write (§16).
+pub struct MarkMenu {
+    /// The room being labelled, captured when the menu opened — walking
+    /// away with it up must not relabel wherever you ended up.
+    pub at: crate::map::RoomId,
+    pub selected: usize,
+    /// `Some` when the room already has a label, so the list can offer to
+    /// take it off again.
+    pub existing: Option<String>,
+    /// What the player is typing, once they have asked for a label of
+    /// their own. `None` while the list is being browsed.
+    pub typing: Option<String>,
+}
+
+/// The row that asks for a label the list does not offer.
+const MARK_CUSTOM_ROW: &str = "something else…";
+
+impl MarkMenu {
+    /// The list as shown: the suggestions, a way to write your own, and —
+    /// when there is one — a way to take the current label off.
+    pub fn entries(&self) -> Vec<String> {
+        let mut entries: Vec<String> = MARK_SUGGESTIONS.iter().map(|s| s.to_string()).collect();
+        entries.push(MARK_CUSTOM_ROW.to_string());
+        if let Some(existing) = &self.existing {
+            entries.push(format!("remove `{existing}`"));
+        }
+        entries
+    }
+
+    /// What picking the highlighted row means.
+    pub fn choice(&self) -> MarkChoice {
+        match MARK_SUGGESTIONS.get(self.selected) {
+            Some(label) => MarkChoice::Label((*label).to_string()),
+            None if self.selected == MARK_SUGGESTIONS.len() => MarkChoice::Custom,
+            None => MarkChoice::Remove,
+        }
+    }
+}
+
 /// One `/goto` walk in progress. Exactly one step is ever in flight: the
 /// rest of `remaining` waits for `expecting` to be confirmed before the next
 /// one is sent, because a route learned earlier can be stale by the time it
@@ -435,6 +495,8 @@ pub struct AppState {
     /// just at first run (§15, UX_REVIEW.md B). `Some` owns the keyboard
     /// and paints over every pane, like the config editor, and sessions
     /// keep running behind it the same way.
+    /// The `/mark` chooser, when it is open (§16).
+    pub mark_menu: Option<MarkMenu>,
     pub new_profile_wizard: Option<NewProfileWizard>,
     /// Every live session's own publish receiver, by name — the hub's half
     /// of the peer mesh (§7.5). Built once at startup from the same
@@ -905,6 +967,26 @@ fn apply_session_event(
                     }
                 }
             }
+        }
+        SessionEvent::Mark(label) => {
+            let session = &mut state.sessions[index];
+            // Same ordering as `Corpse`: whatever room the character is in
+            // as this arrives is the one the line was about.
+            match session.current_room {
+                Some(at) => {
+                    if session.map.set_mark(at, Some(label.clone())) {
+                        session.map_dirty = true;
+                        session.push_line(RetainedLine::client(format!(
+                            "** marked #{} as `{label}`",
+                            at.0
+                        )));
+                    }
+                }
+                None => session.push_line(RetainedLine::client(format!(
+                    "** mark `{label}`: the map doesn't know where you are"
+                ))),
+            }
+            (false, Vec::new())
         }
         SessionEvent::Security(security) => {
             let session = &mut state.sessions[index];
@@ -1770,6 +1852,7 @@ async fn event_loop(
         reload_requested: false,
         line_cursor: None,
         config_dir,
+        mark_menu: None,
         new_profile_wizard: None,
         peer_registry: receivers.into_iter().collect(),
         history_size,
@@ -1967,6 +2050,47 @@ fn handle_key(
             }
             _ => session.pending_password = None,
         }
+    }
+    // The mark chooser owns the keyboard while it is up, and answers to the
+    // same three keys the scrollback line picker does (§11.3) — one small
+    // list, moved with the arrows, taken with Enter, dropped with Esc.
+    if let Some(menu) = state.mark_menu.as_mut() {
+        let last = menu.entries().len().saturating_sub(1);
+        // Typing a label of your own: the keyboard is text now, so the
+        // digit shortcuts below would eat the digits.
+        if let Some(typed) = menu.typing.as_mut() {
+            match code {
+                KeyCode::Char(ch) => typed.push(ch),
+                KeyCode::Backspace => {
+                    typed.pop();
+                }
+                KeyCode::Enter => apply_mark_menu(state),
+                // Back to the list rather than out of the chooser: one Esc
+                // undoes one step, as the profile editor's input does.
+                KeyCode::Esc => menu.typing = None,
+                _ => {}
+            }
+            return true;
+        }
+        match code {
+            KeyCode::Esc => {
+                state.mark_menu = None;
+            }
+            KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Down => menu.selected = (menu.selected + 1).min(last),
+            KeyCode::Enter => apply_mark_menu(state),
+            // A digit takes its row outright: nine entries is short enough
+            // that counting beats arrowing.
+            KeyCode::Char(digit @ '1'..='9') => {
+                let row = digit as usize - '1' as usize;
+                if row <= last {
+                    menu.selected = row;
+                    apply_mark_menu(state);
+                }
+            }
+            _ => {}
+        }
+        return true;
     }
     // The profile editor owns the keyboard while it's open, same as the
     // help overlay below — but it routes keys into its own state machine
@@ -2404,16 +2528,67 @@ fn mark_current_room(state: &mut AppState, label: &str) {
         .rooms
         .get(&at)
         .and_then(|room| room.mark.clone());
-    let notice = match (label.is_empty(), previous) {
-        (true, None) => format!("** /mark: #{} has no mark to remove", at.0),
-        (true, Some(old)) => format!("** unmarked #{} (was `{old}`)", at.0),
-        (false, _) => format!("** marked #{} as `{label}`", at.0),
+
+    // Asked with nothing to write, offer the usual answers rather than
+    // making the player remember what they called the last one. Typing a
+    // label outright still works and is the only way to say something the
+    // list does not.
+    if label.is_empty() {
+        state.mark_menu = Some(MarkMenu {
+            at,
+            selected: 0,
+            existing: previous,
+            typing: None,
+        });
+        return;
+    }
+
+    let notice = match previous {
+        Some(old) if old == label => format!("** #{} is already marked `{label}`", at.0),
+        _ => format!("** marked #{} as `{label}`", at.0),
     };
-    let wanted = (!label.is_empty()).then(|| label.to_string());
+    let wanted = Some(label.to_string());
     // Marks live in the map file, so a change is worth writing out — the
     // player typed it, and losing it to a crash would be worse than losing
     // a room they can simply walk back into.
     session.map_dirty |= session.map.set_mark(at, wanted);
+    session.push_line(RetainedLine::client(notice));
+}
+
+/// Writes what the `/mark` chooser landed on, and closes it.
+fn apply_mark_menu(state: &mut AppState) {
+    let Some(menu) = state.mark_menu.as_mut() else {
+        return;
+    };
+    // Asking for a label of your own does not close the chooser — it turns
+    // it into somewhere to type one.
+    if let (None, MarkChoice::Custom) = (&menu.typing, menu.choice()) {
+        menu.typing = Some(String::new());
+        return;
+    }
+    let chosen = match menu.typing.take() {
+        // A custom label typed and then left empty means "never mind",
+        // rather than silently removing whatever was there.
+        Some(typed) if typed.trim().is_empty() => {
+            state.mark_menu = None;
+            return;
+        }
+        Some(typed) => Some(typed.trim().to_string()),
+        None => match menu.choice() {
+            MarkChoice::Label(label) => Some(label),
+            MarkChoice::Remove => None,
+            MarkChoice::Custom => unreachable!("handled above"),
+        },
+    };
+    let menu = state.mark_menu.take().expect("just checked");
+    let Some(session) = state.bound_mut() else {
+        return;
+    };
+    let notice = match &chosen {
+        Some(label) => format!("** marked #{} as `{label}`", menu.at.0),
+        None => format!("** unmarked #{}", menu.at.0),
+    };
+    session.map_dirty |= session.map.set_mark(menu.at, chosen);
     session.push_line(RetainedLine::client(notice));
 }
 
@@ -2651,6 +2826,7 @@ pub(crate) mod test_support {
                 reload_requested: false,
                 line_cursor: None,
                 config_dir: PathBuf::from("/cfg"),
+                mark_menu: None,
                 new_profile_wizard: None,
                 peer_registry: crate::engine::Peers::new(),
                 history_size: 500,
@@ -5090,8 +5266,10 @@ mod tests {
         assert!(state.sessions[0].map_dirty);
     }
 
+    /// Opening the chooser is not itself a change: a stray `/mark` on a
+    /// room you already labelled must not rub it out.
     #[tokio::test]
-    async fn mark_with_no_label_rubs_the_mark_out() {
+    async fn opening_the_chooser_changes_nothing_by_itself() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(&mut state.sessions[0].map, 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
@@ -5100,10 +5278,22 @@ mod tests {
         submit(&mut state, "/mark").await;
 
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)].mark,
-            None
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("well"),
+            "the label survives until something is actually picked"
         );
-        assert!(scrollback(&state.sessions[0]).contains("unmarked #1 (was `well`)"));
+        assert!(
+            state
+                .mark_menu
+                .as_ref()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|e| e.contains("remove `well`")),
+            "and taking it off is one of the offers"
+        );
     }
 
     #[tokio::test]
@@ -5113,6 +5303,215 @@ mod tests {
         submit(&mut state, "/mark shop").await;
 
         assert!(scrollback(&state.sessions[0]).contains("doesn't know where you are"));
+    }
+
+    /// `/mark` with nothing to write offers the usual answers rather than
+    /// making the player remember what they called the last one.
+    #[tokio::test]
+    async fn bare_mark_opens_the_chooser() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/mark").await;
+
+        let menu = state.mark_menu.as_ref().expect("the chooser is up");
+        assert_eq!(menu.at, crate::map::RoomId(1));
+        assert!(menu.entries().contains(&"shop".to_string()));
+        assert!(
+            menu.entries().iter().any(|e| e.contains("something else")),
+            "and offers a label the list does not have: {:?}",
+            menu.entries()
+        );
+        assert!(
+            !menu.entries().iter().any(|e| e.starts_with("remove")),
+            "nothing to remove from an unmarked room"
+        );
+    }
+
+    #[tokio::test]
+    async fn picking_a_row_marks_the_room() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/mark").await;
+
+        // `2` is the second suggestion.
+        let keys = crate::config::Keybinds::default();
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Char('2'),
+            KeyModifiers::NONE,
+            80,
+            &[],
+        );
+
+        assert!(state.mark_menu.is_none(), "and closes behind itself");
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some(MARK_SUGGESTIONS[1])
+        );
+    }
+
+    /// The list cannot know every MUD, so it has a way out of itself.
+    #[tokio::test]
+    async fn the_chooser_takes_a_label_of_your_own() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/mark").await;
+        let keys = crate::config::Keybinds::default();
+
+        // Down to the "something else" row and take it.
+        for _ in 0..MARK_SUGGESTIONS.len() {
+            handle_key(
+                &mut state,
+                &keys,
+                KeyCode::Down,
+                KeyModifiers::NONE,
+                80,
+                &[],
+            );
+        }
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            80,
+            &[],
+        );
+        assert!(
+            state.mark_menu.as_ref().unwrap().typing.is_some(),
+            "asking for your own label opens a field rather than closing"
+        );
+
+        for ch in "grocer".chars() {
+            handle_key(
+                &mut state,
+                &keys,
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+                80,
+                &[],
+            );
+        }
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            80,
+            &[],
+        );
+
+        assert!(state.mark_menu.is_none());
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("grocer")
+        );
+    }
+
+    /// Digits are text while a label is being typed, not row numbers.
+    #[tokio::test]
+    async fn digits_typed_into_a_custom_label_stay_in_it() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/mark").await;
+        let keys = crate::config::Keybinds::default();
+        state.mark_menu.as_mut().unwrap().typing = Some(String::new());
+
+        for ch in "shop2".chars() {
+            handle_key(
+                &mut state,
+                &keys,
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+                80,
+                &[],
+            );
+        }
+
+        assert_eq!(
+            state.mark_menu.as_ref().unwrap().typing.as_deref(),
+            Some("shop2")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_chooser_offers_to_take_an_existing_mark_off() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/mark well").await;
+        submit(&mut state, "/mark").await;
+        let keys = crate::config::Keybinds::default();
+
+        let last = state.mark_menu.as_ref().unwrap().entries().len() - 1;
+        for _ in 0..last {
+            handle_key(
+                &mut state,
+                &keys,
+                KeyCode::Down,
+                KeyModifiers::NONE,
+                80,
+                &[],
+            );
+        }
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            80,
+            &[],
+        );
+
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)].mark,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_leaves_the_room_as_it_was() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/mark").await;
+        let keys = crate::config::Keybinds::default();
+
+        handle_key(&mut state, &keys, KeyCode::Esc, KeyModifiers::NONE, 80, &[]);
+
+        assert!(state.mark_menu.is_none());
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)].mark,
+            None
+        );
+    }
+
+    /// A trigger can write the label too, so a shop recognises itself the
+    /// second time — the same shape as `corpse:`.
+    #[tokio::test]
+    async fn a_mark_trigger_labels_the_room_the_line_arrived_in() {
+        let (mut state, _rx) = app(&["tank"]);
+        apply_session_event(&mut state, 0, room(1, None));
+
+        apply_session_event(&mut state, 0, SessionEvent::Mark("shop".to_string()));
+
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("shop")
+        );
+        assert!(state.sessions[0].map_dirty);
     }
 
     // ---- /corpse (§16) ----

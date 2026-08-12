@@ -69,6 +69,10 @@ pub enum SessionEvent {
     /// from the room it holds *now*, before the [`SessionEvent::Room`] for
     /// wherever death sends them arrives behind this in stream order.
     Corpse,
+    /// A trigger's `mark:` fired: label the room the character is in (§16).
+    /// Carries no room for the same reason [`SessionEvent::Corpse`] does —
+    /// the hub is what knows which one that is.
+    Mark(String),
     /// What the transport is trusting, once connected.
     Security(net::Security),
     /// A raw GMCP message, for the inspector view (§14 M6, §6.3).
@@ -728,6 +732,9 @@ async fn run_connection(
                                             // room it still holds (§16).
                                             if outcome.corpse {
                                                 emit.push(SessionEvent::Corpse);
+                                            }
+                                            if let Some(mark) = outcome.mark {
+                                                emit.push(SessionEvent::Mark(mark));
                                             }
                                             // The one-time nudge that
                                             // automation is live (UX_REVIEW.md

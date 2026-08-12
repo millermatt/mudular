@@ -138,6 +138,12 @@ pub struct Trigger {
     /// and the client supplies only the remembering and the walking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corpse: Option<bool>,
+    /// Labels the room the character is in, as `/mark` would (§16). The
+    /// client has no idea what a room is for — no protocol says — so a
+    /// pattern the player wrote is the only thing that can recognise a
+    /// shop's own greeting, or a fountain in a room description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
@@ -283,6 +289,8 @@ pub struct LineOutcome {
     /// engine has no notion of where they are, so it only reports that it
     /// happened; the hub is what knows which room to remember.
     pub corpse: bool,
+    /// A label a trigger asked to be written onto the current room (§16).
+    pub mark: Option<String>,
     /// Whether any trigger's pattern *and* guard held on this line — true
     /// even if its only action was silent (a bare `set:`), false if no
     /// rule matched at all. Used for the one-time "a trigger just fired"
@@ -352,6 +360,7 @@ struct CompiledRule {
     highlight: Option<CompiledHighlight>,
     bell: bool,
     corpse: bool,
+    mark: Option<String>,
 }
 
 /// A `highlight:` block reduced to what the hot path needs: the SGR
@@ -716,6 +725,14 @@ impl Engine {
             }
             outcome.bell |= rule.bell;
             outcome.corpse |= rule.corpse;
+            // First match wins, as `route:` does: two rules disagreeing
+            // about what a room is get resolved by rule order rather than
+            // by whichever ran last.
+            if outcome.mark.is_none()
+                && let Some(mark) = &rule.mark
+            {
+                outcome.mark = Some(mark.clone());
+            }
         }
 
         self.changed |= !updates.is_empty();
@@ -1154,6 +1171,7 @@ impl Layered for Trigger {
         self.highlight = self.highlight.take().or_else(|| base.highlight.clone());
         self.bell = self.bell.or(base.bell);
         self.corpse = self.corpse.or(base.corpse);
+        self.mark = self.mark.take().or_else(|| base.mark.clone());
         self.enabled = self.enabled.or(base.enabled);
     }
 }
@@ -1203,6 +1221,7 @@ trait CompilableRule {
     fn highlight(&self) -> Option<HighlightSpec>;
     fn bell(&self) -> bool;
     fn corpse(&self) -> bool;
+    fn mark(&self) -> Option<String>;
 }
 
 impl CompilableRule for Alias {
@@ -1254,6 +1273,10 @@ impl CompilableRule for Alias {
     fn corpse(&self) -> bool {
         false
     }
+    /// Aliases fire on what you type, which says nothing about the room.
+    fn mark(&self) -> Option<String> {
+        None
+    }
 }
 
 impl CompilableRule for Trigger {
@@ -1299,6 +1322,9 @@ impl CompilableRule for Trigger {
     }
     fn corpse(&self) -> bool {
         self.corpse.unwrap_or(false)
+    }
+    fn mark(&self) -> Option<String> {
+        self.mark.clone()
     }
 }
 
@@ -1354,6 +1380,7 @@ fn compile_rules<T: CompilableRule>(
                 .transpose()?,
             bell: rule.bell(),
             corpse: rule.corpse(),
+            mark: rule.mark(),
         });
     }
     Ok(out)
@@ -2945,6 +2972,49 @@ triggers:
             "nor is the room's own id"
         );
         assert!(!engine.server_data().contains_key("Room.Info.exits.n"));
+    }
+
+    #[test]
+    fn a_mark_trigger_carries_its_label_out() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'lists the following items'
+    mark: shop
+"#,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            engine.process_line("Zeke lists the following items:").mark,
+            Some("shop".to_string())
+        );
+        assert_eq!(engine.process_line("Zeke smiles at you.").mark, None);
+    }
+
+    /// Two rules disagreeing about what a room is get settled by rule
+    /// order, as `route:` is, rather than by whichever ran last. (Distinct
+    /// patterns on purpose: two rules sharing one pattern shadow each other
+    /// instead, which is the scope merge doing its job, not precedence.)
+    #[test]
+    fn the_first_mark_rule_to_match_wins() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+name: t
+triggers:
+  - pattern: 'fountain'
+    mark: water
+  - pattern: 'bubbles'
+    mark: landmark
+"#,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            engine.process_line("A fountain bubbles here.").mark,
+            Some("water".to_string())
+        );
     }
 
     // ---- corpse (§16) ----
