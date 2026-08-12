@@ -267,6 +267,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             *rect,
             &state.channels[index],
             state.focus == Focus::Channel(index),
+            state,
         );
     }
 
@@ -569,14 +570,29 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
     map_render::CharRenderer.draw(frame, inner, &scene);
 }
 
-fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: bool) {
+fn draw_channel(
+    frame: &mut Frame,
+    area: Rect,
+    channel: &ChannelPane,
+    focused: bool,
+    state: &AppState,
+) {
     let timestamps = channel.config.timestamps;
+    // Which character said it, in that character's own colour — the pane
+    // itself has no single owner, but every line in it does.
+    let tint = |name: &str| {
+        state
+            .sessions
+            .iter()
+            .find(|session| session.name == name)
+            .and_then(|session| session.color)
+    };
     let (lines, scroll) = visible_window(
         &channel.lines,
         area.height,
         area.width.saturating_sub(2),
         channel.back_offset,
-        |_, line| channel_line(line, timestamps),
+        |_, line| channel_line(line, timestamps, &tint),
     );
     let title = format!(
         "{}{} ",
@@ -593,15 +609,27 @@ fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: b
 /// spliced into its text when it was routed (§8): the pane's `timestamps:`
 /// setting then decides at render time, and the stored line stays the text
 /// the MUD actually sent.
-fn channel_line(line: &RetainedLine, timestamps: bool) -> Vec<Line<'static>> {
-    let mut prefix = String::new();
+fn channel_line(
+    line: &RetainedLine,
+    timestamps: bool,
+    tint: &dyn Fn(&str) -> Option<Color>,
+) -> Vec<Line<'static>> {
+    let mut prefix: Vec<Span<'static>> = Vec::new();
     if timestamps {
         // Local, not UTC: a clock silently mislabeled as local would be
         // wrong for most players, every day, all year.
-        prefix.push_str(&line.at.format("%H:%M:%S ").to_string());
+        prefix.push(Span::raw(line.at.format("%H:%M:%S ").to_string()));
     }
     if let Origin::Session(name) = &line.origin {
-        prefix.push_str(&format!("[{name}] "));
+        // The character's own colour, the same one that tints their pane
+        // border and tab (§11), so a channel that several characters talk
+        // into can be read by who is talking rather than by squinting at
+        // names. Uncoloured profiles keep the plain tag.
+        let tag = format!("[{name}] ");
+        prefix.push(match tint(name) {
+            Some(color) => Span::styled(tag, Style::default().fg(color)),
+            None => Span::raw(tag),
+        });
     }
     if prefix.is_empty() {
         return ansi_lines(&line.text);
@@ -610,8 +638,12 @@ fn channel_line(line: &RetainedLine, timestamps: bool) -> Vec<Line<'static>> {
     // line, and repeating the stamp down its rows would read as several.
     let mut rendered = ansi_lines(&line.text);
     match rendered.first_mut() {
-        Some(first) => first.spans.insert(0, Span::raw(prefix)),
-        None => rendered.push(Line::raw(prefix)),
+        Some(first) => {
+            for span in prefix.into_iter().rev() {
+                first.spans.insert(0, span);
+            }
+        }
+        None => rendered.push(Line::from(prefix)),
     }
     rendered
 }
@@ -1393,6 +1425,71 @@ mod tests {
         let joined: String = (0..12).map(|y| row(&buffer, y)).collect();
         assert!(joined.contains("comms ● 2"), "{joined}");
         assert!(joined.contains("Bob tells you hi"), "{joined}");
+    }
+
+    /// A comms pane aggregates several characters, so the `[name]` tag is
+    /// the only thing saying who spoke — in that character's own colour,
+    /// the same one tinting their pane border and tab (§11), so the pane
+    /// can be read by who is talking rather than by squinting at names.
+    #[test]
+    fn a_channel_tags_each_line_in_the_speaker_s_own_colour() {
+        let mut state = state();
+        state.sessions[0].color = Some(Color::Magenta);
+        let mut channel = ChannelPane {
+            config: test_support::channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        };
+        channel.lines.push_back(RetainedLine::from_session(
+            state.sessions[0].name.clone(),
+            "Bob tells you hi",
+        ));
+        state.channels.push(channel);
+        state.show_channels = true;
+
+        let buffer = render_sized(&state, 70, 12);
+        let tagged = (0..12)
+            .flat_map(|y| (0..70).map(move |x| (x, y)))
+            .find(|(x, y)| buffer.cell((*x, *y)).unwrap().symbol() == "[")
+            .map(|(x, y)| buffer.cell((x, y)).unwrap().fg);
+
+        assert_eq!(
+            tagged,
+            Some(Color::Magenta),
+            "the tag should carry the character's colour: {}",
+            (0..12).map(|y| row(&buffer, y)).collect::<String>()
+        );
+    }
+
+    /// A profile with no colour set keeps a plain tag rather than picking
+    /// one for it.
+    #[test]
+    fn an_uncoloured_profile_keeps_a_plain_tag() {
+        let mut state = state();
+        state.sessions[0].color = None;
+        let mut channel = ChannelPane {
+            config: test_support::channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        };
+        channel.lines.push_back(RetainedLine::from_session(
+            state.sessions[0].name.clone(),
+            "Bob tells you hi",
+        ));
+        state.channels.push(channel);
+        state.show_channels = true;
+
+        let buffer = render_sized(&state, 70, 12);
+        let tagged = (0..12)
+            .flat_map(|y| (0..70).map(move |x| (x, y)))
+            .find(|(x, y)| buffer.cell((*x, *y)).unwrap().symbol() == "[")
+            .map(|(x, y)| buffer.cell((x, y)).unwrap().fg);
+
+        assert_eq!(tagged, Some(Color::Reset));
     }
 
     /// The timestamp is not stored in the line's text (§8): the pane owns
