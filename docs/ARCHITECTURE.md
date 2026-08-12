@@ -1426,6 +1426,45 @@ defaulting to off, and not as a resize handle bolted onto the layout.
 
 ---
 
+### 11.6 The party strip (`F9`)
+
+Every character's gauges on one row, so a multiboxer stops holding them
+in their head across panes.
+
+- **The numbers are already there.** Health and mana land in the merged
+  server-data store that rules and `when:` guards read (§6.3); the strip
+  only says what is already known. Extraction is a leaf module,
+  `vitals`, built exactly as §16's `RoomInfo` is — protocol-agnostic,
+  reading the merged store rather than one protocol's event, with a
+  GMCP-first alias table because `Char.Vitals.hp` and `HEALTH` are
+  different keys carrying the same fact. A server that switched
+  protocols mid-session would otherwise blank the strip.
+- **Both ends or nothing.** A gauge with no maximum is not drawn: a bar
+  needs both, and inventing a ceiling is inventing the number that
+  decides whether a character looks safe. A MUD that reports nothing is
+  shown as reporting nothing, rather than as a character at zero health.
+- **`app` reads it from the peer snapshots**, not by reaching into the
+  session tasks. Each session already publishes `vars` and its flattened
+  server data for its peers to read (§7.5), and `AppState` holds every
+  receiver for `${@name.var}` resolution — so a `watch::Receiver` borrow
+  is a lock-free read of a value already in memory, which is what makes
+  it affordable on a row redrawn every frame. The registry was the
+  prerequisite this feature was once blocked on; `/connect` built it.
+- **MSDP has to be asked.** The same subscription rule §16 records for
+  rooms applies here: a server sends a variable only once the client has
+  `REPORT`ed it, so the gauges are in `report_requests()` alongside
+  `ROOM`. Leaving them out is not a smaller feature, it is a feature
+  that silently never works — which is exactly how the strip first drew
+  every character as having no vitals at all.
+- **Colour is the point.** The strip exists to be noticed rather than
+  read, so a gauge below a quarter goes red and bold, below a half
+  amber. Each character keeps the colour that tints their pane border
+  and tab (§11), and the one bound to the input line is marked, so the
+  strip also answers "who am I typing to".
+
+Follow-the-leader and "who needs me?" are separate work on the same
+foundation, and are not built.
+
 ## 12. Errors, Logging, Testing
 
 - **Errors:** `thiserror` per layer; a session error (socket drop, TLS

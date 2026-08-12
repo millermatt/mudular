@@ -386,6 +386,10 @@ pub fn load_profile(path: &Path) -> Result<Profile> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiState {
     pub show_channels: bool,
+    /// Absent in files written before the party strip existed, so it
+    /// defaults rather than refusing to load them.
+    #[serde(default)]
+    pub show_hud: bool,
     pub show_map: bool,
     pub show_inspector: bool,
     pub channel_width: u16,
@@ -538,6 +542,10 @@ pub struct Keybinds {
     /// (docs/ARCHITECTURE.md §16).
     #[serde(default = "default_map_cursor")]
     pub map_cursor: KeyBinding,
+    /// Shows or hides the party strip — every character's vitals at once
+    /// (docs/ARCHITECTURE.md §11.6).
+    #[serde(default = "default_toggle_hud")]
+    pub toggle_hud: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -558,6 +566,7 @@ impl Default for Keybinds {
             map_wider: default_map_wider(),
             map_narrower: default_map_narrower(),
             map_cursor: default_map_cursor(),
+            toggle_hud: default_toggle_hud(),
         }
     }
 }
@@ -642,6 +651,11 @@ fn default_map_wider() -> KeyBinding {
 fn default_map_cursor() -> KeyBinding {
     // Next free after F7, which shows the column this walks around.
     "f8".parse().expect("built-in default keybinding")
+}
+
+fn default_toggle_hud() -> KeyBinding {
+    // Next free after F8, continuing the same row.
+    "f9".parse().expect("built-in default keybinding")
 }
 
 fn default_map_narrower() -> KeyBinding {
@@ -1651,6 +1665,7 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let saved = UiState {
             show_channels: false,
+            show_hud: false,
             show_map: true,
             show_inspector: false,
             channel_width: 34,
@@ -1693,6 +1708,7 @@ mod tests {
             dir.path(),
             &UiState {
                 show_channels: true,
+                show_hud: false,
                 show_map: true,
                 show_inspector: false,
                 channel_width: 22,

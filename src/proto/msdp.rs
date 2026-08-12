@@ -71,10 +71,27 @@ pub fn encode_pair(name: &str, value: &str) -> Vec<u8> {
 /// the mapper does not already ask for, and the config layer the GMCP list
 /// now uses is there to extend the day something does.
 pub fn report_requests() -> Vec<Vec<u8>> {
-    ["ROOM"]
-        .into_iter()
-        .map(|variable| encode_pair("REPORT", variable))
-        .collect()
+    // Everything the client can actually read: the room for the mapper
+    // (§16) and the gauges for the party strip (§11.6). A server sends a
+    // variable only after it has been REPORTed, so anything absent here is
+    // a feature that silently never works — which is exactly how the strip
+    // first drew every character as having no vitals at all.
+    //
+    // Asking for a variable a server does not have costs nothing: it
+    // simply never sends it, and `vitals::from_server_data` treats a
+    // missing gauge as one not to draw.
+    [
+        "ROOM",
+        "HEALTH",
+        "HEALTH_MAX",
+        "MANA",
+        "MANA_MAX",
+        "MOVEMENT",
+        "MOVEMENT_MAX",
+    ]
+    .into_iter()
+    .map(|variable| encode_pair("REPORT", variable))
+    .collect()
 }
 
 pub fn parse(data: &[u8]) -> Result<Vec<(String, MsdpValue)>, MsdpError> {

@@ -468,6 +468,8 @@ pub struct AppState {
     /// Whether the focused session's pane shows `inspector_log` instead of
     /// its scrollback.
     pub show_inspector: bool,
+    /// The party strip: every character's vitals side by side (§11.6).
+    pub show_hud: bool,
     /// Whether the help overlay is up (§11.2).
     pub show_help: bool,
     /// The live bindings, so the input hint and the help overlay both read
@@ -520,7 +522,7 @@ pub struct AppState {
     /// named (a session added after startup was invisible to every
     /// existing one and vice versa, since the mesh was built once before
     /// `event_loop` and never revisited).
-    peer_registry: crate::engine::Peers,
+    pub(crate) peer_registry: crate::engine::Peers,
     /// Per-session limits new sessions need too, not just the ones spawned
     /// at startup (§8, §11.3) — `/connect` builds a session the same way
     /// `main.rs` does, so it needs the same numbers `event_loop` was
@@ -1682,6 +1684,7 @@ fn current_layout(state: &AppState) -> config::UiState {
         show_channels: state.show_channels,
         show_map: state.show_map,
         show_inspector: state.show_inspector,
+        show_hud: state.show_hud,
         channel_width: state.channel_width,
         map_width: state.map_width,
     }
@@ -1909,6 +1912,7 @@ async fn event_loop(
         show_map: false,
         map_width,
         show_inspector: false,
+        show_hud: false,
         show_help: false,
         keybinds: keybinds.clone(),
         config_editor: None,
@@ -1938,6 +1942,7 @@ async fn event_loop(
         state.show_channels = saved.show_channels;
         state.show_map = saved.show_map;
         state.show_inspector = saved.show_inspector;
+        state.show_hud = saved.show_hud;
         state.channel_width = ui::clamp_channel_width(saved.channel_width, width);
         state.map_width = ui::clamp_map_width(saved.map_width, width);
     }
@@ -2274,6 +2279,10 @@ fn handle_key(
         if let Some(next) = map_cursor_step(state, cursor, step) {
             state.map_cursor = Some(next);
         }
+        return true;
+    }
+    if keybinds.toggle_hud.matches(code, modifiers) {
+        state.show_hud = !state.show_hud;
         return true;
     }
     if keybinds.map_cursor.matches(code, modifiers) {
@@ -3001,6 +3010,7 @@ pub(crate) mod test_support {
                 show_map: false,
                 map_width: crate::ui::MAP_WIDTH,
                 show_inspector: false,
+                show_hud: false,
                 show_help: false,
                 keybinds: Keybinds::default(),
                 config_editor: None,

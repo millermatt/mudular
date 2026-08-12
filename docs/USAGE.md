@@ -366,6 +366,26 @@ there and says so, rather than guessing the rest of the way from a room
 it didn't plan for — leaving that character somewhere unexpected would be
 worse than leaving them in place.
 
+### Watching every character at once
+
+`F9` shows a strip above the prompt with every character's gauges side by
+side:
+
+```
+▸tank hp 27 mp 100 mv 83   cleric hp 140 mp 12 mv 90
+```
+
+The `▸` marks whoever your typing goes to, each name keeps that
+character's colour, and a gauge below half turns amber, below a quarter
+red and bold — the strip is meant to be noticed rather than read.
+
+It shows what the MUD actually reports. A character on a MUD that sends
+no vitals is listed with a `—` rather than being drawn as one at zero
+health, and a gauge the server gives no maximum for is left out, since a
+bar needs both ends.
+
+Whether it is up is remembered between runs, like the other panes.
+
 ### Reading the map, and walking to what you see
 
 `F8` puts a cursor on the map column, starting on your own room. The

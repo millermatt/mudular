@@ -107,6 +107,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
             keybinds.map_cursor,
             "move a cursor around the map; Enter walks there",
         ),
+        row(keybinds.toggle_hud, "show or hide the party strip"),
         row(
             keybinds.server_data_inspector,
             "raw server-data inspector (GMCP/MSDP)",
@@ -153,14 +154,22 @@ pub struct Panes {
     /// has room for it beside everything already there (§16).
     pub map: Option<Rect>,
     pub prompt: Option<Rect>,
+    /// The party strip, when it is on and there is more than nothing to put
+    /// in it (§11.6).
+    pub hud: Option<Rect>,
     pub input: Rect,
 }
 
 /// Splits `area` into the panes `state` asks for.
 pub fn layout(area: Rect, state: &AppState) -> Panes {
     let reserve_prompt = state.bound().is_some_and(|session| session.connected);
-    let [body, prompt_area, input] = Layout::vertical([
+    // Above the prompt rather than below it: the prompt and the input line
+    // are one thing to look at while typing, and a strip between them would
+    // split the pair the player's eye already treats as joined.
+    let hud_rows = u16::from(state.show_hud && !state.sessions.is_empty());
+    let [body, hud_area, prompt_area, input] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(hud_rows),
         Constraint::Length(if reserve_prompt { 1 } else { 0 }),
         Constraint::Length(3),
     ])
@@ -215,6 +224,7 @@ pub fn layout(area: Rect, state: &AppState) -> Panes {
         channels,
         map,
         prompt: reserve_prompt.then_some(prompt_area),
+        hud: (hud_rows > 0).then_some(hud_area),
         input,
     }
 }
@@ -281,6 +291,10 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             state.focus == Focus::Channel(index),
             state,
         );
+    }
+
+    if let Some(rect) = panes.hud {
+        draw_hud(frame, rect, state);
     }
 
     if let Some(rect) = panes.map {
@@ -546,6 +560,90 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     };
 
     render_scrollback(frame, area, lines, title, focused, session.color, scroll);
+}
+
+/// Every character's vitals on one row (§11.6).
+///
+/// Multiboxers do this in their head, flicking between panes to find who is
+/// in trouble; the numbers are already in the merged server-data store that
+/// rules read, so the client can simply say. Each character keeps the
+/// colour that tints their pane border and tab (§11), so the strip is read
+/// by *who* before it is read by *what*.
+fn draw_hud(frame: &mut Frame, area: Rect, state: &AppState) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (index, session) in state.sessions.iter().enumerate() {
+        // Read out of the peer snapshot rather than reaching into the
+        // session task: the snapshot is a value already in memory and
+        // borrowing it costs no lock (§7.5), which matters on a strip
+        // redrawn every frame.
+        let vitals = state
+            .peer_registry
+            .get(&session.name)
+            .map(
+                |peer: &tokio::sync::watch::Receiver<crate::engine::PeerSnapshot>| {
+                    crate::vitals::from_server_data(&peer.borrow().data)
+                },
+            )
+            .unwrap_or_default();
+
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let name = Style::default().fg(session.color.unwrap_or(Color::Gray));
+        let focused = state.input_session == index;
+        spans.push(Span::styled(
+            match focused {
+                // The character the input line is bound to, marked the way
+                // the tab bar marks it — the strip is another place to
+                // answer "who am I typing to".
+                true => format!("▸{}", session.name),
+                false => format!(" {}", session.name),
+            },
+            match focused {
+                true => name.add_modifier(Modifier::BOLD),
+                false => name,
+            },
+        ));
+
+        if vitals.is_empty() {
+            // A MUD that reports nothing is said to report nothing, rather
+            // than being drawn as a character at zero health.
+            spans.push(Span::styled(
+                " —".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            continue;
+        }
+        for (label, gauge) in [
+            ("hp", vitals.health),
+            ("mp", vitals.mana),
+            ("mv", vitals.movement),
+        ] {
+            let Some(gauge) = gauge else { continue };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("{label} {}", gauge.now),
+                gauge_style(gauge),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// How alarming a gauge is. Colour rather than a number alone, because the
+/// point of the strip is noticing trouble without reading it — and bold on
+/// top of colour, so the warning survives a terminal that renders these
+/// hues too close together.
+fn gauge_style(gauge: crate::vitals::Gauge) -> Style {
+    let filled = gauge.fraction();
+    let style = Style::default();
+    match filled {
+        f if f <= 0.25 => style
+            .fg(Color::Rgb(0xE1, 0x1D, 0x48))
+            .add_modifier(Modifier::BOLD),
+        f if f <= 0.5 => style.fg(Color::Rgb(0xE6, 0x9F, 0x00)),
+        _ => style.fg(Color::Rgb(0x64, 0x74, 0x8B)),
+    }
 }
 
 /// Draws the area around the character, from the scene the map builds.
@@ -976,7 +1074,110 @@ mod tests {
         }
     }
 
-    // ---- the map column (§16) ----
+    // ---- the party strip (§11.6) ----
+
+    /// Publishes vitals for a session the way its own task would, so the
+    /// strip reads them the way it will in play.
+    fn publish_vitals(state: &mut AppState, name: &str, pairs: &[(&str, &str)]) {
+        let (tx, rx) = tokio::sync::watch::channel(crate::engine::PeerSnapshot {
+            vars: std::collections::HashMap::new(),
+            data: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        });
+        // The sender goes out of scope here on purpose: a `watch::Receiver`
+        // still reads the last value published after its sender is gone,
+        // which is exactly what the strip does between updates.
+        drop(tx);
+        state.peer_registry.insert(name.to_string(), rx);
+    }
+
+    #[test]
+    fn the_strip_shows_every_character_at_once() {
+        let mut state = test_support::app(&["tank", "cleric"]);
+        state.show_hud = true;
+        publish_vitals(
+            &mut state,
+            "tank",
+            &[("HEALTH", "27"), ("HEALTH_MAX", "30")],
+        );
+        publish_vitals(
+            &mut state,
+            "cleric",
+            &[("Char.Vitals.mp", "12"), ("Char.Vitals.maxmp", "40")],
+        );
+
+        let screen = rows(&render_sized(&state, 70, 12));
+
+        assert!(screen.contains("tank"), "{screen}");
+        assert!(screen.contains("hp 27"), "{screen}");
+        assert!(screen.contains("cleric"), "{screen}");
+        assert!(screen.contains("mp 12"), "{screen}");
+    }
+
+    #[test]
+    fn the_strip_is_off_until_asked_for() {
+        let mut state = test_support::app(&["tank"]);
+        publish_vitals(
+            &mut state,
+            "tank",
+            &[("HEALTH", "27"), ("HEALTH_MAX", "30")],
+        );
+
+        let screen = rows(&render_sized(&state, 70, 12));
+
+        assert!(!screen.contains("hp 27"), "{screen}");
+    }
+
+    /// A MUD that reports nothing is said to report nothing — drawing it as
+    /// a character at zero health would be a lie about someone who is
+    /// probably fine.
+    #[test]
+    fn a_character_with_no_vitals_is_not_drawn_as_a_dying_one() {
+        let mut state = test_support::app(&["tank"]);
+        state.show_hud = true;
+        publish_vitals(&mut state, "tank", &[("Room.Info.num", "1")]);
+
+        let screen = rows(&render_sized(&state, 70, 12));
+
+        assert!(screen.contains("tank"), "{screen}");
+        assert!(!screen.contains("hp 0"), "{screen}");
+    }
+
+    /// The point of the strip is noticing trouble without reading it.
+    #[test]
+    fn a_character_in_trouble_is_coloured_for_it() {
+        let mut state = test_support::app(&["tank"]);
+        state.show_hud = true;
+        publish_vitals(
+            &mut state,
+            "tank",
+            &[("HEALTH", "3"), ("HEALTH_MAX", "100")],
+        );
+        let hurt = render_sized(&state, 70, 12);
+
+        publish_vitals(
+            &mut state,
+            "tank",
+            &[("HEALTH", "95"), ("HEALTH_MAX", "100")],
+        );
+        let well = render_sized(&state, 70, 12);
+
+        let colour_of = |buffer: &ratatui::buffer::Buffer| {
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .find(|(x, y)| buffer.cell((*x, *y)).unwrap().symbol() == "h")
+                .map(|(x, y)| buffer.cell((x, y)).unwrap().fg)
+        };
+        assert_ne!(
+            colour_of(&hurt),
+            colour_of(&well),
+            "3 of 100 and 95 of 100 must not look the same"
+        );
+    }
+
+    // ---- the map column (§16) ----    // ---- the map column (§16) ----
 
     /// Drops a room into a session's map with the exits it should have.
     fn map_room(state: &mut AppState, id: i64, exits: &[(&str, i64)]) {

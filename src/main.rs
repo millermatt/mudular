@@ -7,6 +7,7 @@ mod proto;
 mod scrollback;
 mod session;
 mod ui;
+mod vitals;
 
 use std::path::PathBuf;
 

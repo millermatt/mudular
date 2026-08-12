@@ -2415,7 +2415,7 @@ mod tests {
         let (mut events, commands) = serve_with_rules(
             move |mut sock| async move {
                 sock.write_all(&[IAC, WILL, option::MSDP]).await.unwrap();
-                await_agreement(&mut sock, option::MSDP).await;
+                let tail = await_agreement(&mut sock, option::MSDP).await;
 
                 let mut payload = vec![msdp::VAR];
                 payload.extend_from_slice(b"ROOM_NAME");
@@ -2424,7 +2424,8 @@ mod tests {
                 let msg = encode_subnegotiation(option::MSDP, &payload);
                 sock.write_all(&msg).await.unwrap();
 
-                tx.send(read_command(&mut sock).await).await.unwrap();
+                let mut reader = CommandReader { raw: tail };
+                tx.send(reader.next(&mut sock).await).await.unwrap();
             },
             rules(
                 r#"
@@ -2514,7 +2515,7 @@ mod tests {
         let (mut events, commands) = serve_with_rules(
             move |mut sock| async move {
                 sock.write_all(&[IAC, WILL, option::MSDP]).await.unwrap();
-                await_agreement(&mut sock, option::MSDP).await;
+                let tail = await_agreement(&mut sock, option::MSDP).await;
 
                 // `ROOM_EXITS` as a two-element array, then a one-element
                 // one — the exit that closed behind you.
@@ -2540,7 +2541,8 @@ mod tests {
                 combined.extend_from_slice(b"msdp applied\r\n");
                 sock.write_all(&combined).await.unwrap();
 
-                tx.send(read_command(&mut sock).await).await.unwrap();
+                let mut reader = CommandReader { raw: tail };
+                tx.send(reader.next(&mut sock).await).await.unwrap();
             },
             rules(
                 r#"
@@ -2857,15 +2859,23 @@ mod tests {
 
     /// Reads until the client agrees to `option`, so the server only
     /// starts compressing once the handshake is complete.
-    async fn await_agreement(sock: &mut tokio::net::TcpStream, option: u8) {
+    /// Waits for the client to agree to an option, and hands back whatever
+    /// it read past the agreement.
+    ///
+    /// Returning the tail rather than dropping it matters once the client
+    /// says more than one thing after agreeing: the `REPORT` subscriptions
+    /// follow the `DO` immediately, and a read that swallowed half of one
+    /// used to leave the next reader starting mid-subnegotiation. It looked
+    /// like `REPORT\x02MANA` welded onto the front of a command.
+    async fn await_agreement(sock: &mut tokio::net::TcpStream, option: u8) -> Vec<u8> {
         let mut seen = Vec::new();
         let mut buf = vec![0u8; 64];
         loop {
             let n = sock.read(&mut buf).await.unwrap();
             assert!(n > 0, "client closed before agreeing to option {option}");
             seen.extend_from_slice(&buf[..n]);
-            if seen.windows(3).any(|w| w == [IAC, DO, option]) {
-                return;
+            if let Some(at) = seen.windows(3).position(|w| w == [IAC, DO, option]) {
+                return seen.split_off(at + 3);
             }
         }
     }
@@ -2914,35 +2924,6 @@ mod tests {
     /// Strips Telnet framing from client→server bytes, the way any real
     /// server does before treating input as a typed command. Without this
     /// a fake server mistakes our NAWS offer for the player's first line.
-    fn strip_telnet(bytes: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut iter = bytes.iter().copied().peekable();
-        while let Some(byte) = iter.next() {
-            if byte != IAC {
-                out.push(byte);
-                continue;
-            }
-            match iter.next() {
-                Some(IAC) => out.push(IAC),
-                Some(SB) => {
-                    // Skip through the terminating IAC SE.
-                    while let Some(b) = iter.next() {
-                        if b == IAC && iter.peek() == Some(&SE) {
-                            iter.next();
-                            break;
-                        }
-                    }
-                }
-                // WILL/WONT/DO/DONT carry one option byte.
-                Some(WILL | WONT | DO | 254) => {
-                    iter.next();
-                }
-                _ => {}
-            }
-        }
-        out
-    }
-
     /// Reads until the client sends a complete line of actual input.
     ///
     /// Several commands can share one TCP segment (an alias expands to a
@@ -2950,24 +2931,84 @@ mod tests {
     /// next call rather than discarded.
     #[derive(Default)]
     struct CommandReader {
-        pending: Vec<u8>,
+        /// Bytes as they arrived, Telnet framing and all. Stripping is done
+        /// over the whole buffer rather than per read: a subnegotiation can
+        /// straddle two reads, and stripping each read on its own leaves
+        /// half of one in the output. Found when the client began sending
+        /// seven `REPORT`s instead of one and they stopped fitting in a
+        /// single read — `REPORT\x02MANA` turned up welded to the front of
+        /// the next command.
+        raw: Vec<u8>,
     }
 
     impl CommandReader {
         async fn next(&mut self, sock: &mut tokio::net::TcpStream) -> String {
             let mut buf = vec![0u8; 1024];
             loop {
-                if let Some(idx) = self.pending.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = self.pending.drain(..=idx).collect();
-                    return String::from_utf8_lossy(&line).trim().to_string();
+                let (text, consumed) = strip_complete_telnet(&self.raw);
+                if let Some(idx) = text.iter().position(|&b| b == b'\n') {
+                    // Only the raw bytes behind this line are spent; the
+                    // rest stays for the next call.
+                    let spent = raw_len_for(&self.raw, idx + 1, consumed);
+                    self.raw.drain(..spent);
+                    return String::from_utf8_lossy(&text[..=idx]).trim().to_string();
                 }
                 let n = sock.read(&mut buf).await.unwrap();
                 if n == 0 {
                     return String::new();
                 }
-                self.pending.extend_from_slice(&strip_telnet(&buf[..n]));
+                self.raw.extend_from_slice(&buf[..n]);
             }
         }
+    }
+
+    /// Strips Telnet framing, stopping at any sequence that is not yet
+    /// complete. Returns the readable bytes and how much of `raw` they came
+    /// from, so an unfinished subnegotiation waits for the rest rather than
+    /// leaking its bytes into the output.
+    fn strip_complete_telnet(raw: &[u8]) -> (Vec<u8>, usize) {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] != IAC {
+                out.push(raw[i]);
+                i += 1;
+                continue;
+            }
+            match raw.get(i + 1) {
+                None => break,
+                Some(&IAC) => {
+                    out.push(IAC);
+                    i += 2;
+                }
+                Some(&SB) => {
+                    let Some(end) = (i + 2..raw.len().saturating_sub(1))
+                        .find(|&j| raw[j] == IAC && raw[j + 1] == SE)
+                    else {
+                        break;
+                    };
+                    i = end + 2;
+                }
+                Some(&(WILL | WONT | DO | 254)) => {
+                    if raw.len() < i + 3 {
+                        break;
+                    }
+                    i += 3;
+                }
+                Some(_) => i += 2,
+            }
+        }
+        (out, i)
+    }
+
+    /// How many raw bytes produced the first `wanted` readable ones.
+    fn raw_len_for(raw: &[u8], wanted: usize, consumed: usize) -> usize {
+        for end in 0..=consumed {
+            if strip_complete_telnet(&raw[..end]).0.len() >= wanted {
+                return end;
+            }
+        }
+        consumed
     }
 
     /// One-shot read of a single command, for scripts that only need one.
