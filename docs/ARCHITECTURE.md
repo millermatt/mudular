@@ -1698,7 +1698,23 @@ lives in `ui`, and neither is visible from inside it.
   Collisions are expected, not a bug: first placement wins, and a room that
   loses drops out of the *rendered layout only*. It stays in the graph and
   stays pathable, which is why the pane is never what `/goto` consults.
-- **Persistence:** `<config dir>/maps/<profile>.json`, written through
+- **Keyed by the world, not the character.** A map is a property of the
+  place, not the person: two characters on one MUD walk the same rooms,
+  and keying by profile made each re-explore it from scratch while hiding
+  one's `/mark` labels from the other. The key is the **host**, without
+  the port: a MUD answering on more than one port is one world, and plain
+  telnet beside TLS is the ordinary shape of that — mudular has `--tls`,
+  so keying on the port would map such a server twice and hide each half
+  from the other. Genuinely different MUDs sharing a host do exist, but
+  that is a development arrangement — two builds of one server on one box
+  — and whoever set it up can say so with a `world:` per profile. The
+  same field joins profiles the host alone would separate. A `--host` session keeps a map now
+  where it used to get none: it has no profile, but it has a host and a
+  port. Maps saved under the old per-profile scheme are folded in on
+  first load and the old file renamed, never deleted — it is exploration
+  someone earned, and the rename is what makes the fold happen once
+  rather than resurrecting rooms deleted later.
+- **Persistence:** `<config dir>/maps/<world>.json`, written through
   `config::atomic_write` so a crash mid-save cannot truncate a map. JSON
   rather than YAML deliberately — machine-written data, never hand-edited,
   unlike every other file in the config dir. Saves **merge** rather than

@@ -38,8 +38,71 @@ pub fn log_dir(config_dir: &Path) -> PathBuf {
 
 /// Where a profile's room graph is saved (§16) — a subdirectory of the
 /// config dir, the same layout `log_dir` uses.
-pub fn map_path(dir: &Path, profile: &str) -> PathBuf {
-    dir.join("maps").join(format!("{profile}.json"))
+/// Which saved map a session belongs to (docs/ARCHITECTURE.md §16).
+///
+/// A map is a property of the *world*, not the character: two characters
+/// on one MUD walk the same rooms, and keying by profile made each of them
+/// re-explore it from scratch and hid one's `/mark` labels from the other.
+///
+/// **The host, without the port.** A MUD that answers on more than one
+/// port is one world — plain telnet beside TLS is the ordinary shape of
+/// that, and mudular has `--tls`, so keying on the port would map such a
+/// server twice and hide each half from the other.
+///
+/// Genuinely different MUDs sharing a host do exist, but they are a
+/// development arrangement — two builds of one server on one box — and
+/// whoever set that up is by definition someone who can say so. They name
+/// a `world:` per profile to keep them apart, which is the same field
+/// used to join profiles that the host alone would separate.
+pub fn map_key(world: Option<&str>, host: &str, _port: u16) -> String {
+    let raw = match world {
+        Some(named) => named.to_string(),
+        None => host.to_string(),
+    };
+    // This becomes a filename. Anything that is not plainly safe in one
+    // becomes `_`, so a host with a colon, a slash or worse cannot escape
+    // the maps directory or collide with the path separator.
+    raw.chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
+                true => c,
+                false => '_',
+            },
+        )
+        .collect()
+}
+
+pub fn map_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join("maps").join(format!("{key}.json"))
+}
+
+/// Folds any map saved under the old per-profile scheme into the world's
+/// map, once (§16).
+///
+/// Maps used to be keyed by profile, so a player arriving at this version
+/// has a file per character holding the same world twice over. Merging
+/// under the never-erase rule unions them — one character's rooms and the
+/// other's `/mark` labels both survive, which is the outcome keying by
+/// world was for.
+///
+/// The old file is renamed rather than deleted: it is exploration someone
+/// earned, the merge is not something they asked for, and a rename is
+/// undone with `mv`. Renaming is also what makes this happen once, rather
+/// than resurrecting rooms deleted later.
+pub fn adopt_legacy_map(dir: &Path, legacy_keys: &[String], key: &str) -> Result<()> {
+    for legacy_key in legacy_keys {
+        let legacy = map_path(dir, legacy_key);
+        if legacy_key == key || !legacy.exists() {
+            continue;
+        }
+        let inherited = load_map(dir, legacy_key);
+        if !inherited.rooms.is_empty() {
+            save_map(dir, key, &inherited)?;
+        }
+        std::fs::rename(&legacy, legacy.with_extension("json.migrated"))
+            .with_context(|| format!("setting aside {}", legacy.display()))?;
+    }
+    Ok(())
 }
 
 /// Loads a profile's saved map, or an empty one if there is nothing to
@@ -134,6 +197,11 @@ pub struct Profile {
         skip_serializing_if = "Option::is_none"
     )]
     pub color: Option<Color>,
+    /// Names the world this character plays in, for profiles that should
+    /// share one map (§16). Only needed where `host:port` gets it wrong —
+    /// one MUD reachable on two ports, typically plain beside TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world: Option<String>,
     /// Answers the server's opening name/password prompts (§10). There is
     /// deliberately no `password:` field: `deny_unknown_fields` turns an
     /// attempt to put one here into a load error naming it, which is a
@@ -803,6 +871,9 @@ pub struct NewProfile {
 /// to conflict with yet — this is always a brand-new file.
 pub fn save_new_profile(dir: &Path, profile: &NewProfile) -> Result<()> {
     let full = Profile {
+        // The wizard asks only what is needed to connect (§15); a shared
+        // world is a thing you notice you need later, in the file.
+        world: None,
         name: profile.name.clone(),
         host: profile.host.clone(),
         port: profile.port,
@@ -1605,6 +1676,90 @@ mod tests {
     }
 
     // ---- map persistence (§16) ----
+
+    /// The ordinary shape of a MUD on two ports is plain telnet beside
+    /// TLS, and that is one world. Keying on the port mapped it twice and
+    /// hid each half from the other.
+    #[test]
+    fn one_mud_on_two_ports_shares_a_map() {
+        assert_eq!(
+            map_key(None, "aardmud.org", 4000),
+            map_key(None, "aardmud.org", 4443)
+        );
+    }
+
+    /// Two servers on one address is a development arrangement, and
+    /// whoever set it up can say so.
+    #[test]
+    fn a_profile_can_name_a_world_to_keep_two_local_muds_apart() {
+        assert_ne!(
+            map_key(Some("stable"), "127.0.0.1", 4000),
+            map_key(Some("next"), "127.0.0.1", 4000)
+        );
+    }
+
+    /// The key becomes a filename, so nothing in a host may escape the
+    /// maps directory or collide with a path separator.
+    #[test]
+    fn a_key_is_safe_to_put_in_a_filename() {
+        let key = map_key(None, "../../etc/pass:wd", 23);
+        assert!(!key.contains('/'), "{key}");
+        assert!(!key.contains(':'), "{key}");
+        assert_eq!(
+            map_path(Path::new("/cfg"), &key).parent().unwrap(),
+            Path::new("/cfg/maps")
+        );
+    }
+
+    /// Arriving at this version, a player has a map per character holding
+    /// the same world twice. Both are folded in, so neither character's
+    /// rooms — nor their `/mark` labels — are the one that loses.
+    #[test]
+    fn old_per_character_maps_are_folded_into_the_world() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut hers = crate::map::Map::default();
+        hers.observe(&sample_room(1, "Temple Square"));
+        hers.set_mark(crate::map::RoomId(1), Some("shop".to_string()));
+        save_map(dir.path(), "mathias", &hers).unwrap();
+        let mut his = crate::map::Map::default();
+        his.observe(&sample_room(2, "The Docks"));
+        save_map(dir.path(), "saihtam", &his).unwrap();
+
+        adopt_legacy_map(dir.path(), &["mathias".to_string()], "world").unwrap();
+        adopt_legacy_map(dir.path(), &["saihtam".to_string()], "world").unwrap();
+
+        let world = load_map(dir.path(), "world");
+        assert_eq!(
+            world.rooms[&crate::map::RoomId(1)].mark.as_deref(),
+            Some("shop"),
+            "one character's label survives"
+        );
+        assert!(
+            world.rooms.contains_key(&crate::map::RoomId(2)),
+            "and the other's rooms"
+        );
+    }
+
+    /// Renamed, never deleted: it is exploration someone earned and the
+    /// merge is not something they asked for. Renaming is also what makes
+    /// it happen once, rather than resurrecting rooms deleted later.
+    #[test]
+    fn adopting_sets_the_old_file_aside_rather_than_removing_it() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut old = crate::map::Map::default();
+        old.observe(&sample_room(1, "Temple Square"));
+        save_map(dir.path(), "mathias", &old).unwrap();
+
+        adopt_legacy_map(dir.path(), &["mathias".to_string()], "world").unwrap();
+
+        assert!(!map_path(dir.path(), "mathias").exists());
+        assert!(dir.path().join("maps/mathias.json.migrated").exists());
+
+        // A second run has nothing left to adopt, so a room deleted from
+        // the world map afterwards stays deleted.
+        adopt_legacy_map(dir.path(), &["mathias".to_string()], "world").unwrap();
+        assert!(dir.path().join("maps/mathias.json.migrated").exists());
+    }
 
     #[test]
     fn map_path_lives_under_maps_subdir() {
@@ -2509,6 +2664,7 @@ triggers:
 
     fn minimal_profile(name: &str, host: &str) -> Profile {
         Profile {
+            world: None,
             name: name.to_string(),
             host: host.to_string(),
             port: 4000,

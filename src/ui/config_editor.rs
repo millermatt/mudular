@@ -1519,6 +1519,7 @@ mod tests {
 
     fn minimal(name: &str) -> Profile {
         Profile {
+            world: None,
             name: name.to_string(),
             host: "mud.example.org".to_string(),
             port: 4000,

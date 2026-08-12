@@ -89,6 +89,9 @@ pub struct ConnectTarget {
     pub cross: CrossSession,
     /// Tints this character's border and tab entry (§11).
     pub color: Option<Color>,
+    /// Which world's map this character shares, when `host:port` is not
+    /// the right answer (§16).
+    pub world: Option<String>,
     /// Answers the server's opening prompts, if the profile asked for it.
     pub login: Option<session::login::Autologin>,
     /// Offer to keep the password the player types at the login prompt
@@ -201,6 +204,9 @@ pub struct SessionPane {
     /// player may still be walking back and forth to, and the next death
     /// overwrites it anyway.
     pub corpse: Option<crate::map::RoomId>,
+    /// Which world's map this session reads and writes (§16). Held rather
+    /// than recomputed because the pane outlives the target it came from.
+    pub map_key: String,
     /// Whether the player has already been told that saving is failing.
     /// One notice per run of failures, not one per attempt (§16).
     pub map_save_failed: bool,
@@ -1575,6 +1581,7 @@ pub fn build_profile_target(
         .log
         .then(|| config::log_dir(dir).join(format!("{session_name_str}.log")));
     Ok(ConnectTarget {
+        world: profile.world.clone(),
         name: session_name_str,
         host: profile.host,
         port: profile.port,
@@ -1642,6 +1649,9 @@ fn connect(
     scrollback_limit: usize,
     peers: PeerLinks,
 ) -> SessionPane {
+    // Taken before the target is consumed by `spawn` below.
+    let map_key = config::map_key(target.world.as_deref(), &target.host, target.port);
+    let (target_host, target_port) = (target.host.clone(), target.port);
     let status = format!("connecting to {}:{}...", target.host, target.port);
     let connected_status = format!("connected to {}:{}", target.host, target.port);
     let Rules {
@@ -1660,13 +1670,20 @@ fn connect(
         target.login,
         peers,
     );
-    // A `--host` session has no profile and so no file to load from —
-    // consistent with `/config` and disk logging, which need one too.
-    let map = match &profile {
-        Some(name) => config::load_map(&config_dir, name),
-        None => crate::map::Map::default(),
-    };
+    // Keyed by the world, not the character (§16): two characters on one
+    // MUD walk the same rooms, so they share what they have walked. This is
+    // also why a `--host` session now keeps a map where it used to get
+    // none — it has no profile, but it does have a host and a port.
+    // Both older schemes: the original per-character file, and the
+    // briefly-lived host-and-port one.
+    let mut legacy_keys: Vec<String> = profile.iter().cloned().collect();
+    legacy_keys.push(format!("{}_{}", target_host, target_port));
+    if let Err(err) = config::adopt_legacy_map(&config_dir, &legacy_keys, &map_key) {
+        tracing::warn!("could not adopt an older map: {err:#}");
+    }
+    let map = config::load_map(&config_dir, &map_key);
     SessionPane {
+        map_key,
         name: target.name,
         scrollback: VecDeque::new(),
         prompt: String::new(),
@@ -1756,15 +1773,20 @@ fn save_dirty_maps(sessions: &mut [SessionPane]) {
 }
 
 fn save_session_map(session: &mut SessionPane) {
-    let (config_dir, profile) = &session.rules;
-    let Some(profile) = profile else { return };
-    match config::save_map(config_dir, profile, &session.map) {
+    let (config_dir, _) = &session.rules;
+    // A `--host` session saves too now: it has no profile, but the world it
+    // is in has a name all the same (§16).
+    let key = session.map_key.clone();
+    if key.is_empty() {
+        return;
+    }
+    match config::save_map(config_dir, &key, &session.map) {
         Ok(()) => {
             // Working again, so a later failure is news once more.
             session.map_save_failed = false;
         }
         Err(err) => {
-            tracing::warn!("could not save map for {profile}: {err:#}");
+            tracing::warn!("could not save map for {key}: {err:#}");
             // Said once, not every tick. Saving runs every 30s, and a
             // problem that persists would otherwise fill the scrollback
             // with the same line for the rest of the session — which is
@@ -3056,6 +3078,10 @@ pub(crate) mod test_support {
                 corpse: None,
                 map_dirty: false,
                 map_save_failed: false,
+                // Empty on purpose: a test pane saves nothing unless it
+                // says which world it belongs to, so tests that never
+                // mention maps do not write files or report failing to.
+                map_key: String::new(),
                 walk: None,
             },
             rx,
@@ -4893,20 +4919,22 @@ mod tests {
 
     /// A `--host` session has no profile to key a map on, the same reason
     /// it gets no `/config` and no disk log. It must leave nothing behind
-    /// rather than inventing a name to save the world under.
+    /// A `--host` session used to get no map at all, having no profile to
+    /// key one by. Keying by world instead means it has an answer — it
+    /// knows its host and port — so exploring without a profile is no
+    /// longer exploring into nothing.
     #[test]
-    fn an_ad_hoc_session_saves_no_map() {
+    fn an_ad_hoc_session_now_keeps_its_map() {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["adhoc"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), None);
+        state.sessions[0].map_key = config::map_key(None, "mud.example.org", 4000);
         apply_session_event(&mut state, 0, room(1, None));
 
         save_session_map(&mut state.sessions[0]);
 
-        assert!(
-            !dir.path().join("maps").exists(),
-            "a session with no profile must not invent one to save under"
-        );
+        let reloaded = config::load_map(dir.path(), "mud.example.org");
+        assert!(reloaded.rooms.contains_key(&crate::map::RoomId(1)));
     }
 
     /// The other half: a profile session's exploration outlives it, which
@@ -4916,6 +4944,7 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
         apply_session_event(&mut state, 0, room(2, Some("n")));
 
@@ -5339,6 +5368,7 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
         apply_session_event(&mut state, 0, room(2, Some("n")));
 
@@ -5361,6 +5391,7 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
         save_dirty_maps(&mut state.sessions);
 
@@ -5381,10 +5412,11 @@ mod tests {
     /// A `--host` session has no profile to save under, and must not
     /// invent one just because the timer fired.
     #[test]
-    fn a_periodic_save_skips_a_session_with_no_profile() {
+    fn a_periodic_save_skips_a_session_with_no_world() {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["adhoc"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), None);
+        state.sessions[0].map_key = String::new();
         apply_session_event(&mut state, 0, room(1, None));
 
         save_dirty_maps(&mut state.sessions);
@@ -5510,6 +5542,7 @@ mod tests {
         std::fs::write(maps.join("tank.json"), b"{ not json").unwrap();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
 
         save_dirty_maps(&mut state.sessions);
@@ -5531,6 +5564,7 @@ mod tests {
         std::fs::write(maps.join("tank.json"), b"{ not json").unwrap();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
 
         for room_id in 1..=4 {
             apply_session_event(&mut state, 0, room(room_id, None));
@@ -5553,6 +5587,7 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
         save_dirty_maps(&mut state.sessions);
 

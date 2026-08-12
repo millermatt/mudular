@@ -457,8 +457,23 @@ Bakers Shop (#40602), New: Ofcol Village [shop]
 Exits: west to Outside Ofcol
 ```
 
-Marks are saved with the map, so they're still there next session, and
-another character exploring the same profile won't rub them out.
+Marks are saved with the map, and the map belongs to the **MUD**, not the
+character — so everyone you play on that server shares one map and each
+other's marks. Maps you saved before this change are folded in the first
+time you connect; the old files are renamed to `.migrated` rather than
+deleted.
+
+A MUD that answers on several ports — plain telnet and TLS, usually — is
+one place and shares one map, so there is nothing to configure for it.
+
+If you run *different* MUDs on one address, which mostly means running
+two builds of a server you are working on, say which is which or they
+will map on top of each other:
+
+```yaml
+world: stable      # in one profile
+world: next        # in the other
+```
 
 ### Corpse runs
 

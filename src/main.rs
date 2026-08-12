@@ -151,6 +151,9 @@ async fn main() -> Result<()> {
         // No profile, so only the global layer applies.
         let layers = config::load_rules(&dir, None, &channels)?;
         targets.push(app::ConnectTarget {
+            // An ad-hoc `--host` session has no profile to name a world,
+            // so its host and port are the whole answer.
+            world: None,
             name: session_name(host, &mut names),
             host: host.clone(),
             port: cli.port,
