@@ -15,6 +15,10 @@
 //! deliberately out of scope: it is MUD-specific guesswork, where this is
 //! structured data the server already vouches for.
 
+mod scene;
+
+pub use scene::{RoomRole, Scene};
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};

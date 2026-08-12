@@ -22,6 +22,9 @@ use crate::config::Keybinds;
 use crate::scrollback::{Origin, RetainedLine};
 
 pub mod config_editor;
+mod map_render;
+
+use map_render::MapRenderer as _;
 
 /// Default width of the docked channel column, and the smallest main area
 /// worth keeping beside it — below that the channels are simply not drawn.
@@ -474,18 +477,12 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     render_scrollback(frame, area, lines, title, focused, session.color, scroll);
 }
 
-/// Room glyphs are three cells wide and connectors take one, so a room
-/// occupies four columns and two rows of the drawing grid.
-const MAP_CELL_W: u16 = 4;
-const MAP_CELL_H: u16 = 2;
-
-/// Draws the area around the character as a grid, from `Map::layout_area`.
+/// Draws the area around the character, from the scene the map builds.
 ///
-/// Only a *view* — every fact it shows comes from the graph and the
-/// coordinates, and the prose form of the same knowledge lives in
-/// `Map::describe` (§16). Rooms that lost a coordinate collision, or sit in
-/// another area, are simply not here; they stay in the graph and stay
-/// walkable, which is why this pane is never the thing `/goto` consults.
+/// Only a *view*: every fact shown comes from `Map::scene`, and the prose
+/// form of the same knowledge is `Map::describe` (§16). This function owns
+/// the pane — its border, its title, and what to say when there is nothing
+/// to draw — and hands the picture itself to a [`MapRenderer`].
 fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
     let session = state.bound();
     let title = match session.and_then(|session| session.current_room) {
@@ -510,122 +507,8 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     };
 
-    let coords = session.map.layout_area(current);
-    let mut grid = vec![vec![' '; inner.width as usize]; inner.height as usize];
-    // The current room sits in the middle and everything else is drawn
-    // relative to it, so walking scrolls the world past a fixed marker
-    // rather than moving a dot toward an edge it then falls off.
-    let origin_col = inner.width as i32 / 2 - 1;
-    let origin_row = inner.height as i32 / 2;
-
-    let plot = |col: i32, row: i32, ch: char, grid: &mut Vec<Vec<char>>| {
-        if col < 0 || row < 0 || col >= inner.width as i32 || row >= inner.height as i32 {
-            return;
-        }
-        grid[row as usize][col as usize] = ch;
-    };
-
-    let mut current_cell = None;
-    for (id, (x, y)) in &coords {
-        let col = origin_col + x * MAP_CELL_W as i32;
-        let row = origin_row + y * MAP_CELL_H as i32;
-        let Some(room) = session.map.rooms.get(id) else {
-            continue;
-        };
-
-        // The marker says what the flat grid cannot: this room also leads
-        // somewhere off it.
-        let up = room.exits.contains_key("u");
-        let down = room.exits.contains_key("d");
-        let marker = match (up, down) {
-            (true, true) => 'b',
-            (true, false) => 'u',
-            (false, true) => 'd',
-            (false, false) => '·',
-        };
-        plot(col, row, '[', &mut grid);
-        plot(col + 1, row, marker, &mut grid);
-        plot(col + 2, row, ']', &mut grid);
-        if *id == current {
-            current_cell = Some((col, row));
-        }
-
-        // Connectors are drawn from each room toward its known neighbours,
-        // and only where both ends are on the grid — a corridor drawn to a
-        // room that is not shown reads as an exit into the border.
-        for (direction, dest) in &room.exits {
-            let Some(dest) = dest else { continue };
-            let Some((nx, ny)) = coords.get(dest) else {
-                continue;
-            };
-            // Which way the corridor runs comes from the exit's own
-            // direction, never from where the two rooms happened to land.
-            // `layout_area` places each room once, at whatever coordinate
-            // the first path to it produced, so a *second* exit into an
-            // already-placed room can have any delta at all — MUD geography
-            // folds back on itself constantly. Reading the delta as if it
-            // were the direction turns an ordinary `s` exit into a diagonal
-            // corridor the MUD does not have, which is the shape of every
-            // stray diagonal on a six-direction server.
-            let Some(vector) = crate::map::direction_vector(direction) else {
-                // No 2D meaning (`u`/`d`/`in`/`out`): marked on the room
-                // itself, above, rather than drawn as a corridor.
-                continue;
-            };
-            if (nx - x, ny - y) != vector {
-                // The layout could not place these two rooms the way this
-                // exit says they lie. §16's rule decides it: a wrong edge is
-                // a lie the map keeps telling, where a missing one is only a
-                // gap. The exit stays in the graph and `/goto` still walks
-                // it; it simply is not drawn.
-                continue;
-            }
-            match vector {
-                (1, 0) => plot(col + 3, row, '-', &mut grid),
-                (-1, 0) => plot(col - 1, row, '-', &mut grid),
-                (0, 1) => plot(col + 1, row + 1, '|', &mut grid),
-                (0, -1) => plot(col + 1, row - 1, '|', &mut grid),
-                (1, 1) => plot(col + 3, row + 1, '\\', &mut grid),
-                (-1, -1) => plot(col - 1, row - 1, '\\', &mut grid),
-                (1, -1) => plot(col + 3, row - 1, '/', &mut grid),
-                (-1, 1) => plot(col - 1, row + 1, '/', &mut grid),
-                // `direction_vector` returns only the eight above.
-                _ => {}
-            }
-        }
-    }
-
-    let lines: Vec<Line> = grid
-        .into_iter()
-        .enumerate()
-        .map(|(row, cells)| {
-            match current_cell {
-                // Highlight rather than a distinct glyph: the marker slot
-                // is already saying whether there are vertical exits, and
-                // it cannot say two things at once.
-                //
-                // Split on the *char* vector, never the assembled string:
-                // these are grid columns, and `·` is two bytes, so a room
-                // drawn to the left of this one puts every byte index out
-                // of step with the column it is meant to name.
-                Some((col, marked_row)) if marked_row == row as i32 => {
-                    let start = (col.max(0) as usize).min(cells.len());
-                    let end = (start + 3).min(cells.len());
-                    let take = |range: &[char]| range.iter().collect::<String>();
-                    Line::from(vec![
-                        Span::raw(take(&cells[..start])),
-                        Span::styled(
-                            take(&cells[start..end]),
-                            Style::default().add_modifier(Modifier::REVERSED),
-                        ),
-                        Span::raw(take(&cells[end..])),
-                    ])
-                }
-                _ => Line::from(cells.into_iter().collect::<String>()),
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    let scene = session.map.scene(current, session.corpse);
+    map_render::CharRenderer.draw(frame, inner, &scene);
 }
 
 fn draw_channel(frame: &mut Frame, area: Rect, channel: &ChannelPane, focused: bool) {
@@ -920,6 +803,16 @@ mod tests {
             .join("\n")
     }
 
+    /// How many cells the map painted as room ground. Rooms are a
+    /// background fill rather than a glyph, so counting ink means counting
+    /// backgrounds, not characters.
+    fn filled_cells(buffer: &ratatui::buffer::Buffer) -> usize {
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buffer.cell((*x, *y)).unwrap().bg != ratatui::style::Color::Reset)
+            .count()
+    }
+
     fn row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
         let width = buffer.area.width;
         (0..width)
@@ -993,7 +886,7 @@ mod tests {
         let text = rows(&buffer);
 
         assert!(
-            text.contains("[·]-[·]"),
+            text.contains('─'),
             "an honoured east exit should still draw its corridor:\n{text}"
         );
     }
@@ -1672,16 +1565,25 @@ mod tests {
             "the column is titled with the area: {screen}"
         );
         assert!(
-            screen.contains("[d]"),
+            screen.contains('@'),
+            "the current room carries its own mark: {screen}"
+        );
+        assert!(
+            screen.contains('v'),
             "the current room marks its vertical exit: {screen}"
         );
         assert!(
-            screen.contains("[·]-") || screen.contains("-[·]"),
+            screen.contains('─'),
             "the east neighbour is connected: {screen}"
         );
         assert!(
-            (0..drawn.area.height).any(|y| row(&drawn, y).contains('|')),
+            screen.contains('│'),
             "the north neighbour is connected: {screen}"
+        );
+        assert_eq!(
+            filled_cells(&drawn),
+            9,
+            "three rooms, three cells each, drawn as filled ground: {screen}"
         );
 
         // With the column off, none of it is on screen — the description
@@ -1722,8 +1624,14 @@ mod tests {
         state.show_map = true;
         state.map_width = MAP_WIDTH;
 
-        let screen = rows(&render_sized(&state, 80, 20));
-        assert!(screen.contains("[·]-[·]"), "both rooms drawn: {screen}");
+        let drawn = render_sized(&state, 80, 20);
+        let screen = rows(&drawn);
+        assert!(screen.contains('@'), "the current room is drawn: {screen}");
+        assert_eq!(
+            filled_cells(&drawn),
+            6,
+            "and so is the one to its west: {screen}"
+        );
     }
 
     /// Before the server has placed the character there is nothing to draw,
