@@ -134,9 +134,19 @@ impl MapRenderer for CharRenderer {
                 (false, true) => 'v',
                 (false, false) => ' ',
             };
+            // The third slot is the one that was ground, so nothing has to
+            // give way for this: the tick and the mark both keep their
+            // cell, and a room with nothing left out still draws blank
+            // there. `·` rather than a louder glyph because the dot is
+            // saying "there is more here than fits", not "look at me" — it
+            // must never outshout the `@` or an `X` a cell away. It is also
+            // in every monospace font measured, unlike the dashed and
+            // diagonal box-drawing sets, which Ubuntu Mono and Liberation
+            // Mono are both missing.
+            let elided = if room.hidden_exits { '·' } else { ' ' };
             put(col, row, tick, style);
             put(col + 1, row, letter.unwrap_or(' '), style);
-            put(col + 2, row, ' ', style);
+            put(col + 2, row, elided, style);
         }
 
         let lines: Vec<Line> = cells
@@ -156,5 +166,68 @@ impl MapRenderer for CharRenderer {
             .collect();
 
         frame.render_widget(Paragraph::new(lines), area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::map::{Map, RoomId, RoomInfo};
+
+    /// Scenes are built through the map rather than by hand: `PlacedRoom`
+    /// is the map's own vocabulary and the renderer only ever reads it.
+    fn scene_of(edges: &[(i64, &str, i64)]) -> Scene {
+        let mut map = Map::default();
+        for id in [1, 2, 4] {
+            map.observe(&RoomInfo {
+                id: RoomId(id),
+                name: None,
+                area: Some("Test".to_string()),
+                exits: BTreeMap::new(),
+            });
+        }
+        for (from, dir, to) in edges {
+            map.connect(RoomId(*from), dir, RoomId(*to));
+        }
+        map.scene(RoomId(1), None)
+    }
+
+    fn render(scene: &Scene) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(11, 5)).unwrap();
+        terminal
+            .draw(|frame| CharRenderer.draw(frame, frame.area(), scene))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|col| buffer[(col, row)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The picture, not just the scene, has to distinguish "known but not
+    /// shown" from "nothing there" — the same fixture as
+    /// `map::scene::a_room_whose_exit_could_not_be_drawn_says_so`, drawn.
+    #[test]
+    fn a_room_with_undrawable_exits_is_visibly_different_from_one_without() {
+        let drawn = render(&scene_of(&[(1, "e", 2)]));
+        let gapped = render(&scene_of(&[(1, "e", 2), (1, "n", 4), (2, "s", 4)]));
+
+        assert!(
+            !drawn.contains('·'),
+            "a map with nothing left out is left clean:\n{drawn}"
+        );
+        assert!(
+            gapped.contains('·'),
+            "and #2's undrawable `s` puts a dot on #2:\n{gapped}"
+        );
     }
 }
