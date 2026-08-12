@@ -47,6 +47,15 @@ pub struct PlacedRoom {
     /// — `S` for a shop reads where a pictogram would be a smudge. The
     /// whole note is in `Map::describe`.
     pub mark: Option<char>,
+    /// Whether this room has an exit the picture could not draw — one the
+    /// layout could not honour, or one leading to a room that lost its
+    /// cell. Filtering those out of `links` is right (§16: a wrong edge is
+    /// a lie the map keeps telling, a missing one only a gap) but it is
+    /// only honest if the gap is visible *as* a gap; without this a room
+    /// whose exit could not be placed reads as a room with no exit that
+    /// way. Deliberately a bare flag: which exits, and where they go, is
+    /// what `Map::describe` is for.
+    pub hidden_exits: bool,
 }
 
 /// A corridor between two placed rooms, one grid step long.
@@ -86,6 +95,41 @@ impl Map {
             let Some(room) = self.rooms.get(id) else {
                 continue;
             };
+            let mut hidden_exits = false;
+            for (direction, dest) in &room.exits {
+                // An exit with no destination is unexplored, not hidden:
+                // the map has never been through it, so there is nothing it
+                // knows and is failing to show.
+                let Some(dest) = dest else { continue };
+                let drawn = match (coords.get(dest), super::direction_vector(direction)) {
+                    // The layout has to have honoured this exit's geometry,
+                    // or there is no corridor to draw — only a gap. See
+                    // `a_cardinal_exit_can_still_land_two_rooms_diagonally_apart`.
+                    (Some(there), Some(step)) if (there.0 - at.0, there.1 - at.1) == step => {
+                        links.push(Link { from: *at, step });
+                        true
+                    }
+                    // Not every undrawn exit is *unshown*. `u` and `d` draw
+                    // no corridor and never needed to: the room's own tick
+                    // says they are there (§16). An exit out of the area
+                    // leaves the picture by design, `layout_area` being
+                    // area-scoped — that is the frame, not a hole in it.
+                    // And a destination the map has only a vnum for has
+                    // never been walked into, which is the unexplored case
+                    // wearing a number. Counting any of them would mark two
+                    // rooms in three on a real saved map and bury the fifty
+                    // that are genuinely missing.
+                    _ => {
+                        matches!(direction.as_str(), "u" | "d")
+                            || self
+                                .rooms
+                                .get(dest)
+                                .is_none_or(|elsewhere| elsewhere.area != room.area)
+                    }
+                };
+                hidden_exits |= !drawn;
+            }
+
             rooms.push(PlacedRoom {
                 id: *id,
                 at: *at,
@@ -101,23 +145,8 @@ impl Map {
                     .as_deref()
                     .and_then(|mark| mark.chars().next())
                     .map(|first| first.to_ascii_uppercase()),
+                hidden_exits,
             });
-
-            for (direction, dest) in &room.exits {
-                let Some(dest) = dest else { continue };
-                let Some(there) = coords.get(dest) else {
-                    continue;
-                };
-                let Some(step) = super::direction_vector(direction) else {
-                    continue;
-                };
-                // The layout has to have honoured this exit's geometry, or
-                // there is no corridor to draw — only a gap. See
-                // `a_cardinal_exit_can_still_land_two_rooms_diagonally_apart`.
-                if (there.0 - at.0, there.1 - at.1) == step {
-                    links.push(Link { from: *at, step });
-                }
-            }
         }
 
         // Coordinates come out of a `HashMap`, so fix an order: two runs of
@@ -205,6 +234,134 @@ mod tests {
             }),
             "and the unhonourable `s` is not drawn pointing somewhere else either"
         );
+    }
+
+    /// The other half of that filtering. Dropping an unhonourable exit is
+    /// only honest if the picture shows a gap *as* a gap — otherwise a room
+    /// whose exit could not be placed reads exactly like a room with no
+    /// exit that way, which is a quieter version of the same lie.
+    #[test]
+    fn a_room_whose_exit_could_not_be_drawn_says_so() {
+        let map = map_of(&[1, 2, 4], &[(1, "e", 2), (1, "n", 4), (2, "s", 4)]);
+
+        let scene = map.scene(RoomId(1), None);
+
+        let room = |id: i64| {
+            scene
+                .rooms
+                .iter()
+                .find(|r| r.id == RoomId(id))
+                .unwrap()
+                .clone()
+        };
+        assert!(
+            room(2).hidden_exits,
+            "#2's `s` is known and undrawable, so the room has to admit it"
+        );
+        assert!(
+            !room(1).hidden_exits,
+            "and a room whose every exit is drawn is left clean"
+        );
+    }
+
+    /// The collision case: the exit is fine, the room it leads to is the
+    /// one missing from the picture. §16's own example — `n` then `s` puts
+    /// room 3 back on room 1's cell, so 3 loses and drops out.
+    #[test]
+    fn an_exit_into_a_room_that_lost_its_cell_is_marked_too() {
+        let map = map_of(&[1, 2, 3], &[(1, "n", 2), (2, "s", 3)]);
+
+        let scene = map.scene(RoomId(1), None);
+
+        let two = scene.rooms.iter().find(|r| r.id == RoomId(2)).unwrap();
+        assert!(
+            !scene.rooms.iter().any(|r| r.id == RoomId(3)),
+            "#3 lost the cell, as this test needs it to: {:?}",
+            scene.rooms
+        );
+        assert!(two.hidden_exits, "so #2's `s` leads somewhere undrawn");
+    }
+
+    /// `u` and `d` are undrawable as corridors by design, but they are not
+    /// *unshown* — the room's own tick already carries them, and marking
+    /// them again would put the flag on half the rooms on a MUD with
+    /// stairs, which is how a signal stops meaning anything.
+    #[test]
+    fn a_vertical_exit_is_not_a_hidden_one() {
+        let map = map_of(&[1, 2], &[(1, "u", 2)]);
+
+        let scene = map.scene(RoomId(1), None);
+
+        let here = scene.rooms.iter().find(|r| r.id == RoomId(1)).unwrap();
+        assert!(here.up);
+        assert!(!here.hidden_exits);
+    }
+
+    /// The edge of the area is the frame of the picture, not a hole in it:
+    /// `layout_area` is area-scoped on purpose (§16), so an exit leading out
+    /// of the area is behaving exactly as designed. Measured on a saved
+    /// 56-room map, counting them marked 612 room-draws out of 1501 where
+    /// the real gaps are 51 — a mark on two rooms in five says nothing.
+    #[test]
+    fn an_exit_out_of_the_area_is_not_a_hidden_one() {
+        let mut map = Map::default();
+        for (id, area) in [(1, "Test"), (2, "Elsewhere")] {
+            map.observe(&RoomInfo {
+                id: RoomId(id),
+                name: None,
+                area: Some(area.to_string()),
+                exits: BTreeMap::new(),
+            });
+        }
+        map.connect(RoomId(1), "e", RoomId(2));
+
+        let scene = map.scene(RoomId(1), None);
+
+        assert_eq!(scene.rooms.len(), 1, "the other area is not drawn");
+        assert!(!scene.rooms[0].hidden_exits);
+    }
+
+    /// A server that names an exit's destination vnum names rooms nobody
+    /// has walked into yet, so the map holds the number and nothing else —
+    /// no area, no exits, no place to put it. That is the unexplored case
+    /// wearing a vnum, not a room the picture failed to draw. Measured on
+    /// the same saved map, treating it as a gap marked 526 room-draws out
+    /// of 1501 instead of 51.
+    #[test]
+    fn an_exit_to_a_room_never_observed_is_not_a_hidden_one() {
+        let mut map = Map::default();
+        let mut exits = BTreeMap::new();
+        exits.insert("e".to_string(), Some(RoomId(2)));
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: None,
+            area: Some("Test".to_string()),
+            exits,
+        });
+
+        let scene = map.scene(RoomId(1), None);
+
+        assert!(!scene.rooms[0].hidden_exits);
+    }
+
+    /// An exit the map has never walked has no destination to hide. The
+    /// flag says "known and not shown", so an unexplored exit — which
+    /// `describe` reports in prose — must not raise it.
+    #[test]
+    fn an_unexplored_exit_is_not_a_hidden_one() {
+        let mut map = Map::default();
+        let mut exits = BTreeMap::new();
+        exits.insert("e".to_string(), None);
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: None,
+            area: Some("Test".to_string()),
+            exits,
+        });
+
+        let scene = map.scene(RoomId(1), None);
+
+        assert!(!scene.rooms[0].hidden_exits);
     }
 
     #[test]
