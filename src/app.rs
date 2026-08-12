@@ -2174,6 +2174,17 @@ fn handle_key(
                     apply_mark_menu(state);
                 }
             }
+            // Any other character starts a label of its own, keeping the
+            // one just typed. Someone wanting a word the list has not got
+            // types the word — which is what happened, and it used to be
+            // swallowed silently, leaving `Enter` to apply whatever row was
+            // highlighted. Typing `mail` marked the room `shop`.
+            //
+            // Digits are the row shortcuts above, so a label starting with
+            // one goes through "something else…" first. No label worth
+            // having starts with a digit, and losing the shortcuts would
+            // cost more than that.
+            KeyCode::Char(ch) => menu.typing = Some(ch.to_string()),
             _ => {}
         }
         return true;
@@ -5524,6 +5535,73 @@ mod tests {
         let saved = config::load_ui_state(dir.path()).expect("written on the spot");
         assert_eq!(saved.show_map, state.show_map);
         assert!(saved.show_map, "F7 turned the map column on");
+    }
+
+    /// Reported from play: marking a room `mail` put an `S` on the map.
+    /// Typing into the open list was swallowed silently, so `Enter` applied
+    /// whatever row was highlighted — the first one, `shop`. Not a wrong
+    /// letter but a wrong label.
+    #[tokio::test]
+    async fn typing_a_word_into_the_chooser_writes_that_word() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/mark").await;
+        let keys = crate::config::Keybinds::default();
+
+        for ch in "mail".chars() {
+            handle_key(
+                &mut state,
+                &keys,
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+                100,
+                &[],
+            );
+        }
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("mail")
+        );
+    }
+
+    /// The digit shortcuts have to survive it — they are the fast path the
+    /// list exists for.
+    #[tokio::test]
+    async fn a_digit_still_takes_its_row_rather_than_starting_a_label() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/mark").await;
+        let keys = crate::config::Keybinds::default();
+
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Char('2'),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert!(state.mark_menu.is_none(), "taking a row closes the chooser");
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some(MARK_SUGGESTIONS[1])
+        );
     }
 
     // ---- the map cursor (§16) ----

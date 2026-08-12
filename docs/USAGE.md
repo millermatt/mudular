@@ -402,7 +402,9 @@ places yourself:
 `/mark` on its own opens a short chooser instead — the labels rooms
 usually deserve, a way to type one the list hasn't got, and (if the room
 already has a label) a way to take it off. Arrows move, `Enter` takes,
-a digit takes that row outright, `Esc` closes without changing anything.
+a digit takes that row outright, and just typing a word starts a label of
+your own with it — so `mail`, `Enter` marks the room `mail` whether or not
+the list offered it. `Esc` closes without changing anything.
 
 A trigger can write the label too, so a place recognises itself the
 second time you walk in:
