@@ -1194,6 +1194,9 @@ fn profile_layer(name: &str, path: &Path, profile: &Profile) -> Result<RuleModul
         aliases: profile.aliases.clone(),
         triggers: profile.triggers.clone(),
         timers: profile.timers.clone(),
+        // A profile asks for GMCP packages through the modules it loads
+        // (§6.3), so its own layer has none of its own to contribute.
+        gmcp_packages: Vec::new(),
         script_sources: load_scripts(path, &profile.scripts)?,
         scripts: profile.scripts.clone(),
     })
@@ -1969,6 +1972,37 @@ triggers:
         let err = load_module(&dir.join("modules/combat.yaml")).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("passwd.lua"), "{message}");
+    }
+
+    /// The advertised package list is layered config like any other (§6.3,
+    /// §7.3): the install-wide default lives in `global.yaml`, and a module
+    /// only one character loads adds the packages that character needs.
+    #[test]
+    fn global_and_module_layers_both_declare_gmcp_packages() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::create_dir_all(dir.join("modules")).unwrap();
+        std::fs::write(
+            dir.join("global.yaml"),
+            "name: global\ngmcp_packages: ['Comm.Channel 1']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("modules/party.yaml"),
+            "name: party\ngmcp_packages: ['Group 1']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles/tank.yaml"),
+            "name: tank\nhost: h\nport: 1\nmodules: [party]\n",
+        )
+        .unwrap();
+
+        let layers = load_rules(dir, Some("tank"), &[]).expect("rules load");
+        let engine = crate::engine::Engine::compile(&layers).expect("rules compile");
+
+        assert_eq!(engine.gmcp_packages(), ["Comm.Channel 1", "Group 1"]);
     }
 
     /// A missing script must name itself: a module that half-loaded is

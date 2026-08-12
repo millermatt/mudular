@@ -265,10 +265,18 @@ assembler (§8) uses prompt boundaries to distinguish "prompt" from
 - **GMCP (option 201):** subneg payload is `Package.SubPackage <json>`.
   Codec splits package path and parses JSON lazily (`serde_json::Value`).
   Client sends `Core.Hello {"client":"Mudular","version":…}` and
-  `Core.Supports.Set` after negotiation. The supported list is currently
-  hardcoded to `["Char 1", "Room 1"]` (`gmcp::supports_message`), with no
-  way for a profile, module, or script to add a package (tracked as
-  [#25](https://github.com/millermatt/mudular/issues/25)). Events surface to the engine
+  `Core.Supports.Set` after negotiation. The advertised list is
+  `["Char 1", "Room 1"]` — what the mapper and vitals need — plus whatever
+  the merged config layers declare in `gmcp_packages:` (§7.2), which is how
+  a character asks for `Group`, `Comm.Channel` or `Client.Media`. Declared
+  entries are *added* to the defaults, since a shared module naming only
+  its own package must not unsubscribe the vitals every other rule reads;
+  an entry naming a package already listed replaces that one, because two
+  versions of one package in a single `Set` leaves the choice to the
+  server. The list travels on the compiled `Engine` (`Engine::
+  gmcp_packages`): the advertisement goes out the instant the server offers
+  the option, and the engine is the only thing the session task already
+  holds by then. Events surface to the engine
   (triggers can match on GMCP packages, M7) and to UI consumers (vitals,
   room info) via `SessionEvent::Gmcp`, which also feeds the raw inspector
   view (F2, §14 M6).
@@ -364,6 +372,7 @@ One module = one YAML file, shareable between profiles:
 # modules/uw-combat.yaml
 name: uw-combat
 description: Combat reactions for Underworld
+gmcp_packages: ["Group 1"]        # extra GMCP packages to ask for, §6.3
 variables:
   heal_at: "40"
 aliases:
@@ -390,7 +399,12 @@ Effective rule set per session = merge of:
 
 Later layers **shadow** earlier ones by rule `id` (explicit) or by exact
 `pattern` (implicit); `enabled: false` in a later layer disables an
-inherited rule without redefining it. Each session gets its own engine
+inherited rule without redefining it. `gmcp_packages:` (§6.3) is the one
+setting that **accumulates** instead: every layer's entries are appended in
+layer order, because a module's triggers are dead weight unless the package
+they match on was actually asked for. A character that needs a package no
+other one does declares it in a module of its own — the layer-3 profile
+file carries rules, not the ask. Each session gets its own engine
 instance compiled from this merge at connect time; `/reload` recompiles
 (M5) without reconnecting.
 
