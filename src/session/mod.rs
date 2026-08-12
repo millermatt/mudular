@@ -1064,9 +1064,14 @@ fn forget_exits_on_room_change(engine: &mut Engine, pairs: &[(String, String)]) 
     // And a message that names a different room replaces them even when it
     // brings no exits of its own, so arriving somewhere with no exits at all
     // does not inherit the last room's.
-    let Some(arriving) = crate::map::vnum_in_pairs(pairs) else {
+    let Some((arriving_key, arriving)) = crate::map::vnum_in_pairs(pairs) else {
         return;
     };
+    // Whichever protocol just named the room is the one describing it now.
+    // Any other spelling of the room number in the store is an older
+    // report, and leaving it there let a single stale GMCP `Room.Info.num`
+    // outrank every MSDP move for the rest of the session.
+    engine.forget_stale_room_numbers(arriving_key);
     if crate::map::vnum_in_store(engine.server_data()) != Some(arriving) {
         engine.forget_room_exits();
     }
@@ -1632,6 +1637,31 @@ mod tests {
             None,
             "the room left behind must not keep lending its exits: {:?}",
             room.exits
+        );
+    }
+
+    /// An adversarial review found a whole class of server on which the map
+    /// simply froze: one that names the room over GMCP once, then reports
+    /// every move over MSDP. `from_server_data` prefers GMCP's spelling
+    /// unconditionally, so the stale value won forever and the character
+    /// never appeared to move.
+    #[test]
+    fn a_stale_gmcp_room_number_does_not_outrank_the_move_just_reported() {
+        let mut engine = rules("name: t\n");
+        engine.update_server_data_from_gmcp("Room.Info.num", "40600".to_string());
+
+        // From here on the server reports movement over MSDP only.
+        let arriving = pairs(&[("ROOM.VNUM", "40601")]);
+        forget_exits_on_room_change(&mut engine, &arriving);
+        for (key, value) in arriving {
+            engine.update_server_data_from_msdp(&key, value);
+        }
+
+        let room = crate::map::RoomInfo::from_server_data(engine.server_data()).expect("a room");
+        assert_eq!(
+            room.id,
+            crate::map::RoomId(40601),
+            "the map must follow the move it was actually told about"
         );
     }
 

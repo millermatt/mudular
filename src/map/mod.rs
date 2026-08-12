@@ -122,22 +122,47 @@ pub(crate) fn is_exit_key(key: &str) -> bool {
 /// Used to notice that the character has moved *before* the new room's data
 /// is merged in, which is the only moment the previous room's exits can
 /// still be told apart from this one's.
-pub(crate) fn vnum_in_pairs(pairs: &[(String, String)]) -> Option<&str> {
+pub(crate) fn vnum_in_pairs(pairs: &[(String, String)]) -> Option<(&str, &str)> {
     pairs.iter().find_map(|(key, value)| {
         VNUM_KEYS
             .iter()
             .any(|known| key.eq_ignore_ascii_case(known))
-            .then_some(value.as_str())
+            .then_some((key.as_str(), value.as_str()))
     })
+}
+
+/// Whether a key is one of the room-number spellings, but not `fresh`.
+///
+/// The protocols each have their own name for the room id, and
+/// `from_server_data` prefers GMCP's unconditionally. That is right when
+/// both are live and says nothing about *age*: a server that wrote
+/// `Room.Info.num` once and then reported every move over MSDP left the
+/// map reading the frozen GMCP value forever, so the character never
+/// appeared to move at all.
+pub(crate) fn is_stale_vnum_key(key: &str, fresh: &str) -> bool {
+    !key.eq_ignore_ascii_case(fresh)
+        && VNUM_KEYS
+            .iter()
+            .any(|known| key.eq_ignore_ascii_case(known))
+}
+
+/// One case-insensitive lookup in a case-*sensitive* store.
+///
+/// Several stored keys can match one name — a server spelling
+/// `room.info.num` where another sent `Room.Info.num` — and picking with
+/// `find` let `HashMap` iteration order choose between them, so the same
+/// store answered differently from one run to the next. The smallest key
+/// wins instead: arbitrary, but the same arbitrary every time.
+fn lookup_ci<'a>(data: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    data.iter()
+        .filter(|(stored, _)| stored.eq_ignore_ascii_case(key))
+        .min_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, value)| value.as_str())
 }
 
 /// The room id the store currently describes.
 pub(crate) fn vnum_in_store(data: &HashMap<String, String>) -> Option<&str> {
-    VNUM_KEYS.iter().find_map(|known| {
-        data.iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(known))
-            .map(|(_, value)| value.as_str())
-    })
+    VNUM_KEYS.iter().find_map(|known| lookup_ci(data, known))
 }
 
 /// One room-data update, as extracted from the server-data store.
@@ -164,11 +189,7 @@ impl RoomInfo {
     /// that precedence actually lives for room data.
     pub fn from_server_data(data: &HashMap<String, String>) -> Option<Self> {
         fn find_ci<'a>(data: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
-            keys.iter().find_map(|key| {
-                data.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                    .map(|(_, v)| v.as_str())
-            })
+            keys.iter().find_map(|key| lookup_ci(data, key))
         }
 
         // Zero is not a room. The DikuMUD family reserves the vnum, and
@@ -621,6 +642,27 @@ mod tests {
             ("Room.Info.exits.n".to_string(), "12346".to_string()),
             ("Room.Info.exits.e".to_string(), "12350".to_string()),
         ])
+    }
+
+    /// A case-insensitive lookup over a case-sensitive store can match more
+    /// than one key. Picking with `find` let `HashMap` order choose between
+    /// them, so the same store answered differently between runs.
+    #[test]
+    fn two_spellings_of_one_key_resolve_the_same_way_every_time() {
+        let mut answers = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let data = HashMap::from([
+                ("Room.Info.num".to_string(), "1".to_string()),
+                ("room.info.num".to_string(), "2".to_string()),
+                ("Room.Info.name".to_string(), "Somewhere".to_string()),
+            ]);
+            answers.insert(RoomInfo::from_server_data(&data).expect("a room").id);
+        }
+        assert_eq!(
+            answers.len(),
+            1,
+            "the same store answered differently across runs: {answers:?}"
+        );
     }
 
     #[test]

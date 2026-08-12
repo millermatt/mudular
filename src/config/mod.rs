@@ -78,9 +78,33 @@ pub fn load_map(dir: &Path, profile: &str) -> crate::map::Map {
 /// rest of this directory: unlike everything else in the config dir, this
 /// file is only ever machine-written and machine-read, never hand-edited.
 pub fn save_map(dir: &Path, profile: &str, map: &crate::map::Map) -> Result<()> {
-    let mut on_disk = load_map(dir, profile);
-    on_disk.merge(map.clone());
     let path = map_path(dir, profile);
+    // Deliberately *not* `load_map`: that one answers "what can this
+    // session start with", where anything unreadable is fairly an empty
+    // map, because a corrupt file must never stop someone playing. This
+    // answers a different question — "what am I about to merge into and
+    // overwrite" — and there the same leniency is data loss. A transient
+    // read error or one bad parse would turn "I could not read your map"
+    // into "your map is now the few rooms this session has seen", and
+    // saving every 30s makes that window continuous rather than rare.
+    // Deliberately *not* `load_map`: that one answers "what can this
+    // session start with", where anything unreadable is fairly an empty
+    // map, because a corrupt file must never stop someone playing. This
+    // answers a different question — "what am I about to merge into and
+    // overwrite" — and there the same leniency is data loss. A transient
+    // read error or one bad parse would turn "I could not read your map"
+    // into "your map is now the few rooms this session has seen", and
+    // saving every 30s makes that window continuous rather than rare.
+    let mut on_disk = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("parsing the map already at {}", path.display()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => crate::map::Map::default(),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading the map already at {}", path.display()));
+        }
+    };
+    on_disk.merge(map.clone());
     let json = serde_json::to_string_pretty(&on_disk).context("serializing the map")?;
     atomic_write(&path, json.as_bytes()).context("writing the map")?;
     Ok(())
@@ -1548,6 +1572,49 @@ mod tests {
     /// Two sessions on the same profile each learn something the other
     /// doesn't; saving one must not blank out what the other already
     /// wrote to disk.
+    /// An adversarial review flagged this as data loss: `save_map` used to
+    /// merge into `load_map`, which answers "start empty" for anything it
+    /// cannot read. One unreadable file, and the next save — every 30s now
+    /// — replaced a whole explored world with the handful of rooms this
+    /// session happened to see.
+    #[test]
+    fn save_map_refuses_to_overwrite_a_map_it_could_not_read() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = dir.path().join("maps").join("kestrel.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        let mut session = crate::map::Map::default();
+        session.observe(&sample_room(1, "Temple Square"));
+        let err = save_map(dir.path(), "kestrel", &session).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("parsing the map already at"),
+            "the failure should name what it refused to do: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not json",
+            "and the file the player still has must be left alone"
+        );
+    }
+
+    /// The other half — a missing file is not a failure, it is a first run.
+    #[test]
+    fn save_map_still_writes_when_there_is_nothing_on_disk_yet() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut session = crate::map::Map::default();
+        session.observe(&sample_room(1, "Temple Square"));
+
+        save_map(dir.path(), "kestrel", &session).unwrap();
+
+        assert!(
+            load_map(dir.path(), "kestrel")
+                .rooms
+                .contains_key(&crate::map::RoomId(1))
+        );
+    }
+
     #[test]
     fn save_map_merges_with_what_is_already_on_disk() {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();

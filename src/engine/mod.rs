@@ -839,6 +839,23 @@ impl Engine {
         self.changed = true;
     }
 
+    /// Drops every other spelling of the room number, so the one that just
+    /// arrived is the only one left to read.
+    ///
+    /// `from_server_data` prefers GMCP's `Room.Info.num` over MSDP's
+    /// `ROOM.VNUM`, which settles precedence but not freshness. A server
+    /// that named the room over GMCP once and then reported every move over
+    /// MSDP left the stale GMCP value winning forever: the character never
+    /// appeared to leave the first room, and every move also tripped the
+    /// exits forget, wiping them each step.
+    pub fn forget_stale_room_numbers(&mut self, fresh: &str) {
+        self.server_data
+            .retain(|key, _| !crate::map::is_stale_vnum_key(key, fresh));
+        self.gmcp_keys
+            .retain(|key| !crate::map::is_stale_vnum_key(key, fresh));
+        self.changed = true;
+    }
+
     pub fn update_server_data_from_msdp(&mut self, key: &str, value: String) {
         if self.gmcp_keys.contains(key) {
             return;
