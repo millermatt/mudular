@@ -15,7 +15,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 
 use crate::app::{AppState, ChannelPane, Focus, LayoutMode};
 use crate::config::Keybinds;
@@ -323,7 +323,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     }
 
     if state.show_help {
-        draw_help(frame, frame.area(), &state.keybinds);
+        draw_help(frame, frame.area(), state);
     }
 
     if let Some(menu) = &state.mark_menu {
@@ -348,7 +348,8 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
 
 /// The help overlay: a box centred over the layout, sized to its content and
 /// clipped to the terminal (docs/ARCHITECTURE.md §11.2).
-fn draw_help(frame: &mut Frame, area: Rect, keybinds: &Keybinds) {
+fn draw_help(frame: &mut Frame, area: Rect, state: &AppState) {
+    let keybinds = &state.keybinds;
     let lines = help_lines(keybinds);
     let content_width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     // +2 for the border on each axis.
@@ -361,12 +362,44 @@ fn draw_help(frame: &mut Frame, area: Rect, keybinds: &Keybinds) {
         height,
     };
 
+    // The listing is longer than a short terminal, and used to be simply
+    // cut off at the bottom — the part a newcomer most needs being the part
+    // that did not fit (§11.2).
+    let rows = lines.len() as u16;
+    let viewport = overlay.height.saturating_sub(2);
+    let hidden = rows.saturating_sub(viewport);
+    let scroll = state.help_scroll.min(hidden);
+
+    let title = match hidden {
+        0 => format!(" Help — {} or Esc to close ", keybinds.help),
+        // The keys are only worth naming when there is somewhere to go.
+        _ => format!(" Help — ↑↓ PgUp/PgDn, {} or Esc to close ", keybinds.help),
+    };
     let text = Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>());
-    let block =
-        Block::bordered().title(format!(" Help — {} or Esc to close ", keybinds.help).bold());
+    let block = Block::bordered().title(title.bold());
     // Clear first: the overlay sits on top of panes that already drew here.
     frame.render_widget(ratatui::widgets::Clear, overlay);
-    frame.render_widget(Paragraph::new(text).block(block), overlay);
+    frame.render_widget(
+        Paragraph::new(text).block(block).scroll((scroll, 0)),
+        overlay,
+    );
+
+    if hidden > 0 {
+        // Says how much is out of sight, and where in it you are — the
+        // title alone cannot, and a listing that silently had more was the
+        // whole defect.
+        let mut bar = ScrollbarState::new(rows as usize)
+            .position(scroll as usize)
+            .viewport_content_length(viewport as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            overlay.inner(ratatui::layout::Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut bar,
+        );
+    }
 }
 
 /// The `/mark` chooser (§16): what is this room *for*?
@@ -529,7 +562,7 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         session.back_offset
     };
 
-    let (lines, scroll) = if showing_inspector {
+    let (lines, extent) = if showing_inspector {
         visible_window(
             &session.inspector_log,
             area.height,
@@ -559,7 +592,7 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         )
     };
 
-    render_scrollback(frame, area, lines, title, focused, session.color, scroll);
+    render_scrollback(frame, area, lines, title, focused, session.color, extent);
 }
 
 /// Every character's vitals on one row (§11.6).
@@ -740,7 +773,7 @@ fn draw_channel(
             .find(|session| session.name == name)
             .and_then(|session| session.color)
     };
-    let (lines, scroll) = visible_window(
+    let (lines, extent) = visible_window(
         &channel.lines,
         area.height,
         area.width.saturating_sub(2),
@@ -754,7 +787,7 @@ fn draw_channel(
     );
     // Channels aggregate across characters, so no one profile's colour
     // could stand for the pane.
-    render_scrollback(frame, area, lines, title, focused, None, scroll);
+    render_scrollback(frame, area, lines, title, focused, None, extent);
 }
 
 /// A channel line as the pane shows it. The `HH:MM:SS` and the `[character]`
@@ -847,13 +880,28 @@ fn wrapped_rows(lines: &[Line<'static>], width: u16) -> usize {
 /// Cost is O(visible rows) while a pane is tailing, and O(visible rows +
 /// `back_offset`) while scrolled back — proportional to what the player
 /// asked to see, rather than to everything they have ever seen.
+/// Where a pane's viewport sits in its buffer, for the scrollbar.
+///
+/// Counted in buffer *entries* rather than wrapped rows. `visible_window`
+/// already knows the index of the topmost entry it kept, so this costs
+/// nothing, and both numbers are then in the same unit — where mixing
+/// wrapped rows against entry counts would put the thumb in the wrong
+/// place on any pane with wrapped output.
+pub(crate) struct Extent {
+    pub total: usize,
+    pub top: usize,
+    /// Rows to scroll the rendered paragraph by, so a partly-visible line
+    /// at the top of the window is cut rather than pushing the tail off.
+    pub scroll: u16,
+}
+
 fn visible_window<T>(
     raws: &VecDeque<T>,
     area_height: u16,
     content_width: u16,
     back_offset: usize,
     parse: impl Fn(usize, &T) -> Vec<Line<'static>>,
-) -> (Vec<Line<'static>>, u16) {
+) -> (Vec<Line<'static>>, Extent) {
     let viewport = area_height.saturating_sub(2) as usize; // borders
     let needed = viewport.saturating_add(back_offset);
 
@@ -863,6 +911,7 @@ fn visible_window<T>(
     // of buffer" — only the latter knows the true total, and only the
     // latter therefore has to clamp `back_offset` (below).
     let mut exhausted = true;
+    let mut top = raws.len();
 
     for (i, raw) in raws.iter().enumerate().rev() {
         if rows >= needed {
@@ -873,6 +922,7 @@ fn visible_window<T>(
         rows += wrapped_rows(&parsed, content_width);
         parsed.append(&mut window);
         window = parsed;
+        top = i;
     }
 
     let scroll = if exhausted {
@@ -887,7 +937,14 @@ fn visible_window<T>(
         rows.saturating_sub(viewport).saturating_sub(back_offset)
     };
 
-    (window, scroll as u16)
+    (
+        window,
+        Extent {
+            total: raws.len(),
+            top,
+            scroll: scroll as u16,
+        },
+    )
 }
 
 /// Renders a bordered pane over an already-windowed `lines` and the
@@ -899,7 +956,7 @@ fn render_scrollback(
     title: String,
     focused: bool,
     color: Option<Color>,
-    scroll: u16,
+    extent: Extent,
 ) {
     // A profile's colour tints the border; dimming still marks the pane as
     // unfocused, so colour identifies the character and brightness
@@ -917,8 +974,31 @@ fn render_scrollback(
     let body = Paragraph::new(Text::from(lines))
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .scroll((extent.scroll, 0));
     frame.render_widget(body, area);
+
+    // Only when something is out of sight. A bar on a pane holding four
+    // lines is furniture saying nothing, and every column it takes is one
+    // the MUD's own output does not get.
+    let shown = extent.total.saturating_sub(extent.top);
+    if extent.total > shown {
+        let mut bar = ScrollbarState::new(extent.total)
+            .position(extent.top)
+            .viewport_content_length(shown);
+        frame.render_stateful_widget(
+            // No arrows on the ends: they read as buttons, and nothing here
+            // is clickable — this says how much there is and where you are,
+            // and is not a control.
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            area.inner(ratatui::layout::Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut bar,
+        );
+    }
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -1074,7 +1154,75 @@ mod tests {
         }
     }
 
-    // ---- the party strip (§11.6) ----
+    // ---- the help overlay (§11.2) ----
+
+    /// The listing outgrew a short terminal and was simply cut off, so the
+    /// bottom of it — the commands, and how to leave — could not be read at
+    /// all. Adding one binding was enough to do it.
+    #[test]
+    fn a_help_listing_taller_than_the_terminal_can_be_scrolled_to_its_end() {
+        let mut state = state();
+        state.show_help = true;
+
+        let top = rows(&render_sized(&state, 70, 20));
+        state.help_scroll = u16::MAX;
+        let bottom = rows(&render_sized(&state, 70, 20));
+
+        assert_ne!(top, bottom, "a short terminal has somewhere to scroll to");
+        assert!(
+            bottom.contains("Leaving"),
+            "the end of the listing has to be reachable: {bottom}"
+        );
+    }
+
+    /// And says so, rather than leaving the player to guess there is more.
+    #[test]
+    fn a_clipped_help_listing_shows_a_scrollbar_and_says_how_to_move() {
+        let mut state = state();
+        state.show_help = true;
+
+        let clipped = rows(&render_sized(&state, 70, 20));
+
+        // The listing itself has a `PgUp / PgDn` row, so match the title's
+        // own spacing rather than the word.
+        assert!(clipped.contains("PgUp/PgDn"), "{clipped}");
+        assert!(
+            clipped.contains('█') || clipped.contains('▐') || clipped.contains('║'),
+            "a scrollbar should be drawn: {clipped}"
+        );
+    }
+
+    /// A terminal with room for all of it gets neither, since there is
+    /// nowhere to go and the hint would be noise.
+    #[test]
+    fn a_help_listing_that_fits_has_no_scrollbar() {
+        let mut state = state();
+        state.show_help = true;
+
+        let roomy = rows(&render_sized(&state, 70, 60));
+
+        assert!(roomy.contains("Leaving"), "all of it is on screen: {roomy}");
+        assert!(
+            !roomy.contains("PgUp/PgDn"),
+            "no hint when there is nowhere to go: {roomy}"
+        );
+        assert!(!roomy.contains('█'), "and no scrollbar: {roomy}");
+    }
+
+    /// Scrolling past the end stops at the end rather than running the
+    /// listing off the top of its own box.
+    #[test]
+    fn scrolling_the_help_stops_at_the_bottom() {
+        let mut state = state();
+        state.show_help = true;
+        state.help_scroll = u16::MAX;
+        let pinned = rows(&render_sized(&state, 70, 20));
+
+        state.help_scroll = u16::MAX / 2;
+        assert_eq!(rows(&render_sized(&state, 70, 20)), pinned);
+    }
+
+    // ---- the party strip (§11.6) ----    // ---- the party strip (§11.6) ----
 
     /// Publishes vitals for a session the way its own task would, so the
     /// strip reads them the way it will in play.
@@ -2226,7 +2374,12 @@ mod tests {
     }
 
     /// Windowing must not change what the player sees: the tail of a huge
-    /// buffer renders exactly as the same tail does on its own.
+    /// buffer reads exactly as the same tail does on its own.
+    ///
+    /// The scrollbar is excluded on purpose — it is the one thing that
+    /// *should* differ, since one of these has five thousand lines above
+    /// the view and the other has none. Saying so here is cheaper than a
+    /// reader wondering why the comparison is narrowed.
     #[test]
     fn a_huge_buffer_shows_the_same_tail_as_a_small_one() {
         let mut big = state();
@@ -2242,10 +2395,19 @@ mod tests {
                 .push_back(RetainedLine::server(format!("line {i}")));
         }
 
-        assert_eq!(
-            rows(&render_sized(&big, 40, 12)),
-            rows(&render_sized(&small, 40, 12))
-        );
+        let text = |state: &AppState| {
+            let buffer = render_sized(state, 40, 12);
+            (0..buffer.area.height)
+                .map(|y| {
+                    // Drop the last column, where the bar is drawn.
+                    let line = row(&buffer, y);
+                    line.chars().take(39).collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert_eq!(text(&big), text(&small));
     }
 
     /// Scrolled back into a large buffer, the window has to start further

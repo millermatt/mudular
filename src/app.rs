@@ -472,6 +472,10 @@ pub struct AppState {
     pub show_hud: bool,
     /// Whether the help overlay is up (§11.2).
     pub show_help: bool,
+    /// How far down the help listing has been scrolled, in rows. The
+    /// listing outgrew a short terminal (§11.2), so it has to be reachable
+    /// rather than merely clipped.
+    pub help_scroll: u16,
     /// The live bindings, so the input hint and the help overlay both read
     /// what the event loop actually matches against — never a second copy
     /// that can drift (§11.2).
@@ -1918,6 +1922,7 @@ async fn event_loop(
         // for — the numbers a multiboxer was holding in their head.
         show_hud: multiple_characters,
         show_help: false,
+        help_scroll: 0,
         keybinds: keybinds.clone(),
         config_editor: None,
         config_editor_save: None,
@@ -2274,12 +2279,15 @@ fn handle_key(
             KeyCode::Down => (0, 1),
             KeyCode::Left => (-1, 0),
             KeyCode::Right => (1, 0),
-            // Anything else closes it rather than falling through to the
-            // input line: a keystroke meant for the game must not be
-            // swallowed, but nor should it land half-read.
+            // Anything else puts the cursor away and then *does its
+            // ordinary job*: closing it must not also cost the keystroke.
+            // Swallowing it meant `Alt+2` did nothing the first time it was
+            // pressed with the cursor up — the character it was meant to
+            // switch to stayed where it was, and the key had to be pressed
+            // again.
             _ => {
                 state.map_cursor = None;
-                return true;
+                return handle_key(state, keybinds, code, modifiers, area_width, channels);
             }
         };
         // A nudge into empty space leaves the cursor where it is, rather
@@ -2335,12 +2343,32 @@ fn handle_key(
     // While the overlay is up it owns the keyboard: any key dismisses it and
     // goes no further. Typing blind into an input line hidden behind the
     // help is worse than the extra keystroke to reopen it (§11.2).
+    //
+    // Except the scroll keys, which now move the listing instead. It is
+    // longer than a short terminal can show, and a key that dismissed the
+    // help would make the bottom of it unreachable — the one part a
+    // newcomer most needs is the part that scrolled off.
     if state.show_help {
-        state.show_help = false;
+        match code {
+            KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
+            KeyCode::Down => state.help_scroll = state.help_scroll.saturating_add(1),
+            KeyCode::PageUp => {
+                state.help_scroll = state.help_scroll.saturating_sub(SCROLL_PAGE as u16)
+            }
+            KeyCode::PageDown => {
+                state.help_scroll = state.help_scroll.saturating_add(SCROLL_PAGE as u16)
+            }
+            KeyCode::Home => state.help_scroll = 0,
+            KeyCode::End => state.help_scroll = u16::MAX,
+            _ => state.show_help = false,
+        }
         return true;
     }
     if keybinds.help.matches(code, modifiers) {
         state.show_help = true;
+        // Always from the top: reopening to wherever it was left reads as
+        // the overlay having lost its place.
+        state.help_scroll = 0;
         return true;
     }
     if keybinds.config_editor.matches(code, modifiers) {
@@ -3021,6 +3049,7 @@ pub(crate) mod test_support {
                 show_inspector: false,
                 show_hud: false,
                 show_help: false,
+                help_scroll: 0,
                 keybinds: Keybinds::default(),
                 config_editor: None,
                 config_editor_save: None,
@@ -5819,7 +5848,72 @@ mod tests {
         assert!(scrollback(&state.sessions[0]).contains("doesn't know where you are"));
     }
 
-    // ---- /mark (§16) ----
+    /// Reported from play. The cursor swallowed every key it did not use,
+    /// so `Alt+2` with the map cursor up closed the cursor and went no
+    /// further — the character it was meant to switch to stayed put, and
+    /// the key had to be pressed twice.
+    #[tokio::test]
+    async fn a_key_the_cursor_ignores_still_does_its_own_job() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        let keys = crate::config::Keybinds::default();
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+        assert!(state.map_cursor.is_some(), "the cursor is up");
+
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Char('2'),
+            KeyModifiers::ALT,
+            100,
+            &[],
+        );
+
+        assert!(state.map_cursor.is_none(), "the cursor is put away");
+        assert_eq!(state.input_session, 1, "and the jump still happened");
+    }
+
+    /// The same for a binding rather than a jump, so this is not a special
+    /// case for Alt+N.
+    #[tokio::test]
+    async fn a_binding_pressed_with_the_cursor_up_still_fires() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        let keys = crate::config::Keybinds::default();
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+        let before = state.show_hud;
+
+        // F9 toggles the party strip.
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::F(9),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert!(state.map_cursor.is_none());
+        assert_ne!(state.show_hud, before, "the binding fired too");
+    }
+
+    // ---- /mark (§16) ----    // ---- /mark (§16) ----
 
     #[tokio::test]
     async fn mark_labels_the_room_and_shows_on_the_map() {
