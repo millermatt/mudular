@@ -2094,12 +2094,26 @@ async fn event_loop(
     // period away rather than at startup.
     map_saves.tick().await;
 
+    let mut had_image = false;
     loop {
         let mut image = None;
         terminal.draw(|frame| image = ui::draw(frame, &state))?;
-        if let Some(image) = image {
-            write_map_image(&image)?;
+        if let Some(image) = &image {
+            write_map_image(image)?;
+        } else if had_image {
+            // The cells under a picture are marked skipped while it is up,
+            // so the frame that stops drawing one leaves ratatui's diff
+            // nothing to repaint and the pixels stay on screen over
+            // whatever replaced them — a switch to a session with no room
+            // data yet, or the map pane going away. Clearing drops the
+            // known state, so the next frame repaints the lot.
+            terminal.clear()?;
+            terminal.draw(|frame| image = ui::draw(frame, &state))?;
+            if let Some(image) = &image {
+                write_map_image(image)?;
+            }
         }
+        had_image = image.is_some();
 
         let wake = tokio::select! {
             ev = term_events.next() => Wake::Terminal(ev),
