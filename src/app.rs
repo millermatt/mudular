@@ -5740,9 +5740,9 @@ mod tests {
         );
         let scene = state.sessions[0].map.scene(crate::map::RoomId(1), None);
         assert_eq!(
-            scene.rooms[0].mark,
-            Some('S'),
-            "and the map has a letter to draw for it"
+            scene.rooms[0].mark.as_deref(),
+            Some("shop"),
+            "and the map carries the label to draw it from"
         );
         assert!(scrollback(&state.sessions[0]).contains("marked #1 as `shop`"));
     }

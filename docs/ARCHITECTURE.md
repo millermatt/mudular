@@ -1735,6 +1735,21 @@ lives in `ui`, and neither is visible from inside it.
   copies, and lands in the disk log, which the pane does none of. The
   wider question of speech in a full-screen TUI is deliberately left open;
   see `ARCH_REVIEW.md`.
+- **The pane's colours are given in RGB, not by ANSI name.** A named
+  colour is whatever the player's terminal theme says it is — one
+  person's `Yellow` is mustard and another's is near-white — so a set
+  chosen to be told apart cannot be, and the map ends up looking like
+  whatever the theme did to it. The label colours are **Okabe-Ito**,
+  built to stay distinguishable under all three common kinds of
+  colour-vision deficiency, which is the same reason the label's initial
+  is drawn *on* the colour rather than instead of it. Ink is picked by
+  luminance rather than a second table, so a dark swatch takes light text
+  without anyone remembering to say so. Seven colours and nine offered
+  labels means two pairs share a hue; they are required by test never to
+  share a letter as well. The cost is that a terminal without true colour
+  approximates them — acceptable because the pane is a picture rather
+  than text to be read, and because a fallback belongs with the style
+  file (§16 roadmap) rather than hardcoded twice.
 - **The map cursor (`F8`) makes the pane a control surface**, not just a
   picture: the arrows move it room to room, `Map::describe` says what it is
   on, and `Enter` hands the room to the same `walk_to` `/goto` uses. It

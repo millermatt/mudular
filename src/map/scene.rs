@@ -41,12 +41,11 @@ pub struct PlacedRoom {
     /// they are a property of the room rather than a corridor.
     pub up: bool,
     pub down: bool,
-    /// The first letter of the player's own note for this room, if they
-    /// left one. A single cell is all a room has to say it with, and a
-    /// letter is the glyph a font is actually built to render at this size
-    /// — `S` for a shop reads where a pictogram would be a smudge. The
-    /// whole note is in `Map::describe`.
-    pub mark: Option<char>,
+    /// The player's own note for this room, if they left one. The whole
+    /// label rather than the initial it is drawn as: a renderer needs it to
+    /// tell `shop` from `smith`, which share a letter, and deciding how to
+    /// show that is a presentation question the map has no view on.
+    pub mark: Option<String>,
     /// Whether this room has an exit the picture could not draw — one the
     /// layout could not honour, or one leading to a room that lost its
     /// cell. Filtering those out of `links` is right (§16: a wrong edge is
@@ -140,11 +139,7 @@ impl Map {
                 },
                 up: room.exits.contains_key("u"),
                 down: room.exits.contains_key("d"),
-                mark: room
-                    .mark
-                    .as_deref()
-                    .and_then(|mark| mark.chars().next())
-                    .map(|first| first.to_ascii_uppercase()),
+                mark: room.mark.clone(),
                 hidden_exits,
             });
         }
