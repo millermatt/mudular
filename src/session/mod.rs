@@ -566,7 +566,9 @@ async fn run_connection(
                                         ));
                                         raw_out.push(encode_subnegotiation(
                                             option::GMCP,
-                                            &gmcp::encode(&gmcp::supports_message()),
+                                            &gmcp::encode(&gmcp::supports_message(
+                                                engine.gmcp_packages(),
+                                            )),
                                         ));
                                         Vec::new()
                                     }
@@ -2307,6 +2309,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_sent(&mut sent).await, "tell hp 87");
+    }
+
+    /// A declared package is only worth anything if it reaches the wire:
+    /// a server that gates its pushes on `Core.Supports.Set` stays silent
+    /// about `Group` forever if the advertisement never names it.
+    #[tokio::test]
+    async fn a_declared_gmcp_package_reaches_the_advertisement() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let (_events, _commands) = serve_with_rules(
+            move |mut sock| async move {
+                sock.write_all(&[IAC, WILL, option::GMCP]).await.unwrap();
+
+                let mut subnegs = SubnegReader::default();
+                subnegs.next(&mut sock, option::GMCP).await; // Core.Hello
+                let supports = subnegs.next(&mut sock, option::GMCP).await;
+                tx.send(String::from_utf8_lossy(&supports).into_owned())
+                    .await
+                    .unwrap();
+            },
+            rules(
+                r#"
+                name: test
+                gmcp_packages: ['Group 1']
+                "#,
+            ),
+        );
+
+        let supports = sent.recv().await.expect("advertisement");
+        assert_eq!(
+            supports,
+            r#"Core.Supports.Set ["Char 1","Room 1","Group 1"]"#
+        );
     }
 
     /// GMCP arrays flatten to positional keys, so merging each payload

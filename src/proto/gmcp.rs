@@ -62,13 +62,46 @@ pub fn hello_message() -> GmcpMessage {
     }
 }
 
-/// `Core.Supports.Set`, advertising the packages we want pushed — vitals and
-/// room data, the two the milestone's "done when" criterion calls for.
-pub fn supports_message() -> GmcpMessage {
+/// Advertised no matter what the config declares: vitals and room data,
+/// the two the M6 "done when" criterion calls for.
+const DEFAULT_PACKAGES: [&str; 2] = ["Char 1", "Room 1"];
+
+/// `Core.Supports.Set`, advertising the packages we want pushed (§6.3).
+///
+/// `declared` is what the config layers asked for on top of the defaults
+/// (§7.3) — added rather than substituted, so a shared module that names
+/// only `Group 1` cannot silently unsubscribe the vitals every other rule
+/// reads. A declaration for a package already in the list replaces that
+/// entry instead: which of two advertised versions of one package a server
+/// honours is the server's choice, so naming both is a coin flip.
+pub fn supports_message(declared: &[String]) -> GmcpMessage {
+    let mut packages: Vec<String> = DEFAULT_PACKAGES.iter().map(|p| p.to_string()).collect();
+    for entry in declared {
+        let entry = entry.trim();
+        // A blank list entry would go out as `""`, which names no package
+        // any server can act on.
+        if entry.is_empty() {
+            continue;
+        }
+        match packages
+            .iter_mut()
+            .find(|listed| same_package(listed, entry))
+        {
+            Some(listed) => *listed = entry.to_string(),
+            None => packages.push(entry.to_string()),
+        }
+    }
     GmcpMessage {
         package: "Core.Supports.Set".to_string(),
-        payload: Some(json!(["Char 1", "Room 1"]).to_string()),
+        payload: Some(json!(packages).to_string()),
     }
+}
+
+/// Whether two entries name the same package: the version follows a space,
+/// and GMCP package names are not case-sensitive.
+fn same_package(a: &str, b: &str) -> bool {
+    let name = |entry: &str| entry.split(' ').next().unwrap_or("").to_ascii_lowercase();
+    name(a) == name(b)
 }
 
 /// Flattens a message's JSON payload into dotted-path `(key, value)` pairs
@@ -192,6 +225,54 @@ mod tests {
         let encoded = encode(&msg);
         let parsed = parse(&encoded).unwrap();
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn supports_advertises_the_defaults_when_nothing_is_declared() {
+        let msg = supports_message(&[]);
+        assert_eq!(msg.package, "Core.Supports.Set");
+        assert_eq!(
+            encode(&msg),
+            br#"Core.Supports.Set ["Char 1","Room 1"]"#.to_vec()
+        );
+    }
+
+    /// A server that gates its pushes on `Core.Supports.Set` sends nothing
+    /// for a package it was never named, so a declared one has to reach the
+    /// wire — and the defaults have to survive alongside it.
+    #[test]
+    fn declared_packages_are_advertised_after_the_defaults() {
+        let declared = ["Group 1".to_string(), "Comm.Channel 1".to_string()];
+        assert_eq!(
+            encode(&supports_message(&declared)),
+            br#"Core.Supports.Set ["Char 1","Room 1","Group 1","Comm.Channel 1"]"#.to_vec()
+        );
+    }
+
+    /// Which of two versions of one package a server honours is its own
+    /// business, so naming both is a coin flip: a declaration for a package
+    /// already listed replaces that entry instead of joining it.
+    #[test]
+    fn a_declared_version_replaces_an_earlier_entry_for_the_same_package() {
+        let declared = [
+            "char 2".to_string(),
+            "Group 1".to_string(),
+            "Group 2".into(),
+        ];
+        assert_eq!(
+            encode(&supports_message(&declared)),
+            br#"Core.Supports.Set ["char 2","Room 1","Group 2"]"#.to_vec()
+        );
+    }
+
+    /// A stray empty list entry would otherwise be advertised as `""`, which
+    /// no server can make sense of.
+    #[test]
+    fn a_blank_declaration_is_dropped_rather_than_advertised() {
+        assert_eq!(
+            encode(&supports_message(&["  ".to_string()])),
+            br#"Core.Supports.Set ["Char 1","Room 1"]"#.to_vec()
+        );
     }
 
     #[test]

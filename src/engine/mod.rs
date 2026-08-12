@@ -47,6 +47,12 @@ pub struct RuleModule {
     pub triggers: Vec<Trigger>,
     #[serde(default)]
     pub timers: Vec<Timer>,
+    /// Extra GMCP packages this layer wants pushed, in `Package Version`
+    /// form (`Group 1`). Rules can only read server data the server was
+    /// asked for, so the ask belongs in the same layered merge as the rules
+    /// that read it (docs/ARCHITECTURE.md §6.3, §7.3).
+    #[serde(default)]
+    pub gmcp_packages: Vec<String>,
     /// Script files this module brings, by name relative to the module
     /// (§7.4). The extension picks the engine.
     #[serde(default)]
@@ -442,6 +448,11 @@ pub struct Engine {
     /// Snapshots are values, so publishing copies the stores; doing it only
     /// on change keeps a quiet session free.
     changed: bool,
+    /// What the merged layers asked the server to push beyond the defaults
+    /// (§6.3). Held here because the session already carries the compiled
+    /// engine, and the advertisement goes out the moment the server offers
+    /// GMCP — before anything else could be handed to the session task.
+    gmcp_packages: Vec<String>,
 }
 
 impl Engine {
@@ -452,9 +463,11 @@ impl Engine {
         let mut aliases: Vec<Alias> = Vec::new();
         let mut triggers: Vec<Trigger> = Vec::new();
         let mut timers: Vec<Timer> = Vec::new();
+        let mut gmcp_packages: Vec<String> = Vec::new();
 
         for layer in layers {
             variables.extend(layer.variables.clone());
+            gmcp_packages.extend(layer.gmcp_packages.iter().cloned());
             merge_layer(&mut aliases, &layer.aliases, &layer.name)?;
             merge_layer(&mut triggers, &layer.triggers, &layer.name)?;
             merge_layer(&mut timers, &layer.timers, &layer.name)?;
@@ -477,7 +490,15 @@ impl Engine {
             peers_seen: HashMap::new(),
             script_timers: Vec::new(),
             changed: false,
+            gmcp_packages,
         })
+    }
+
+    /// The extra GMCP packages the merged layers declared, in layer order
+    /// (§7.3). The defaults are the protocol's business, not the config's —
+    /// see [`crate::proto::gmcp::supports_message`].
+    pub fn gmcp_packages(&self) -> &[String] {
+        &self.gmcp_packages
     }
 
     /// Hands this session the receivers for every other session's snapshot
@@ -2328,6 +2349,19 @@ mod tests {
     fn layers(yaml: &[&str]) -> Engine {
         let modules: Vec<RuleModule> = yaml.iter().map(|y| module(y)).collect();
         Engine::compile(&modules).expect("compiles")
+    }
+
+    /// A module's triggers are useless if nobody asked the server for the
+    /// package they match on, so the declaration rides the same merge the
+    /// rules do — every layer contributes, in layer order.
+    #[test]
+    fn every_layer_contributes_its_declared_gmcp_packages() {
+        let engine = layers(&[
+            "name: global\ngmcp_packages: ['Comm.Channel 1']\n",
+            "name: party\ngmcp_packages: ['Group 1']\n",
+            "name: profile\n",
+        ]);
+        assert_eq!(engine.gmcp_packages(), ["Comm.Channel 1", "Group 1"]);
     }
 
     #[test]

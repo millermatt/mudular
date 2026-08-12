@@ -66,9 +66,10 @@ pub fn encode_pair(name: &str, value: &str) -> Vec<u8> {
 /// perfectly working server silent, which reads exactly like a server that
 /// does not speak MSDP at all.
 ///
-/// Hardcoded, and for the same reason as GMCP's `Core.Supports.Set`
-/// (`gmcp::supports_message`): making either declarable is one change, not
-/// two, and neither is useful to declare until profiles can say so.
+/// Hardcoded, unlike GMCP's `Core.Supports.Set` (`gmcp::supports_message`,
+/// declarable per §7.3 since #25): nothing has yet needed an MSDP variable
+/// the mapper does not already ask for, and the config layer the GMCP list
+/// now uses is there to extend the day something does.
 pub fn report_requests() -> Vec<Vec<u8>> {
     ["ROOM"]
         .into_iter()

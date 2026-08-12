@@ -501,6 +501,28 @@ timers:             # act on a schedule
   so aliases cannot loop.
 - **Durations** need a unit: `500ms`, `30s`, `5m`, `2h`.
 
+### Asking for more server data
+
+`${Char.Vitals.hp}` works because the client tells the MUD, at connect
+time, which GMCP packages it wants pushed: `Char` and `Room` out of the
+box. Many MUDs send nothing at all for a package you never asked for, so
+if `Group`, `Comm.Channel` or `Client.Media` data never shows up in the
+`F2` inspector, ask for it — in `global.yaml` for every character, or in a
+module for the ones that need it:
+
+```yaml
+# modules/party.yaml — loaded by the characters that group
+name: party
+gmcp_packages: ["Group 1", "Comm.Channel 1"]
+```
+
+Entries are `Package Version`, exactly as the MUD's own GMCP documentation
+spells them. Every layer's list is added to the built-in `Char 1` and
+`Room 1`, so asking for extras never costs you the vitals; naming a
+package that is already there (`Char 2`) replaces it instead of asking for
+both versions at once. What arrives is whatever the MUD chooses to send —
+`F2` shows it live.
+
 ### Firing only when it matters
 
 A pattern says *what* matched; `when:` says whether to act on it. Add it
