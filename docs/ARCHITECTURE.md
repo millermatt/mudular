@@ -1456,6 +1456,13 @@ in their head across panes.
   `ROOM`. Leaving them out is not a smaller feature, it is a feature
   that silently never works — which is exactly how the strip first drew
   every character as having no vitals at all.
+- **On by default for more than one character.** One character has
+  nothing to compare and the strip would be a row spent restating the
+  prompt; two or more is the case it exists for. A *default*, not an
+  override — the remembered layout (§11.4) still wins where the player
+  has actually said, and `show_hud` is `Option<bool>` precisely so that
+  "nobody has said" stays distinguishable from "off". A layout file
+  written before the strip existed leaves the count to decide.
 - **Colour is the point.** The strip exists to be noticed rather than
   read, so a gauge below a quarter goes red and bold, below a half
   amber. Each character keeps the colour that tints their pane border

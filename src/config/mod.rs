@@ -386,10 +386,13 @@ pub fn load_profile(path: &Path) -> Result<Profile> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiState {
     pub show_channels: bool,
-    /// Absent in files written before the party strip existed, so it
-    /// defaults rather than refusing to load them.
+    /// `None` where nobody has said either way — a fresh install, or a
+    /// file written before the strip existed — which is what lets the
+    /// default depend on how many characters are being played. Once the
+    /// layout is written at all it becomes an answer, because by then the
+    /// player has been looking at whatever it says.
     #[serde(default)]
-    pub show_hud: bool,
+    pub show_hud: Option<bool>,
     pub show_map: bool,
     pub show_inspector: bool,
     pub channel_width: u16,
@@ -1665,7 +1668,7 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let saved = UiState {
             show_channels: false,
-            show_hud: false,
+            show_hud: Some(false),
             show_map: true,
             show_inspector: false,
             channel_width: 34,
@@ -1675,6 +1678,24 @@ mod tests {
         save_ui_state(dir.path(), &saved).unwrap();
 
         assert_eq!(load_ui_state(dir.path()), Some(saved));
+    }
+
+    /// The strip's default depends on how many characters are being
+    /// played, so a layout that never mentions it must not answer for it.
+    #[test]
+    fn a_layout_from_before_the_strip_leaves_it_unanswered() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        std::fs::write(
+            dir.path().join("ui_state.json"),
+            br#"{"show_channels":true,"show_map":false,"show_inspector":false,
+                 "channel_width":28,"map_width":24}"#,
+        )
+        .unwrap();
+
+        let saved = load_ui_state(dir.path()).expect("still loads");
+
+        assert_eq!(saved.show_hud, None);
+        assert!(saved.show_channels, "and the rest of it survives");
     }
 
     /// A fresh install has none, and that is not a failure — config's
@@ -1708,7 +1729,7 @@ mod tests {
             dir.path(),
             &UiState {
                 show_channels: true,
-                show_hud: false,
+                show_hud: Some(true),
                 show_map: true,
                 show_inspector: false,
                 channel_width: 22,

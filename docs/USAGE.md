@@ -384,7 +384,10 @@ no vitals is listed with a `—` rather than being drawn as one at zero
 health, and a gauge the server gives no maximum for is left out, since a
 bar needs both ends.
 
-Whether it is up is remembered between runs, like the other panes.
+It starts on when you launch more than one character, which is the case
+it exists for — a single character has nothing to compare, and the strip
+would just restate the prompt. That is only a starting point: press `F9`
+once and your answer is remembered from then on, like the other panes.
 
 ### Reading the map, and walking to what you see
 

@@ -1684,7 +1684,7 @@ fn current_layout(state: &AppState) -> config::UiState {
         show_channels: state.show_channels,
         show_map: state.show_map,
         show_inspector: state.show_inspector,
-        show_hud: state.show_hud,
+        show_hud: Some(state.show_hud),
         channel_width: state.channel_width,
         map_width: state.map_width,
     }
@@ -1868,6 +1868,7 @@ async fn event_loop(
         .map(|(name, _, rx)| (name.clone(), rx.clone()))
         .collect();
 
+    let multiple_characters = targets.len() > 1;
     let sessions: Vec<SessionPane> = targets
         .into_iter()
         .zip(published)
@@ -1912,7 +1913,10 @@ async fn event_loop(
         show_map: false,
         map_width,
         show_inspector: false,
-        show_hud: false,
+        // One character has nothing to compare, and the strip would be a
+        // row spent restating the prompt. Two or more is the case it exists
+        // for — the numbers a multiboxer was holding in their head.
+        show_hud: multiple_characters,
         show_help: false,
         keybinds: keybinds.clone(),
         config_editor: None,
@@ -1942,7 +1946,12 @@ async fn event_loop(
         state.show_channels = saved.show_channels;
         state.show_map = saved.show_map;
         state.show_inspector = saved.show_inspector;
-        state.show_hud = saved.show_hud;
+        // Only where the player has actually said. A saved layout that
+        // predates the strip, or one from before they ever touched it,
+        // leaves the count to decide.
+        if let Some(shown) = saved.show_hud {
+            state.show_hud = shown;
+        }
         state.channel_width = ui::clamp_channel_width(saved.channel_width, width);
         state.map_width = ui::clamp_map_width(saved.map_width, width);
     }
