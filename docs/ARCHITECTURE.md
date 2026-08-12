@@ -1469,8 +1469,54 @@ in their head across panes.
   and tab (§11), and the one bound to the input line is marked, so the
   strip also answers "who am I typing to".
 
-Follow-the-leader and "who needs me?" are separate work on the same
-foundation, and are not built.
+Follow-the-leader is separate work on the same foundation, and is not
+built.
+
+### 11.7 "Who needs me?" (`F10`)
+
+The strip answers the question only for a player looking at it, and the
+moment it matters is the one where they are reading another character's
+pane. So the same numbers get to say something where the eyes already
+are.
+
+- **Health alone, at the strip's own threshold.** `vitals::ALARM` is one
+  constant read by both the gauge colour and the alarm, because a client
+  whose red and whose bell disagreed about what counts as trouble would
+  teach the player to trust neither. Mana and movement are excluded on
+  meaning rather than on cost: an empty mana bar is a caster out of
+  spells, and an alarm that fires for all three is one nobody looks up
+  for. A server reporting no health raises no alarm, on §11.6's "both
+  ends or nothing" rule.
+- **`app` decides, `ui` shows.** The strip can read peer snapshots at
+  draw time because it only states what is true now; the bell fires on an
+  *edge* — the pass where a character enters trouble — and only something
+  that remembers the previous pass can see one. So `SessionPane.distress`
+  is recomputed once per pass of the event loop and everything that draws
+  reads that one answer. It costs a lock-free `watch::Receiver` borrow
+  per character per pass, which is what §11.6 established the snapshots
+  are cheap enough for.
+- **The mark is not the unread badge.** Unread means "you have not
+  looked", so looking clears it; trouble is a fact about the character,
+  so looking does not. The `!` therefore shows on the focused pane too,
+  and the tab bar stops dimming a tab that carries one — dimming is
+  exactly the treatment that would hide the one name worth seeing, and an
+  unfocused character is the case the alarm exists for.
+- **The bell is the M9 notification path, unchanged.** Desktop
+  notification via OSC 9 where the terminal turns a bell into one, and
+  only for a character the player is not already watching — the same rule
+  `wants_bell` applies to an unfocused session's trigger, for the same
+  reason.
+- **The key names its own failure.** With nobody in trouble `F10` says so
+  in the pane rather than doing nothing, on the precedent §16's map
+  cursor set: a key that silently does nothing is a key the player
+  concludes is broken.
+
+**What would change the answer:** a MUD reporting *party* vitals over
+GMCP `Group` — other people's characters, not just the ones this client
+is playing. Then "who needs me?" would have a second, larger source, and
+the answer would come from a package rather than from peers. The client's
+own characters are the ones it can be certain about, so they are the ones
+it speaks for.
 
 ## 12. Errors, Logging, Testing
 

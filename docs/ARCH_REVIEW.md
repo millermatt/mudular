@@ -110,9 +110,9 @@ why they're filed as issues rather than left as a feature-request list:
   line is. Deliberately scoped to *adding* only — see #3 below and the
   "worth resolving alongside" note on index-as-identity, which this did
   not touch.
-- **Party HUD / "who needs me?" / follow-the-leader** (#3) — #2's peer-mesh
-  blocker is resolved; `app` still has to join the mesh as a reader (only
-  session tasks hold receivers today), which is the piece left.
+- **Party HUD / "who needs me?" / follow-the-leader** (#3) — the strip
+  (§11.6) and the alarm (§11.7) are built; `app` joined the mesh as a
+  reader to do it. Follow-the-leader is the piece left.
 - **Auto-mapper, sound packs (MSP), tell threading** — all blocked by the
   same gap as the party HUD: `gmcp::supports_message()` hardcodes the
   advertised package list (#25), so `Group`, `Comm.Channel`, and

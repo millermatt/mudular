@@ -112,6 +112,10 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         ),
         row(keybinds.toggle_hud, "show or hide the party strip"),
         row(
+            keybinds.who_needs_me,
+            "jump to whoever is in the most trouble",
+        ),
+        row(
             keybinds.server_data_inspector,
             "raw server-data inspector (GMCP/MSDP)",
         ),
@@ -553,7 +557,7 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         };
         format!(
             "{} — {}{security}{latency}{picking} ",
-            pane_title(&session.name, session.unread),
+            pane_title(&session.name, session.unread, session.distress.is_some()),
             session.status,
         )
     };
@@ -671,6 +675,12 @@ fn draw_hud(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// The one colour for "this needs you now": a gauge under
+/// [`crate::vitals::ALARM`] and the tab of the character it belongs to
+/// (§11.6, §11.7). Named once so the strip and the tab bar cannot come to
+/// mean different things by the same red.
+const ALARM: Color = Color::Rgb(0xE1, 0x1D, 0x48);
+
 /// How alarming a gauge is. Colour rather than a number alone, because the
 /// point of the strip is noticing trouble without reading it — and bold on
 /// top of colour, so the warning survives a terminal that renders these
@@ -679,9 +689,7 @@ fn gauge_style(gauge: crate::vitals::Gauge) -> Style {
     let filled = gauge.fraction();
     let style = Style::default();
     match filled {
-        f if f <= 0.25 => style
-            .fg(Color::Rgb(0xE1, 0x1D, 0x48))
-            .add_modifier(Modifier::BOLD),
+        f if f <= crate::vitals::ALARM => style.fg(ALARM).add_modifier(Modifier::BOLD),
         f if f <= 0.5 => style.fg(Color::Rgb(0xE6, 0x9F, 0x00)),
         _ => style.fg(Color::Rgb(0x64, 0x74, 0x8B)),
     }
@@ -863,7 +871,7 @@ fn draw_channel(
     );
     let title = format!(
         "{}{} ",
-        pane_title(&channel.config.name, channel.unread),
+        pane_title(&channel.config.name, channel.unread, false),
         scroll_indicator(channel.back_offset)
     );
     // Channels aggregate across characters, so no one profile's colour
@@ -1124,11 +1132,21 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.set_cursor_position((area.x + 1 + cursor, area.y + 1));
 }
 
-/// `name ● 3` — the unread badge for a pane that isn't focused (§11). The
-/// space before the count matters: `●` commonly renders wider than the
-/// single cell it's measured as, and packed straight against a digit it
-/// visually collides with it in most terminal fonts.
-fn pane_title(name: &str, unread: usize) -> String {
+/// `! name ● 3` — the unread badge for a pane that isn't focused (§11),
+/// and the mark for a character in trouble (§11.7). The space before the
+/// count matters: `●` commonly renders wider than the single cell it's
+/// measured as, and packed straight against a digit it visually collides
+/// with it in most terminal fonts.
+///
+/// The `!` is shown on a focused pane too, which the unread badge never is:
+/// unread means "you have not looked", so looking clears it, while a
+/// character at a tenth of their health is in trouble whether or not
+/// anybody is watching.
+fn pane_title(name: &str, unread: usize, in_trouble: bool) -> String {
+    let name = match in_trouble {
+        true => format!("! {name}"),
+        false => name.to_string(),
+    };
     if unread == 0 {
         format!(" {name}")
     } else {
@@ -1142,10 +1160,11 @@ fn tab_line(state: &AppState) -> Line<'static> {
         if index > 0 {
             spans.push(Span::raw(" │"));
         }
+        let in_trouble = session.distress.is_some();
         let label = format!(
             "{}:{}",
             index + 1,
-            pane_title(&session.name, session.unread)
+            pane_title(&session.name, session.unread, in_trouble)
         );
         let mut style = match session.color {
             Some(color) => Style::new().fg(color),
@@ -1153,6 +1172,12 @@ fn tab_line(state: &AppState) -> Line<'static> {
         };
         style = if state.is_focused_session(index) {
             style.bold().reversed()
+        } else if in_trouble {
+            // Never dim, whatever else this tab is. Dimming is exactly the
+            // treatment that would hide the one tab the player needs to
+            // see, and an unfocused character is the case the alarm exists
+            // for (§11.7).
+            style.fg(ALARM).bold()
         } else {
             style.dim()
         };
@@ -1643,6 +1668,42 @@ mod tests {
         assert_eq!(badge.fg, Color::Magenta);
     }
 
+    /// A character in trouble is marked wherever their name is written, and
+    /// the mark is not dimmed — dimming is precisely the treatment that
+    /// would hide the one tab worth looking at (§11.7).
+    #[test]
+    fn a_character_in_trouble_is_marked_in_the_tab_bar() {
+        let mut state = test_support::app(&["tank", "cleric"]);
+        state.sessions[1].color = Some(Color::Magenta);
+        state.sessions[1].distress = Some(0.1);
+
+        let buffer = render_sized(&state, 40, 12);
+        let bar = row(&buffer, 0);
+        assert!(bar.contains("! cleric"), "{bar}");
+
+        let mark = buffer
+            .content()
+            .iter()
+            .take(40)
+            .find(|cell| cell.symbol() == "!")
+            .expect("the tab bar marks the character");
+        assert_eq!(mark.fg, ALARM);
+        assert!(!mark.modifier.contains(Modifier::DIM), "{mark:?}");
+    }
+
+    /// Unread means "you have not looked", so looking clears it. Trouble is
+    /// a fact about the character, so looking does not — the mark stays on
+    /// the pane being read (§11.7).
+    #[test]
+    fn the_mark_stays_on_the_pane_being_looked_at() {
+        let mut state = test_support::app(&["tank", "cleric"]);
+        state.sessions[0].distress = Some(0.1);
+
+        let screen = rows(&render_sized(&state, 40, 12));
+
+        assert!(screen.contains("! tank"), "{screen}");
+    }
+
     /// The tab bar only exists in Tabs mode (`>1` session). In Splits, an
     /// unfocused pane's own unread badge is the only place the count shows
     /// at all — it should carry the same colour identity, for the same
@@ -1701,11 +1762,14 @@ mod tests {
                 .push_back(RetainedLine::server("You are in a forest."));
         }
 
-        let without = render_sized(&state, 70, 40);
+        // A row taller than the listing, so "is every binding in here"
+        // stays a question about the listing rather than about scrolling —
+        // the overlay grew a row when the party alarm got its key.
+        let without = render_sized(&state, 70, 41);
         assert!(rows(&without).contains("forest"));
 
         state.show_help = true;
-        let with = render_sized(&state, 70, 40);
+        let with = render_sized(&state, 70, 41);
         let listing = rows(&with);
         assert!(listing.contains("Help"), "{listing}");
         assert!(listing.contains("Ctrl+C"), "{listing}");

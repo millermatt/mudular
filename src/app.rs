@@ -145,6 +145,15 @@ pub struct SessionPane {
     msdp_seen: bool,
     /// Lines that arrived while the pane was not focused (§11).
     pub unread: usize,
+    /// How much trouble this character is in, if any — the fraction of
+    /// health left, once it is low enough to be worth saying (§11.7).
+    ///
+    /// Kept here rather than derived where it is drawn, because the bell
+    /// rings on the *edge* — the moment a character enters trouble — and
+    /// only something that remembers the last pass can see an edge. The
+    /// strip and the tab bar then read one answer instead of each
+    /// recomputing their own.
+    pub distress: Option<f64>,
     /// The profile's `color:`, if it set one — the pane border and this
     /// session's tab entry are drawn in it (§11).
     pub color: Option<Color>,
@@ -637,6 +646,45 @@ impl AppState {
         });
     }
 
+    /// Recomputes who is in trouble, and answers with the characters who
+    /// have just got into it while the player was looking elsewhere —
+    /// the ones worth ringing about (§11.7).
+    ///
+    /// Read from the peer snapshots for the reason §11.6 gives for the
+    /// strip reading them: the numbers are already in memory and borrowing
+    /// them takes no lock, so asking every pass of the event loop costs
+    /// nothing worth avoiding.
+    fn refresh_distress(&mut self) -> Vec<String> {
+        let mut newly_in_trouble = Vec::new();
+        for index in 0..self.sessions.len() {
+            let now = self
+                .peer_registry
+                .get(&self.sessions[index].name)
+                .and_then(|peer| crate::vitals::from_server_data(&peer.borrow().data).distress());
+            let was = self.sessions[index].distress.is_some();
+            // Not while the player is already looking at them: the pane
+            // they are reading needs no bell to point at itself.
+            let unwatched = !self.is_focused(index);
+            self.sessions[index].distress = now;
+            if now.is_some() && !was && unwatched {
+                newly_in_trouble.push(self.sessions[index].name.clone());
+            }
+        }
+        newly_in_trouble
+    }
+
+    /// Whoever is in the most trouble — the character the "who needs me?"
+    /// key jumps to. Least health left first, because with two characters
+    /// under a quarter the answer to "who needs me?" is the worse of them.
+    fn neediest(&self) -> Option<usize> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, session)| session.distress.map(|left| (index, left)))
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(index, _)| index)
+    }
+
     /// Strictly focused: what unread counting keys off.
     fn is_focused(&self, index: usize) -> bool {
         self.focus == Focus::Session(index)
@@ -816,12 +864,12 @@ fn wants_bell(state: &AppState, index: usize, ev: &SessionEvent) -> bool {
 }
 
 /// Rings the terminal bell and, on terminals that turn it into one (iTerm2,
-/// kitty, foot, …), an OSC 9 desktop notification. Best-effort: a write
-/// failure here is not worth ending the session over.
-fn notify_unfocused(session_name: &str) {
+/// kitty, foot, …), an OSC 9 desktop notification saying what happened.
+/// Best-effort: a write failure here is not worth ending the session over.
+fn notify(message: &str) {
     use std::io::Write as _;
     let mut stdout = std::io::stdout();
-    let _ = write!(stdout, "\x07\x1b]9;{session_name} has new output\x07");
+    let _ = write!(stdout, "\x07\x1b]9;{message}\x07");
     let _ = stdout.flush();
 }
 
@@ -1704,6 +1752,7 @@ fn connect(
         gmcp_seen: false,
         msdp_seen: false,
         unread: 0,
+        distress: None,
         color: target.color,
         history: VecDeque::new(),
         history_pos: None,
@@ -2096,6 +2145,12 @@ async fn event_loop(
 
     let mut had_image = false;
     loop {
+        // Before the frame that will draw the answer: a character who has
+        // just dropped into trouble is worth saying out loud once, for the
+        // player whose eyes are on another pane entirely (§11.7).
+        for name in state.refresh_distress() {
+            notify(&format!("{name} needs help"));
+        }
         let mut image = None;
         terminal.draw(|frame| image = ui::draw(frame, &state))?;
         if let Some(image) = &image {
@@ -2236,7 +2291,7 @@ async fn event_loop(
                     None => state.sessions[index].events = None,
                 }
                 if ring_bell {
-                    notify_unfocused(&state.sessions[index].name);
+                    notify(&format!("{} has new output", state.sessions[index].name));
                 }
                 for (target, command) in injections {
                     let _ = state.sessions[target].commands.send(command).await;
@@ -2431,6 +2486,20 @@ fn handle_key(
     }
     if keybinds.toggle_hud.matches(code, modifiers) {
         state.show_hud = !state.show_hud;
+        return true;
+    }
+    if keybinds.who_needs_me.matches(code, modifiers) {
+        match state.neediest() {
+            Some(index) => state.focus_pane(Focus::Session(index)),
+            // Said rather than ignored, the same way the map cursor says
+            // why it did nothing: a key that silently does nothing is a
+            // key the player assumes is broken.
+            None => {
+                if let Some(session) = state.bound_mut() {
+                    session.push_line(RetainedLine::client("** nobody is in trouble"));
+                }
+            }
+        }
         return true;
     }
     if keybinds.map_cursor.matches(code, modifiers) {
@@ -3141,6 +3210,7 @@ pub(crate) mod test_support {
                 gmcp_seen: false,
                 msdp_seen: false,
                 unread: 0,
+                distress: None,
                 color: None,
                 history: VecDeque::new(),
                 history_pos: None,
@@ -4381,6 +4451,120 @@ mod tests {
         // Wide enough that the channel-width clamp never binds by accident;
         // the tests that care about the ceiling pass their own width.
         handle_key(state, &Keybinds::default(), code, modifiers, 120, &[])
+    }
+
+    // ---- who needs me? (docs/ARCHITECTURE.md §11.7) ----
+
+    /// Publishes vitals for a session the way its own task would, so the
+    /// alarm reads them the way it will in play.
+    fn publish_vitals(state: &mut AppState, name: &str, pairs: &[(&str, &str)]) {
+        let (tx, rx) = tokio::sync::watch::channel(crate::engine::PeerSnapshot {
+            vars: std::collections::HashMap::new(),
+            data: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        });
+        // Dropped on purpose: a `watch::Receiver` still reads the last
+        // value published after its sender is gone, which is what the
+        // client does between updates.
+        drop(tx);
+        state.peer_registry.insert(name.to_string(), rx);
+    }
+
+    /// The bell is for the moment trouble starts. Ringing it again on every
+    /// pass of the event loop while a character sits at low health would
+    /// make the sound mean "someone is hurt", which the player already
+    /// knows, instead of "someone just got hurt".
+    #[test]
+    fn a_character_dropping_into_trouble_is_announced_once() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        publish_vitals(
+            &mut state,
+            "cleric",
+            &[("HEALTH", "9"), ("HEALTH_MAX", "100")],
+        );
+
+        assert_eq!(state.refresh_distress(), vec!["cleric".to_string()]);
+        assert_eq!(state.refresh_distress(), Vec::<String>::new());
+
+        publish_vitals(
+            &mut state,
+            "cleric",
+            &[("HEALTH", "90"), ("HEALTH_MAX", "100")],
+        );
+        assert_eq!(state.refresh_distress(), Vec::<String>::new());
+        assert_eq!(state.sessions[1].distress, None, "healed, and said so");
+
+        publish_vitals(
+            &mut state,
+            "cleric",
+            &[("HEALTH", "9"), ("HEALTH_MAX", "100")],
+        );
+        assert_eq!(
+            state.refresh_distress(),
+            vec!["cleric".to_string()],
+            "hurt again is news again"
+        );
+    }
+
+    /// The pane the player is reading needs no bell to point at itself —
+    /// but it is still marked, because the mark is a fact about the
+    /// character rather than about what has been looked at.
+    #[test]
+    fn the_character_being_watched_is_marked_but_not_rung_for() {
+        let (mut state, _rx) = app(&["tank"]);
+        publish_vitals(
+            &mut state,
+            "tank",
+            &[("HEALTH", "9"), ("HEALTH_MAX", "100")],
+        );
+
+        assert_eq!(state.refresh_distress(), Vec::<String>::new());
+        assert!(state.sessions[0].distress.is_some());
+    }
+
+    #[test]
+    fn the_key_jumps_to_whoever_is_worst() {
+        let (mut state, _rx) = app(&["tank", "cleric", "mage"]);
+        publish_vitals(
+            &mut state,
+            "cleric",
+            &[("HEALTH", "20"), ("HEALTH_MAX", "100")],
+        );
+        publish_vitals(
+            &mut state,
+            "mage",
+            &[("HEALTH", "5"), ("HEALTH_MAX", "100")],
+        );
+        state.refresh_distress();
+
+        assert!(press(&mut state, KeyCode::F(10), KeyModifiers::NONE));
+
+        assert_eq!(state.input_session, 2, "the mage is closer to dying");
+        assert_eq!(state.focus, Focus::Session(2));
+    }
+
+    /// A key that silently does nothing is a key the player assumes is
+    /// broken.
+    #[test]
+    fn the_key_says_so_when_nobody_needs_you() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        publish_vitals(
+            &mut state,
+            "cleric",
+            &[("HEALTH", "90"), ("HEALTH_MAX", "100")],
+        );
+        state.refresh_distress();
+
+        assert!(press(&mut state, KeyCode::F(10), KeyModifiers::NONE));
+
+        assert_eq!(state.input_session, 0, "nobody to jump to");
+        let said = state.sessions[0]
+            .scrollback
+            .iter()
+            .any(|line| line.text.contains("nobody is in trouble"));
+        assert!(said, "{:?}", state.sessions[0].scrollback);
     }
 
     #[test]

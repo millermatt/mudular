@@ -45,7 +45,31 @@ impl Vitals {
     pub fn is_empty(&self) -> bool {
         self.health.is_none() && self.mana.is_none() && self.movement.is_none()
     }
+
+    /// How much trouble this character is in, or `None` for none — the
+    /// number the party strip's red already means, named so the rest of the
+    /// client can act on it (§11.7).
+    ///
+    /// **Health alone.** Mana at a tenth is a caster out of spells and
+    /// movement at a tenth is a long walk home; neither is a character
+    /// about to die, and an alarm that fires for all three is an alarm
+    /// nobody looks up for. A server that reports no health reports no
+    /// trouble, on §11.6's "both ends or nothing" rule — a missing gauge is
+    /// silence, not zero.
+    pub fn distress(&self) -> Option<f64> {
+        let health = self.health?;
+        let filled = health.fraction();
+        (filled <= ALARM).then_some(filled)
+    }
 }
+
+/// How empty a gauge has to be before the client says something about it.
+///
+/// One constant rather than one per caller: the strip paints this red and
+/// "who needs me?" jumps to it, and a client whose alarm colour and alarm
+/// key disagreed about what counts as trouble would teach the player to
+/// trust neither.
+pub const ALARM: f64 = 0.25;
 
 /// Where each protocol puts a gauge, **GMCP first** for the same reason
 /// §16's room table is: §6.3's store-level precedence settles keys that
@@ -187,5 +211,38 @@ mod tests {
     #[test]
     fn a_server_that_says_nothing_shows_nothing() {
         assert!(from_server_data(&store(&[("Room.Info.num", "1")])).is_empty());
+    }
+
+    #[test]
+    fn trouble_is_a_quarter_of_health_or_less() {
+        let hurt = from_server_data(&store(&[("HEALTH", "25"), ("HEALTH_MAX", "100")]));
+        assert_eq!(hurt.distress(), Some(0.25));
+
+        let fine = from_server_data(&store(&[("HEALTH", "26"), ("HEALTH_MAX", "100")]));
+        assert_eq!(fine.distress(), None);
+    }
+
+    /// A caster out of spells is not a character about to die, and an alarm
+    /// that fires for both is one nobody looks up for.
+    #[test]
+    fn an_empty_mana_bar_is_not_trouble() {
+        let dry = from_server_data(&store(&[
+            ("HEALTH", "100"),
+            ("HEALTH_MAX", "100"),
+            ("MANA", "1"),
+            ("MANA_MAX", "100"),
+            ("MOVEMENT", "1"),
+            ("MOVEMENT_MAX", "100"),
+        ]));
+
+        assert_eq!(dry.distress(), None);
+    }
+
+    /// A missing gauge is silence, not zero — §11.6's rule, which the alarm
+    /// has to keep or every MUD that reports nothing would look like a
+    /// party of corpses.
+    #[test]
+    fn a_character_with_no_health_reported_is_not_in_trouble() {
+        assert_eq!(from_server_data(&store(&[("MANA", "1")])).distress(), None);
     }
 }

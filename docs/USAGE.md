@@ -389,6 +389,33 @@ it exists for — a single character has nothing to compare, and the strip
 would just restate the prompt. That is only a starting point: press `F9`
 once and your answer is remembered from then on, like the other panes.
 
+### Who needs me?
+
+The strip only helps while you are looking at it, and the moment you need
+it most is the one where you are reading someone else's pane. So the
+client says it where you are:
+
+- The character's name is marked with a `!` wherever it is written — in
+  the tab bar, and on their pane's own border in the side-by-side layout.
+  The tab keeps its colour but stops being dimmed, since dimming is what
+  would hide the one name worth seeing.
+- The terminal bell rings once, with a desktop notification on terminals
+  that turn it into one, saying `<name> needs help`. Once, at the moment
+  it starts — not again while they stay hurt, and not at all for the
+  character you are already watching.
+- `F10` jumps to whoever is in the most trouble. With two characters
+  hurt it goes to the worse of them; with nobody hurt it says so rather
+  than doing nothing.
+
+Trouble means **health at a quarter or less** — the same point the strip
+turns a gauge red. Only health: an empty mana bar is a caster out of
+spells, not a character about to die, and an alarm that fires for both is
+one you stop looking up for. A MUD that reports no health raises no
+alarm, for the same reason it draws no gauge.
+
+Unlike the unread badge, the `!` does not clear when you look. Looking at
+someone does not heal them.
+
 ### Reading the map, and walking to what you see
 
 The map column is a pane like any other: `Alt+<n>` reaches it on the

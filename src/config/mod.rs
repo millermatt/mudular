@@ -623,6 +623,10 @@ pub struct Keybinds {
     /// (docs/ARCHITECTURE.md §11.6).
     #[serde(default = "default_toggle_hud")]
     pub toggle_hud: KeyBinding,
+    /// Jumps to whichever character is in the most trouble
+    /// (docs/ARCHITECTURE.md §11.7).
+    #[serde(default = "default_who_needs_me")]
+    pub who_needs_me: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -644,6 +648,7 @@ impl Default for Keybinds {
             map_narrower: default_map_narrower(),
             map_cursor: default_map_cursor(),
             toggle_hud: default_toggle_hud(),
+            who_needs_me: default_who_needs_me(),
         }
     }
 }
@@ -733,6 +738,12 @@ fn default_map_cursor() -> KeyBinding {
 fn default_toggle_hud() -> KeyBinding {
     // Next free after F8, continuing the same row.
     "f9".parse().expect("built-in default keybinding")
+}
+
+fn default_who_needs_me() -> KeyBinding {
+    // Next free after F9, and beside the strip it acts on: F9 shows who is
+    // in trouble, F10 goes there.
+    "f10".parse().expect("built-in default keybinding")
 }
 
 fn default_map_narrower() -> KeyBinding {
