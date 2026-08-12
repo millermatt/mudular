@@ -239,6 +239,111 @@ mod tests {
         assert!(scene.links.is_empty(), "and nothing is drawn as a corridor");
     }
 
+    /// The shape of an area, normalised so it can be compared no matter
+    /// which room the character was standing in when it was drawn.
+    fn shape(map: &Map, standing_in: i64) -> Vec<(RoomId, (i32, i32))> {
+        let scene = map.scene(RoomId(standing_in), None);
+        let base = scene
+            .rooms
+            .iter()
+            .min_by_key(|room| room.id)
+            .map(|room| room.at)
+            .unwrap_or((0, 0));
+        let mut shape: Vec<(RoomId, (i32, i32))> = scene
+            .rooms
+            .iter()
+            .map(|room| (room.id, (room.at.0 - base.0, room.at.1 - base.1)))
+            .collect();
+        shape.sort();
+        shape
+    }
+
+    /// Found in play: walking around the north end of Ofcol Village made
+    /// the map reshape under the player, though every exit there is
+    /// consistent. The layout was computed *from* the current room, so each
+    /// step re-ran it in a new order and a different room won each
+    /// contested cell. Measured on that saved map, 34 of 36 pairs of
+    /// starting rooms disagreed about the shape of the same nine rooms.
+    ///
+    /// Reproducing it needs a genuinely *contested* cell — two different
+    /// rooms whose geometry puts them in the same place. Here #3 (north
+    /// then east) and #5 (east then north) both want the cell up and right
+    /// of #1, which is ordinary non-Euclidean MUD geography. Whichever the
+    /// traversal reaches first takes the cell and the other is dropped, so
+    /// laying out from the player meant standing in #1 drew one of them and
+    /// standing in #2 drew the other.
+    #[test]
+    fn the_area_is_the_same_shape_from_every_room_in_it() {
+        let map = map_of(
+            &[1, 2, 3, 4, 5],
+            &[
+                (1, "n", 2),
+                (2, "s", 1),
+                (2, "e", 3),
+                (3, "w", 2),
+                (1, "e", 4),
+                (4, "w", 1),
+                (4, "n", 5),
+                (5, "s", 4),
+            ],
+        );
+
+        let baseline = shape(&map, 1);
+        for standing_in in [2, 3, 4, 5] {
+            assert_eq!(
+                shape(&map, standing_in),
+                baseline,
+                "the map must not reshape just because the player moved to #{standing_in}"
+            );
+        }
+    }
+
+    /// The other half of the same bug. Exits are one-way until the return
+    /// trip is walked, and laying out along that one-way graph meant every
+    /// room behind the player fell off the map. Here a perfectly ordinary
+    /// 3x3 grid is walked once, in a snake, with no backtracking: before,
+    /// standing in the last room showed one room — itself.
+    #[test]
+    fn rooms_behind_the_player_stay_on_the_map() {
+        let map = map_of(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+            &[
+                (1, "e", 2),
+                (2, "e", 3),
+                (3, "s", 6),
+                (6, "w", 5),
+                (5, "w", 4),
+                (4, "s", 7),
+                (7, "e", 8),
+                (8, "e", 9),
+            ],
+        );
+
+        for standing_in in 1..=9 {
+            assert_eq!(
+                map.scene(RoomId(standing_in), None).rooms.len(),
+                9,
+                "every room walked should still be drawn from #{standing_in}"
+            );
+        }
+    }
+
+    /// Centring is the only thing standing somewhere else may change.
+    #[test]
+    fn the_room_you_are_in_is_always_the_centre() {
+        let map = map_of(&[1, 2, 3], &[(1, "e", 2), (2, "e", 3)]);
+
+        for standing_in in 1..=3 {
+            let scene = map.scene(RoomId(standing_in), None);
+            let here = scene
+                .rooms
+                .iter()
+                .find(|room| room.id == RoomId(standing_in))
+                .expect("the room the player is in is on its own map");
+            assert_eq!(here.at, (0, 0));
+        }
+    }
+
     #[test]
     fn a_scene_is_stable_across_runs() {
         let map = map_of(&[1, 2, 3], &[(1, "e", 2), (1, "s", 3)]);

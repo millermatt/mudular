@@ -93,6 +93,11 @@ pub(crate) fn direction_vector(direction: &str) -> Option<(i32, i32)> {
     })
 }
 
+/// Which rooms sit one grid step from which, and in what direction —
+/// `Map::placement_steps`. Both ways along every learned exit, because
+/// where a room *lies* is symmetric even where walking it is not.
+type PlacementSteps = BTreeMap<RoomId, Vec<(RoomId, (i32, i32))>>;
+
 /// One room-data update, as extracted from the server-data store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomInfo {
@@ -341,47 +346,93 @@ impl Map {
         None
     }
 
-    /// Grid coordinates for drawing the area `origin` sits in.
+    /// Where two rooms lie relative to each other, for *placement only*.
+    ///
+    /// An exit is one-way until the return trip is walked (`path` depends on
+    /// that, and rightly — plenty of MUDs have exits that don't come back).
+    /// But "which way is that room from this one" is geometry, not passage:
+    /// learning `a --n--> b` tells you b is north of a *and* that a is south
+    /// of b, whether or not you can walk it. Laying out along the one-way
+    /// graph made rooms vanish from the picture the moment you stepped
+    /// somewhere you hadn't yet walked back from.
+    ///
+    /// Scoped to one area, and only for directions with a 2D meaning —
+    /// `u`/`d`/`in`/`out` are marked on the room they leave (§16).
+    fn placement_steps(&self, area: &Option<String>) -> PlacementSteps {
+        let mut steps: PlacementSteps = BTreeMap::new();
+        for (id, room) in &self.rooms {
+            if room.area != *area {
+                continue;
+            }
+            for (direction, dest) in &room.exits {
+                let Some(dest) = dest else { continue };
+                let Some((dx, dy)) = direction_vector(direction) else {
+                    continue;
+                };
+                if self.rooms.get(dest).is_none_or(|next| next.area != *area) {
+                    continue;
+                }
+                steps.entry(*id).or_default().push((*dest, (dx, dy)));
+                steps.entry(*dest).or_default().push((*id, (-dx, -dy)));
+            }
+        }
+        // A canonical order, so which room wins a contested cell is decided
+        // by the graph and never by iteration order.
+        for neighbours in steps.values_mut() {
+            neighbours.sort_unstable();
+            neighbours.dedup();
+        }
+        steps
+    }
+
+    /// Grid coordinates for drawing the area `origin` sits in, with `origin`
+    /// itself at `(0, 0)`.
     ///
     /// Scoped to one area on purpose: MUD geography is not Euclidean, and
     /// coordinates accumulated across a whole world diverge into nonsense.
     /// Collisions happen even inside an area — first placement wins, and a
     /// room that loses stays in the graph and stays pathable, it just is
-    /// not drawn. `u`/`d` are not followed: they are marked on the room
-    /// they leave (§16), not rendered as a third axis.
+    /// not drawn.
+    ///
+    /// **The shape does not depend on where the character is standing.** It
+    /// is laid out from an anchor — the lowest vnum in `origin`'s connected
+    /// group — and only then shifted so `origin` lands in the middle. Laying
+    /// out *from* the character meant every step re-ran the survey in a new
+    /// order, so a different room won each contested cell and the map
+    /// reshaped underneath a player who had only walked one room. Anchoring
+    /// makes walking a pan across a fixed picture, which is what §16 wanted
+    /// from centring in the first place.
     pub fn layout_area(&self, origin: RoomId) -> HashMap<RoomId, (i32, i32)> {
-        let mut coords = HashMap::new();
         let Some(origin_room) = self.rooms.get(&origin) else {
-            return coords;
+            return HashMap::new();
         };
-        let area = &origin_room.area;
+        let steps = self.placement_steps(&origin_room.area);
 
-        let mut occupied = HashSet::new();
-        coords.insert(origin, (0, 0));
-        occupied.insert((0, 0));
+        // Anchor on the group `origin` can actually be placed with, not on
+        // the area as a whole: an area explored in two disconnected pieces
+        // would otherwise anchor on a piece this room is not part of, and
+        // there would be no shared coordinate to shift by.
+        let mut group = HashSet::from([origin]);
+        let mut walk = VecDeque::from([origin]);
+        while let Some(current) = walk.pop_front() {
+            for (next, _) in steps.get(&current).into_iter().flatten() {
+                if group.insert(*next) {
+                    walk.push_back(*next);
+                }
+            }
+        }
+        let anchor = group.iter().min().copied().unwrap_or(origin);
 
-        let mut queue = VecDeque::new();
-        queue.push_back(origin);
+        let mut coords = HashMap::from([(anchor, (0, 0))]);
+        let mut occupied = HashSet::from([(0, 0)]);
+        let mut queue = VecDeque::from([anchor]);
         while let Some(current) = queue.pop_front() {
-            let current_coord = coords[&current];
-            let Some(room) = self.rooms.get(&current) else {
-                continue;
-            };
-            for (direction, dest) in &room.exits {
-                let Some(next) = dest else { continue };
+            let at = coords[&current];
+            for (next, (dx, dy)) in steps.get(&current).into_iter().flatten() {
                 if coords.contains_key(next) {
                     continue;
                 }
-                let Some((dx, dy)) = direction_vector(direction) else {
-                    continue;
-                };
-                let Some(next_room) = self.rooms.get(next) else {
-                    continue;
-                };
-                if next_room.area != *area {
-                    continue;
-                }
-                let candidate = (current_coord.0 + dx, current_coord.1 + dy);
+                let candidate = (at.0 + dx, at.1 + dy);
                 if !occupied.insert(candidate) {
                     continue;
                 }
@@ -389,7 +440,14 @@ impl Map {
                 queue.push_back(*next);
             }
         }
+
+        // Re-centre on the character. The picture is already decided; this
+        // only chooses where to point the camera.
+        let here = coords.get(&origin).copied().unwrap_or((0, 0));
         coords
+            .into_iter()
+            .map(|(id, (x, y))| (id, (x - here.0, y - here.1)))
+            .collect()
     }
 
     /// What is here and where it leads, in prose, as scrollback lines.
