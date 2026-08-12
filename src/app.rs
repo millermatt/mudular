@@ -866,13 +866,40 @@ fn apply_session_event(
                     (false, Vec::new())
                 }
                 Some(direction) => {
-                    // The path this direction came from (`Map::path`) only
-                    // ever follows edges with a known destination, so this
-                    // lookup cannot come up empty.
-                    let next_expecting = session.map.rooms[&info.id].exits[&direction]
-                        .expect("map.path only follows edges with a known destination");
-                    session.walk.as_mut().unwrap().expecting = next_expecting;
-                    (false, vec![(index, SessionCommand::SendLine(direction))])
+                    // `Map::path` only follows edges with a known
+                    // destination, but it said so about the map as it stood
+                    // when the route was planned. `observe` has run since,
+                    // one event ago, and the step in flight takes its next
+                    // expectation from the *live* map — so a server that
+                    // re-points an exit mid-walk can land the character in a
+                    // room the route never planned for, whose own exits need
+                    // not include the next direction at all. Indexing here
+                    // took the whole client down with it.
+                    let next = session
+                        .map
+                        .rooms
+                        .get(&info.id)
+                        .and_then(|room| room.exits.get(&direction))
+                        .copied()
+                        .flatten();
+                    match next {
+                        Some(next_expecting) => {
+                            session.walk.as_mut().unwrap().expecting = next_expecting;
+                            (false, vec![(index, SessionCommand::SendLine(direction))])
+                        }
+                        None => {
+                            // Same verdict as a step that lands somewhere
+                            // unexpected: the route has been proven wrong,
+                            // so stop rather than guess the rest of it.
+                            session.walk = None;
+                            session.push_line(RetainedLine::client(format!(
+                                "** walk stopped: the map no longer knows where `{direction}` \
+                                 leads from #{}",
+                                info.id.0
+                            )));
+                            (false, Vec::new())
+                        }
+                    }
                 }
             }
         }
@@ -2400,10 +2427,24 @@ async fn walk_to(
     // returns `None` instead when there's no route — so this is always one
     // real direction, not a placeholder.
     let direction = remaining.pop_front().expect("path is non-empty here");
-    // `path` only ever follows edges with a known destination, so this
-    // lookup cannot come up empty either.
-    let expecting = session.map.rooms[&current].exits[&direction]
-        .expect("map.path only follows edges with a known destination");
+    // Sound today — `path` ran against this same map a few lines up — but
+    // not worth asserting: the version of this in the arrival handler made
+    // exactly this argument and panicked the client when the map moved
+    // underneath it. A route that cannot be started is a route that cannot
+    // be walked, and saying so costs nothing.
+    let Some(expecting) = session
+        .map
+        .rooms
+        .get(&current)
+        .and_then(|room| room.exits.get(&direction))
+        .copied()
+        .flatten()
+    else {
+        session.push_line(RetainedLine::client(format!(
+            "** {command}: the map no longer knows where `{direction}` leads from here"
+        )));
+        return;
+    };
 
     let steps = remaining.len() + 1;
     session.walk = Some(Walk {
@@ -4859,6 +4900,110 @@ mod tests {
         save_dirty_maps(&mut state.sessions);
 
         assert!(!dir.path().join("maps").exists());
+    }
+
+    /// An adversarial review found this taking the whole client down: the
+    /// walk sets its next expectation from the live map, so a server that
+    /// re-points an exit mid-route lands the character in a room the route
+    /// never planned for, and the next step indexed an exit that room does
+    /// not have.
+    #[tokio::test]
+    async fn a_repointed_exit_mid_walk_stops_the_walk_instead_of_panicking() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[("n", 2)]);
+        put_room(&mut state.sessions[0].map, 2, None, &[("e", 3)]);
+        put_room(&mut state.sessions[0].map, 3, None, &[("e", 4)]);
+        put_room(&mut state.sessions[0].map, 4, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/goto 4").await;
+        let _ = receivers[0].try_recv();
+
+        // Arriving in #2 as planned, but the server now says #2's `e` leads
+        // somewhere else entirely.
+        let mut moved = crate::map::RoomInfo {
+            id: crate::map::RoomId(2),
+            name: None,
+            area: None,
+            exits: std::collections::BTreeMap::new(),
+        };
+        moved
+            .exits
+            .insert("e".to_string(), Some(crate::map::RoomId(9)));
+        apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::Room {
+                info: Box::new(moved),
+                arrived_via: Some("n".to_string()),
+            },
+        );
+        let _ = receivers[0].try_recv();
+
+        // …which lands the walk in #9, a room the route knows nothing about
+        // and which has no `e` of its own.
+        let mut elsewhere = crate::map::RoomInfo {
+            id: crate::map::RoomId(9),
+            name: None,
+            area: None,
+            exits: std::collections::BTreeMap::new(),
+        };
+        elsewhere.exits.insert("n".to_string(), None);
+        let (_, out) = apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::Room {
+                info: Box::new(elsewhere),
+                arrived_via: Some("e".to_string()),
+            },
+        );
+
+        assert!(state.sessions[0].walk.is_none(), "the walk stops");
+        assert!(out.is_empty(), "and sends nothing further: {out:?}");
+        assert!(
+            scrollback(&state.sessions[0]).contains("walk stopped"),
+            "and says so: {}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    /// The same hazard where the exit exists but its destination does not —
+    /// the bare `direction` form most servers send.
+    #[tokio::test]
+    async fn a_destinationless_exit_mid_walk_stops_the_walk() {
+        let (mut state, mut receivers) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[("n", 2)]);
+        put_room(&mut state.sessions[0].map, 2, None, &[("e", 3)]);
+        put_room(&mut state.sessions[0].map, 3, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/goto 3").await;
+        let _ = receivers[0].try_recv();
+
+        // #2 re-reports its `e` with no destination at all.
+        let mut vague = crate::map::RoomInfo {
+            id: crate::map::RoomId(2),
+            name: None,
+            area: None,
+            exits: std::collections::BTreeMap::new(),
+        };
+        vague.exits.insert("e".to_string(), None);
+        state.sessions[0]
+            .map
+            .rooms
+            .get_mut(&crate::map::RoomId(2))
+            .unwrap()
+            .exits
+            .insert("e".to_string(), None);
+        let (_, out) = apply_session_event(
+            &mut state,
+            0,
+            SessionEvent::Room {
+                info: Box::new(vague),
+                arrived_via: Some("n".to_string()),
+            },
+        );
+
+        assert!(state.sessions[0].walk.is_none());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     // ---- /corpse (§16) ----
