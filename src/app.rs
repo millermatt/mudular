@@ -1477,6 +1477,7 @@ pub async fn run(
     history_size: usize,
     scrollback_size: usize,
     channel_width: u16,
+    map_width: u16,
     cross_session_default: CrossSession,
     first_run_hint: bool,
 ) -> Result<()> {
@@ -1490,6 +1491,7 @@ pub async fn run(
         history_size,
         scrollback_size,
         channel_width,
+        map_width,
         cross_session_default,
         first_run_hint,
     )
@@ -1661,6 +1663,32 @@ fn connect(
     }
 }
 
+/// The pane layout as it stands.
+fn current_layout(state: &AppState) -> config::UiState {
+    config::UiState {
+        show_channels: state.show_channels,
+        show_map: state.show_map,
+        show_inspector: state.show_inspector,
+        channel_width: state.channel_width,
+        map_width: state.map_width,
+    }
+}
+
+/// Writes the layout when a key actually moved something (§11.4).
+///
+/// Compared rather than written unconditionally, so holding a resize key
+/// against its clamp — which changes nothing — writes nothing, and an
+/// ordinary keystroke costs no disk at all.
+fn remember_layout_if_changed(state: &AppState, before: config::UiState) {
+    let now = current_layout(state);
+    if now == before {
+        return;
+    }
+    if let Err(err) = config::save_ui_state(&state.config_dir, &now) {
+        tracing::warn!("could not save the pane layout: {err:#}");
+    }
+}
+
 /// Saves a session's map to its profile, merged with whatever is already on
 /// disk (`config::save_map`). An ad-hoc `--host` session has no profile and
 /// so nothing to save to — the same rule `/config` and disk logging already
@@ -1778,6 +1806,7 @@ async fn event_loop(
     history_size: usize,
     scrollback_size: usize,
     channel_width: u16,
+    map_width: u16,
     cross_session_default: CrossSession,
     first_run_hint: bool,
 ) -> Result<()> {
@@ -1843,7 +1872,7 @@ async fn event_loop(
         // be a permanently empty column, and the player has not said yet
         // whether they want it.
         show_map: false,
-        map_width: crate::ui::MAP_WIDTH,
+        map_width,
         show_inspector: false,
         show_help: false,
         keybinds: keybinds.clone(),
@@ -1864,6 +1893,17 @@ async fn event_loop(
     state.channel_width =
         ui::clamp_channel_width(state.channel_width, terminal.get_frame().area().width);
     state.map_width = ui::clamp_map_width(state.map_width, terminal.get_frame().area().width);
+    // Config says where a fresh install starts; this says where the player
+    // left off, so it goes on top (§11.4). Widths are re-clamped because
+    // the terminal may be narrower than it was last time.
+    if let Some(saved) = config::load_ui_state(&state.config_dir) {
+        let width = terminal.get_frame().area().width;
+        state.show_channels = saved.show_channels;
+        state.show_map = saved.show_map;
+        state.show_inspector = saved.show_inspector;
+        state.channel_width = ui::clamp_channel_width(saved.channel_width, width);
+        state.map_width = ui::clamp_map_width(saved.map_width, width);
+    }
 
     if !has_sessions {
         // Nothing to drive the loop but the terminal; the empty-state help
@@ -1898,6 +1938,11 @@ async fn event_loop(
 
         match wake {
             Wake::Terminal(Some(Ok(Event::Key(key)))) if key.kind == KeyEventKind::Press => {
+                // Deliberately only around keys. A *terminal* resize also
+                // clamps the columns, and remembering that would throw away
+                // the width the player chose the moment they shrank the
+                // window.
+                let layout_before = current_layout(&state);
                 if keybinds.quit.matches(key.code, key.modifiers) {
                     for session in &state.sessions {
                         save_session_map(session);
@@ -1953,6 +1998,7 @@ async fn event_loop(
                         session.input.handle_event(&Event::Key(key));
                     }
                 }
+                remember_layout_if_changed(&state, layout_before);
             }
             Wake::Terminal(Some(Ok(Event::Resize(cols, rows)))) => {
                 let area = ratatui::layout::Rect::new(0, 0, cols, rows);
@@ -5225,6 +5271,57 @@ mod tests {
 
         assert!(state.sessions[0].walk.is_none());
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    // ---- remembered pane layout (§11.4) ----
+
+    #[test]
+    fn a_pane_key_that_changes_nothing_writes_nothing() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.config_dir = dir.path().to_path_buf();
+        state.map_width = crate::ui::MIN_MAP_WIDTH;
+
+        // Narrowing a column already at its floor clamps to the same value.
+        let before = current_layout(&state);
+        let keys = crate::config::Keybinds::default();
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Char('.'),
+            KeyModifiers::ALT,
+            100,
+            &[],
+        );
+        remember_layout_if_changed(&state, before);
+
+        assert!(
+            !dir.path().join("ui_state.json").exists(),
+            "holding a key against its clamp must not write on every repeat"
+        );
+    }
+
+    #[test]
+    fn toggling_a_pane_is_remembered_at_once() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.config_dir = dir.path().to_path_buf();
+
+        let before = current_layout(&state);
+        let keys = crate::config::Keybinds::default();
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::F(7),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+        remember_layout_if_changed(&state, before);
+
+        let saved = config::load_ui_state(dir.path()).expect("written on the spot");
+        assert_eq!(saved.show_map, state.show_map);
+        assert!(saved.show_map, "F7 turned the map column on");
     }
 
     // ---- /mark (§16) ----

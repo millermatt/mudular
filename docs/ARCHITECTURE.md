@@ -1291,12 +1291,22 @@ anything else:
 - **Resizing is a NAWS event** (§6.2): the session panes' widths change,
   so a resize ends in the same per-pane size report a layout key triggers.
   A server told the wrong pane width wraps its output wrong.
-- **The width lasts the session.** The config sets the starting value and
-  the keys move it; nothing rewrites the user's config file. Config is a
-  file the user owns and hand-edits with comments, and a client that
-  silently rewrites it is one whose config you cannot trust to stay as you
-  left it. Persisting layout later belongs in a separate state file, not
-  in `mudular.yaml`.
+- **The width outlasts the session, in a file of its own.** Config sets
+  where a fresh install starts (`channel_width`, `map_width`); the keys
+  move it, and where they leave it is written to `ui_state.json` on the
+  spot, alongside which panes were up. `mudular.yaml` is never rewritten:
+  it is a file the user owns and hand-edits with comments, a serde
+  round-trip drops every one of them, and neither mitigation the profile
+  editor uses transfers — you cannot show a "this file has comments"
+  banner on an F7 press, nor take a timestamped backup on every repeat of
+  a held resize key. So config stays authoritative-as-written and the
+  remembered layout layers over it at startup, re-clamped to the terminal
+  in case it is narrower than last time. Written only when a key actually
+  changed something, which means holding a key against its clamp writes
+  nothing. A *terminal* resize is deliberately not remembered: it clamps
+  the columns too, and recording that would throw away the width the
+  player chose the moment they shrank the window. Losing the file costs a
+  keystroke, so unlike a map it is read leniently and replaced freely.
 
 Per-channel heights within the column stay evenly split. Splitting three
 comms panes unevenly is a want nobody has voiced; the column's width

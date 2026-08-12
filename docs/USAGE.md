@@ -444,6 +444,19 @@ you woke up in. The confirmation line names the room every time, so if
 your pattern is the wrong one you'll see it the first time rather than
 the first time it matters.
 
+### The panes remember themselves
+
+Whether the map and comms columns were up, and how wide, is remembered
+between runs — toggle the map on with `F7` once and it comes back next
+launch. `channel_width` and `map_width` in `mudular.yaml` say where a
+fresh install starts; after that, wherever you leave the resize keys is
+where it stays.
+
+It's kept in `ui_state.json` in the config dir, not written back into
+`mudular.yaml` — your config is a file you own and comment, and nothing
+here rewrites it. Delete `ui_state.json` to go back to what the config
+says.
+
 ## Automation: aliases, triggers, timers
 
 Rules can go directly in a profile, or in a shared module that several

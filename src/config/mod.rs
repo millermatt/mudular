@@ -373,6 +373,50 @@ pub fn load_profile(path: &Path) -> Result<Profile> {
     serde_yaml::from_str(&text).with_context(|| format!("parsing profile {}", path.display()))
 }
 
+/// Which panes were up and how wide, remembered between runs
+/// (docs/ARCHITECTURE.md §11.4).
+///
+/// Its own file, deliberately. `mudular.yaml` is a file the player owns and
+/// hand-edits with comments, and a serde round-trip drops every one of them
+/// — §11.4's whole reason for saying the width lasts the session was that a
+/// client which silently rewrites your config is one you cannot trust to
+/// leave it as you wrote it. Config still says where a fresh install
+/// starts; this says where *you* left off, and being derived state, losing
+/// it costs nothing worse than a keystroke.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiState {
+    pub show_channels: bool,
+    pub show_map: bool,
+    pub show_inspector: bool,
+    pub channel_width: u16,
+    pub map_width: u16,
+}
+
+/// Reads the remembered layout, or `None` if there is not a usable one.
+///
+/// Lenient about everything, unlike `save_map`'s careful read: this is
+/// state the client derived, not exploration the player earned, so a file
+/// that cannot be read is fairly replaced by the next thing that happens.
+pub fn load_ui_state(dir: &Path) -> Option<UiState> {
+    let text = std::fs::read_to_string(dir.join("ui_state.json")).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(state) => Some(state),
+        Err(err) => {
+            tracing::warn!("could not parse ui_state.json: {err}; using defaults");
+            None
+        }
+    }
+}
+
+/// Writes the remembered layout. Called whenever a pane key actually
+/// changes something, so it is small and frequent — JSON, machine-written,
+/// never hand-edited, exactly as `maps/` is (§16).
+pub fn save_ui_state(dir: &Path, state: &UiState) -> Result<()> {
+    let json = serde_json::to_string_pretty(state).context("serializing the layout")?;
+    atomic_write(&dir.join("ui_state.json"), json.as_bytes()).context("writing the layout")?;
+    Ok(())
+}
+
 /// App-wide settings (`mudular.yaml`): keybinds, history, and scrollback
 /// size. Absent entirely is fine — a fresh install has sensible defaults
 /// and no config dir yet (§15).
@@ -395,9 +439,18 @@ pub struct AppConfig {
     #[serde(default = "default_scrollback_size")]
     pub scrollback_size: usize,
     /// Starting width of the docked channel column (docs/ARCHITECTURE.md
-    /// §11.4). The keybinds move it from here; nothing writes it back.
+    /// §11.4). The keybinds move it from here, and where they leave it is
+    /// remembered in `ui_state.json` rather than written back into this
+    /// file — see `UiState`.
     #[serde(default = "default_channel_width")]
     pub channel_width: u16,
+    /// Starting width of the docked map column (§16), on the same terms.
+    #[serde(default = "default_map_width")]
+    pub map_width: u16,
+}
+
+fn default_map_width() -> u16 {
+    crate::ui::MAP_WIDTH
 }
 
 /// Hand-written rather than derived: a derived `Default` would give a
@@ -412,6 +465,7 @@ impl Default for AppConfig {
             history_size: default_history_size(),
             scrollback_size: default_scrollback_size(),
             channel_width: default_channel_width(),
+            map_width: default_map_width(),
         }
     }
 }
@@ -1577,6 +1631,70 @@ mod tests {
     /// cannot read. One unreadable file, and the next save — every 30s now
     /// — replaced a whole explored world with the handful of rooms this
     /// session happened to see.
+    // ---- remembered pane layout (§11.4) ----
+
+    #[test]
+    fn the_layout_round_trips() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let saved = UiState {
+            show_channels: false,
+            show_map: true,
+            show_inspector: false,
+            channel_width: 34,
+            map_width: 30,
+        };
+
+        save_ui_state(dir.path(), &saved).unwrap();
+
+        assert_eq!(load_ui_state(dir.path()), Some(saved));
+    }
+
+    /// A fresh install has none, and that is not a failure — config's
+    /// defaults are what a first run is for.
+    #[test]
+    fn no_remembered_layout_is_not_an_error() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        assert_eq!(load_ui_state(dir.path()), None);
+    }
+
+    /// Derived state, not something the player earned: a file that cannot
+    /// be read is fairly ignored, where the same leniency in `save_map`
+    /// would have been data loss.
+    #[test]
+    fn an_unreadable_layout_falls_back_to_the_configured_one() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        std::fs::write(dir.path().join("ui_state.json"), b"{ not json").unwrap();
+
+        assert_eq!(load_ui_state(dir.path()), None);
+    }
+
+    /// §11.4's reason for keeping this out of `mudular.yaml`: that file is
+    /// hand-edited, with comments, and must be left exactly as written.
+    #[test]
+    fn remembering_the_layout_does_not_touch_the_config_file() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let config = "# my notes\nchannel_width: 40\n";
+        std::fs::write(dir.path().join("mudular.yaml"), config).unwrap();
+
+        save_ui_state(
+            dir.path(),
+            &UiState {
+                show_channels: true,
+                show_map: true,
+                show_inspector: false,
+                channel_width: 22,
+                map_width: 18,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("mudular.yaml")).unwrap(),
+            config,
+            "the player's config, comments and all, is left alone"
+        );
+    }
+
     #[test]
     fn save_map_refuses_to_overwrite_a_map_it_could_not_read() {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();

@@ -179,6 +179,7 @@ async fn main() -> Result<()> {
         app_config.history_size,
         app_config.scrollback_size,
         app_config.channel_width,
+        app_config.map_width,
         app_config.cross_session,
         first_run_hint,
     )
