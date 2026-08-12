@@ -16,26 +16,44 @@ use ratatui::widgets::Paragraph;
 
 use crate::map::{RoomId, RoomRole, Scene};
 
+/// A picture the terminal has to be told about directly, because it is not
+/// made of cells: the escape sequence, the pane it covers, and the glyphs
+/// to write on top once it is drawn (§16).
+pub(crate) struct PendingImage {
+    pub area: Rect,
+    pub sixel: String,
+    pub glyphs: Vec<(u16, u16, char, Style)>,
+}
+
 /// One way of drawing a map scene into a pane.
 pub(crate) trait MapRenderer {
     /// `cursor` is view state, not map knowledge — where the player is
     /// *looking*, which the map has no opinion about — so it arrives here
     /// rather than in the [`Scene`].
-    fn draw(&self, frame: &mut Frame, area: Rect, scene: &Scene, cursor: Option<RoomId>);
+    /// Returns a picture for the caller to write after the frame, for a
+    /// renderer that paints pixels. A cell renderer draws into `frame` and
+    /// returns `None`.
+    fn draw(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        scene: &Scene,
+        cursor: Option<RoomId>,
+    ) -> Option<PendingImage>;
 }
 
 /// A room occupies three columns and a corridor the gap beside it, so a
 /// grid step is four columns across and two rows down. In pixels that is
 /// close to square on a typical cell, which is what keeps a diagonal
 /// looking like a diagonal.
-const STEP_X: i32 = 4;
-const STEP_Y: i32 = 2;
+pub(super) const STEP_X: i32 = 4;
+pub(super) const STEP_Y: i32 = 2;
 
 /// What each role paints. Colour carries the meaning here because a room is
 /// three cells of solid ground with one slot on it — shape alone cannot say
 /// "shop" at this size, and a letter plus a hue says it twice, which is what
 /// survives a monochrome terminal or a colour-blind reader.
-fn role_style(role: RoomRole) -> (Style, Option<char>) {
+pub(super) fn role_style(role: RoomRole) -> (Style, Option<char>) {
     match role {
         RoomRole::Here => (
             Style::default()
@@ -73,7 +91,7 @@ fn role_style(role: RoomRole) -> (Style, Option<char>) {
 /// colour-vision deficiency — the same reason the letter is drawn on top
 /// of the colour rather than instead of it. Its eighth entry is black,
 /// which cannot be a background here, so seven remain.
-mod palette {
+pub(super) mod palette {
     use ratatui::style::Color;
 
     pub const HERE: Color = Color::Rgb(0x38, 0xBD, 0xF8); // sky
@@ -121,7 +139,7 @@ fn ink_for(background: Color) -> Color {
 /// `RandomState` is seeded per process: the same label would land on a
 /// different colour every launch, which is worse than one colour for
 /// everything, because it would look like the map meant something by it.
-fn marked_style(label: &str) -> (Style, Option<char>) {
+pub(super) fn marked_style(label: &str) -> (Style, Option<char>) {
     let label = label.trim();
     let folded = label.to_ascii_lowercase();
     // The labels `/mark` offers get a colour each, by position, so the
@@ -165,7 +183,13 @@ fn marked_style(label: &str) -> (Style, Option<char>) {
 pub(crate) struct CharRenderer;
 
 impl MapRenderer for CharRenderer {
-    fn draw(&self, frame: &mut Frame, area: Rect, scene: &Scene, cursor: Option<RoomId>) {
+    fn draw(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        scene: &Scene,
+        cursor: Option<RoomId>,
+    ) -> Option<PendingImage> {
         let width = area.width as i32;
         let height = area.height as i32;
         // The current room sits in the middle, so walking scrolls the world
@@ -264,6 +288,7 @@ impl MapRenderer for CharRenderer {
             .collect();
 
         frame.render_widget(Paragraph::new(lines), area);
+        None
     }
 }
 
@@ -395,7 +420,9 @@ mod tests {
     fn render(scene: &Scene) -> String {
         let mut terminal = Terminal::new(TestBackend::new(11, 5)).unwrap();
         terminal
-            .draw(|frame| CharRenderer.draw(frame, frame.area(), scene, None))
+            .draw(|frame| {
+                CharRenderer.draw(frame, frame.area(), scene, None);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)

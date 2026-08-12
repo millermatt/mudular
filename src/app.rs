@@ -482,6 +482,11 @@ pub struct AppState {
     pub show_inspector: bool,
     /// The party strip: every character's vitals side by side (§11.6).
     pub show_hud: bool,
+    /// Draw the map with pixels, and how big a cell is in them (§16).
+    /// `None` where the player has not asked, or the terminal never said
+    /// how big its cells are — an image sized against a guess would span
+    /// the wrong number of cells and shove the panes beside it sideways.
+    pub map_cell_px: Option<(u16, u16)>,
     /// Whether the help overlay is up (§11.2).
     pub show_help: bool,
     /// How far down the help listing has been scrolled, in rows. The
@@ -1525,6 +1530,7 @@ pub async fn run(
     scrollback_size: usize,
     channel_width: u16,
     map_width: u16,
+    map_graphics: bool,
     cross_session_default: CrossSession,
     first_run_hint: bool,
 ) -> Result<()> {
@@ -1539,6 +1545,7 @@ pub async fn run(
         scrollback_size,
         channel_width,
         map_width,
+        map_graphics,
         cross_session_default,
         first_run_hint,
     )
@@ -1722,6 +1729,55 @@ fn connect(
     }
 }
 
+/// Puts the map's picture on the terminal, after ratatui has flushed the
+/// cells around it (§16).
+///
+/// Written here rather than through a widget because an image is not made
+/// of cells and ratatui has nowhere to put one. The cells underneath were
+/// marked skipped while the frame was built, so nothing has painted over
+/// the space and nothing will until the next frame.
+fn write_map_image(image: &ui::PendingImage) -> Result<()> {
+    use crossterm::{cursor, queue, style};
+    use std::io::Write as _;
+
+    let mut out = std::io::stdout();
+    queue!(out, cursor::SavePosition)?;
+    queue!(out, cursor::MoveTo(image.area.x, image.area.y))?;
+    out.write_all(image.sixel.as_bytes())?;
+    // The letters go on last, in the terminal's own font, onto the cells
+    // the image covers — a bitmap font small enough to embed would draw
+    // them worse than this, and the map's grid is shared by both halves so
+    // they line up without being told to.
+    for (x, y, ch, glyph_style) in &image.glyphs {
+        queue!(out, cursor::MoveTo(*x, *y))?;
+        if let Some(ratatui::style::Color::Rgb(r, g, b)) = glyph_style.fg {
+            queue!(
+                out,
+                style::SetForegroundColor(style::Color::Rgb { r, g, b })
+            )?;
+        }
+        queue!(out, style::Print(ch))?;
+    }
+    queue!(out, style::ResetColor, cursor::RestorePosition)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// How many pixels a cell is, if the terminal has said.
+///
+/// Asked of the kernel rather than the terminal: `TIOCGWINSZ` carries pixel
+/// dimensions beside the row and column counts, so this needs no escape
+/// sequence, no reply to wait for, and no timeout to get wrong. A terminal
+/// that leaves them zero — and a pty, which is why the live-test driver
+/// never takes this path — simply has not said.
+fn cell_pixels() -> Option<(u16, u16)> {
+    let size = crossterm::terminal::window_size().ok()?;
+    if size.width == 0 || size.height == 0 || size.columns == 0 || size.rows == 0 {
+        return None;
+    }
+    Some((size.width / size.columns, size.height / size.rows))
+}
+
 /// The pane layout as it stands.
 fn current_layout(state: &AppState) -> config::UiState {
     config::UiState {
@@ -1894,6 +1950,7 @@ async fn event_loop(
     scrollback_size: usize,
     channel_width: u16,
     map_width: u16,
+    map_graphics: bool,
     cross_session_default: CrossSession,
     first_run_hint: bool,
 ) -> Result<()> {
@@ -1966,6 +2023,7 @@ async fn event_loop(
         // row spent restating the prompt. Two or more is the case it exists
         // for — the numbers a multiboxer was holding in their head.
         show_hud: multiple_characters,
+        map_cell_px: map_graphics.then(cell_pixels).flatten(),
         show_help: false,
         help_scroll: 0,
         keybinds: keybinds.clone(),
@@ -2029,7 +2087,11 @@ async fn event_loop(
     map_saves.tick().await;
 
     loop {
-        terminal.draw(|frame| ui::draw(frame, &state))?;
+        let mut image = None;
+        terminal.draw(|frame| image = ui::draw(frame, &state))?;
+        if let Some(image) = image {
+            write_map_image(&image)?;
+        }
 
         let wake = tokio::select! {
             ev = term_events.next() => Wake::Terminal(ev),
@@ -3111,6 +3173,7 @@ pub(crate) mod test_support {
                 map_width: crate::ui::MAP_WIDTH,
                 show_inspector: false,
                 show_hud: false,
+                map_cell_px: None,
                 show_help: false,
                 help_scroll: 0,
                 keybinds: Keybinds::default(),

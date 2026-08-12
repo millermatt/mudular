@@ -522,6 +522,11 @@ pub struct AppConfig {
     /// Starting width of the docked map column (§16), on the same terms.
     #[serde(default = "default_map_width")]
     pub map_width: u16,
+    /// Draw the map with pixels rather than characters, on a terminal that
+    /// can take them (§16). Off by default: it is invisible on a terminal
+    /// without Sixel, and most are — GNOME Terminal among them.
+    #[serde(default)]
+    pub map_graphics: bool,
 }
 
 fn default_map_width() -> u16 {
@@ -541,6 +546,7 @@ impl Default for AppConfig {
             scrollback_size: default_scrollback_size(),
             channel_width: default_channel_width(),
             map_width: default_map_width(),
+            map_graphics: false,
         }
     }
 }

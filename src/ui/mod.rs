@@ -23,6 +23,9 @@ use crate::scrollback::{Origin, RetainedLine};
 
 pub mod config_editor;
 mod map_render;
+mod map_sixel;
+pub(crate) use map_render::PendingImage;
+mod sixel;
 
 use map_render::MapRenderer as _;
 
@@ -257,7 +260,8 @@ pub fn session_pane_sizes(area: Rect, state: &AppState) -> Vec<(usize, (u16, u16
         .collect()
 }
 
-pub fn draw(frame: &mut Frame, state: &AppState) {
+pub fn draw(frame: &mut Frame, state: &AppState) -> Option<map_render::PendingImage> {
+    let mut pending = None;
     let panes = layout(frame.area(), state);
 
     if state.sessions.is_empty() {
@@ -298,7 +302,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     }
 
     if let Some(rect) = panes.map {
-        draw_map(frame, rect, state);
+        pending = draw_map(frame, rect, state);
     }
 
     let bound = state.bound();
@@ -344,6 +348,10 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             wizard.error.as_deref(),
         );
     }
+
+    // Written by the caller once the frame has been flushed: an image is
+    // not made of cells, so ratatui cannot carry it.
+    pending
 }
 
 /// The help overlay: a box centred over the layout, sized to its content and
@@ -685,7 +693,7 @@ fn gauge_style(gauge: crate::vitals::Gauge) -> Style {
 /// form of the same knowledge is `Map::describe` (§16). This function owns
 /// the pane — its border, its title, and what to say when there is nothing
 /// to draw — and hands the picture itself to a [`MapRenderer`].
-fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
+fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) -> Option<map_render::PendingImage> {
     let session = state.bound();
     let title = match session.and_then(|session| session.current_room) {
         Some(at) => session
@@ -713,7 +721,7 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return None;
     }
 
     let (Some(session), Some(current)) = (session, session.and_then(|s| s.current_room)) else {
@@ -721,10 +729,28 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
             Paragraph::new("no room data yet").wrap(Wrap { trim: true }),
             inner,
         );
-        return;
+        return None;
     };
 
     let scene = session.map.scene(current, session.corpse);
+    // Pixels where the terminal takes them, cells everywhere else — the
+    // same scene either way (§16).
+    if let Some(cell) = state.map_cell_px {
+        let described_rows = described_height(state, session, inner);
+        let (grid, caption) = split_caption(inner, described_rows);
+        if let Some(image) = map_sixel::render(grid, &scene, state.map_cursor, cell) {
+            // The cells under the image belong to it now: left to ratatui
+            // they would be painted over the pixels every frame.
+            for y in grid.top()..grid.bottom() {
+                for x in grid.left()..grid.right() {
+                    frame.buffer_mut()[(x, y)]
+                        .set_diff_option(ratatui::buffer::CellDiffOption::Skip);
+                }
+            }
+            draw_caption(frame, caption, state, session);
+            return Some(image);
+        }
+    }
 
     // With the cursor up, the bottom of the column says what it is sitting
     // on — `Map::describe`, the same prose `/map` prints. It goes in the
@@ -763,6 +789,52 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
             rect,
         );
     }
+    None
+}
+
+/// How many rows the cursor's description wants, so both renderers leave
+/// it the same room.
+fn described_height(state: &AppState, session: &crate::app::SessionPane, inner: Rect) -> u16 {
+    let Some(at) = state.map_cursor else {
+        return 0;
+    };
+    let lines = session.map.describe(at);
+    if lines.is_empty() {
+        return 0;
+    }
+    let wanted: u16 = lines
+        .iter()
+        .map(|line| line.len().div_ceil(inner.width.max(1) as usize) as u16)
+        .sum();
+    wanted.clamp(1, inner.height / 2)
+}
+
+fn split_caption(inner: Rect, rows: u16) -> (Rect, Option<Rect>) {
+    if rows == 0 {
+        return (inner, None);
+    }
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(rows)])
+        .split(inner);
+    (split[0], Some(split[1]))
+}
+
+fn draw_caption(
+    frame: &mut Frame,
+    caption: Option<Rect>,
+    state: &AppState,
+    session: &crate::app::SessionPane,
+) {
+    let (Some(rect), Some(at)) = (caption, state.map_cursor) else {
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(session.map.describe(at).join("\n"))
+            .wrap(Wrap { trim: true })
+            .style(Style::default().add_modifier(Modifier::DIM)),
+        rect,
+    );
 }
 
 fn draw_channel(
@@ -1123,7 +1195,11 @@ mod tests {
 
     fn render_sized(state: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, state)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, state);
+            })
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -2258,12 +2334,20 @@ mod tests {
             state.sessions[0]
                 .scrollback
                 .push_back(RetainedLine::server(line));
-            terminal.draw(|frame| draw(frame, &state)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &state);
+                })
+                .unwrap();
             assert_left_border_intact(terminal.backend().buffer());
         }
 
         state.sessions[0].prompt = "By what name do you wish to be known?".to_string();
-        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &state);
+            })
+            .unwrap();
         assert_left_border_intact(terminal.backend().buffer());
 
         state.sessions[0].prompt.clear();
@@ -2274,7 +2358,11 @@ mod tests {
             state.sessions[0]
                 .scrollback
                 .push_back(RetainedLine::server(line));
-            terminal.draw(|frame| draw(frame, &state)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &state);
+                })
+                .unwrap();
             assert_left_border_intact(terminal.backend().buffer());
         }
     }

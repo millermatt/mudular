@@ -1797,6 +1797,35 @@ lives in `ui`, and neither is visible from inside it.
   copies, and lands in the disk log, which the pane does none of. The
   wider question of speech in a full-screen TUI is deliberately left open;
   see `ARCH_REVIEW.md`.
+- **On a terminal that draws pixels, the map is drawn with them**
+  (`map_graphics: true`). The second implementor of `MapRenderer`, and the
+  reason that trait exists: it takes the same `Scene`, so nothing above it
+  knows which is running. Sixel rather than kitty's protocol because it
+  reaches Windows Terminal, xterm, Konsole, VS Code, iTerm2 and WezTerm,
+  including the Windows default. Encoded first-party — §15 promises a
+  static binary with no C dependencies, ruling out `libsixel`, and the
+  hard part of Sixel is reducing an image to 256 colours, which a map
+  drawing from a dozen fixed ones never has to do.
+  - **Corridors and rooms are pixels; the letters are not.** A `@` or a
+    shop's `S` would need an embedded bitmap font, and one small enough
+    to ship would draw them worse than the terminal's own font already
+    does — the one part of the character renderer that was never the
+    problem. So the map keeps the cells it covers (`CellDiffOption::Skip`,
+    which exists for exactly this), paints the background as one image,
+    and writes the letters onto those cells itself. Both halves use the
+    same grid, so they line up by construction rather than by arithmetic.
+  - **The cell size comes from `TIOCGWINSZ`, not from the terminal.**
+    `crossterm::terminal::window_size` carries pixel dimensions beside the
+    rows and columns, so there is no escape sequence to send, no reply to
+    wait for and no timeout to get wrong. Where they are zero — a pty,
+    which is why the live-test driver never takes this path — there is no
+    cell size, and no image: one sized against a guess would span the
+    wrong number of cells and shove the panes beside it sideways.
+  - **Off by default**, because it is invisible on a terminal without
+    Sixel and most have none. GNOME Terminal in particular cannot be
+    talked into it: VTE compiles the `enable-sixel` API unconditionally
+    but the parser only with `-Dsixel=true`, which Debian and Ubuntu do
+    not set, so the setting exists and does nothing.
 - **The pane's colours are given in RGB, not by ANSI name.** A named
   colour is whatever the player's terminal theme says it is — one
   person's `Yellow` is mustard and another's is near-white — so a set

@@ -416,6 +416,26 @@ It only steps onto rooms the picture actually shows — the grid is mostly
 empty space, and a cursor that could sit on a blank cell would have you
 steering around gaps. A nudge into nothing leaves it where it is.
 
+### Drawing the map with pixels
+
+On a terminal that can draw images, the map can be drawn as one — real
+diagonals at the angle the rooms actually lie at, and corridors that meet
+the rooms they join:
+
+```yaml
+# mudular.yaml
+map_graphics: true
+```
+
+It uses Sixel, so it works in WezTerm, kitty, Windows Terminal, Konsole,
+xterm, VS Code and iTerm2. It does **not** work in GNOME Terminal, and
+cannot be made to — Debian and Ubuntu build VTE without the Sixel parser,
+so there is no setting to turn on. If nothing appears, that is almost
+always why; mudular falls back to the character map and carries on.
+
+The letters stay letters, drawn in your terminal's own font on top of the
+picture, because that is the one thing a font does better than pixels.
+
 ### Marking places you care about
 
 Nothing in the protocols says what a room is *for*. A Diku MUD's MSDP
