@@ -366,6 +366,30 @@ there and says so, rather than guessing the rest of the way from a room
 it didn't plan for — leaving that character somewhere unexpected would be
 worse than leaving them in place.
 
+### Marking places you care about
+
+Nothing in the protocols says what a room is *for*. A Diku MUD's MSDP
+carries the room's number, name, area and exits and nothing else — no
+shop flag, no terrain — so the client will not invent one. You label
+places yourself:
+
+```
+/mark shop
+/mark well
+/mark            (rubs out this room's mark)
+```
+
+The room you're standing in gets the note, it shows on the map as its
+first letter in its own colour, and `/map` prints the whole label:
+
+```
+Bakers Shop (#40602), New: Ofcol Village [shop]
+Exits: west to Outside Ofcol
+```
+
+Marks are saved with the map, so they're still there next session, and
+another character exploring the same profile won't rub them out.
+
 ### Corpse runs
 
 The worst part of dying isn't the walk back, it's not remembering where

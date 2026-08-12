@@ -1711,6 +1711,18 @@ lives in `ui`, and neither is visible from inside it.
   copies, and lands in the disk log, which the pane does none of. The
   wider question of speech in a full-screen TUI is deliberately left open;
   see `ARCH_REVIEW.md`.
+- **`/mark <label>` is the player's own note on a room**, and the only
+  source of one. No protocol carries what a place is *for*: a
+  Diku-derived server's MSDP variable table is `ROOM`, `ROOM_VNUM`,
+  `ROOM_NAME`, `ROOM_EXITS`, `AREA_NAME` and nothing else — no shop flag,
+  no terrain. (GMCP's `Room.Info.details` does carry `["shop","bank"]`,
+  but that is an IRE convention, absent from the Diku family most people
+  play.) So the label is typed, stored on the `Room` beside the server's
+  own facts — persisting, merging and loading with everything else for
+  free — and covered by the same never-erase rule, since another
+  character's save knows nothing about it. The map draws its first letter,
+  which is the glyph a font is actually built to render at 8x16 where a
+  pictogram is a smudge; `describe` prints the whole thing.
 - **No text inference.** A MUD that sends neither GMCP `Room.Info` nor MSDP
   `ROOM_*` gets no map, and is told so rather than half-mapped. Inferring
   rooms from prose is MUD-specific guesswork; this is structured data the

@@ -261,6 +261,15 @@ pub struct Room {
     pub name: Option<String>,
     pub area: Option<String>,
     pub exits: BTreeMap<String, Option<RoomId>>,
+    /// What the *player* called this place — "shop", "well", "smith" (§16).
+    ///
+    /// Kept on the room beside the server's own facts rather than in a
+    /// table of its own, so it persists, merges and loads with everything
+    /// else for free. Nothing derives it: a Diku MUD's MSDP carries only
+    /// vnum, name, area and exits, with no notion of what a room *is*, so
+    /// the only honest source is the person who walked in and looked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<String>,
 }
 
 /// Everywhere the client has been, and how those places connect.
@@ -327,6 +336,7 @@ impl Map {
     pub fn observe(&mut self, info: &RoomInfo) {
         let room = self.rooms.entry(info.id).or_insert_with(|| Room {
             id: info.id,
+            mark: None,
             name: None,
             area: None,
             exits: BTreeMap::new(),
@@ -351,6 +361,7 @@ impl Map {
                 name: None,
                 area: None,
                 exits: BTreeMap::new(),
+                mark: None,
             });
             merge_room_facts(
                 room,
@@ -358,7 +369,24 @@ impl Map {
                 other_room.area.as_deref(),
                 &other_room.exits,
             );
+            // A mark is the player's own note, so the never-erase rule
+            // covers it too: the other side having none does not clear one.
+            if other_room.mark.is_some() {
+                room.mark = other_room.mark;
+            }
         }
+    }
+
+    /// Labels a room with the player's own note, or clears it with `None`.
+    /// Returns whether anything changed, so a caller can decide whether the
+    /// map is worth saving again.
+    pub fn set_mark(&mut self, at: RoomId, mark: Option<String>) -> bool {
+        let Some(room) = self.rooms.get_mut(&at) else {
+            return false;
+        };
+        let changed = room.mark != mark;
+        room.mark = mark;
+        changed
     }
 
     /// Records an edge learned by walking it — the destination a server's
@@ -366,6 +394,7 @@ impl Map {
     pub fn connect(&mut self, from: RoomId, direction: &str, to: RoomId) {
         let room = self.rooms.entry(from).or_insert_with(|| Room {
             id: from,
+            mark: None,
             name: None,
             area: None,
             exits: BTreeMap::new(),
@@ -573,6 +602,11 @@ impl Map {
         };
         if let Some(area) = &room.area {
             heading.push_str(&format!(", {area}"));
+        }
+        // The player's own note reads before the exits, because it is the
+        // reason they wrote it down: what this place is *for*.
+        if let Some(mark) = &room.mark {
+            heading.push_str(&format!(" [{mark}]"));
         }
 
         let mut exits: Vec<&String> = room.exits.keys().collect();
@@ -977,6 +1011,68 @@ mod tests {
             Some((0, 1)),
             "but south is straight down, so the renderer must not draw this"
         );
+    }
+
+    /// A mark is the player's own note, so the never-erase rule that
+    /// protects walked exits protects it too — another character's save,
+    /// or a reload that knows nothing about it, must not rub it out.
+    #[test]
+    fn a_mark_survives_a_merge_that_does_not_mention_it() {
+        let mut mine = Map::default();
+        mine.observe(&RoomInfo {
+            id: RoomId(1),
+            name: Some("Bakers Shop".to_string()),
+            area: None,
+            exits: BTreeMap::new(),
+        });
+        assert!(mine.set_mark(RoomId(1), Some("shop".to_string())));
+
+        // Another session that only ever saw the room, never the note.
+        let mut theirs = Map::default();
+        theirs.observe(&RoomInfo {
+            id: RoomId(1),
+            name: Some("Bakers Shop".to_string()),
+            area: None,
+            exits: BTreeMap::new(),
+        });
+        mine.merge(theirs);
+
+        assert_eq!(mine.rooms[&RoomId(1)].mark.as_deref(), Some("shop"));
+    }
+
+    #[test]
+    fn a_marked_room_says_so_when_described() {
+        let mut map = Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: Some("Bakers Shop".to_string()),
+            area: Some("Ofcol".to_string()),
+            exits: BTreeMap::new(),
+        });
+        map.set_mark(RoomId(1), Some("shop".to_string()));
+
+        let described = map.describe(RoomId(1)).join("\n");
+
+        assert!(described.contains("[shop]"), "{described}");
+    }
+
+    /// The map file is the only place a mark lives, so it has to survive
+    /// the round trip that everything else does.
+    #[test]
+    fn a_mark_survives_being_written_and_read_back() {
+        let mut map = Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: None,
+            area: None,
+            exits: BTreeMap::new(),
+        });
+        map.set_mark(RoomId(1), Some("well".to_string()));
+
+        let json = serde_json::to_string(&map).unwrap();
+        let back: Map = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.rooms[&RoomId(1)].mark.as_deref(), Some("well"));
     }
 
     #[test]

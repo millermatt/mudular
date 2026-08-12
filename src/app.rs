@@ -66,6 +66,9 @@ const GOTO_COMMAND: &str = "/goto";
 /// Walks back to where a `corpse:` trigger last said the character died
 /// (§16) — `/goto` with the target already remembered.
 const CORPSE_COMMAND: &str = "/corpse";
+/// Labels the room the character is standing in (§16) — the player's own
+/// note about what a place is for, since no protocol tells us.
+const MARK_COMMAND: &str = "/mark";
 const MAP_COMMAND: &str = "/map";
 
 /// `send_to` address meaning "every other session" (§7.5).
@@ -2268,6 +2271,11 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         start_corpse_run(state).await;
         return;
     }
+    if trimmed == MARK_COMMAND || trimmed.starts_with("/mark ") {
+        let label = trimmed.strip_prefix(MARK_COMMAND).unwrap_or("").trim();
+        mark_current_room(state, label);
+        return;
+    }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
 }
 
@@ -2371,6 +2379,42 @@ async fn start_goto(state: &mut AppState, arg: &str) {
     };
 
     walk_to(session, current, target, GOTO_COMMAND).await;
+}
+
+/// `/mark <label>` (§16): writes the player's own note onto the room they
+/// are standing in, and `/mark` alone rubs it out again.
+///
+/// The client never guesses the label. A Diku MUD's MSDP carries vnum,
+/// name, area and exits and nothing about what a room is *for* — no shop
+/// flag, no terrain — so the only honest source for "this is the baker's"
+/// is the person who walked in and read the sign.
+fn mark_current_room(state: &mut AppState, label: &str) {
+    let Some(session) = state.bound_mut() else {
+        return;
+    };
+    let Some(at) = session.current_room else {
+        session.push_line(RetainedLine::client(
+            "** /mark doesn't know where you are yet",
+        ));
+        return;
+    };
+
+    let previous = session
+        .map
+        .rooms
+        .get(&at)
+        .and_then(|room| room.mark.clone());
+    let notice = match (label.is_empty(), previous) {
+        (true, None) => format!("** /mark: #{} has no mark to remove", at.0),
+        (true, Some(old)) => format!("** unmarked #{} (was `{old}`)", at.0),
+        (false, _) => format!("** marked #{} as `{label}`", at.0),
+    };
+    let wanted = (!label.is_empty()).then(|| label.to_string());
+    // Marks live in the map file, so a change is worth writing out — the
+    // player typed it, and losing it to a crash would be worse than losing
+    // a room they can simply walk back into.
+    session.map_dirty |= session.map.set_mark(at, wanted);
+    session.push_line(RetainedLine::client(notice));
 }
 
 /// `/corpse` (§16): retraces the way back to the room a `corpse:` trigger
@@ -4474,6 +4518,7 @@ mod tests {
             crate::map::RoomId(id),
             crate::map::Room {
                 id: crate::map::RoomId(id),
+                mark: None,
                 name: name.map(str::to_string),
                 area: None,
                 exits: exits
@@ -5004,6 +5049,70 @@ mod tests {
 
         assert!(state.sessions[0].walk.is_none());
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    // ---- /mark (§16) ----
+
+    #[tokio::test]
+    async fn mark_labels_the_room_and_shows_on_the_map() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, Some("Bakers Shop"), &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/mark shop").await;
+
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("shop")
+        );
+        let scene = state.sessions[0].map.scene(crate::map::RoomId(1), None);
+        assert_eq!(
+            scene.rooms[0].mark,
+            Some('S'),
+            "and the map has a letter to draw for it"
+        );
+        assert!(scrollback(&state.sessions[0]).contains("marked #1 as `shop`"));
+    }
+
+    /// A mark is something the player typed, so losing it to a crash would
+    /// be worse than losing a room they can walk back into.
+    #[tokio::test]
+    async fn marking_a_room_makes_the_map_worth_saving() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].map_dirty = false;
+
+        submit(&mut state, "/mark well").await;
+
+        assert!(state.sessions[0].map_dirty);
+    }
+
+    #[tokio::test]
+    async fn mark_with_no_label_rubs_the_mark_out() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        submit(&mut state, "/mark well").await;
+
+        submit(&mut state, "/mark").await;
+
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)].mark,
+            None
+        );
+        assert!(scrollback(&state.sessions[0]).contains("unmarked #1 (was `well`)"));
+    }
+
+    #[tokio::test]
+    async fn mark_without_a_known_room_says_so() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        submit(&mut state, "/mark shop").await;
+
+        assert!(scrollback(&state.sessions[0]).contains("doesn't know where you are"));
     }
 
     // ---- /corpse (§16) ----

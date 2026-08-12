@@ -41,6 +41,12 @@ pub struct PlacedRoom {
     /// they are a property of the room rather than a corridor.
     pub up: bool,
     pub down: bool,
+    /// The first letter of the player's own note for this room, if they
+    /// left one. A single cell is all a room has to say it with, and a
+    /// letter is the glyph a font is actually built to render at this size
+    /// — `S` for a shop reads where a pictogram would be a smudge. The
+    /// whole note is in `Map::describe`.
+    pub mark: Option<char>,
 }
 
 /// A corridor between two placed rooms, one grid step long.
@@ -90,6 +96,11 @@ impl Map {
                 },
                 up: room.exits.contains_key("u"),
                 down: room.exits.contains_key("d"),
+                mark: room
+                    .mark
+                    .as_deref()
+                    .and_then(|mark| mark.chars().next())
+                    .map(|first| first.to_ascii_uppercase()),
             });
 
             for (direction, dest) in &room.exits {

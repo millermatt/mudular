@@ -115,6 +115,10 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/connect", "add a character to this running instance"),
         row("/goto", "walk to a known room, one step at a time"),
         row("/corpse", "walk back to where you last died"),
+        row(
+            "/mark",
+            "label this room on the map (`/mark` alone clears it)",
+        ),
         row("/map", "show or hide the map, and describe this room"),
         String::new(),
         "Leaving".to_string(),
@@ -839,6 +843,7 @@ mod tests {
             crate::map::RoomId(id),
             crate::map::Room {
                 id: crate::map::RoomId(id),
+                mark: None,
                 name: None,
                 area: Some("Test".to_string()),
                 exits: exits

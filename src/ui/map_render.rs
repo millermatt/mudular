@@ -52,6 +52,17 @@ fn role_style(role: RoomRole) -> (Style, Option<char>) {
     }
 }
 
+/// A room the player has labelled. Its own colour so a shop reads as a
+/// shop at a glance, with the letter saying which kind — shape and hue
+/// carrying the same fact, so neither a colour-blind reader nor a
+/// monochrome terminal loses it.
+fn marked_style() -> Style {
+    Style::default()
+        .bg(Color::Yellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
+}
+
 /// Draws the scene as filled cells on a character grid.
 ///
 /// Rooms are a *background* fill rather than a glyph: a filled cell is the
@@ -105,7 +116,16 @@ impl MapRenderer for CharRenderer {
         for room in &scene.rooms {
             let col = origin_col + room.at.0 * STEP_X;
             let row = origin_row + room.at.1 * STEP_Y;
-            let (style, letter) = role_style(room.role);
+            let (mut style, mut letter) = role_style(room.role);
+            // Where the player is, and where their corpse is, outrank a
+            // label: both are things they are looking for right now, and a
+            // room has one slot to say it with.
+            if room.role == RoomRole::Known
+                && let Some(mark) = room.mark
+            {
+                style = marked_style();
+                letter = Some(mark);
+            }
             // Three slots: a tick for exits off the grid, the room's own
             // mark, and ground. All on one fill, so none of it crowds.
             let tick = match (room.up, room.down) {
