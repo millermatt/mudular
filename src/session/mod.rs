@@ -570,6 +570,7 @@ async fn run_connection(
                                         match gmcp::parse(&data) {
                                             Ok(message) => {
                                                 let flat = gmcp::flatten(&message);
+                                                forget_exits_on_room_change(engine, &flat.pairs);
                                                 for (key, value) in flat.pairs {
                                                     engine.update_server_data_from_gmcp(&key, value);
                                                 }
@@ -610,6 +611,7 @@ async fn run_connection(
                                             // the loop right after this one consumes
                                             // `flat.pairs` feeding the engine.
                                             let inspector_pairs = flat.pairs.clone();
+                                            forget_exits_on_room_change(engine, &flat.pairs);
                                             for (key, value) in flat.pairs {
                                                 engine.update_server_data_from_msdp(&key, value);
                                             }
@@ -1040,6 +1042,22 @@ const MOVEMENT_SETTLE: Duration = Duration::from_secs(5);
 
 /// Records what an outbound command means for room tracking (§16).
 ///
+/// Drops the store's exit list when an arriving message names a different
+/// room than the one already there (§6.3, §16).
+///
+/// Has to run *before* the message is merged in: once the new room's keys
+/// are written, the previous room's exits are indistinguishable from this
+/// room's own. A message that names no room at all changes nothing, so a
+/// server sending `Room.Info` in pieces still accumulates as it did.
+fn forget_exits_on_room_change(engine: &mut Engine, pairs: &[(String, String)]) {
+    let Some(arriving) = crate::map::vnum_in_pairs(pairs) else {
+        return;
+    };
+    if crate::map::vnum_in_store(engine.server_data()) != Some(arriving) {
+        engine.forget_room_exits();
+    }
+}
+
 /// Movement accumulates; anything else clears it. The clearing is the
 /// interesting half: a command that is *not* a step is the likeliest
 /// explanation for a room change right after it — a recall, a portal, a
@@ -1523,6 +1541,78 @@ mod tests {
     fn rules(yaml: &str) -> Engine {
         let module = serde_yaml::from_str(yaml).expect("valid test YAML");
         Engine::compile(&[module]).expect("compiles")
+    }
+
+    // ---- exits across a move (§6.3, §16) ----
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn engine_in_room(vnum: &str, exits: &[(&str, &str)]) -> Engine {
+        let mut engine = rules("name: t\n");
+        engine.update_server_data_from_gmcp("Room.Info.num", vnum.to_string());
+        for (direction, dest) in exits {
+            engine.update_server_data_from_gmcp(
+                &format!("Room.Info.exits.{direction}"),
+                dest.to_string(),
+            );
+        }
+        engine
+    }
+
+    #[test]
+    fn arriving_in_a_new_room_drops_the_last_rooms_exits() {
+        let mut engine = engine_in_room("40601", &[("n", "40600"), ("e", "40602")]);
+
+        forget_exits_on_room_change(&mut engine, &pairs(&[("Room.Info.num", "40602")]));
+
+        assert!(
+            !engine.server_data().keys().any(|k| k.contains("exits")),
+            "the crossroads' exits must not survive into the shop: {:?}",
+            engine.server_data()
+        );
+    }
+
+    /// The other half: a server updating the room it already described must
+    /// not have its exits thrown away, or a partial `Room.Info` would empty
+    /// the map every time it arrived (§6.3).
+    #[test]
+    fn an_update_about_the_same_room_keeps_its_exits() {
+        let mut engine = engine_in_room("40601", &[("n", "40600"), ("e", "40602")]);
+
+        forget_exits_on_room_change(
+            &mut engine,
+            &pairs(&[("Room.Info.num", "40601"), ("Room.Info.name", "Renamed")]),
+        );
+
+        assert_eq!(
+            engine
+                .server_data()
+                .get("Room.Info.exits.n")
+                .map(String::as_str),
+            Some("40600"),
+        );
+    }
+
+    /// A message that names no room says nothing about which room we are
+    /// in, so it decides nothing about the exits either.
+    #[test]
+    fn a_message_with_no_room_number_changes_nothing() {
+        let mut engine = engine_in_room("40601", &[("n", "40600")]);
+
+        forget_exits_on_room_change(&mut engine, &pairs(&[("Char.Vitals.hp", "90")]));
+
+        assert_eq!(
+            engine
+                .server_data()
+                .get("Room.Info.exits.n")
+                .map(String::as_str),
+            Some("40600"),
+        );
     }
 
     /// A session publishes what its rules learn, so its peers can read it

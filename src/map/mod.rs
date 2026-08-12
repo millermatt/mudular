@@ -98,6 +98,48 @@ pub(crate) fn direction_vector(direction: &str) -> Option<(i32, i32)> {
 /// where a room *lies* is symmetric even where walking it is not.
 type PlacementSteps = BTreeMap<RoomId, Vec<(RoomId, (i32, i32))>>;
 
+/// Where a server puts the room's own id, in each protocol's spelling.
+pub(crate) const VNUM_KEYS: &[&str] = &["Room.Info.num", "ROOM.VNUM", "ROOM_VNUM"];
+
+/// Where a server puts the room's exits. A key under one of these belongs
+/// to whichever room the store currently describes, and to no other.
+pub(crate) const EXIT_PREFIXES: &[&str] = &[
+    "Room.Info.exits.",
+    "Room.Exits.",
+    "ROOM.EXITS.",
+    "ROOM_EXITS.",
+];
+
+/// Whether a server-data key is part of a room's exit list.
+pub(crate) fn is_exit_key(key: &str) -> bool {
+    EXIT_PREFIXES.iter().any(|prefix| {
+        key.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+/// The room id in a set of just-arrived key/value pairs, if it names one.
+/// Used to notice that the character has moved *before* the new room's data
+/// is merged in, which is the only moment the previous room's exits can
+/// still be told apart from this one's.
+pub(crate) fn vnum_in_pairs(pairs: &[(String, String)]) -> Option<&str> {
+    pairs.iter().find_map(|(key, value)| {
+        VNUM_KEYS
+            .iter()
+            .any(|known| key.eq_ignore_ascii_case(known))
+            .then_some(value.as_str())
+    })
+}
+
+/// The room id the store currently describes.
+pub(crate) fn vnum_in_store(data: &HashMap<String, String>) -> Option<&str> {
+    VNUM_KEYS.iter().find_map(|known| {
+        data.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(known))
+            .map(|(_, value)| value.as_str())
+    })
+}
+
 /// One room-data update, as extracted from the server-data store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomInfo {
@@ -134,7 +176,7 @@ impl RoomInfo {
         // identity — a maze built to defeat mapping, where every room
         // reports the same nothing. Believing it collapses the whole maze
         // into one room and hangs the real rooms around it off that.
-        let vnum = find_ci(data, &["Room.Info.num", "ROOM.VNUM", "ROOM_VNUM"])?;
+        let vnum = find_ci(data, VNUM_KEYS)?;
         let id = RoomId(vnum.parse::<i64>().ok().filter(|num| *num != 0)?);
 
         let name = find_ci(data, &["Room.Info.name", "ROOM.NAME", "ROOM_NAME"]).map(str::to_string);
@@ -146,14 +188,8 @@ impl RoomInfo {
 
         // Only one prefix's worth of exits is read: mixing two protocols'
         // exit lists would double-count exits that both happen to name.
-        let exit_prefixes = [
-            "Room.Info.exits.",
-            "Room.Exits.",
-            "ROOM.EXITS.",
-            "ROOM_EXITS.",
-        ];
         let mut exits = BTreeMap::new();
-        for prefix in exit_prefixes {
+        for prefix in EXIT_PREFIXES.iter().copied() {
             let matches: Vec<_> = data
                 .iter()
                 // `get`, not a slice: a key is server data (§13), and

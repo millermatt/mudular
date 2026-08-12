@@ -818,6 +818,27 @@ impl Engine {
     /// As [`Self::update_server_data_from_gmcp`], but for MSDP: a no-op if
     /// GMCP already owns this key, since a server offering both protocols
     /// has GMCP preferred (§6.3).
+    /// Forgets the exits the store currently holds, for use the moment a
+    /// server names a *different* room than the one already described.
+    ///
+    /// A room's exit list arrives whole, never incrementally, so merging one
+    /// room's exits over another's leaves the previous room's directions
+    /// hanging off the new one. A dead-end shop reached from a crossroads
+    /// inherited all four of the crossroads' exits plus one pointing at
+    /// itself — the direction walked in by, whose key still held the vnum
+    /// the player had just arrived at.
+    ///
+    /// Deliberately not a general "replace the subtree" rule, for the same
+    /// reason `prune_gmcp_array` is narrow: §6.3 tolerates servers sending
+    /// partial object updates, and clearing whatever a message omitted
+    /// would throw those away. Only exits, and only on a room change.
+    pub fn forget_room_exits(&mut self) {
+        self.server_data
+            .retain(|key, _| !crate::map::is_exit_key(key));
+        self.gmcp_keys.retain(|key| !crate::map::is_exit_key(key));
+        self.changed = true;
+    }
+
     pub fn update_server_data_from_msdp(&mut self, key: &str, value: String) {
         if self.gmcp_keys.contains(key) {
             return;
@@ -2829,6 +2850,84 @@ triggers:
 
         assert!(engine.process_line("You have been slain by a rat.").bell);
         assert!(!engine.process_line("You see a rat.").bell);
+    }
+
+    // ---- room exits across a move (§6.3, §16) ----
+
+    /// Found in play, in Ofcol: every shop on the west side of the village
+    /// had four exits instead of one, three of them belonging to the room
+    /// the player had walked in from, and one pointing at the shop itself —
+    /// the direction walked in by, whose key still held the vnum just
+    /// arrived at. A room's exits arrive whole, so a new room's list has to
+    /// replace the old one rather than merge over it.
+    #[test]
+    fn a_new_room_does_not_inherit_the_last_rooms_exits() {
+        let mut engine = Engine::compile(&[module("name: t\n")]).unwrap();
+
+        // A crossroads with exits in all four directions.
+        for (key, value) in [
+            ("Room.Info.num", "40601"),
+            ("Room.Info.exits.n", "40600"),
+            ("Room.Info.exits.s", "40604"),
+            ("Room.Info.exits.e", "40602"),
+            ("Room.Info.exits.w", "40603"),
+        ] {
+            engine.update_server_data_from_gmcp(key, value.to_string());
+        }
+
+        // Walk east into a shop, which is a dead end back the way you came.
+        engine.forget_room_exits();
+        for (key, value) in [("Room.Info.num", "40602"), ("Room.Info.exits.w", "40601")] {
+            engine.update_server_data_from_gmcp(key, value.to_string());
+        }
+
+        let room = crate::map::RoomInfo::from_server_data(engine.server_data()).expect("a room");
+        assert_eq!(room.id, crate::map::RoomId(40602));
+        assert_eq!(
+            room.exits.keys().collect::<Vec<_>>(),
+            vec!["w"],
+            "a dead-end shop has one exit, not the crossroads' four: {:?}",
+            room.exits
+        );
+        assert_eq!(
+            room.exits.get("w"),
+            Some(&Some(crate::map::RoomId(40601))),
+            "and it leads back out, not to itself"
+        );
+    }
+
+    /// The narrowness matters as much as the fix: §6.3 tolerates partial
+    /// object updates, so everything that is not an exit survives.
+    #[test]
+    fn forgetting_exits_leaves_the_rest_of_the_store_alone() {
+        let mut engine = Engine::compile(&[module("name: t\n")]).unwrap();
+        for (key, value) in [
+            ("Room.Info.num", "40601"),
+            ("Room.Info.exits.n", "40600"),
+            ("Char.Vitals.hp", "90"),
+        ] {
+            engine.update_server_data_from_gmcp(key, value.to_string());
+        }
+
+        engine.forget_room_exits();
+
+        assert_eq!(
+            engine
+                .server_data()
+                .get("Char.Vitals.hp")
+                .map(String::as_str),
+            Some("90"),
+            "vitals are not exits"
+        );
+        assert_eq!(
+            engine
+                .server_data()
+                .get("Room.Info.num")
+                .map(String::as_str),
+            Some("40601"),
+            "nor is the room's own id"
+        );
+        assert!(!engine.server_data().contains_key("Room.Info.exits.n"));
     }
 
     // ---- corpse (§16) ----
