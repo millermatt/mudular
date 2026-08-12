@@ -74,7 +74,7 @@ pub fn canonical_direction(raw: &str) -> Option<&'static str> {
 /// How a direction moves a room on the rendered grid. `None` for exits with
 /// no 2D meaning (`u`/`d`/`in`/`out`) — they are real exits and stay
 /// pathable, they just cannot be drawn as a displacement on a flat map.
-fn direction_vector(direction: &str) -> Option<(i32, i32)> {
+pub(crate) fn direction_vector(direction: &str) -> Option<(i32, i32)> {
     // Screen coordinates: y grows downward, so north is -1.
     Some(match direction {
         "n" => (0, -1),
@@ -762,6 +762,40 @@ mod tests {
     fn edges_are_directional() {
         let map = line_of_three();
         assert_eq!(map.path(RoomId(3), RoomId(1)), None);
+    }
+
+    /// Why the renderer cannot read a corridor's direction off the two
+    /// rooms' coordinates. Every exit here is cardinal, yet room 2 and room
+    /// 4 — joined by a plain `s` — land diagonally apart, because `layout_area`
+    /// places each room once and room 4 was already sited by room 1's `n`.
+    /// A renderer that trusted the delta would draw a diagonal corridor on a
+    /// MUD that has no diagonals at all.
+    #[test]
+    fn a_cardinal_exit_can_still_land_two_rooms_diagonally_apart() {
+        let mut map = Map::default();
+        for id in 1..=4 {
+            map.observe(&RoomInfo {
+                id: RoomId(id),
+                name: None,
+                area: Some("Test".to_string()),
+                exits: BTreeMap::new(),
+            });
+        }
+        map.connect(RoomId(1), "e", RoomId(2));
+        map.connect(RoomId(1), "n", RoomId(4));
+        map.connect(RoomId(2), "s", RoomId(4));
+
+        let coords = map.layout_area(RoomId(1));
+        let from = coords[&RoomId(2)];
+        let to = coords[&RoomId(4)];
+        let delta = (to.0 - from.0, to.1 - from.1);
+
+        assert_eq!(delta, (-1, -1), "the `s` exit's rooms lie diagonally");
+        assert_eq!(
+            direction_vector("s"),
+            Some((0, 1)),
+            "but south is straight down, so the renderer must not draw this"
+        );
     }
 
     #[test]

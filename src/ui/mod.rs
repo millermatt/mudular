@@ -558,8 +558,29 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
             let Some((nx, ny)) = coords.get(dest) else {
                 continue;
             };
-            let (dx, dy) = (nx - x, ny - y);
-            match (dx, dy) {
+            // Which way the corridor runs comes from the exit's own
+            // direction, never from where the two rooms happened to land.
+            // `layout_area` places each room once, at whatever coordinate
+            // the first path to it produced, so a *second* exit into an
+            // already-placed room can have any delta at all — MUD geography
+            // folds back on itself constantly. Reading the delta as if it
+            // were the direction turns an ordinary `s` exit into a diagonal
+            // corridor the MUD does not have, which is the shape of every
+            // stray diagonal on a six-direction server.
+            let Some(vector) = crate::map::direction_vector(direction) else {
+                // No 2D meaning (`u`/`d`/`in`/`out`): marked on the room
+                // itself, above, rather than drawn as a corridor.
+                continue;
+            };
+            if (nx - x, ny - y) != vector {
+                // The layout could not place these two rooms the way this
+                // exit says they lie. §16's rule decides it: a wrong edge is
+                // a lie the map keeps telling, where a missing one is only a
+                // gap. The exit stays in the graph and `/goto` still walks
+                // it; it simply is not drawn.
+                continue;
+            }
+            match vector {
                 (1, 0) => plot(col + 3, row, '-', &mut grid),
                 (-1, 0) => plot(col - 1, row, '-', &mut grid),
                 (0, 1) => plot(col + 1, row + 1, '|', &mut grid),
@@ -568,11 +589,8 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
                 (-1, -1) => plot(col - 1, row - 1, '\\', &mut grid),
                 (1, -1) => plot(col + 3, row - 1, '/', &mut grid),
                 (-1, 1) => plot(col - 1, row + 1, '/', &mut grid),
-                // A neighbour more than one cell away is a coordinate
-                // collision's leftover, not a corridor worth inventing.
-                _ => {
-                    let _ = direction;
-                }
+                // `direction_vector` returns only the eight above.
+                _ => {}
             }
         }
     }
@@ -918,6 +936,85 @@ mod tests {
                 row(buffer, y)
             );
         }
+    }
+
+    // ---- the map column (§16) ----
+
+    /// Drops a room into a session's map with the exits it should have.
+    fn map_room(state: &mut AppState, id: i64, exits: &[(&str, i64)]) {
+        state.sessions[0].map.rooms.insert(
+            crate::map::RoomId(id),
+            crate::map::Room {
+                id: crate::map::RoomId(id),
+                name: None,
+                area: Some("Test".to_string()),
+                exits: exits
+                    .iter()
+                    .map(|(dir, dest)| (dir.to_string(), Some(crate::map::RoomId(*dest))))
+                    .collect(),
+            },
+        );
+    }
+
+    /// The bug this guards: on a MUD with only n/s/e/w, the map column used
+    /// to sprout diagonal corridors. `layout_area` sites each room once, so
+    /// a second exit into an already-placed room can have any delta — and
+    /// the renderer was reading that delta as if it were the direction.
+    #[test]
+    fn a_six_direction_mud_never_draws_a_diagonal_corridor() {
+        let mut state = state();
+        state.show_map = true;
+        map_room(&mut state, 1, &[("e", 2), ("n", 4)]);
+        map_room(&mut state, 2, &[("s", 4)]);
+        map_room(&mut state, 4, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        let buffer = render_sized(&state, 60, 14);
+        let text = rows(&buffer);
+
+        assert!(
+            !text.contains('\\') && !text.contains('/'),
+            "no exit here is diagonal, so no diagonal may be drawn:\n{text}"
+        );
+    }
+
+    /// The complementary half, so the guard above is not mistaken for the
+    /// renderer having stopped drawing corridors: an exit whose rooms *did*
+    /// land where it says they lie is still connected.
+    #[test]
+    fn an_exit_the_layout_honoured_is_still_drawn() {
+        let mut state = state();
+        state.show_map = true;
+        map_room(&mut state, 1, &[("e", 2)]);
+        map_room(&mut state, 2, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        let buffer = render_sized(&state, 60, 14);
+        let text = rows(&buffer);
+
+        assert!(
+            text.contains("[·]-[·]"),
+            "an honoured east exit should still draw its corridor:\n{text}"
+        );
+    }
+
+    /// A genuine diagonal on a MUD that has them is drawn as one — the fix
+    /// is about trusting the direction, not about refusing diagonals.
+    #[test]
+    fn a_real_diagonal_exit_is_still_drawn_diagonally() {
+        let mut state = state();
+        state.show_map = true;
+        map_room(&mut state, 1, &[("se", 2)]);
+        map_room(&mut state, 2, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        let buffer = render_sized(&state, 60, 14);
+        let text = rows(&buffer);
+
+        assert!(
+            text.contains('\\'),
+            "a real southeast exit still gets its diagonal:\n{text}"
+        );
     }
 
     /// The prompt belongs on its own row above the input box, not in the
