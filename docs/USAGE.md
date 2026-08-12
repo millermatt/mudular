@@ -391,7 +391,13 @@ once and your answer is remembered from then on, like the other panes.
 
 ### Reading the map, and walking to what you see
 
-`F8` puts a cursor on the map column, starting on your own room. The
+The map column is a pane like any other: `Alt+<n>` reaches it on the
+number after your last character — the number is in its title — and
+`Ctrl+Tab` cycles onto it. `F8` is a shortcut to the same place. Typing
+still goes to whoever you were playing, as it does when a comms pane has
+focus.
+
+Once it has focus a cursor sits on your own room. The
 arrows move it room to room, the bottom of the column says what it is
 sitting on, and `Enter` walks you there — the same one-step-at-a-time
 walk `/goto` does. `Esc` closes it, and so does any other key, so a

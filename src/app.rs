@@ -438,6 +438,12 @@ impl ChannelPane {
 pub enum Focus {
     Session(usize),
     Channel(usize),
+    /// The map column. Unlike the others it holds no buffer, so focusing
+    /// it moves neither the input line nor the scroll keys — what it takes
+    /// is the arrows, which drive the map cursor (§16). That is the whole
+    /// reason it is a focus stop rather than only a mode: reaching the map
+    /// is the same gesture as reaching any other pane.
+    Map,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -581,6 +587,12 @@ impl AppState {
                     channel.unread = 0;
                 }
             }
+            // Focusing the map puts the cursor on the character, which is
+            // what the arrows will move from. Typing stays bound where it
+            // was, as it does for a comms pane.
+            Focus::Map => {
+                self.map_cursor = self.bound().and_then(|session| session.current_room);
+            }
         }
     }
 
@@ -592,15 +604,21 @@ impl AppState {
         } else {
             0
         };
-        let total = sessions + channels;
+        let map = usize::from(self.show_map);
+        let total = sessions + channels + map;
         if total == 0 {
             return;
         }
         let current = match self.focus {
             Focus::Session(index) => index,
             Focus::Channel(index) => sessions + index,
+            Focus::Map => sessions + channels,
         };
         let next = (current + 1) % total;
+        if next >= sessions + channels {
+            self.focus_pane(Focus::Map);
+            return;
+        }
         self.focus_pane(if next < sessions {
             Focus::Session(next)
         } else {
@@ -619,7 +637,9 @@ impl AppState {
     pub fn is_focused_session(&self, index: usize) -> bool {
         match self.focus {
             Focus::Session(focused) => focused == index,
-            Focus::Channel(_) => self.input_session == index,
+            // With focus elsewhere the bound session stays highlighted — it
+            // is still the character being played (§11.1).
+            Focus::Channel(_) | Focus::Map => self.input_session == index,
         }
     }
 
@@ -633,6 +653,9 @@ impl AppState {
         let back_offset = match self.focus {
             Focus::Session(index) => self.sessions.get_mut(index).map(|s| &mut s.back_offset),
             Focus::Channel(index) => self.channels.get_mut(index).map(|c| &mut c.back_offset),
+            // The map holds no buffer: it is a view on the world recomputed
+            // each frame, and it moves by walking rather than scrolling.
+            Focus::Map => None,
         };
         let Some(back_offset) = back_offset else {
             return;
@@ -2267,10 +2290,12 @@ fn handle_key(
     if let Some(cursor) = state.map_cursor {
         let step = match code {
             KeyCode::Esc => {
+                state.focus_pane(Focus::Session(state.input_session));
                 state.map_cursor = None;
                 return true;
             }
             KeyCode::Enter => {
+                state.focus_pane(Focus::Session(state.input_session));
                 state.map_cursor = None;
                 state.walk_requested = Some(cursor);
                 return true;
@@ -2303,17 +2328,23 @@ fn handle_key(
         return true;
     }
     if keybinds.map_cursor.matches(code, modifiers) {
-        // Starts on the character: the one room they certainly want to
-        // measure everything else against, and the one the pane centres.
-        state.map_cursor = state.bound().and_then(|session| session.current_room);
-        if state.map_cursor.is_some() {
-            // No use steering a map nobody can see.
-            state.show_map = true;
-        } else if let Some(session) = state.bound_mut() {
-            session.push_line(RetainedLine::client(
-                "** the map doesn't know where you are yet",
-            ));
+        // The same place `Alt+<map>` and `focus_next` arrive at — one key
+        // for players who reach for a shortcut rather than counting panes.
+        if state
+            .bound()
+            .and_then(|session| session.current_room)
+            .is_none()
+        {
+            if let Some(session) = state.bound_mut() {
+                session.push_line(RetainedLine::client(
+                    "** the map doesn't know where you are yet",
+                ));
+            }
+            return true;
         }
+        // No use steering a map nobody can see.
+        state.show_map = true;
+        state.focus_pane(Focus::Map);
         return true;
     }
     if let Some(cursor) = state.line_cursor {
@@ -2454,7 +2485,9 @@ fn handle_key(
         );
         return true;
     }
-    // Alt+1..9 jumps straight to a session (§11).
+    // Alt+1..9 jumps straight to a session (§11), and to the map column on
+    // the number after the last one — the sessions keep the numbers they
+    // always had, so nothing anybody has learned moves.
     if modifiers.contains(KeyModifiers::ALT)
         && let KeyCode::Char(c) = code
         && let Some(n) = c.to_digit(10).filter(|&n| n >= 1)
@@ -2462,6 +2495,10 @@ fn handle_key(
         let index = n as usize - 1;
         if index < state.sessions.len() {
             state.focus_pane(Focus::Session(index));
+            return true;
+        }
+        if index == state.sessions.len() && state.show_map {
+            state.focus_pane(Focus::Map);
             return true;
         }
     }
@@ -5913,7 +5950,125 @@ mod tests {
         assert_ne!(state.show_hud, before, "the binding fired too");
     }
 
-    // ---- /mark (§16) ----    // ---- /mark (§16) ----
+    /// Asked for after the map cursor landed: reaching the map should be
+    /// the same gesture as reaching any other pane, not a mode of its own.
+    /// The sessions keep the numbers they always had and the map takes the
+    /// next one.
+    #[tokio::test]
+    async fn alt_n_reaches_the_map_pane() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.show_map = true;
+        let keys = crate::config::Keybinds::default();
+
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Char('3'),
+            KeyModifiers::ALT,
+            100,
+            &[],
+        );
+
+        assert_eq!(state.focus, Focus::Map);
+        assert_eq!(
+            state.map_cursor,
+            Some(crate::map::RoomId(1)),
+            "and the cursor starts on the character"
+        );
+        assert_eq!(
+            state.input_session, 0,
+            "typing stays with the character, as it does for a comms pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_existing_session_numbers_do_not_move() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        state.show_map = true;
+        let keys = crate::config::Keybinds::default();
+
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Char('2'),
+            KeyModifiers::ALT,
+            100,
+            &[],
+        );
+
+        assert_eq!(state.focus, Focus::Session(1));
+    }
+
+    /// With the column hidden there is no pane to reach, so the number
+    /// answers to nothing rather than focusing something invisible.
+    #[tokio::test]
+    async fn alt_n_does_not_reach_a_hidden_map() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.show_map = false;
+        let keys = crate::config::Keybinds::default();
+
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Char('2'),
+            KeyModifiers::ALT,
+            100,
+            &[],
+        );
+
+        assert_eq!(state.focus, Focus::Session(0));
+    }
+
+    #[tokio::test]
+    async fn cycling_focus_visits_the_map_when_it_is_shown() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.show_map = true;
+        state.show_channels = false;
+
+        state.focus_next();
+
+        assert_eq!(state.focus, Focus::Map);
+        state.focus_next();
+        assert_eq!(state.focus, Focus::Session(0), "and comes back round");
+    }
+
+    /// Leaving the map hands the keyboard back rather than stranding focus
+    /// on a pane that does not take typing.
+    #[tokio::test]
+    async fn esc_returns_focus_to_the_character() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.show_map = true;
+        let keys = crate::config::Keybinds::default();
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+        assert_eq!(state.focus, Focus::Map);
+
+        handle_key(
+            &mut state,
+            &keys,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            100,
+            &[],
+        );
+
+        assert_eq!(state.focus, Focus::Session(0));
+        assert!(state.map_cursor.is_none());
+    }
+
+    // ---- /mark (§16) ----    // ---- /mark (§16) ----    // ---- /mark (§16) ----
 
     #[tokio::test]
     async fn mark_labels_the_room_and_shows_on_the_map() {

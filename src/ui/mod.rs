@@ -84,7 +84,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("Home / End", "jump to the oldest / newest line"),
         String::new(),
         "Characters".to_string(),
-        row("Alt+1 … Alt+9", "jump to character 1-9"),
+        row("Alt+1 … Alt+9", "jump to character 1-9, then the map"),
         row(keybinds.focus_next, "cycle focus, comms included"),
         String::new(),
         "Views".to_string(),
@@ -105,7 +105,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         ),
         row(
             keybinds.map_cursor,
-            "move a cursor around the map; Enter walks there",
+            "focus the map: arrows read rooms, Enter walks there",
         ),
         row(keybinds.toggle_hud, "show or hide the party strip"),
         row(
@@ -696,11 +696,20 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     // The same three keys the scrollback line picker advertises, for the
     // same reason: a selection nobody can see how to leave is a trap.
-    let title = match state.map_cursor.is_some() {
-        true => format!(" {title} — ↑↓←→ Enter Esc "),
-        false => format!(" {title} "),
+    let focused = state.focus == crate::app::Focus::Map;
+    let title = match focused {
+        true => format!(" {}:{title} — ↑↓←→ Enter Esc ", state.sessions.len() + 1),
+        // The number it answers to, so the way in is discoverable from the
+        // pane itself rather than only from the help listing.
+        false => format!(" {}:{title} ", state.sessions.len() + 1),
     };
-    let block = Block::bordered().title(title);
+    let block = Block::bordered()
+        .title(if focused { title.bold() } else { title.into() })
+        .border_style(if focused {
+            Style::new()
+        } else {
+            Style::new().dim()
+        });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {

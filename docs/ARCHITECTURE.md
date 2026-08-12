@@ -1796,7 +1796,21 @@ lives in `ui`, and neither is visible from inside it.
   approximates them — acceptable because the pane is a picture rather
   than text to be read, and because a fallback belongs with the style
   file (§16 roadmap) rather than hardcoded twice.
-- **The map cursor (`F8`) makes the pane a control surface**, not just a
+- **The map is a focus stop, not only a mode.** `Alt+<n>` reaches it on
+  the number after the last character, `focus_next` cycles onto it, and
+  `F8` is a shortcut to the same place. Focusing it does *not* move the
+  input line — typing stays with the character being played, exactly as
+  it does for a comms pane (§11.1) — and it does not move the scroll
+  keys either, because the map holds no buffer. What it takes is the
+  arrows. A pane reachable only by its own dedicated key reads as a tool
+  bolted on beside the panes rather than one of them, which is what it
+  was before someone tried `Alt+<n>` on it and nothing happened. The
+  sessions keep the numbers they always had, so no muscle memory moves,
+  and the pane's title carries its own number so the way in is
+  discoverable from the pane rather than only from the help listing.
+  `Esc` hands focus back to the character rather than stranding it on a
+  pane that does not take typing.
+- **The map cursor makes the pane a control surface**, not just a
   picture: the arrows move it room to room, `Map::describe` says what it is
   on, and `Enter` hands the room to the same `walk_to` `/goto` uses. It
   moves between *drawn rooms* rather than grid cells, because the grid is
@@ -1808,7 +1822,9 @@ lives in `ui`, and neither is visible from inside it.
   already means something and the cursor has to read on top of any of them.
   `Enter` cannot walk from `handle_key`, which is not async, so it sets
   `walk_requested` for the event loop — the hand-off `reload_requested`
-  already uses. Deliberately keyboard-only: hover would need mouse capture,
+  already uses. A key the cursor has no use for puts it away and then
+  does its ordinary job: swallowing it meant `Alt+<n>` did nothing the
+  first time it was pressed with the cursor up. Deliberately keyboard-only: hover would need mouse capture,
   which takes over selection terminal-wide, and OSC 8 cannot carry it since
   `ratatui`'s `Cell` has nowhere to hang a URI. A cursor is also the only
   form of this a screen reader can follow.
