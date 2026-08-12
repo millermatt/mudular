@@ -1050,6 +1050,20 @@ const MOVEMENT_SETTLE: Duration = Duration::from_secs(5);
 /// room's own. A message that names no room at all changes nothing, so a
 /// server sending `Room.Info` in pieces still accumulates as it did.
 fn forget_exits_on_room_change(engine: &mut Engine, pairs: &[(String, String)]) {
+    // A message carrying exits carries *all* of that room's exits — servers
+    // send the list whole, never a key at a time — so it replaces whatever
+    // is there rather than merging into it. This is what catches a server
+    // that sends the exits and the room number in separate messages, which
+    // the flat `ROOM_EXITS.*` / `ROOM_VNUM` form invites: keying only on the
+    // number meant the exits arriving first were merged onto the room the
+    // character had just left.
+    if pairs.iter().any(|(key, _)| crate::map::is_exit_key(key)) {
+        engine.forget_room_exits();
+        return;
+    }
+    // And a message that names a different room replaces them even when it
+    // brings no exits of its own, so arriving somewhere with no exits at all
+    // does not inherit the last room's.
     let Some(arriving) = crate::map::vnum_in_pairs(pairs) else {
         return;
     };
@@ -1595,6 +1609,29 @@ mod tests {
                 .get("Room.Info.exits.n")
                 .map(String::as_str),
             Some("40600"),
+        );
+    }
+
+    /// An adversarial review found the previous fix only closed the
+    /// ordering where the room number arrives with its exits. A server that
+    /// sends the exits first — natural in MSDP's flat `ROOM_EXITS.*` /
+    /// `ROOM_VNUM` form, which `EXIT_PREFIXES` supports — still had them
+    /// merged onto the room the character had just left, and that blend was
+    /// then written to disk.
+    #[test]
+    fn exits_arriving_before_the_room_number_do_not_join_the_last_room() {
+        let mut engine = engine_in_room("40601", &[("n", "40600")]);
+
+        // The next room's exits, with its number still to come.
+        forget_exits_on_room_change(&mut engine, &pairs(&[("Room.Info.exits.s", "40700")]));
+        engine.update_server_data_from_gmcp("Room.Info.exits.s", "40700".to_string());
+
+        let room = crate::map::RoomInfo::from_server_data(engine.server_data()).expect("a room");
+        assert_eq!(
+            room.exits.get("n"),
+            None,
+            "the room left behind must not keep lending its exits: {:?}",
+            room.exits
         );
     }
 
