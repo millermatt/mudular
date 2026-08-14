@@ -797,7 +797,9 @@ fn draw_map(
     // description — chrome rather than content, the same either way.
     let (inner, legend_area) = split_legend(inner);
     frame.render_widget(
-        Paragraph::new(map_render::legend()).wrap(Wrap { trim: true }),
+        // Already broken to this width, so no wrapping: `Paragraph`'s
+        // would split entries apart again.
+        Paragraph::new(map_render::legend(legend_area.width)),
         legend_area,
     );
 
@@ -932,10 +934,7 @@ fn described_height(state: &AppState, inner: Rect) -> u16 {
 /// as fits and loses the tail; the alternative is a legend that crowds
 /// out the thing it is explaining.
 fn split_legend(inner: Rect) -> (Rect, Rect) {
-    let width = map_render::legend().width() as u16;
-    let rows = width
-        .div_ceil(inner.width.max(1))
-        .clamp(1, (inner.height / 2).max(1));
+    let rows = (map_render::legend(inner.width).len() as u16).clamp(1, (inner.height / 2).max(1));
     let split = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(rows)])
@@ -1378,9 +1377,9 @@ mod tests {
     /// to be about room tiles can subtract the legend rather than being
     /// broken by it.
     fn legend_swatches() -> usize {
-        map_render::legend()
-            .spans
+        map_render::legend(u16::MAX)
             .iter()
+            .flat_map(|line| line.spans.iter())
             .filter(|span| span.style.bg.is_some())
             .count()
     }

@@ -248,14 +248,20 @@ pub(super) fn room_style(room: &PlacedRoom) -> (Style, Option<char>) {
 /// Static rather than scene-derived: it lists what `/mark` offers and the
 /// two roles every scene can show, not what happens to be on screen right
 /// now, so it reads the same whether the pane is empty or full.
-pub(super) fn legend() -> Line<'static> {
-    let mut entries: Vec<(Style, Option<char>, &str)> = Vec::new();
+pub(super) fn legend(width: u16) -> Vec<Line<'static>> {
+    // The third field groups entries that answer the same question, so a
+    // row break can be forced between groups: who is on the map, what a
+    // room's exits do, what a room is for. Packed as one long run they
+    // interleave — the three arrows would split across a line boundary —
+    // and a legend is read by scanning, which wants the answer to one
+    // question in one place.
+    let mut entries: Vec<(Style, Option<char>, &str, u8)> = Vec::new();
     let (here_style, here_letter) = role_style(RoomRole::Here);
-    entries.push((here_style, here_letter, "you"));
+    entries.push((here_style, here_letter, "you", 0));
     let (corpse_style, corpse_letter) = role_style(RoomRole::Corpse);
-    entries.push((corpse_style, corpse_letter, "corpse"));
+    entries.push((corpse_style, corpse_letter, "corpse", 0));
     let (party, party_letter) = party_style("party");
-    entries.push((party, party_letter, "another char"));
+    entries.push((party, party_letter, "another char", 0));
 
     // The two slots either side of the room's own letter. Drawn on plain
     // room ground rather than a colour of their own, because that is
@@ -268,13 +274,13 @@ pub(super) fn legend() -> Line<'static> {
         (false, true, "down"),
         (true, true, "up+down"),
     ] {
-        entries.push((ground, exit_tick(up, down), meaning));
+        entries.push((ground, exit_tick(up, down), meaning, 1));
     }
-    entries.push((ground, Some('·'), "more exits"));
+    entries.push((ground, Some('·'), "more exits", 1));
 
     for label in crate::app::MARK_SUGGESTIONS {
         let (style, letter) = marked_style(label);
-        entries.push((style, letter, label));
+        entries.push((style, letter, label, 2));
     }
     // Whatever a custom `/mark` actually says is never `?` — this row is
     // the one place that glyph is honest, standing in for "some label of
@@ -286,12 +292,35 @@ pub(super) fn legend() -> Line<'static> {
             .add_modifier(Modifier::BOLD),
         Some('?'),
         "other",
+        2,
     ));
 
-    let mut spans = Vec::new();
-    for (index, (style, letter, label)) in entries.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw("  "));
+    // Broken at entry boundaries rather than left to `Paragraph`'s word
+    // wrap, which knows nothing about which words belong together: it
+    // would end a line on a swatch and start the next with the word that
+    // swatch names, so `S` sat alone above `shop`. An entry is one thing
+    // and now wraps as one, whatever the column is doing.
+    const GAP: &str = "  ";
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut group = None;
+    for (style, letter, label, entry_group) in entries {
+        // A swatch, a space, and the word: the swatch is drawn in the
+        // style the map would draw it, the word beside it dim so the
+        // colours stay the loudest thing in the row.
+        let entry = letter.map_or(0, |_| 1) + 1 + label.chars().count();
+        let new_group = group
+            .replace(entry_group)
+            .is_some_and(|was| was != entry_group);
+        let wrapping =
+            !spans.is_empty() && (new_group || used + GAP.len() + entry > width.max(1) as usize);
+        if wrapping {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        } else if !spans.is_empty() {
+            spans.push(Span::raw(GAP));
+            used += GAP.len();
         }
         if let Some(letter) = letter {
             spans.push(Span::styled(letter.to_string(), style));
@@ -300,8 +329,12 @@ pub(super) fn legend() -> Line<'static> {
             format!(" {label}"),
             Style::default().add_modifier(Modifier::DIM),
         ));
+        used += entry;
     }
-    Line::from(spans)
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// Draws the scene as filled cells on a character grid.
@@ -518,13 +551,58 @@ mod tests {
         }
     }
 
+    /// The bug this pins: the legend was one long `Line` left to
+    /// `Paragraph`'s word wrap, which knows nothing about which words
+    /// belong together — it ended lines on a swatch and began the next
+    /// with the word that swatch named, so `S` sat alone above `shop`.
+    /// An entry is one thing; a group of them answers one question.
+    #[test]
+    fn the_legend_never_splits_an_entry_or_mixes_two_groups() {
+        let who = ["you", "corpse", "another char"];
+        let exits = ["up", "down", "up+down", "more exits"];
+
+        for width in [18u16, 22, 30, 42, 60, 200] {
+            for line in legend(width) {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    line.width() <= width.max(1) as usize,
+                    "`{text}` overruns {width}"
+                );
+
+                let mut groups = std::collections::HashSet::new();
+                for entry in text.trim_end().split("  ") {
+                    let (glyph, label) = entry
+                        .split_once(' ')
+                        .unwrap_or_else(|| panic!("`{entry}` lost its swatch or its word: {text}"));
+                    assert_eq!(
+                        glyph.chars().count(),
+                        1,
+                        "`{entry}` should be one swatch and its word: {text}"
+                    );
+                    assert!(!label.is_empty(), "`{entry}` names nothing: {text}");
+                    groups.insert(match label {
+                        l if who.contains(&l) => 0,
+                        l if exits.contains(&l) => 1,
+                        _ => 2,
+                    });
+                }
+                assert_eq!(
+                    groups.len(),
+                    1,
+                    "one row should answer one question, not {}: {text}",
+                    groups.len()
+                );
+            }
+        }
+    }
+
     /// The tick was written out twice, once per renderer, and the legend
     /// named its glyphs a third time — three places to keep in step. They
     /// read one function now, so a changed arrow cannot leave the legend
     /// describing the old one.
     #[test]
     fn the_legend_names_the_arrows_the_map_actually_draws() {
-        let legend = legend().to_string();
+        let legend: String = legend(u16::MAX).iter().map(ToString::to_string).collect();
         for (up, down) in [(true, false), (false, true), (true, true)] {
             let drawn = exit_tick(up, down).expect("an exit that leaves the grid has a tick");
             assert!(
