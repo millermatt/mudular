@@ -70,6 +70,10 @@ const CORPSE_COMMAND: &str = "/corpse";
 /// note about what a place is for, since no protocol tells us.
 const MARK_COMMAND: &str = "/mark";
 const MAP_COMMAND: &str = "/map";
+/// Shows or hides the comms column (§11.1) — the same thing
+/// `toggle_channels` does, for players who reach for a command before a
+/// function key.
+const COMMS_COMMAND: &str = "/comms";
 
 /// `send_to` address meaning "every other session" (§7.5).
 const ALL_SESSIONS: &str = "*";
@@ -3269,12 +3273,8 @@ fn handle_key(
         };
         return true;
     }
-    if keybinds.toggle_channels.matches(code, modifiers) && !state.channels.is_empty() {
-        state.show_channels = !state.show_channels;
-        // Focus must never rest on a pane that is no longer drawn.
-        if !state.show_channels && matches!(state.focus, Focus::Channel(_)) {
-            state.focus_pane(Focus::Session(state.input_session));
-        }
+    if keybinds.toggle_channels.matches(code, modifiers) {
+        toggle_comms(state);
         return true;
     }
     // Resizing the column resizes the session panes beside it, so both keys
@@ -3441,6 +3441,10 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         describe_current_room(state);
         return;
     }
+    if trimmed == COMMS_COMMAND {
+        toggle_comms(state);
+        return;
+    }
     if trimmed == GOTO_COMMAND || trimmed.starts_with("/goto ") {
         let arg = trimmed.strip_prefix(GOTO_COMMAND).unwrap_or("").trim();
         start_goto(state, arg).await;
@@ -3456,6 +3460,29 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         return;
     }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
+}
+
+/// Shows or hides the comms column, from either the key or `/comms`
+/// (§11.1).
+///
+/// Says so when there is nothing to show. An install with no `channels:`
+/// block has no comms pane to reveal, and a command — or a key — that
+/// silently does nothing is how a player concludes the client is broken;
+/// the map cursor already answers the same way for the same reason.
+fn toggle_comms(state: &mut AppState) {
+    if state.channels.is_empty() {
+        if let Some(session) = state.bound_mut() {
+            session.push_line(RetainedLine::client(
+                "** no comms panes to show — declare one under `channels:` in mudular.yaml",
+            ));
+        }
+        return;
+    }
+    state.show_channels = !state.show_channels;
+    // Focus must never rest on a pane that is no longer drawn.
+    if !state.show_channels && matches!(state.focus, Focus::Channel(_)) {
+        state.focus_pane(Focus::Session(state.input_session));
+    }
 }
 
 /// Prints where the character is standing and what leads out of it, as
@@ -6657,6 +6684,52 @@ mod tests {
             printed.matches("Town Square (#1)").count(),
             2,
             "printed on the way down too, not only on the way up: {printed}"
+        );
+    }
+
+    /// `/comms` is the typed way to the column the key already toggles —
+    /// same state, so the two cannot disagree about whether it is up.
+    #[tokio::test]
+    async fn comms_toggles_the_column() {
+        let (mut state, _receivers) = app(&["tank"]);
+        with_channel(&mut state, "comms", false);
+        state.show_channels = false;
+
+        submit(&mut state, "/comms").await;
+        assert!(state.show_channels, "the column comes up");
+
+        submit(&mut state, "/comms").await;
+        assert!(!state.show_channels, "and goes back down");
+    }
+
+    /// Hiding the column must take focus with it: focus resting on a pane
+    /// that is no longer drawn is what sends the next keystroke nowhere.
+    #[tokio::test]
+    async fn hiding_comms_takes_focus_off_it() {
+        let (mut state, _receivers) = app(&["tank"]);
+        with_channel(&mut state, "comms", false);
+        state.focus_pane(Focus::Channel(0));
+
+        submit(&mut state, "/comms").await;
+
+        assert!(!state.show_channels);
+        assert_eq!(state.focus, Focus::Session(0));
+    }
+
+    /// An install with no `channels:` block has no column to reveal.
+    /// Saying so beats toggling a flag nothing draws — a command that
+    /// silently does nothing is how a player concludes it is broken.
+    #[tokio::test]
+    async fn comms_says_so_when_there_are_none() {
+        let (mut state, _receivers) = app(&["tank"]);
+
+        submit(&mut state, "/comms").await;
+
+        assert!(!state.show_channels);
+        assert!(
+            scrollback(&state.sessions[0]).contains("no comms panes to show"),
+            "{}",
+            scrollback(&state.sessions[0])
         );
     }
 

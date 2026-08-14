@@ -1193,6 +1193,13 @@ spam — and conversely, so slow conversations stay visible.
 - **Move vs copy:** `keep_in_main: false` gags the line from the source
   session's main scrollback (the WoW-like default); `true` mirrors it to
   both.
+- **Toggled by `toggle_channels` (`F4`) or `/comms`**, which are one
+  operation with one piece of state — a key and a command that could
+  disagree about whether the column is up would be two features. Both say
+  so when no `channels:` block declares one, rather than flipping a flag
+  nothing draws. Hiding the column moves focus back to the bound session:
+  focus resting on a pane that is not drawn is where the next keystroke
+  goes missing.
 - **Layout:** channel panes dock as a fixed-width column beside the
   session area — a slim comms column next to two character panes — and are
   hotkey-toggleable, focusable, and scrollable like any other pane. There

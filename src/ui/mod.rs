@@ -144,6 +144,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
             "label this room on the map (`/mark` alone clears it)",
         ),
         row("/map", "show or hide the map, and describe this room"),
+        row("/comms", "show or hide the comms column"),
         String::new(),
         "Leaving".to_string(),
         row(keybinds.quit, "quit"),
@@ -2046,13 +2047,14 @@ mod tests {
 
         // A row taller than the listing, so "is every binding in here"
         // stays a question about the listing rather than about scrolling —
-        // the overlay grew a row when the party alarm got its key, and
-        // another when the character panes got a clock.
-        let without = render_sized(&state, 70, 42);
+        // the overlay grew a row when the party alarm got its key, another
+        // when the character panes got a clock, and another when `/comms`
+        // joined the command list.
+        let without = render_sized(&state, 70, 43);
         assert!(rows(&without).contains("forest"));
 
         state.show_help = true;
-        let with = render_sized(&state, 70, 42);
+        let with = render_sized(&state, 70, 43);
         let listing = rows(&with);
         assert!(listing.contains("Help"), "{listing}");
         assert!(listing.contains("Ctrl+C"), "{listing}");

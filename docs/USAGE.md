@@ -301,8 +301,9 @@ a pane at all, so they cannot arrive in the file by this route.
 One broadcast heard by several of your characters is stored, and restored,
 as the single line the pane shows.
 
-The panes dock in a column beside the character panes; `F4` shows or hides
-them. With more than one character connected, lines are tagged with the
+The panes dock in a column beside the character panes; `F4` or `/comms`
+shows or hides them (the same column either way — if you have no
+`channels:` declared, `/comms` says so rather than doing nothing). With more than one character connected, lines are tagged with the
 one that received them (`[cleric] Bob tells you …`). Add `session: tank`
 to a channel to pin it to a single character instead.
 
@@ -1142,6 +1143,7 @@ fallback.
 | `Alt+,` / `Alt+.` | Widen / narrow the map column | `map_wider` / `map_narrower` |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 | `Alt+T` | Show or hide the clock down the character panes | `toggle_timestamps` |
+| `/comms` | Show or hide the comms column — the same thing `F4` does | — (a command) |
 
 `F1` shows this same list inside the client, built from your actual
 config — so it stays right even if you remap something. `/help` prints it
