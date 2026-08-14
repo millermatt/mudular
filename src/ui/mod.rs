@@ -763,8 +763,9 @@ fn draw_map(
 ) -> (Option<map_render::PendingImage>, bool) {
     let session = state.bound();
     let title = match session.and_then(|session| session.current_room) {
-        Some(at) => session
-            .and_then(|session| session.map.rooms.get(&at))
+        Some(at) => state
+            .bound_map()
+            .and_then(|map| map.rooms.get(&at))
             .and_then(|room| room.area.clone())
             .unwrap_or_else(|| "map".to_string()),
         None => "map".to_string(),
@@ -808,11 +809,14 @@ fn draw_map(
         return (None, true);
     };
 
-    let scene = session.map.scene(current, session.corpse);
+    let Some(map) = state.bound_map() else {
+        return (None, true);
+    };
+    let scene = map.scene(current, session.corpse);
     // Pixels where the terminal takes them, cells everywhere else — the
     // same scene either way (§16).
     if let Some(cell) = state.map_cell_px {
-        let described_rows = described_height(state, session, inner);
+        let described_rows = described_height(state, inner);
         let (grid, caption) = split_caption(inner, described_rows);
         let key = MapImageCacheKey {
             scene: scene.clone(),
@@ -846,7 +850,7 @@ fn draw_map(
                         .set_diff_option(ratatui::buffer::CellDiffOption::Skip);
                 }
             }
-            draw_caption(frame, caption, state, session);
+            draw_caption(frame, caption, state);
             return (Some(image), fresh);
         }
     }
@@ -858,7 +862,8 @@ fn draw_map(
     // descriptions nobody asked to keep.
     let described: Vec<String> = state
         .map_cursor
-        .map(|at| session.map.describe(at))
+        .zip(state.bound_map())
+        .map(|(at, map)| map.describe(at))
         .unwrap_or_default();
     let (grid, caption) = match described.is_empty() {
         true => (inner, None),
@@ -897,11 +902,14 @@ fn draw_map(
 
 /// How many rows the cursor's description wants, so both renderers leave
 /// it the same room.
-fn described_height(state: &AppState, session: &crate::app::SessionPane, inner: Rect) -> u16 {
+fn described_height(state: &AppState, inner: Rect) -> u16 {
     let Some(at) = state.map_cursor else {
         return 0;
     };
-    let lines = session.map.describe(at);
+    let Some(map) = state.bound_map() else {
+        return 0;
+    };
+    let lines = map.describe(at);
     if lines.is_empty() {
         return 0;
     }
@@ -938,19 +946,19 @@ fn split_caption(inner: Rect, rows: u16) -> (Rect, Option<Rect>) {
     (split[0], Some(split[1]))
 }
 
-fn draw_caption(
-    frame: &mut Frame,
-    caption: Option<Rect>,
-    state: &AppState,
-    session: &crate::app::SessionPane,
-) {
+fn draw_caption(frame: &mut Frame, caption: Option<Rect>, state: &AppState) {
     let (Some(rect), Some(at)) = (caption, state.map_cursor) else {
         return;
     };
     frame.render_widget(
-        Paragraph::new(session.map.describe(at).join("\n"))
-            .wrap(Wrap { trim: true })
-            .style(Style::default().add_modifier(Modifier::DIM)),
+        Paragraph::new(
+            state
+                .bound_map()
+                .map(|map| map.describe(at).join("\n"))
+                .unwrap_or_default(),
+        )
+        .wrap(Wrap { trim: true })
+        .style(Style::default().add_modifier(Modifier::DIM)),
         rect,
     );
 }
@@ -1562,7 +1570,7 @@ mod tests {
 
     /// Drops a room into a session's map with the exits it should have.
     fn map_room(state: &mut AppState, id: i64, exits: &[(&str, i64)]) {
-        state.sessions[0].map.rooms.insert(
+        state.map_of_mut(0).rooms.insert(
             crate::map::RoomId(id),
             crate::map::Room {
                 id: crate::map::RoomId(id),
@@ -2385,7 +2393,7 @@ mod tests {
         // A vertical exit the flat grid cannot place, so the glyph says so.
         map.connect(RoomId(1), "d", RoomId(9));
 
-        state.sessions[0].map = map;
+        state.world_mut(0).map = map;
         state.sessions[0].current_room = Some(RoomId(1));
         state.show_map = true;
         state.map_width = MAP_WIDTH;
@@ -2443,7 +2451,7 @@ mod tests {
             area: Some("Midgaard".to_string()),
             exits: BTreeMap::new(),
         });
-        state.sessions[0].map = map;
+        state.world_mut(0).map = map;
         state.sessions[0].current_room = Some(RoomId(1));
         state.show_map = true;
         state.map_width = MAP_WIDTH;
@@ -2524,7 +2532,7 @@ mod tests {
         map.connect(RoomId(2), "w", RoomId(1));
         map.connect(RoomId(1), "e", RoomId(2));
 
-        state.sessions[0].map = map;
+        state.world_mut(0).map = map;
         state.sessions[0].current_room = Some(RoomId(2));
         state.show_map = true;
         state.map_width = MAP_WIDTH;
@@ -2562,7 +2570,7 @@ mod tests {
             area: Some("Midgaard".to_string()),
             exits: Default::default(),
         });
-        state.sessions[0].map = map;
+        state.world_mut(0).map = map;
         state.sessions[0].current_room = Some(RoomId(1));
 
         let populated = rows(&render_sized(&state, 80, 20));

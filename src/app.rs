@@ -9,7 +9,7 @@
 //! [`SessionEvent::SendTo`], which this hub turns into an explicit
 //! [`SessionCommand::Inject`] for the addressed session (§7.5).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -201,11 +201,11 @@ pub struct SessionPane {
     /// compensation to keep a scrolled reader's view stable — the buffer
     /// grows underneath the same offset (docs/ARCHITECTURE.md §11.5).
     pub back_offset: usize,
-    /// What this character has learned of the world's shape (§16), and
-    /// where on it they are. Per session, not shared: two characters can
-    /// be on different MUDs entirely, and buffer/state isolation is
-    /// structural (§3).
-    pub map: crate::map::Map,
+    /// Where on the world's map this character is standing (§16).
+    ///
+    /// The map itself is *not* here: it belongs to the world, and lives in
+    /// `AppState::maps` keyed by [`SessionPane::map_key`]. Where a
+    /// character stands is the part that is genuinely theirs.
     pub current_room: Option<crate::map::RoomId>,
     /// Where this character died last, for `/corpse` (§16). Set by a
     /// trigger's `corpse:`, never cleared: a corpse run that reaches the
@@ -213,34 +213,47 @@ pub struct SessionPane {
     /// player may still be walking back and forth to, and the next death
     /// overwrites it anyway.
     pub corpse: Option<crate::map::RoomId>,
-    /// Which world's map this session reads and writes (§16). Held rather
-    /// than recomputed because the pane outlives the target it came from.
+    /// Which world's map this session reads and writes (§16) — the key
+    /// into `AppState::maps`. Held rather than recomputed because the pane
+    /// outlives the target it came from.
     pub map_key: String,
-    /// Whether the player has already been told that saving is failing.
-    /// One notice per run of failures, not one per attempt (§16).
-    pub map_save_failed: bool,
-    /// Whether this session has mapped anything not yet on disk (§16).
-    /// Saving is a merge, so writing often is safe; writing when nothing
-    /// has changed is just disk churn, and a map that never changes should
-    /// never be rewritten.
-    pub map_dirty: bool,
-    /// Rooms whose mark this session explicitly set or cleared since the
-    /// last successful save (§16).
-    ///
-    /// A save merges into whatever another session already wrote, and
-    /// that merge must not erase a mark this session never touched —
-    /// otherwise a second character loading a stale copy would blank out
-    /// the first character's label just by autosaving. But the same "never
-    /// erase" rule then means `None` can never win against an existing
-    /// `Some`, so *removing* a mark could never actually reach disk: every
-    /// save re-merged this session's "no mark" against the on-disk mark
-    /// that was still there, and the mark always survived. This is the
-    /// list of rooms where the absence is not "I never knew," it is "I
-    /// just cleared it" — `config::save_map` applies those authoritatively
-    /// instead of merging them.
-    pub explicit_marks: HashSet<crate::map::RoomId>,
     /// A `/goto` walk in progress (§16). `None` when nothing is walking.
     pub walk: Option<Walk>,
+}
+
+/// One world's map, and everything about writing it back (§16).
+///
+/// Shared by every character on that world rather than copied per session,
+/// because a map *is* a property of the world: two characters on one MUD
+/// walk the same rooms and read and write one file. Copying it per session
+/// meant two in-memory maps drifting apart between saves — one character
+/// unmarking a room while the other went on holding the label, one
+/// character discovering a corridor the other could not see — and the file
+/// reconciling them only at the next launch. Sharing makes that
+/// divergence unrepresentable rather than something each writer has to
+/// remember to fan out.
+#[derive(Default)]
+pub struct WorldMap {
+    pub map: crate::map::Map,
+    /// Whether this world has learned something not yet on disk (§16).
+    /// Saving is a merge, so writing often is safe; writing when nothing
+    /// has changed is just disk churn.
+    pub dirty: bool,
+    /// Whether the player has already been told that saving is failing.
+    /// One notice per run of failures, not one per attempt (§16).
+    pub save_failed: bool,
+    /// Rooms whose mark was explicitly set or cleared since the last
+    /// successful write (§16).
+    ///
+    /// A save merges into whatever is already on disk, and that merge must
+    /// not erase a mark this run never touched — another *process*, or a
+    /// `/connect` elsewhere, may have written one. But the same "never
+    /// erase" rule means `None` can never win against an existing `Some`,
+    /// so *removing* a mark would never reach disk at all. These are the
+    /// rooms where the absence is not "I never knew", it is "I just
+    /// cleared it", and `config::save_map` applies them authoritatively
+    /// instead of merging them.
+    pub explicit_marks: HashSet<crate::map::RoomId>,
 }
 
 /// The labels `/mark` offers when asked with no argument (§16).
@@ -547,8 +560,14 @@ pub struct AppState {
     /// event loop rather than acted on in `handle_key`, which is not async
     /// — the same hand-off `reload_requested` uses.
     pub walk_requested: Option<crate::map::RoomId>,
+    /// One map per world, keyed by `SessionPane::map_key` (§16). Every
+    /// character on a MUD shares the entry, so what one of them learns or
+    /// labels is what all of them see.
+    pub maps: HashMap<String, WorldMap>,
     /// Where profiles live, so `/newprofile` knows where to save one
     /// without depending on which session happens to be bound (§15).
+    /// Maps are written here too, for the same reason: a world's file
+    /// belongs to the client, not to whichever character noticed a room.
     config_dir: PathBuf,
     /// `/newprofile`'s form, when it is open — reachable any time, not
     /// just at first run (§15, UX_REVIEW.md B). `Some` owns the keyboard
@@ -596,6 +615,42 @@ impl AppState {
     /// from the list, so this index always resolves.
     pub fn bound(&self) -> Option<&SessionPane> {
         self.sessions.get(self.input_session)
+    }
+
+    /// The world this session belongs to, opened if this is the first
+    /// character to reach it. Sessions never outlive their entry, so a
+    /// caller with a valid index always gets one.
+    pub fn world_mut(&mut self, index: usize) -> &mut WorldMap {
+        let key = self
+            .sessions
+            .get(index)
+            .map(|session| session.map_key.clone())
+            .unwrap_or_default();
+        self.maps.entry(key).or_default()
+    }
+
+    /// The map this session reads and writes, or an empty one for a
+    /// session whose world has not been opened — the drawing path asks
+    /// before there is anything to draw, and must not panic there.
+    pub fn world(&self, index: usize) -> Option<&WorldMap> {
+        self.maps.get(&self.sessions.get(index)?.map_key)
+    }
+
+    /// The bound session's map — what the map pane draws.
+    pub fn bound_map(&self) -> Option<&crate::map::Map> {
+        self.map_of(self.input_session)
+    }
+
+    /// Shorthand for the map itself, which is what most callers want.
+    pub fn map_of(&self, index: usize) -> Option<&crate::map::Map> {
+        self.world(index).map(|world| &world.map)
+    }
+
+    /// Only tests reach for the map without also wanting the rest of the
+    /// world's state; production goes through `world_mut`.
+    #[cfg(test)]
+    pub fn map_of_mut(&mut self, index: usize) -> &mut crate::map::Map {
+        &mut self.world_mut(index).map
     }
 
     fn bound_mut(&mut self) -> Option<&mut SessionPane> {
@@ -958,12 +1013,12 @@ fn apply_session_event(
             match session.current_room {
                 Some(at) => {
                     session.corpse = Some(at);
-                    let name = session
-                        .map
-                        .rooms
-                        .get(&at)
-                        .and_then(|room| room.name.as_deref())
-                        .unwrap_or("somewhere unnamed");
+                    let name = state
+                        .map_of(index)
+                        .and_then(|map| map.rooms.get(&at))
+                        .and_then(|room| room.name.clone())
+                        .unwrap_or_else(|| "somewhere unnamed".to_string());
+                    let session = &mut state.sessions[index];
                     session.push_line(RetainedLine::client(format!(
                         "** corpse marked at #{} {name} — /corpse walks back",
                         at.0
@@ -1001,15 +1056,22 @@ fn apply_session_event(
             // Only the hub can close an edge: the session knows which way
             // the character went, and the hub is what remembers where they
             // were when they went.
-            if !surprising
-                && let (Some(from), Some(direction)) =
-                    (session.current_room, arrived_via.as_deref())
-            {
-                session.map.connect(from, direction, info.id);
-            }
-            session.map.observe(&info);
+            let walked = match surprising {
+                false => session
+                    .current_room
+                    .zip(arrived_via.as_deref().map(str::to_string)),
+                true => None,
+            };
             session.current_room = Some(info.id);
-            session.map_dirty = true;
+            // The world learns the room and the edge; the session only
+            // learns where it now stands (§16).
+            let world = state.world_mut(index);
+            if let Some((from, direction)) = walked {
+                world.map.connect(from, &direction, info.id);
+            }
+            world.map.observe(&info);
+            world.dirty = true;
+            let session = &mut state.sessions[index];
 
             // `/goto` (§16) never has more than one step outstanding, so a
             // room change while it is running is the answer to that step —
@@ -1055,13 +1117,13 @@ fn apply_session_event(
                     // room the route never planned for, whose own exits need
                     // not include the next direction at all. Indexing here
                     // took the whole client down with it.
-                    let next = session
-                        .map
-                        .rooms
-                        .get(&info.id)
+                    let next = state
+                        .map_of(index)
+                        .and_then(|map| map.rooms.get(&info.id))
                         .and_then(|room| room.exits.get(&direction))
                         .copied()
                         .flatten();
+                    let session = &mut state.sessions[index];
                     match next {
                         Some(next_expecting) => {
                             session.walk.as_mut().unwrap().expecting = next_expecting;
@@ -1091,7 +1153,7 @@ fn apply_session_event(
                 Some(at) => {
                     // Through the same door as `/mark`, so a trigger's
                     // label reaches this world's other characters too.
-                    if set_mark_across_world(&mut state.sessions, index, at, Some(label.clone())) {
+                    if set_mark(state, index, at, Some(label.clone())) {
                         state.sessions[index].push_line(RetainedLine::client(format!(
                             "** marked #{} as `{label}`",
                             at.0
@@ -1152,7 +1214,8 @@ fn apply_session_event(
             // would have the next `/goto` compare against a room from a
             // connection that no longer exists.
             session.walk = None;
-            save_session_map(session);
+            let key = session.map_key.clone();
+            save_world_map(state, &key);
             (true, Vec::new())
         }
     }
@@ -1754,7 +1817,6 @@ fn connect(
     if let Err(err) = config::adopt_legacy_map(&config_dir, &legacy_keys, &map_key) {
         tracing::warn!("could not adopt an older map: {err:#}");
     }
-    let map = config::load_map(&config_dir, &map_key);
     SessionPane {
         map_key,
         name: target.name,
@@ -1787,12 +1849,8 @@ fn connect(
         scrollback_limit,
         log: target.log_path.as_deref().and_then(open_log),
         back_offset: 0,
-        map,
         current_room: None,
         corpse: None,
-        map_dirty: false,
-        map_save_failed: false,
-        explicit_marks: HashSet::new(),
         walk: None,
     }
 }
@@ -1880,7 +1938,10 @@ fn map_debug_snapshot(state: &AppState, has_image: bool, screen_text: &str) -> S
     let _ = writeln!(
         out,
         "current room: {}",
-        match current.and_then(|id| session.map.rooms.get(&id).map(|room| (id, room))) {
+        match current
+            .zip(state.map_of(state.input_session))
+            .and_then(|(id, map)| map.rooms.get(&id).map(|room| (id, room)))
+        {
             Some((id, room)) => format!("{} {:?} area {:?}", id.0, room.name, room.area),
             None => "none (no room data yet)".to_string(),
         }
@@ -1891,7 +1952,10 @@ fn map_debug_snapshot(state: &AppState, has_image: bool, screen_text: &str) -> S
     let Some(current) = current else {
         return out;
     };
-    let scene = session.map.scene(current, session.corpse);
+    let Some(map) = state.map_of(state.input_session) else {
+        return out;
+    };
+    let scene = map.scene(current, session.corpse);
     out.push_str("\n\nrooms:\n");
     for room in &scene.rooms {
         let _ = writeln!(
@@ -2089,41 +2153,94 @@ fn remember_layout_if_changed(state: &AppState, before: config::UiState) {
 /// exploration a crash can cost, not a fixed write rate.
 const MAP_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Saves every session whose map has learned something since the last
-/// write, and marks it clean.
+/// Saves every world that has learned something since the last write.
+///
+/// Per world, not per session: the characters on one MUD share the file,
+/// so saving each of them in turn wrote it several times over — and the
+/// last writer's copy was the one that stuck, which is how an unmark made
+/// through one character used to be undone by another.
 ///
 /// Kept out of the quit and disconnect paths, which save unconditionally:
 /// those are the last chance to write anything, so "nothing has changed"
 /// is not worth being clever about at the moment the client is going away.
-fn save_dirty_maps(sessions: &mut [SessionPane]) {
-    for session in sessions.iter_mut().filter(|session| session.map_dirty) {
-        save_session_map(session);
-        session.map_dirty = false;
+fn save_dirty_maps(state: &mut AppState) {
+    let dirty: Vec<String> = state
+        .maps
+        .iter()
+        .filter(|(_, world)| world.dirty)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in dirty {
+        save_world_map(state, &key);
+    }
+}
+
+/// Writes every world, dirty or not — the way out, where the question is
+/// not whether it is worth writing but whether there is a last chance to.
+fn save_all_maps(state: &mut AppState) {
+    let keys: Vec<String> = state.maps.keys().cloned().collect();
+    for key in keys {
+        save_world_map(state, &key);
     }
 }
 
 /// Returns whether the map actually reached disk, so a caller can tell
 /// "written" from "there was nowhere to write it" as well as from a
 /// failure.
-fn save_session_map(session: &mut SessionPane) -> bool {
-    let (config_dir, _) = &session.rules;
-    // A `--host` session saves too now: it has no profile, but the world it
-    // is in has a name all the same (§16).
-    let key = session.map_key.clone();
+/// Reads a world's map off disk, the first time a character arrives on
+/// it. Later characters on the same MUD join the entry that is already
+/// there rather than loading a second copy of it (§16).
+///
+/// Only on first open: re-reading for a later arrival would merge the
+/// file back over what this run has since changed, and `Map::merge`'s
+/// never-erase rule would put a just-removed mark back. A legacy file
+/// adopted by a profile that `/connect`s into an already-open world is
+/// therefore picked up at the next launch rather than immediately —
+/// one-time migration against a rare ordering, and it does not lose
+/// anything.
+fn open_world(maps: &mut HashMap<String, WorldMap>, config_dir: &Path, key: &str) {
+    if key.is_empty() || maps.contains_key(key) {
+        return;
+    }
+    maps.insert(
+        key.to_string(),
+        WorldMap {
+            map: config::load_map(config_dir, key),
+            ..WorldMap::default()
+        },
+    );
+}
+
+fn save_world_map(state: &mut AppState, key: &str) -> bool {
+    // A `--host` session saves too: it has no profile, but the world it is
+    // in has a name all the same (§16). An empty key is a session with no
+    // world at all, which is nothing to write.
     if key.is_empty() {
         return false;
     }
-    match config::save_map(config_dir, &key, &session.map, &session.explicit_marks) {
+    let Some(world) = state.maps.get(key) else {
+        return false;
+    };
+    let outcome = config::save_map(&state.config_dir, key, &world.map, &world.explicit_marks);
+
+    let notice = match outcome {
         Ok(()) => {
+            let Some(world) = state.maps.get_mut(key) else {
+                return false;
+            };
             // Working again, so a later failure is news once more.
-            session.map_save_failed = false;
+            world.save_failed = false;
+            world.dirty = false;
             // Reached disk, authoritatively — the next save is a plain
             // merge again until something is explicitly marked or cleared.
-            session.explicit_marks.clear();
-            true
+            world.explicit_marks.clear();
+            return true;
         }
         Err(err) => {
             tracing::warn!("could not save map for {key}: {err:#}");
+            let Some(world) = state.maps.get_mut(key) else {
+                return false;
+            };
             // Said once, not every tick. Saving runs every 30s, and a
             // problem that persists would otherwise fill the scrollback
             // with the same line for the rest of the session — which is
@@ -2134,15 +2251,26 @@ fn save_session_map(session: &mut SessionPane) -> bool {
             // while the player can still act on it. A failure that only
             // ever happens on the way out has at most the last tick's
             // exploration to lose, and still reaches the log.
-            if !session.map_save_failed {
-                session.map_save_failed = true;
-                session.push_line(RetainedLine::client(format!(
+            let first = !world.save_failed;
+            world.save_failed = true;
+            match first {
+                true => format!(
                     "** could not save the map: {err:#} — exploration since the last save is not on disk"
-                )));
+                ),
+                false => return false,
             }
-            false
         }
+    };
+    // Every character on this world, since it is every character's
+    // exploration that is not reaching disk.
+    for session in state
+        .sessions
+        .iter_mut()
+        .filter(|session| session.map_key == key)
+    {
+        session.push_line(RetainedLine::client(notice.clone()));
     }
+    false
 }
 
 /// Opens a session's transcript file for append, creating its directory if
@@ -2281,6 +2409,7 @@ async fn event_loop(
 
     let mut state = AppState {
         sessions,
+        maps: HashMap::new(),
         channels: channels
             .iter()
             .map(|config| ChannelPane {
@@ -2324,6 +2453,13 @@ async fn event_loop(
         scrollback_size,
         cross_session_default,
     };
+    // Each world read off disk once, by whichever character reaches it
+    // first — the rest join the entry that is already there (§16).
+    for index in 0..state.sessions.len() {
+        let key = state.sessions[index].map_key.clone();
+        open_world(&mut state.maps, &state.config_dir, &key);
+    }
+
     // A config value wider than this terminal is clamped before the first
     // frame, the same as a `Resize` clamps it later (§11.4).
     state.channel_width =
@@ -2437,9 +2573,7 @@ async fn event_loop(
                 // window.
                 let layout_before = current_layout(&state);
                 if keybinds.quit.matches(key.code, key.modifiers) {
-                    for session in &mut state.sessions {
-                        save_session_map(session);
-                    }
+                    save_all_maps(&mut state);
                     return Ok(());
                 }
                 let area_width = terminal.get_frame().area().width;
@@ -2513,7 +2647,7 @@ async fn event_loop(
                 // does: a map is a few tens of kilobytes of JSON, and the
                 // alternative is cloning it to hand to a blocking task on a
                 // timer that mostly finds nothing to do.
-                save_dirty_maps(&mut state.sessions);
+                save_dirty_maps(&mut state);
             }
             Wake::Session(index, ev) => {
                 let mut injections = Vec::new();
@@ -3069,12 +3203,12 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
 /// they are not a consolation for having the pane off. They also scroll,
 /// copy, and land in the disk log, which the pane does none of.
 fn describe_current_room(state: &mut AppState) {
-    let described = state.bound().and_then(|session| {
-        session
-            .current_room
-            .map(|at| session.map.describe(at))
-            .filter(|lines| !lines.is_empty())
-    });
+    let described = state
+        .bound()
+        .and_then(|session| session.current_room)
+        .zip(state.map_of(state.input_session))
+        .map(|(at, map)| map.describe(at))
+        .filter(|lines| !lines.is_empty());
     let Some(session) = state.bound_mut() else {
         return;
     };
@@ -3098,19 +3232,22 @@ fn describe_current_room(state: &mut AppState) {
 /// the walk rather than keep firing steps planned for a world that has since
 /// changed.
 async fn start_goto(state: &mut AppState, arg: &str) {
-    let Some(session) = state.bound_mut() else {
-        return;
-    };
-    let Some(current) = session.current_room else {
-        session.push_line(RetainedLine::client(
-            "** /goto doesn't know where you are yet",
-        ));
+    let Some(current) = state.bound().and_then(|session| session.current_room) else {
+        if let Some(session) = state.bound_mut() {
+            session.push_line(RetainedLine::client(
+                "** /goto doesn't know where you are yet",
+            ));
+        }
         return;
     };
 
     let target = if let Ok(vnum) = arg.parse::<i64>() {
         let id = crate::map::RoomId(vnum);
-        if !session.map.rooms.contains_key(&id) {
+        if !state
+            .bound_map()
+            .is_some_and(|map| map.rooms.contains_key(&id))
+        {
+            let session = &mut state.sessions[state.input_session];
             session.push_line(RetainedLine::client(format!(
                 "** /goto: no room #{vnum} on the map"
             )));
@@ -3119,8 +3256,10 @@ async fn start_goto(state: &mut AppState, arg: &str) {
         id
     } else {
         let needle = arg.to_ascii_lowercase();
-        let matches: Vec<&crate::map::Room> = session
-            .map
+        let Some(map) = state.bound_map() else {
+            return;
+        };
+        let matches: Vec<&crate::map::Room> = map
             .rooms
             .values()
             .filter(|room| {
@@ -3129,14 +3268,12 @@ async fn start_goto(state: &mut AppState, arg: &str) {
                     .is_some_and(|name| name.to_ascii_lowercase().contains(&needle))
             })
             .collect();
-        match matches.as_slice() {
-            [] => {
-                session.push_line(RetainedLine::client(format!(
-                    "** /goto: no room matches `{arg}`"
-                )));
-                return;
-            }
-            [room] => room.id,
+        // Decided while the map is still borrowed, acted on after: the
+        // refusals want to write to the session, which the borrow rules
+        // will not allow until this is an owned answer.
+        let chosen: Result<crate::map::RoomId, String> = match matches.as_slice() {
+            [] => Err(format!("** /goto: no room matches `{arg}`")),
+            [room] => Ok(room.id),
             many => {
                 // Silently picking one would walk the character somewhere
                 // they did not ask for — a vnum is unambiguous, so that is
@@ -3149,16 +3286,25 @@ async fn start_goto(state: &mut AppState, arg: &str) {
                 if many.len() > 5 {
                     candidates.push("…".to_string());
                 }
-                session.push_line(RetainedLine::client(format!(
+                Err(format!(
                     "** /goto: `{arg}` matches more than one room, say which vnum: {}",
                     candidates.join(", ")
-                )));
+                ))
+            }
+        };
+        match chosen {
+            Ok(id) => id,
+            Err(notice) => {
+                if let Some(session) = state.bound_mut() {
+                    session.push_line(RetainedLine::client(notice));
+                }
                 return;
             }
         }
     };
 
-    walk_to(session, current, target, GOTO_COMMAND).await;
+    let index = state.input_session;
+    walk_to(state, index, current, target, GOTO_COMMAND).await;
 }
 
 /// Walks to a room the map cursor picked, reusing `/goto`'s route and its
@@ -3171,7 +3317,8 @@ async fn walk_to_room(state: &mut AppState, target: crate::map::RoomId) {
     let Some(current) = session.current_room else {
         return;
     };
-    walk_to(session, current, target, GOTO_COMMAND).await;
+    let index = state.input_session;
+    walk_to(state, index, current, target, GOTO_COMMAND).await;
 }
 
 /// Where the map cursor lands when nudged one step in `step`, or `None` if
@@ -3187,7 +3334,9 @@ fn map_cursor_step(
     step: (i32, i32),
 ) -> Option<crate::map::RoomId> {
     let session = state.bound()?;
-    let scene = session.map.scene(session.current_room?, session.corpse);
+    let scene = state
+        .map_of(state.input_session)?
+        .scene(session.current_room?, session.corpse);
     let at = scene.rooms.iter().find(|room| room.id == from)?.at;
     let wanted = (at.0 + step.0, at.1 + step.1);
     scene
@@ -3204,62 +3353,40 @@ fn map_cursor_step(
 /// name, area and exits and nothing about what a room is *for* — no shop
 /// flag, no terrain — so the only honest source for "this is the baker's"
 /// is the person who walked in and read the sign.
-/// Writes a mark to every session that shares this world's map, and puts
-/// it on disk once. Returns whether anything actually changed.
+/// Writes a mark into this session's world and puts it on disk. Returns
+/// whether anything actually changed.
 ///
-/// A map belongs to the world, not the character (§16): every character on
-/// one MUD reads and writes one file. So a mark set or cleared through one
-/// pane is not that pane's private business. Its siblings hold their own
-/// in-memory copy of the same rooms, and `Map::merge`'s never-erase rule
-/// means a sibling saving afterwards puts a *removed* mark straight back
-/// from its stale copy — and the quit path saves every session
-/// unconditionally, so quitting guaranteed it. That is the whole of the
-/// "unmarking does not stick" bug: the removal did reach disk, and the
-/// other character then undid it on the way out.
+/// One map per world (§16), so there is nothing to fan out: every
+/// character on this MUD is already reading the map being written here.
+/// That is the point of sharing it — the version that copied the map per
+/// session had to remember to update every sibling, and a sibling left
+/// holding an old label wrote it straight back on its next save.
 ///
-/// Recording the change in each sibling, `explicit_marks` included, is
-/// what makes it stay: whichever of them saves next now carries the same
-/// answer rather than an older one. It also keeps the two panes agreeing
-/// about what the room is, which they otherwise would not.
-fn set_mark_across_world(
-    sessions: &mut [SessionPane],
+/// Written immediately rather than left to the next periodic tick or a
+/// clean quit, since a process that dies first takes both of those with
+/// it, and a mark is one keystroke the player is not walking back into.
+fn set_mark(
+    state: &mut AppState,
     from: usize,
     at: crate::map::RoomId,
     mark: Option<String>,
 ) -> bool {
-    let Some(world) = sessions.get(from).map(|session| session.map_key.clone()) else {
-        return false;
-    };
-
-    let mut changed = false;
-    for (index, session) in sessions.iter_mut().enumerate() {
-        // An empty key is a session with no world to share — two of them
-        // are not siblings just for both being nameless, so only the one
-        // the change came from is touched.
-        let shares = !world.is_empty() && session.map_key == world;
-        if index != from && !shares {
-            continue;
-        }
-        if session.map.set_mark(at, mark.clone()) {
-            session.explicit_marks.insert(at);
-            changed = true;
-        }
-    }
-    if !changed {
+    let world = state.world_mut(from);
+    if !world.map.set_mark(at, mark) {
         return false;
     }
+    world.explicit_marks.insert(at);
 
-    // One write rather than one per character: they share the file, and
-    // every session that could save next now carries the change, so none
-    // of them can merge it away. Immediate rather than left to the next
-    // periodic tick or a clean quit, since a process that dies first
-    // takes both of those with it.
-    if let Some(session) = sessions.get_mut(from) {
-        // Dirty exactly when the write did not happen — a failure, or a
-        // session with no world to write to — so the periodic tick still
-        // owes it a retry in both cases and in neither other.
-        session.map_dirty = !save_session_map(session);
-    }
+    let key = state
+        .sessions
+        .get(from)
+        .map(|session| session.map_key.clone())
+        .unwrap_or_default();
+    // Dirty exactly when the write did not happen — a failure, or a
+    // session with no world to write to — so the periodic tick still owes
+    // it a retry in both cases and in neither other.
+    let wrote = save_world_map(state, &key);
+    state.world_mut(from).dirty = !wrote;
     true
 }
 
@@ -3274,10 +3401,9 @@ fn mark_current_room(state: &mut AppState, label: &str) {
         return;
     };
 
-    let previous = session
-        .map
-        .rooms
-        .get(&at)
+    let previous = state
+        .map_of(state.input_session)
+        .and_then(|map| map.rooms.get(&at))
         .and_then(|room| room.mark.clone());
 
     // Asked with nothing to write, offer the usual answers rather than
@@ -3301,7 +3427,7 @@ fn mark_current_room(state: &mut AppState, label: &str) {
     // Every character on this world, not only the one who typed it — see
     // `set_mark_across_world`.
     let from = state.input_session;
-    set_mark_across_world(&mut state.sessions, from, at, Some(label.to_string()));
+    set_mark(state, from, at, Some(label.to_string()));
     if let Some(session) = state.bound_mut() {
         session.push_line(RetainedLine::client(notice));
     }
@@ -3343,7 +3469,7 @@ fn apply_mark_menu(state: &mut AppState) {
     // Removing is exactly the case `set_mark_across_world` exists for: a
     // sibling still holding the old label would otherwise write it back.
     let from = state.input_session;
-    set_mark_across_world(&mut state.sessions, from, menu.at, chosen);
+    set_mark(state, from, menu.at, chosen);
     if let Some(session) = state.bound_mut() {
         session.push_line(RetainedLine::client(notice));
     }
@@ -3372,7 +3498,8 @@ async fn start_corpse_run(state: &mut AppState) {
         ));
         return;
     };
-    walk_to(session, current, corpse, CORPSE_COMMAND).await;
+    let index = state.input_session;
+    walk_to(state, index, current, corpse, CORPSE_COMMAND).await;
 }
 
 /// Starts a one-step-at-a-time walk from `current` to `target`, or says
@@ -3381,18 +3508,23 @@ async fn start_corpse_run(state: &mut AppState) {
 /// each refusal should blame, since a message naming the wrong command
 /// reads as a bug in whichever one the player actually typed.
 async fn walk_to(
-    session: &mut SessionPane,
+    state: &mut AppState,
+    index: usize,
     current: crate::map::RoomId,
     target: crate::map::RoomId,
     command: &str,
 ) {
     if target == current {
-        session.push_line(RetainedLine::client(format!("** {command}: already there")));
+        state.sessions[index]
+            .push_line(RetainedLine::client(format!("** {command}: already there")));
         return;
     }
 
-    let Some(path) = session.map.path(current, target) else {
-        session.push_line(RetainedLine::client(format!(
+    let Some(path) = state
+        .map_of(index)
+        .and_then(|map| map.path(current, target))
+    else {
+        state.sessions[index].push_line(RetainedLine::client(format!(
             "** {command}: no known route there"
         )));
         return;
@@ -3408,21 +3540,21 @@ async fn walk_to(
     // exactly this argument and panicked the client when the map moved
     // underneath it. A route that cannot be started is a route that cannot
     // be walked, and saying so costs nothing.
-    let Some(expecting) = session
-        .map
-        .rooms
-        .get(&current)
+    let Some(expecting) = state
+        .map_of(index)
+        .and_then(|map| map.rooms.get(&current))
         .and_then(|room| room.exits.get(&direction))
         .copied()
         .flatten()
     else {
-        session.push_line(RetainedLine::client(format!(
+        state.sessions[index].push_line(RetainedLine::client(format!(
             "** {command}: the map no longer knows where `{direction}` leads from here"
         )));
         return;
     };
 
     let steps = remaining.len() + 1;
+    let session = &mut state.sessions[index];
     session.walk = Some(Walk {
         remaining,
         expecting,
@@ -3490,7 +3622,9 @@ async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &
         others,
     };
     let session = connect(target, state.history_size, state.scrollback_size, links);
+    let key = session.map_key.clone();
     state.sessions.push(session);
+    open_world(&mut state.maps, &state.config_dir, &key);
 
     // Focused immediately, the same as a freshly launched character would
     // be — the confirmation below lands in the pane it describes.
@@ -3545,12 +3679,8 @@ pub(crate) mod test_support {
                 scrollback_limit: 10_000,
                 log: None,
                 back_offset: 0,
-                map: crate::map::Map::default(),
                 current_room: None,
                 corpse: None,
-                map_dirty: false,
-                map_save_failed: false,
-                explicit_marks: HashSet::new(),
                 // Empty on purpose: a test pane saves nothing unless it
                 // says which world it belongs to, so tests that never
                 // mention maps do not write files or report failing to.
@@ -3574,6 +3704,7 @@ pub(crate) mod test_support {
         (
             AppState {
                 sessions,
+                maps: HashMap::new(),
                 channels: Vec::new(),
                 focus: Focus::Session(0),
                 input_session: 0,
@@ -3646,8 +3777,8 @@ mod tests {
     #[test]
     fn a_map_debug_snapshot_names_the_room_and_pictures_the_scene() {
         let mut state = test_support::app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, Some("Temple"), &[("n", 2)]);
-        put_room(&mut state.sessions[0].map, 2, None, &[]);
+        put_room(state.map_of_mut(0), 1, Some("Temple"), &[("n", 2)]);
+        put_room(state.map_of_mut(0), 2, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         let snapshot = map_debug_snapshot(&state, true, "@ captured screen text @");
@@ -3735,7 +3866,7 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let mut writer = MapDebugWriter::new(dir.path().to_path_buf());
         let mut state = test_support::app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         writer
@@ -3770,7 +3901,7 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let mut writer = MapDebugWriter::new(dir.path().to_path_buf());
         let mut state = test_support::app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         let calls = std::cell::Cell::new(0);
@@ -5658,11 +5789,20 @@ mod tests {
             "position still tracks, even with nothing learned about the way there"
         );
         assert!(
-            session.map.rooms.values().all(|r| r.exits.is_empty()),
+            state
+                .map_of(0)
+                .unwrap()
+                .rooms
+                .values()
+                .all(|r| r.exits.is_empty()),
             "a broken walk must leave no edge behind: {:?}",
-            session.map.rooms
+            state.map_of(0).unwrap().rooms
         );
-        assert_eq!(session.map.rooms.len(), 4, "but the rooms are still known");
+        assert_eq!(
+            state.map_of(0).unwrap().rooms.len(),
+            4,
+            "but the rooms are still known"
+        );
     }
 
     /// A `--host` session has no profile to key a map on, the same reason
@@ -5676,10 +5816,12 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["adhoc"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), None);
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = config::map_key(None, "mud.example.org", 4000);
         apply_session_event(&mut state, 0, room(1, None));
 
-        save_session_map(&mut state.sessions[0]);
+        let key = state.sessions[0].map_key.clone();
+        save_world_map(&mut state, &key);
 
         let reloaded = config::load_map(dir.path(), "mud.example.org");
         assert!(reloaded.rooms.contains_key(&crate::map::RoomId(1)));
@@ -5692,11 +5834,13 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
         apply_session_event(&mut state, 0, room(2, Some("n")));
 
-        save_session_map(&mut state.sessions[0]);
+        let key = state.sessions[0].map_key.clone();
+        save_world_map(&mut state, &key);
 
         let reloaded = config::load_map(dir.path(), "tank");
         assert_eq!(
@@ -5716,14 +5860,16 @@ mod tests {
         apply_session_event(&mut state, 0, room(1, None));
         apply_session_event(&mut state, 0, room(2, Some("n")));
 
-        let session = &state.sessions[0];
         assert_eq!(
-            session.map.rooms[&crate::map::RoomId(1)].exits.get("n"),
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
+                .exits
+                .get("n"),
             Some(&Some(crate::map::RoomId(2)))
         );
         assert_eq!(
-            session
-                .map
+            state
+                .map_of(0)
+                .unwrap()
                 .path(crate::map::RoomId(1), crate::map::RoomId(2)),
             Some(vec!["n".to_string()])
         );
@@ -5770,9 +5916,9 @@ mod tests {
     #[tokio::test]
     async fn goto_by_vnum_walks_one_step_at_a_time() {
         let (mut state, mut receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[("n", 2)]);
-        put_room(&mut state.sessions[0].map, 2, None, &[("n", 3)]);
-        put_room(&mut state.sessions[0].map, 3, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[("n", 2)]);
+        put_room(state.map_of_mut(0), 2, None, &[("n", 3)]);
+        put_room(state.map_of_mut(0), 3, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto 3").await;
@@ -5801,18 +5947,8 @@ mod tests {
     #[tokio::test]
     async fn goto_by_name_substring() {
         let (mut state, mut receivers) = app(&["tank"]);
-        put_room(
-            &mut state.sessions[0].map,
-            1,
-            Some("Town Square"),
-            &[("e", 2)],
-        );
-        put_room(
-            &mut state.sessions[0].map,
-            2,
-            Some("Temple of the Sun"),
-            &[],
-        );
+        put_room(state.map_of_mut(0), 1, Some("Town Square"), &[("e", 2)]);
+        put_room(state.map_of_mut(0), 2, Some("Temple of the Sun"), &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto temple").await;
@@ -5834,18 +5970,8 @@ mod tests {
     #[tokio::test]
     async fn map_toggles_the_column_and_always_prints_the_description() {
         let (mut state, _receivers) = app(&["tank"]);
-        put_room(
-            &mut state.sessions[0].map,
-            1,
-            Some("Town Square"),
-            &[("e", 2)],
-        );
-        put_room(
-            &mut state.sessions[0].map,
-            2,
-            Some("Temple of the Sun"),
-            &[],
-        );
+        put_room(state.map_of_mut(0), 1, Some("Town Square"), &[("e", 2)]);
+        put_room(state.map_of_mut(0), 2, Some("Temple of the Sun"), &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/map").await;
@@ -5890,9 +6016,9 @@ mod tests {
     #[tokio::test]
     async fn goto_ambiguous_name_lists_candidates_and_starts_no_walk() {
         let (mut state, mut receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, Some("Start"), &[]);
-        put_room(&mut state.sessions[0].map, 10, Some("North Gate"), &[]);
-        put_room(&mut state.sessions[0].map, 11, Some("South Gate"), &[]);
+        put_room(state.map_of_mut(0), 1, Some("Start"), &[]);
+        put_room(state.map_of_mut(0), 10, Some("North Gate"), &[]);
+        put_room(state.map_of_mut(0), 11, Some("South Gate"), &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto gate").await;
@@ -5909,7 +6035,7 @@ mod tests {
     #[tokio::test]
     async fn goto_reports_a_name_with_no_match() {
         let (mut state, _receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, Some("Start"), &[]);
+        put_room(state.map_of_mut(0), 1, Some("Start"), &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto nowhere").await;
@@ -5921,7 +6047,7 @@ mod tests {
     #[tokio::test]
     async fn goto_reports_an_unknown_vnum() {
         let (mut state, _receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto 999").await;
@@ -5933,8 +6059,8 @@ mod tests {
     #[tokio::test]
     async fn goto_reports_no_known_route() {
         let (mut state, _receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
-        put_room(&mut state.sessions[0].map, 2, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
+        put_room(state.map_of_mut(0), 2, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto 2").await;
@@ -5946,7 +6072,7 @@ mod tests {
     #[tokio::test]
     async fn goto_reports_already_there() {
         let (mut state, _receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto 1").await;
@@ -5986,10 +6112,10 @@ mod tests {
     #[test]
     fn a_surprise_during_a_walk_teaches_the_map_nothing() {
         let (mut state, _rx) = app(&["tank"]);
+        // The route believes `n` from room 1 reaches room 99.
+        put_room(state.map_of_mut(0), 1, None, &[("n", 99)]);
         let session = &mut state.sessions[0];
         session.current_room = Some(crate::map::RoomId(1));
-        // The route believes `n` from room 1 reaches room 99.
-        put_room(&mut session.map, 1, None, &[("n", 99)]);
         session.walk = Some(Walk {
             remaining: VecDeque::new(),
             expecting: crate::map::RoomId(99),
@@ -6008,7 +6134,9 @@ mod tests {
             "arriving somewhere the route didn't predict must stop the walk"
         );
         assert_eq!(
-            session.map.rooms[&crate::map::RoomId(1)].exits.get("n"),
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
+                .exits
+                .get("n"),
             Some(&Some(crate::map::RoomId(99))),
             "and must not overwrite the edge with an arrival it cannot attribute"
         );
@@ -6027,15 +6155,15 @@ mod tests {
     #[test]
     fn walking_on_foot_still_corrects_a_stale_edge() {
         let (mut state, _rx) = app(&["tank"]);
+        put_room(state.map_of_mut(0), 1, None, &[("n", 99)]);
         let session = &mut state.sessions[0];
         session.current_room = Some(crate::map::RoomId(1));
-        put_room(&mut session.map, 1, None, &[("n", 99)]);
         assert!(session.walk.is_none(), "no route running");
 
         apply_session_event(&mut state, 0, room(2, Some("n")));
 
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
                 .exits
                 .get("n"),
             Some(&Some(crate::map::RoomId(2))),
@@ -6104,11 +6232,11 @@ mod tests {
     #[test]
     fn arriving_somewhere_new_marks_the_map_for_saving() {
         let (mut state, _rx) = app(&["tank"]);
-        assert!(!state.sessions[0].map_dirty, "nothing learned yet");
+        assert!(!state.world_mut(0).dirty, "nothing learned yet");
 
         apply_session_event(&mut state, 0, room(1, None));
 
-        assert!(state.sessions[0].map_dirty);
+        assert!(state.world_mut(0).dirty);
     }
 
     #[test]
@@ -6116,13 +6244,14 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
         apply_session_event(&mut state, 0, room(2, Some("n")));
 
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
 
-        assert!(!state.sessions[0].map_dirty, "written, so no longer dirty");
+        assert!(!state.world_mut(0).dirty, "written, so no longer dirty");
         let reloaded = config::load_map(dir.path(), "tank");
         assert_eq!(
             reloaded.path(crate::map::RoomId(1), crate::map::RoomId(2)),
@@ -6142,12 +6271,13 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         mark_current_room(&mut state, "shop");
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
         assert_eq!(
             config::load_map(dir.path(), "tank").rooms[&crate::map::RoomId(1)]
                 .mark
@@ -6160,7 +6290,7 @@ mod tests {
         let remove_row = state.mark_menu.as_ref().unwrap().entries().len() - 1;
         state.mark_menu.as_mut().unwrap().selected = remove_row;
         apply_mark_menu(&mut state);
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
 
         assert_eq!(
             config::load_map(dir.path(), "tank").rooms[&crate::map::RoomId(1)].mark,
@@ -6177,16 +6307,17 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
 
         // Overwrite the file behind the client's back: if the next tick
         // rewrites it, this sentinel is gone.
         let path = dir.path().join("maps").join("tank.json");
         std::fs::write(&path, b"{\"rooms\":[]}").unwrap();
 
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -6202,10 +6333,11 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["adhoc"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), None);
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = String::new();
         apply_session_event(&mut state, 0, room(1, None));
 
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
 
         assert!(!dir.path().join("maps").exists());
     }
@@ -6218,10 +6350,10 @@ mod tests {
     #[tokio::test]
     async fn a_repointed_exit_mid_walk_stops_the_walk_instead_of_panicking() {
         let (mut state, mut receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[("n", 2)]);
-        put_room(&mut state.sessions[0].map, 2, None, &[("e", 3)]);
-        put_room(&mut state.sessions[0].map, 3, None, &[("e", 4)]);
-        put_room(&mut state.sessions[0].map, 4, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[("n", 2)]);
+        put_room(state.map_of_mut(0), 2, None, &[("e", 3)]);
+        put_room(state.map_of_mut(0), 3, None, &[("e", 4)]);
+        put_room(state.map_of_mut(0), 4, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/goto 4").await;
         let _ = receivers[0].try_recv();
@@ -6279,9 +6411,9 @@ mod tests {
     #[tokio::test]
     async fn a_destinationless_exit_mid_walk_stops_the_walk() {
         let (mut state, mut receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[("n", 2)]);
-        put_room(&mut state.sessions[0].map, 2, None, &[("e", 3)]);
-        put_room(&mut state.sessions[0].map, 3, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[("n", 2)]);
+        put_room(state.map_of_mut(0), 2, None, &[("e", 3)]);
+        put_room(state.map_of_mut(0), 3, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/goto 3").await;
         let _ = receivers[0].try_recv();
@@ -6294,8 +6426,8 @@ mod tests {
             exits: std::collections::BTreeMap::new(),
         };
         vague.exits.insert("e".to_string(), None);
-        state.sessions[0]
-            .map
+        state
+            .map_of_mut(0)
             .rooms
             .get_mut(&crate::map::RoomId(2))
             .unwrap()
@@ -6328,10 +6460,11 @@ mod tests {
         std::fs::write(maps.join("tank.json"), b"{ not json").unwrap();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
 
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
 
         assert!(
             scrollback(&state.sessions[0]).contains("could not save the map"),
@@ -6350,11 +6483,12 @@ mod tests {
         std::fs::write(maps.join("tank.json"), b"{ not json").unwrap();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
 
         for room_id in 1..=4 {
             apply_session_event(&mut state, 0, room(room_id, None));
-            save_dirty_maps(&mut state.sessions);
+            save_dirty_maps(&mut state);
         }
 
         let complaints = scrollback(&state.sessions[0])
@@ -6373,18 +6507,19 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
         apply_session_event(&mut state, 0, room(1, None));
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
 
         // The file becomes readable, one save succeeds, then it breaks again.
         std::fs::remove_file(&path).unwrap();
         apply_session_event(&mut state, 0, room(2, Some("n")));
-        save_dirty_maps(&mut state.sessions);
-        assert!(!state.sessions[0].map_save_failed, "recovered");
+        save_dirty_maps(&mut state);
+        assert!(!state.world_mut(0).save_failed, "recovered");
         std::fs::write(&path, b"{ not json either").unwrap();
         apply_session_event(&mut state, 0, room(3, Some("n")));
-        save_dirty_maps(&mut state.sessions);
+        save_dirty_maps(&mut state);
 
         let complaints = scrollback(&state.sessions[0])
             .matches("could not save the map")
@@ -6450,7 +6585,7 @@ mod tests {
     #[tokio::test]
     async fn typing_a_word_into_the_chooser_writes_that_word() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
@@ -6475,7 +6610,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
                 .mark
                 .as_deref(),
             Some("mail")
@@ -6487,7 +6622,7 @@ mod tests {
     #[tokio::test]
     async fn a_digit_still_takes_its_row_rather_than_starting_a_label() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
@@ -6503,7 +6638,7 @@ mod tests {
 
         assert!(state.mark_menu.is_none(), "taking a row closes the chooser");
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
                 .mark
                 .as_deref(),
             Some(MARK_SUGGESTIONS[1])
@@ -6519,19 +6654,9 @@ mod tests {
     /// A three-room row, so left and right have somewhere to go.
     fn cursor_state() -> (AppState, Vec<mpsc::Receiver<SessionCommand>>) {
         let (mut state, rx) = app(&["tank"]);
-        put_room(
-            &mut state.sessions[0].map,
-            1,
-            Some("West Gate"),
-            &[("e", 2)],
-        );
-        put_room(
-            &mut state.sessions[0].map,
-            2,
-            Some("Town Square"),
-            &[("e", 3)],
-        );
-        put_room(&mut state.sessions[0].map, 3, Some("East Road"), &[]);
+        put_room(state.map_of_mut(0), 1, Some("West Gate"), &[("e", 2)]);
+        put_room(state.map_of_mut(0), 2, Some("Town Square"), &[("e", 3)]);
+        put_room(state.map_of_mut(0), 3, Some("East Road"), &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(2));
         (state, rx)
     }
@@ -6713,7 +6838,7 @@ mod tests {
     #[tokio::test]
     async fn a_key_the_cursor_ignores_still_does_its_own_job() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         let keys = crate::config::Keybinds::default();
         handle_key(
@@ -6744,7 +6869,7 @@ mod tests {
     #[tokio::test]
     async fn a_binding_pressed_with_the_cursor_up_still_fires() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         let keys = crate::config::Keybinds::default();
         handle_key(
@@ -6778,7 +6903,7 @@ mod tests {
     #[tokio::test]
     async fn alt_n_reaches_the_map_pane() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         state.show_map = true;
         let keys = crate::config::Keybinds::default();
@@ -6845,7 +6970,7 @@ mod tests {
     #[tokio::test]
     async fn cycling_focus_visits_the_map_when_it_is_shown() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         state.show_map = true;
         state.show_channels = false;
@@ -6862,7 +6987,7 @@ mod tests {
     #[tokio::test]
     async fn esc_returns_focus_to_the_character() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         state.show_map = true;
         let keys = crate::config::Keybinds::default();
@@ -6894,18 +7019,18 @@ mod tests {
     #[tokio::test]
     async fn mark_labels_the_room_and_shows_on_the_map() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, Some("Bakers Shop"), &[]);
+        put_room(state.map_of_mut(0), 1, Some("Bakers Shop"), &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark shop").await;
 
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
                 .mark
                 .as_deref(),
             Some("shop")
         );
-        let scene = state.sessions[0].map.scene(crate::map::RoomId(1), None);
+        let scene = state.map_of(0).unwrap().scene(crate::map::RoomId(1), None);
         assert_eq!(
             scene.rooms[0].mark.as_deref(),
             Some("shop"),
@@ -6925,8 +7050,9 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark shop").await;
@@ -6949,6 +7075,36 @@ mod tests {
             config::load_map(dir.path(), "tank").rooms[&crate::map::RoomId(1)].mark,
             None,
             "the removal must already be on disk with no save step run here"
+        );
+    }
+
+    /// The property the shared map exists for, stated directly: what one
+    /// character learns, every character on that MUD knows at once. The
+    /// per-session copies this replaced only reconciled through the file,
+    /// so until the next launch two panes could show different amounts of
+    /// the same world — quieter than the mark bug, and the same cause.
+    #[test]
+    fn what_one_character_explores_the_other_sees_immediately() {
+        let (mut state, _rx) = app(&["mathias", "saihtam"]);
+        for session in &mut state.sessions {
+            session.map_key = "hercmud.net".to_string();
+        }
+
+        // Only mathias walks.
+        apply_session_event(&mut state, 0, room(1, None));
+        apply_session_event(&mut state, 0, room(2, Some("n")));
+
+        assert_eq!(
+            state
+                .map_of(1)
+                .unwrap()
+                .path(crate::map::RoomId(1), crate::map::RoomId(2)),
+            Some(vec!["n".to_string()]),
+            "saihtam reads the same map, so the edge is already there"
+        );
+        assert_eq!(
+            state.sessions[1].current_room, None,
+            "but standing somewhere is still each character's own business"
         );
     }
 
@@ -6980,18 +7136,19 @@ mod tests {
         .unwrap();
 
         let (mut state, _rx) = app(&["mathias", "saihtam"]);
+        state.config_dir = dir.path().to_path_buf();
         for session in &mut state.sessions {
             session.rules = (dir.path().to_path_buf(), None);
             session.map_key = "hercmud.net".to_string();
-            session.map = config::load_map(dir.path(), "hercmud.net");
             session.current_room = Some(crate::map::RoomId(1));
         }
+        state.world_mut(0).map = config::load_map(dir.path(), "hercmud.net");
         assert_eq!(
-            state.sessions[1].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(1).unwrap().rooms[&crate::map::RoomId(1)]
                 .mark
                 .as_deref(),
             Some("shop"),
-            "both characters start out holding the label"
+            "both characters read the one map, so both see the label"
         );
 
         // One of them takes it off.
@@ -7001,16 +7158,14 @@ mod tests {
         apply_mark_menu(&mut state);
 
         assert_eq!(
-            state.sessions[1].map.rooms[&crate::map::RoomId(1)].mark,
+            state.map_of(1).unwrap().rooms[&crate::map::RoomId(1)].mark,
             None,
-            "the sibling must not still be holding the old label"
+            "the other character reads the same map, so it cannot still hold it"
         );
 
         // Quitting: every session is written, siblings included. This is
         // the write that used to resurrect it.
-        for session in &mut state.sessions {
-            save_session_map(session);
-        }
+        save_all_maps(&mut state);
 
         assert_eq!(
             config::load_map(dir.path(), "hercmud.net").rooms[&crate::map::RoomId(1)].mark,
@@ -7030,14 +7185,15 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark well").await;
 
         assert!(
-            !state.sessions[0].map_dirty,
+            !state.world_mut(0).dirty,
             "the write already happened, so there is nothing left owed to a later tick"
         );
         assert_eq!(
@@ -7055,12 +7211,13 @@ mod tests {
     #[tokio::test]
     async fn marking_and_removing_both_record_the_room_as_explicitly_touched() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark shop").await;
         assert!(
-            state.sessions[0]
+            state
+                .world_mut(0)
                 .explicit_marks
                 .contains(&crate::map::RoomId(1)),
             "setting a mark should record the room"
@@ -7068,7 +7225,7 @@ mod tests {
 
         // A save happened in between — the set is cleared once the mark
         // has actually reached disk.
-        state.sessions[0].explicit_marks.clear();
+        state.world_mut(0).explicit_marks.clear();
 
         state.mark_menu = Some(MarkMenu {
             at: crate::map::RoomId(1),
@@ -7082,12 +7239,13 @@ mod tests {
         apply_mark_menu(&mut state);
 
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)].mark,
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)].mark,
             None,
             "the mark should be gone from the in-memory map"
         );
         assert!(
-            state.sessions[0]
+            state
+                .world_mut(0)
                 .explicit_marks
                 .contains(&crate::map::RoomId(1)),
             "removing a mark should record the room just as setting one does"
@@ -7099,14 +7257,14 @@ mod tests {
     #[tokio::test]
     async fn opening_the_chooser_changes_nothing_by_itself() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark well").await;
 
         submit(&mut state, "/mark").await;
 
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
                 .mark
                 .as_deref(),
             Some("well"),
@@ -7138,7 +7296,7 @@ mod tests {
     #[tokio::test]
     async fn bare_mark_opens_the_chooser() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark").await;
@@ -7160,7 +7318,7 @@ mod tests {
     #[tokio::test]
     async fn picking_a_row_marks_the_room() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
 
@@ -7177,7 +7335,7 @@ mod tests {
 
         assert!(state.mark_menu.is_none(), "and closes behind itself");
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
                 .mark
                 .as_deref(),
             Some(MARK_SUGGESTIONS[1])
@@ -7188,7 +7346,7 @@ mod tests {
     #[tokio::test]
     async fn the_chooser_takes_a_label_of_your_own() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
@@ -7238,7 +7396,7 @@ mod tests {
 
         assert!(state.mark_menu.is_none());
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
                 .mark
                 .as_deref(),
             Some("grocer")
@@ -7249,7 +7407,7 @@ mod tests {
     #[tokio::test]
     async fn digits_typed_into_a_custom_label_stay_in_it() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
@@ -7275,7 +7433,7 @@ mod tests {
     #[tokio::test]
     async fn the_chooser_offers_to_take_an_existing_mark_off() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark well").await;
         submit(&mut state, "/mark").await;
@@ -7302,7 +7460,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)].mark,
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)].mark,
             None
         );
     }
@@ -7310,7 +7468,7 @@ mod tests {
     #[tokio::test]
     async fn esc_leaves_the_room_as_it_was() {
         let (mut state, _rx) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
@@ -7319,7 +7477,7 @@ mod tests {
 
         assert!(state.mark_menu.is_none());
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)].mark,
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)].mark,
             None
         );
     }
@@ -7334,12 +7492,12 @@ mod tests {
         apply_session_event(&mut state, 0, SessionEvent::Mark("shop".to_string()));
 
         assert_eq!(
-            state.sessions[0].map.rooms[&crate::map::RoomId(1)]
+            state.map_of(0).unwrap().rooms[&crate::map::RoomId(1)]
                 .mark
                 .as_deref(),
             Some("shop")
         );
-        assert!(state.sessions[0].map_dirty);
+        assert!(state.world_mut(0).dirty);
     }
 
     // ---- /corpse (§16) ----
@@ -7395,9 +7553,9 @@ mod tests {
     #[tokio::test]
     async fn corpse_walks_back_to_the_marked_room_one_step_at_a_time() {
         let (mut state, mut receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, Some("Dark Alley"), &[]);
-        put_room(&mut state.sessions[0].map, 99, Some("Temple"), &[("s", 2)]);
-        put_room(&mut state.sessions[0].map, 2, Some("Street"), &[("w", 1)]);
+        put_room(state.map_of_mut(0), 1, Some("Dark Alley"), &[]);
+        put_room(state.map_of_mut(0), 99, Some("Temple"), &[("s", 2)]);
+        put_room(state.map_of_mut(0), 2, Some("Street"), &[("w", 1)]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         apply_session_event(&mut state, 0, SessionEvent::Corpse);
         state.sessions[0].current_room = Some(crate::map::RoomId(99));
@@ -7423,7 +7581,7 @@ mod tests {
     #[tokio::test]
     async fn corpse_without_a_recorded_death_says_no_death_was_recorded() {
         let (mut state, mut receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/corpse").await;
@@ -7442,8 +7600,8 @@ mod tests {
     #[tokio::test]
     async fn corpse_with_no_route_back_blames_corpse_and_not_goto() {
         let (mut state, _receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
-        put_room(&mut state.sessions[0].map, 99, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
+        put_room(state.map_of_mut(0), 99, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         apply_session_event(&mut state, 0, SessionEvent::Corpse);
         state.sessions[0].current_room = Some(crate::map::RoomId(99));
@@ -7463,7 +7621,7 @@ mod tests {
     #[tokio::test]
     async fn walking_back_to_the_corpse_leaves_the_mark_in_place() {
         let (mut state, _receivers) = app(&["tank"]);
-        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        put_room(state.map_of_mut(0), 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
         apply_session_event(&mut state, 0, SessionEvent::Corpse);
 
