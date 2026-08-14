@@ -494,7 +494,13 @@ fn draw_mark_menu(frame: &mut Frame, area: Rect, menu: &crate::app::MarkMenu) {
             .collect(),
     };
 
-    let width = 24.min(area.width);
+    // 24 was wide enough for the list, whose longest row is a fixed
+    // `{:<16}` field — but not for "Enter to mark, Esc to go back", which
+    // this box also has to show once a custom label is being typed. Sized
+    // to the actual content instead, so the day a longer prompt is added
+    // here it grows with it rather than clipping silently.
+    let content_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (content_width + 2).max(24).min(area.width);
     let height = (lines.len() as u16 + 2).min(area.height);
     let overlay = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -504,7 +510,12 @@ fn draw_mark_menu(frame: &mut Frame, area: Rect, menu: &crate::app::MarkMenu) {
     };
     let block = Block::bordered().title(format!(" mark #{} ", menu.at.0).bold());
     frame.render_widget(ratatui::widgets::Clear, overlay);
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), overlay);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(block),
+        overlay,
+    );
 }
 
 /// The "new profile" wizard (docs/ARCHITECTURE.md §15): one field at a
@@ -780,6 +791,15 @@ fn draw_map(
         return (None, true);
     }
 
+    // Reserved before anything else claims the bottom of the pane, so it
+    // stays put whether the pane is empty, mid-walk, or showing a room's
+    // description — chrome rather than content, the same either way.
+    let (inner, legend_area) = split_legend(inner);
+    frame.render_widget(
+        Paragraph::new(map_render::legend()).wrap(Wrap { trim: true }),
+        legend_area,
+    );
+
     let (Some(session), Some(current)) = (session, session.and_then(|s| s.current_room)) else {
         frame.render_widget(
             Paragraph::new("no room data yet").wrap(Wrap { trim: true }),
@@ -890,6 +910,21 @@ fn described_height(state: &AppState, session: &crate::app::SessionPane, inner: 
         .map(|line| line.len().div_ceil(inner.width.max(1) as usize) as u16)
         .sum();
     wanted.clamp(1, inner.height / 2)
+}
+
+/// Splits the legend's row(s) off the bottom of the map pane. Wrapping
+/// rather than clipping, so a narrow pane still shows every entry — just
+/// over more rows — instead of quietly cutting the list short.
+fn split_legend(inner: Rect) -> (Rect, Rect) {
+    let width = map_render::legend().width() as u16;
+    let rows = width
+        .div_ceil(inner.width.max(1))
+        .clamp(1, (inner.height / 2).max(1));
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(rows)])
+        .split(inner);
+    (split[0], split[1])
 }
 
 fn split_caption(inner: Rect, rows: u16) -> (Rect, Option<Rect>) {
@@ -1319,6 +1354,18 @@ mod tests {
         (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
             .filter(|(x, y)| buffer.cell((*x, *y)).unwrap().bg != ratatui::style::Color::Reset)
+            .count()
+    }
+
+    /// The legend's own contribution to `filled_cells` — one coloured
+    /// swatch per entry, however many rows it wraps to — so a count meant
+    /// to be about room tiles can subtract the legend rather than being
+    /// broken by it.
+    fn legend_swatches() -> usize {
+        map_render::legend()
+            .spans
+            .iter()
+            .filter(|span| span.style.bg.is_some())
             .count()
     }
 
@@ -2366,7 +2413,7 @@ mod tests {
             "the north neighbour is connected: {screen}"
         );
         assert_eq!(
-            filled_cells(&drawn),
+            filled_cells(&drawn) - legend_swatches(),
             9,
             "three rooms, three cells each, drawn as filled ground: {screen}"
         );
@@ -2486,10 +2533,66 @@ mod tests {
         let screen = rows(&drawn);
         assert!(screen.contains('@'), "the current room is drawn: {screen}");
         assert_eq!(
-            filled_cells(&drawn),
+            filled_cells(&drawn) - legend_swatches(),
             6,
             "and so is the one to its west: {screen}"
         );
+    }
+
+    /// The point of the legend: a player who has never seen the map before
+    /// can tell what a colour means without leaving the pane, whether or
+    /// not the server has placed them anywhere yet.
+    #[test]
+    fn the_map_pane_always_shows_the_legend() {
+        let mut state = state();
+        state.show_map = true;
+        state.map_width = MAP_WIDTH;
+
+        let empty = rows(&render_sized(&state, 80, 20));
+        assert!(
+            empty.contains("shop") && empty.contains("corpse"),
+            "the legend should show even with no room data yet: {empty}"
+        );
+
+        use crate::map::{RoomId, RoomInfo};
+        let mut map = crate::map::Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: Some("Town Square".to_string()),
+            area: Some("Midgaard".to_string()),
+            exits: Default::default(),
+        });
+        state.sessions[0].map = map;
+        state.sessions[0].current_room = Some(RoomId(1));
+
+        let populated = rows(&render_sized(&state, 80, 20));
+        assert!(
+            populated.contains("shop") && populated.contains("you"),
+            "the legend should stay put once the map has something to show: {populated}"
+        );
+    }
+
+    /// The bug this pins: the box was a fixed 24 columns, sized for the
+    /// list view's longest row — but typing a custom label swaps in
+    /// "Enter to mark, Esc to go back", which is longer than that and
+    /// nothing wrapped it, so it clipped silently at the border.
+    #[test]
+    fn the_mark_menus_typing_prompt_is_not_clipped() {
+        let mut state = state();
+        state.mark_menu = Some(crate::app::MarkMenu {
+            at: crate::map::RoomId(1),
+            selected: 0,
+            existing: None,
+            typing: Some("a shrine to".to_string()),
+        });
+
+        let screen = rows(&render_sized(&state, 80, 20));
+
+        assert!(
+            screen.contains("Enter to mark, Esc to go back"),
+            "the full prompt should be on screen, not cut off: {screen}"
+        );
+        assert!(screen.contains("what is this room for?"), "{screen}");
     }
 
     /// Before the server has placed the character there is nothing to draw,

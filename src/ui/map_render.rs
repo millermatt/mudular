@@ -102,6 +102,11 @@ pub(super) mod palette {
     pub const CORPSE: Color = Color::Rgb(0xE1, 0x1D, 0x48); // rose
     pub const KNOWN: Color = Color::Rgb(0x3F, 0x46, 0x51); // slate
     pub const CORRIDOR: Color = Color::Rgb(0x64, 0x74, 0x8B); // lighter slate
+    /// A mark that is not one of `MARK_SUGGESTIONS` — a player's own
+    /// "sewer" or "stable" — outside the Okabe-Ito set on purpose, so it
+    /// can never land on the same colour a curated label uses and read as
+    /// one at a glance.
+    pub const OTHER: Color = Color::Rgb(0x8A, 0x8D, 0x91); // neutral grey
     pub const INK: Color = Color::Rgb(0x0B, 0x0E, 0x11); // near-black
     pub const PAPER: Color = Color::Rgb(0xF8, 0xFA, 0xFC); // near-white
 
@@ -136,34 +141,30 @@ fn ink_for(background: Color) -> Color {
 /// label itself.
 ///
 /// Derived rather than configured, so `shop` is the same colour on every
-/// map, in every session, without anyone having to say so — and `shop` and
-/// `smith`, which share an initial, do not share a colour.
+/// map, in every session, without anyone having to say so — `MARK_SUGGESTIONS`
+/// gets a colour each, by position, so the common ones are all told apart.
 ///
-/// The hash is written out rather than taken from `DefaultHasher`, whose
-/// `RandomState` is seeded per process: the same label would land on a
-/// different colour every launch, which is worse than one colour for
-/// everything, because it would look like the map meant something by it.
+/// Anything else — a label the client did not offer — gets `palette::OTHER`
+/// rather than a colour of its own. A hashed colour was tried first, and
+/// the hash could land on the *same* colour a curated label already uses:
+/// a player's own "stable" could read as an actual shop at a glance, purely
+/// by the coincidence of where its hash fell. One shared colour for
+/// "something the player wrote, not a category the client knows" cannot
+/// collide with a curated label's meaning, which is the property that
+/// matters — it can still collide with *another* custom label sharing a
+/// first letter, but the full label is always a look at `Map::describe`
+/// away, and that ambiguity already existed for two curated labels sharing
+/// a hue (`labels_sharing_a_colour_do_not_share_a_letter`).
 pub(super) fn marked_style(label: &str) -> (Style, Option<char>) {
     let label = label.trim();
     let folded = label.to_ascii_lowercase();
-    // The labels `/mark` offers get a colour each, by position, so the
-    // common ones are all told apart. Hashing alone put three of the nine
-    // on one colour and two more pairs on another — fine for arbitrary
-    // labels, poor for the list the client itself suggests.
-    let slot = crate::app::MARK_SUGGESTIONS
+    let background = match crate::app::MARK_SUGGESTIONS
         .iter()
         .position(|known| *known == folded)
-        .unwrap_or_else(|| {
-            // Anything else: derived from the label, so it is at least
-            // stable and usually distinct.
-            let mut hash: u32 = 0x811c_9dc5;
-            for byte in folded.bytes() {
-                hash ^= byte as u32;
-                hash = hash.wrapping_mul(0x0100_0193);
-            }
-            hash as usize
-        });
-    let background = palette::LABELS[slot % palette::LABELS.len()];
+    {
+        Some(slot) => palette::LABELS[slot % palette::LABELS.len()],
+        None => palette::OTHER,
+    };
     let style = Style::default()
         .bg(background)
         .fg(ink_for(background))
@@ -175,6 +176,51 @@ pub(super) fn marked_style(label: &str) -> (Style, Option<char>) {
         style,
         label.chars().next().map(|first| first.to_ascii_uppercase()),
     )
+}
+
+/// What every colour and letter the map draws actually means, in the same
+/// styles the map itself uses — a swatch is only honest if it is the exact
+/// style a room would be drawn in, not a description of one (§16).
+///
+/// Static rather than scene-derived: it lists what `/mark` offers and the
+/// two roles every scene can show, not what happens to be on screen right
+/// now, so it reads the same whether the pane is empty or full.
+pub(super) fn legend() -> Line<'static> {
+    let mut entries: Vec<(Style, Option<char>, &str)> = Vec::new();
+    let (here_style, here_letter) = role_style(RoomRole::Here);
+    entries.push((here_style, here_letter, "you"));
+    let (corpse_style, corpse_letter) = role_style(RoomRole::Corpse);
+    entries.push((corpse_style, corpse_letter, "corpse"));
+    for label in crate::app::MARK_SUGGESTIONS {
+        let (style, letter) = marked_style(label);
+        entries.push((style, letter, label));
+    }
+    // Whatever a custom `/mark` actually says is never `?` — this row is
+    // the one place that glyph is honest, standing in for "some label of
+    // your own" rather than any real room's first letter.
+    entries.push((
+        Style::default()
+            .bg(palette::OTHER)
+            .fg(ink_for(palette::OTHER))
+            .add_modifier(Modifier::BOLD),
+        Some('?'),
+        "other",
+    ));
+
+    let mut spans = Vec::new();
+    for (index, (style, letter, label)) in entries.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        if let Some(letter) = letter {
+            spans.push(Span::styled(letter.to_string(), style));
+        }
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Draws the scene as filled cells on a character grid.
@@ -315,21 +361,33 @@ mod tests {
         assert_ne!(marked_style("bank").0.bg, marked_style("healer").0.bg);
     }
 
-    /// The property that makes a derived colour usable at all: `shop` is
-    /// the same colour on every map, in every session, on every launch.
-    /// `DefaultHasher` would have broken this silently — its `RandomState`
-    /// is seeded per process, so the colours would reshuffle on every
-    /// start, which is worse than one colour for everything because it
-    /// would look like the map meant something by the change.
+    /// The property that makes a fixed colour usable at all: `shop` is the
+    /// same colour on every map, in every session, on every launch.
     #[test]
-    fn a_label_keeps_its_colour_between_runs() {
-        // Pinned, not compared with itself: a self-comparison passes
-        // happily under a per-process seed.
+    fn a_curated_label_keeps_its_colour_between_runs() {
         assert_eq!(marked_style("shop").0.bg, Some(palette::LABELS[0]));
         assert_eq!(marked_style("water").0.bg, Some(palette::LABELS[1]));
-        // An arbitrary label goes through the hash rather than the table
-        // and has to be just as steady.
-        assert_eq!(marked_style("grocer").0.bg, marked_style("grocer").0.bg);
+    }
+
+    /// The bug this pins: a hashed colour for anything outside
+    /// `MARK_SUGGESTIONS` was tried first, and the hash could land on the
+    /// *same* colour a curated label already uses — a player's own
+    /// "smith" could read as an actual `shop` at a glance, purely by where
+    /// its hash fell, sharing both the colour and (since both start with
+    /// `s`) the letter. `palette::OTHER` cannot collide with a curated
+    /// label's meaning no matter what the player types.
+    #[test]
+    fn an_uncurated_label_never_collides_with_a_curated_one() {
+        assert_eq!(marked_style("smith").0.bg, Some(palette::OTHER));
+        assert_ne!(marked_style("smith").0.bg, marked_style("shop").0.bg);
+        // Any label at all — not just one that happens to share a letter.
+        for custom in ["grocer", "stable", "sewer", "well"] {
+            assert_eq!(
+                marked_style(custom).0.bg,
+                Some(palette::OTHER),
+                "{custom} is not offered, so it should not borrow a curated colour"
+            );
+        }
     }
 
     /// The labels the client offers are the ones most likely to share a
@@ -378,12 +436,12 @@ mod tests {
             let luma = |r: u8, g: u8, b: u8| 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
             (luma(r, g, b) - luma(ir, ig, ib)).abs()
         };
-        for bg in
-            palette::LABELS
-                .iter()
-                .copied()
-                .chain([palette::HERE, palette::CORPSE, palette::KNOWN])
-        {
+        for bg in palette::LABELS.iter().copied().chain([
+            palette::HERE,
+            palette::CORPSE,
+            palette::KNOWN,
+            palette::OTHER,
+        ]) {
             assert!(
                 contrast(bg) > 60.0,
                 "{bg:?} and its ink are too close to read"
@@ -395,7 +453,10 @@ mod tests {
     /// something else in this pane.
     #[test]
     fn no_label_colour_collides_with_a_role_colour() {
-        for label in crate::app::MARK_SUGGESTIONS {
+        for label in crate::app::MARK_SUGGESTIONS
+            .iter()
+            .chain(["anything"].iter())
+        {
             let bg = marked_style(label).0.bg;
             assert_ne!(bg, Some(palette::HERE), "{label} would read as the player");
             assert_ne!(bg, Some(palette::CORPSE), "{label} would read as a corpse");
