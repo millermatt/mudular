@@ -19,6 +19,10 @@ use crate::map::{RoomId, RoomRole, Scene};
 /// A picture the terminal has to be told about directly, because it is not
 /// made of cells: the escape sequence, the pane it covers, and the glyphs
 /// to write on top once it is drawn (§16).
+///
+/// `Clone` so `MapImageCache` can hand out a copy of the last one rendered
+/// on a frame where nothing about the scene changed, without re-rasterising.
+#[derive(Clone)]
 pub(crate) struct PendingImage {
     pub area: Rect,
     pub sixel: String,

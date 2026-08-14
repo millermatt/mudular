@@ -24,8 +24,9 @@
 /// Wraps a bitmap in the escape sequence a terminal will draw.
 ///
 /// `pixels` is one palette index per pixel, row-major, `width * height` of
-/// them. Indices outside `palette` are treated as transparent, which is
-/// what leaves the terminal's own background showing through.
+/// them. Indices outside `palette` are painted as the terminal's background,
+/// which is what lets a room that leaves the scene — the map recentres on
+/// every move — actually disappear.
 pub(crate) fn encode(
     width: usize,
     height: usize,
@@ -33,11 +34,23 @@ pub(crate) fn encode(
     pixels: &[u8],
 ) -> String {
     debug_assert_eq!(pixels.len(), width * height, "one index per pixel");
-    // `ESC P q` opens the data; the `0;1;0` selects the ordinary pixel
-    // aspect ratio and says that unset pixels stay transparent rather than
-    // painting the background, so the map sits *on* the pane rather than
-    // cutting a hole in it.
-    let mut out = String::from("\x1bP0;1;0q");
+    // `ESC P q` opens the data; the `0;2;0` selects the ordinary pixel
+    // aspect ratio and paints unset pixels as the background rather than
+    // leaving them transparent.
+    //
+    // Transparent (`P2=1`) sounds like the right choice for a canvas that
+    // is mostly empty, and it was tried first — but "transparent" in Sixel
+    // means the terminal leaves whatever was already there alone, not that
+    // it paints nothing. Every frame draws the same fixed-size canvas, so a
+    // room that fell out of the picture (the map is always centred on the
+    // player, so nearly every move shifts every room) left its old pixels
+    // on screen forever: rooms the player had long since walked away from
+    // kept accumulating, session over session, because nothing ever told
+    // the terminal to erase them. Painting the background instead means
+    // every frame is a real overwrite of the whole canvas, at the cost of
+    // the pane's own background no longer showing through the gaps — a
+    // black rectangle is a small enough price for a map that stops lying.
+    let mut out = String::from("\x1bP0;2;0q");
     // Raster attributes: square pixels, and the size up front so a terminal
     // can reserve the room before it starts drawing.
     out.push_str(&format!("\"1;1;{width};{height}"));
@@ -126,7 +139,7 @@ mod tests {
     fn decode(sixel: &str, width: usize, height: usize) -> Vec<Option<u8>> {
         let mut pixels = vec![None; width * height];
         let body = sixel
-            .strip_prefix("\x1bP0;1;0q")
+            .strip_prefix("\x1bP0;2;0q")
             .expect("opens with a DCS")
             .strip_suffix("\x1b\\")
             .expect("closes with ST");
@@ -218,15 +231,33 @@ mod tests {
         assert_eq!(decoded, expected);
     }
 
-    /// An index the palette does not have leaves the pixel unpainted, which
-    /// is how the pane behind shows through.
+    /// An index the palette does not have gets no explicit paint command in
+    /// the raster — `P2=2` is what then tells the terminal to fill those
+    /// positions with the background rather than leave them alone.
     #[test]
-    fn an_index_outside_the_palette_is_transparent() {
+    fn an_index_outside_the_palette_is_never_explicitly_painted() {
         let pixels = vec![9u8; 4 * 6];
 
         let decoded = decode(&encode(4, 6, &PALETTE, &pixels), 4, 6);
 
         assert!(decoded.iter().all(Option::is_none));
+    }
+
+    /// The bug this pins: `P2=1` ("transparent") tells the terminal to
+    /// leave whatever was already on screen alone at every pixel this
+    /// image does not paint. Since the map recentres on the player every
+    /// move, almost every frame leaves *some* pixel unpainted that a
+    /// previous frame did paint — and with `P2=1` those old pixels never
+    /// go away, so rooms the player walked away from kept accumulating on
+    /// screen for the rest of the session. `P2=2` fills them with the
+    /// background instead, so every frame is a genuine overwrite.
+    #[test]
+    fn unpainted_pixels_are_told_to_erase_to_background_not_stay_transparent() {
+        let encoded = encode(1, 1, &PALETTE, &[0]);
+        assert!(
+            encoded.starts_with("\x1bP0;2;0q"),
+            "P2 must not be 1 (transparent): {encoded:?}"
+        );
     }
 
     /// A map is mostly flat colour, and without run-length encoding one

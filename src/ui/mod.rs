@@ -264,8 +264,46 @@ pub fn session_pane_sizes(area: Rect, state: &AppState) -> Vec<(usize, (u16, u16
         .collect()
 }
 
-pub fn draw(frame: &mut Frame, state: &AppState) -> Option<map_render::PendingImage> {
+/// What a frame put on screen that a step after `Terminal::draw` needs to
+/// know about: the picture to write once ratatui has flushed the cells
+/// around it (§16), and the map pane's own area — real screen coordinates,
+/// not a guess — so `--map-debug` can read back exactly what this frame
+/// showed instead of re-rendering a separate approximation of it.
+pub struct DrawnFrame {
+    /// The map's picture this frame — present whenever one occupies the
+    /// pane, whether freshly rasterised or reused from `MapImageCache`, so
+    /// a consumer like `--map-debug` always has real glyphs to read.
+    pub image: Option<map_render::PendingImage>,
+    /// Whether `image` was actually rasterised this frame rather than
+    /// reused unchanged. Only a fresh picture is worth the cost of writing
+    /// to the terminal again — the one already on screen is still correct.
+    pub image_is_fresh: bool,
+    pub map_area: Option<Rect>,
+}
+
+/// What the map pane drew last frame, so a frame where nothing about the
+/// scene changed can skip rasterising and RLE-encoding a fresh picture —
+/// on a real map that took long enough to be felt on every single
+/// keystroke, not just the ones that moved the character (see `render` in
+/// `map_sixel.rs`).
+#[derive(Default)]
+pub struct MapImageCache {
+    key: Option<MapImageCacheKey>,
+    image: Option<map_render::PendingImage>,
+}
+
+#[derive(PartialEq, Eq)]
+struct MapImageCacheKey {
+    scene: crate::map::Scene,
+    cursor: Option<crate::map::RoomId>,
+    area: Rect,
+    cell: (u16, u16),
+}
+
+pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) -> DrawnFrame {
     let mut pending = None;
+    let mut image_is_fresh = true;
+    let mut map_area = None;
     let panes = layout(frame.area(), state);
 
     if state.sessions.is_empty() {
@@ -306,7 +344,8 @@ pub fn draw(frame: &mut Frame, state: &AppState) -> Option<map_render::PendingIm
     }
 
     if let Some(rect) = panes.map {
-        pending = draw_map(frame, rect, state);
+        (pending, image_is_fresh) = draw_map(frame, rect, state, map_cache);
+        map_area = Some(rect);
     }
 
     let bound = state.bound();
@@ -353,9 +392,13 @@ pub fn draw(frame: &mut Frame, state: &AppState) -> Option<map_render::PendingIm
         );
     }
 
-    // Written by the caller once the frame has been flushed: an image is
-    // not made of cells, so ratatui cannot carry it.
-    pending
+    // The picture is written by the caller once the frame has been
+    // flushed: an image is not made of cells, so ratatui cannot carry it.
+    DrawnFrame {
+        image: pending,
+        image_is_fresh,
+        map_area,
+    }
 }
 
 /// The help overlay: a box centred over the layout, sized to its content and
@@ -701,7 +744,12 @@ fn gauge_style(gauge: crate::vitals::Gauge) -> Style {
 /// form of the same knowledge is `Map::describe` (§16). This function owns
 /// the pane — its border, its title, and what to say when there is nothing
 /// to draw — and hands the picture itself to a [`MapRenderer`].
-fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) -> Option<map_render::PendingImage> {
+fn draw_map(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    map_cache: &mut MapImageCache,
+) -> (Option<map_render::PendingImage>, bool) {
     let session = state.bound();
     let title = match session.and_then(|session| session.current_room) {
         Some(at) => session
@@ -729,7 +777,7 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) -> Option<map_rende
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
-        return None;
+        return (None, true);
     }
 
     let (Some(session), Some(current)) = (session, session.and_then(|s| s.current_room)) else {
@@ -737,7 +785,7 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) -> Option<map_rende
             Paragraph::new("no room data yet").wrap(Wrap { trim: true }),
             inner,
         );
-        return None;
+        return (None, true);
     };
 
     let scene = session.map.scene(current, session.corpse);
@@ -746,7 +794,30 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) -> Option<map_rende
     if let Some(cell) = state.map_cell_px {
         let described_rows = described_height(state, session, inner);
         let (grid, caption) = split_caption(inner, described_rows);
-        if let Some(image) = map_sixel::render(grid, &scene, state.map_cursor, cell) {
+        let key = MapImageCacheKey {
+            scene: scene.clone(),
+            cursor: state.map_cursor,
+            area: grid,
+            cell,
+        };
+        // Rasterising and RLE-encoding a real map costs tens of
+        // milliseconds — fine once, on the frame that moved the player,
+        // but `draw` runs on every keystroke, map-related or not. Reusing
+        // the last picture whenever nothing the key covers has changed is
+        // what keeps typing from paying that cost on every character.
+        let cached = (map_cache.key.as_ref() == Some(&key))
+            .then(|| map_cache.image.clone())
+            .flatten();
+        let (image, fresh) = match cached {
+            Some(image) => (Some(image), false),
+            None => {
+                let image = map_sixel::render(grid, &scene, state.map_cursor, cell);
+                map_cache.key = Some(key);
+                map_cache.image = image.clone();
+                (image, true)
+            }
+        };
+        if let Some(image) = image {
             // The cells under the image belong to it now: left to ratatui
             // they would be painted over the pixels every frame.
             for y in grid.top()..grid.bottom() {
@@ -756,7 +827,7 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) -> Option<map_rende
                 }
             }
             draw_caption(frame, caption, state, session);
-            return Some(image);
+            return (Some(image), fresh);
         }
     }
 
@@ -797,7 +868,11 @@ fn draw_map(frame: &mut Frame, area: Rect, state: &AppState) -> Option<map_rende
             rect,
         );
     }
-    None
+    // No picture occupies the pane this frame, so nothing in the cache is
+    // still on screen to reuse.
+    map_cache.key = None;
+    map_cache.image = None;
+    (None, true)
 }
 
 /// How many rows the cursor's description wants, so both renderers leave
@@ -1220,9 +1295,10 @@ mod tests {
 
     fn render_sized(state: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut cache = MapImageCache::default();
         terminal
             .draw(|frame| {
-                draw(frame, state);
+                draw(frame, state, &mut cache);
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -2302,6 +2378,79 @@ mod tests {
         assert!(!hidden.contains("Midgaard"), "{hidden}");
     }
 
+    /// The bug this pins: rasterising and RLE-encoding a real map costs
+    /// tens of milliseconds, and `draw` used to redo it on every frame —
+    /// every keystroke, map-related or not — which was slow enough to be
+    /// felt while typing. A second frame with nothing about the scene
+    /// changed has to reuse the picture rather than rebuild it.
+    #[test]
+    fn a_second_frame_with_nothing_changed_reuses_the_map_picture() {
+        use crate::map::{RoomId, RoomInfo};
+        use std::collections::BTreeMap;
+
+        let mut state = state();
+        let mut map = crate::map::Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: Some("Town Square".to_string()),
+            area: Some("Midgaard".to_string()),
+            exits: BTreeMap::new(),
+        });
+        state.sessions[0].map = map;
+        state.sessions[0].current_room = Some(RoomId(1));
+        state.show_map = true;
+        state.map_width = MAP_WIDTH;
+        state.map_cell_px = Some((8, 16));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut cache = MapImageCache::default();
+
+        let mut first = DrawnFrame {
+            image: None,
+            image_is_fresh: true,
+            map_area: None,
+        };
+        terminal
+            .draw(|frame| first = draw(frame, &state, &mut cache))
+            .unwrap();
+        assert!(first.image.is_some(), "a sixel image should have rendered");
+        assert!(first.image_is_fresh, "the first frame always has to render");
+
+        let mut second = DrawnFrame {
+            image: None,
+            image_is_fresh: true,
+            map_area: None,
+        };
+        terminal
+            .draw(|frame| second = draw(frame, &state, &mut cache))
+            .unwrap();
+        assert!(
+            second.image.is_some(),
+            "the picture must still be there to write, or the pane goes blank"
+        );
+        assert!(
+            !second.image_is_fresh,
+            "nothing about the scene changed, so this frame must reuse the cache"
+        );
+
+        // Moving invalidates it: the picture drawn afterward has to be a
+        // different render, not the stale one from the old room.
+        state.sessions[0].current_room = Some(RoomId(1));
+        state.map_cursor = Some(RoomId(1));
+        let mut third = DrawnFrame {
+            image: None,
+            image_is_fresh: true,
+            map_area: None,
+        };
+        terminal
+            .draw(|frame| third = draw(frame, &state, &mut cache))
+            .unwrap();
+        assert!(
+            third.image_is_fresh,
+            "moving the cursor changes the scene the cache key covers"
+        );
+    }
+
     /// The room glyph's default marker is `·`, which is two bytes wide and
     /// one column wide. Highlighting the current room by byte-slicing the
     /// assembled row therefore panicked the moment any room was drawn to
@@ -2387,6 +2536,7 @@ mod tests {
     fn repeated_draws_never_corrupt_the_left_border() {
         let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
         let mut state = state();
+        let mut cache = MapImageCache::default();
 
         let banner = [
             "Welcome to FakeMUD",
@@ -2400,7 +2550,7 @@ mod tests {
                 .push_back(RetainedLine::server(line));
             terminal
                 .draw(|frame| {
-                    draw(frame, &state);
+                    draw(frame, &state, &mut cache);
                 })
                 .unwrap();
             assert_left_border_intact(terminal.backend().buffer());
@@ -2409,7 +2559,7 @@ mod tests {
         state.sessions[0].prompt = "By what name do you wish to be known?".to_string();
         terminal
             .draw(|frame| {
-                draw(frame, &state);
+                draw(frame, &state, &mut cache);
             })
             .unwrap();
         assert_left_border_intact(terminal.backend().buffer());
@@ -2424,7 +2574,7 @@ mod tests {
                 .push_back(RetainedLine::server(line));
             terminal
                 .draw(|frame| {
-                    draw(frame, &state);
+                    draw(frame, &state, &mut cache);
                 })
                 .unwrap();
             assert_left_border_intact(terminal.backend().buffer());

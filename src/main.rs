@@ -57,6 +57,12 @@ struct Cli {
     #[arg(long)]
     record: Option<PathBuf>,
 
+    /// Write a snapshot of the map pane to this directory every time it
+    /// changes — a room listing and an ASCII picture of the whole scene,
+    /// not just what fit on screen, for diagnosing map bugs after the run.
+    #[arg(long)]
+    map_debug: Option<PathBuf>,
+
     /// Store this profile's auto-login password in the OS keyring, then
     /// exit. Prompts for the password; it is never echoed or logged.
     #[arg(long, value_name = "PROFILE")]
@@ -187,6 +193,7 @@ async fn main() -> Result<()> {
         app_config.map_graphics,
         app_config.cross_session,
         first_run_hint,
+        cli.map_debug,
     )
     .await
 }

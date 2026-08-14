@@ -51,8 +51,15 @@ pub(crate) fn render(
         return None;
     }
 
-    // Index 0 is "nothing", left transparent so the pane's own background
-    // shows through rather than the map painting a black rectangle over it.
+    // Index 0 is plain black, and every pixel starts there — a real,
+    // transmitted colour rather than a gap left for the terminal to fill
+    // in on its own. `P2=2` (`sixel::encode`) says to paint the background
+    // over anything the image leaves unpainted, but "background" there is
+    // the *terminal's* idea of one, and WezTerm's default theme is a pale
+    // blue-grey rather than black — light enough to wash out the corridor
+    // colour drawn on top of it. Owning the colour ourselves means every
+    // terminal draws the same void, whatever its theme says background
+    // means.
     let mut colours: Vec<(u8, u8, u8)> = vec![(0, 0, 0)];
     let mut pixels = vec![u8::MAX; (width * height) as usize];
     let mut glyphs: Vec<(u16, u16, char, Style)> = Vec::new();
@@ -78,6 +85,45 @@ pub(crate) fn render(
         let row = origin_row + at.1 * STEP_Y;
         (col * cw + (ROOM_CELLS_W * cw) / 2, row * ch + ch / 2)
     };
+
+    // Black, but only under the rooms — plus one room-step of margin, not
+    // the whole canvas. The map is always centred on the current room, so
+    // an ordinary step shifts every room's position by exactly one step;
+    // a step's worth of margin is exactly enough to cover whatever the
+    // previous frame drew that this one does not. Filling the *whole*
+    // pane instead was tried first, to fix the ghosting `P2=2` alone
+    // could not: it fixed the ghosting, but a canvas that is mostly
+    // unbroken black no longer compresses the way a mostly-empty one did,
+    // and paying that cost on every frame — every keystroke, whether or
+    // not it had anything to do with the map — made typing sluggish.
+    // Bounding the fill to where rooms actually are keeps both fixes at
+    // the cost of neither.
+    if let Some((min_x, max_x, min_y, max_y)) =
+        scene
+            .rooms
+            .iter()
+            .fold(None::<(i32, i32, i32, i32)>, |bounds, room| {
+                Some(match bounds {
+                    None => (room.at.0, room.at.0, room.at.1, room.at.1),
+                    Some((min_x, max_x, min_y, max_y)) => (
+                        min_x.min(room.at.0),
+                        max_x.max(room.at.0),
+                        min_y.min(room.at.1),
+                        max_y.max(room.at.1),
+                    ),
+                })
+            })
+    {
+        let px0 = ((origin_col + (min_x - 1) * STEP_X) * cw).clamp(0, width);
+        let py0 = ((origin_row + (min_y - 1) * STEP_Y) * ch).clamp(0, height);
+        let px1 = ((origin_col + (max_x + 1) * STEP_X + ROOM_CELLS_W) * cw).clamp(0, width);
+        let py1 = ((origin_row + (max_y + 1) * STEP_Y + 1) * ch).clamp(0, height);
+        for y in py0..py1 {
+            for x in px0..px1 {
+                pixels[(y * width + x) as usize] = 0;
+            }
+        }
+    }
 
     let corridor = index_of(palette::CORRIDOR, &mut colours);
     for link in &scene.links {
@@ -171,17 +217,7 @@ pub(crate) fn render(
 
     Some(PendingImage {
         area,
-        sixel: sixel::encode(
-            width as usize,
-            height as usize,
-            &colours[1..],
-            // Index 0 is the transparent slot, so everything shifts down by
-            // one to address the palette actually written out.
-            &pixels
-                .iter()
-                .map(|i| i.wrapping_sub(1))
-                .collect::<Vec<u8>>(),
-        ),
+        sixel: sixel::encode(width as usize, height as usize, &colours, &pixels),
         glyphs,
     })
 }
@@ -295,6 +331,43 @@ mod tests {
         assert!(
             image.sixel.contains("\"1;1;160;160"),
             "20x8 by 10x16 pixels"
+        );
+    }
+
+    /// The bug this pins: the void behind the map used to be left for the
+    /// terminal to fill in on its own (`P2=2`'s "background"), and WezTerm
+    /// paints that as its own pale theme colour rather than black — light
+    /// enough to wash out the corridor colour drawn on top of it. Every
+    /// pixel the renderer does not otherwise touch has to be an explicit,
+    /// transmitted black, not a gap.
+    #[test]
+    fn the_void_behind_the_map_is_an_explicit_black_not_left_to_the_terminal() {
+        let image =
+            render(Rect::new(0, 0, 20, 10), &scene_of(&[]), None, (8, 16)).expect("an image");
+
+        assert!(
+            image.sixel.contains("#0;2;0;0;0"),
+            "index 0 should be transmitted as black: {}",
+            image.sixel
+        );
+    }
+
+    /// The bug painting the *whole* canvas black caused: on a pane much
+    /// bigger than the explored map — the ordinary case, since the pane is
+    /// sized to the terminal and the map to what has been walked — a full
+    /// fill turns a mostly-empty image into a mostly-solid one, which
+    /// costs real bytes and real time to encode on every single frame.
+    /// One room's picture on a huge pane has to stay cheap regardless of
+    /// how big the pane is.
+    #[test]
+    fn the_payload_stays_small_on_a_pane_much_bigger_than_the_map() {
+        let image =
+            render(Rect::new(0, 0, 200, 150), &scene_of(&[]), None, (8, 16)).expect("an image");
+
+        assert!(
+            image.sixel.len() < 4_000,
+            "a single room on a 1600x2400 canvas should stay a small fraction of a full fill: {} bytes",
+            image.sixel.len()
         );
     }
 

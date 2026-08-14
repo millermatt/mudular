@@ -1581,6 +1581,7 @@ pub async fn run(
     map_graphics: bool,
     cross_session_default: CrossSession,
     first_run_hint: bool,
+    map_debug: Option<PathBuf>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let result = event_loop(
@@ -1596,6 +1597,7 @@ pub async fn run(
         map_graphics,
         cross_session_default,
         first_run_hint,
+        map_debug,
     )
     .await;
     ratatui::restore();
@@ -1775,6 +1777,204 @@ fn connect(
         map_dirty: false,
         map_save_failed: false,
         walk: None,
+    }
+}
+
+/// Whether the skip-diffed region just changed shape in either direction,
+/// making the terminal's actual contents there untrustworthy against
+/// ratatui's buffer — a skipped cell is excluded from the diff no matter
+/// which side of the transition it is on.
+fn image_presence_changed(had_image: bool, has_image: bool) -> bool {
+    had_image != has_image
+}
+
+/// Everything `--map-debug` writes about one moment: which session's map is
+/// showing, the room it is centred on, and the scene itself — both as a
+/// picture sized to the whole thing (not clipped to the pane) and as a
+/// listing exact enough to catch what the picture can't, like which room a
+/// stray gap or a collision-dropped neighbour actually was.
+/// Reads back the exact cells [`ui::draw`] just put in the map pane, from
+/// ratatui's own buffer — real screen content, not a re-render — plus the
+/// glyphs `write_map_image` writes straight to the terminal afterward. The
+/// cells under a Sixel picture are marked skipped so ratatui's buffer never
+/// learns what covers them; the glyphs are as much of that region as a text
+/// snapshot can show at all, since the pixels underneath have no text form.
+fn capture_map_area(
+    buffer: &ratatui::buffer::Buffer,
+    area: Option<ratatui::layout::Rect>,
+    image: Option<&ui::PendingImage>,
+) -> String {
+    let Some(area) = area else {
+        return "(map pane not shown this frame)".to_string();
+    };
+    let mut rows: Vec<Vec<char>> = (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| {
+                    buffer[(area.x + x, area.y + y)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' ')
+                })
+                .collect()
+        })
+        .collect();
+    if let Some(image) = image {
+        for (x, y, ch, _) in &image.glyphs {
+            if *x >= area.x && *x < area.x + area.width && *y >= area.y && *y < area.y + area.height
+            {
+                rows[(*y - area.y) as usize][(*x - area.x) as usize] = *ch;
+            }
+        }
+    }
+    let note = if image.is_some() {
+        "(sixel pixels have no text form — only the letters written on top \
+         of them show here; the room listing below says what the pixels \
+         themselves would be)\n"
+    } else {
+        ""
+    };
+    let picture = rows
+        .into_iter()
+        .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{note}{picture}")
+}
+
+/// Everything `--map-debug` writes about one moment: the header facts, the
+/// pane exactly as it was captured off screen (`capture_map_area`), and the
+/// full room/link listing — the off-screen half of the picture, since a
+/// screen capture only ever shows what fit.
+fn map_debug_snapshot(state: &AppState, has_image: bool, screen_text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let Some(session) = state.bound() else {
+        out.push_str("no session bound\n");
+        return out;
+    };
+    let _ = writeln!(out, "session: {}", session.name);
+    let _ = writeln!(out, "sixel image this frame: {has_image}");
+    let _ = writeln!(out, "map cursor: {:?}", state.map_cursor);
+    let _ = writeln!(out, "corpse: {:?}", session.corpse);
+    let current = session.current_room;
+    let _ = writeln!(
+        out,
+        "current room: {}",
+        match current.and_then(|id| session.map.rooms.get(&id).map(|room| (id, room))) {
+            Some((id, room)) => format!("{} {:?} area {:?}", id.0, room.name, room.area),
+            None => "none (no room data yet)".to_string(),
+        }
+    );
+    out.push('\n');
+    out.push_str(screen_text);
+
+    let Some(current) = current else {
+        return out;
+    };
+    let scene = session.map.scene(current, session.corpse);
+    out.push_str("\n\nrooms:\n");
+    for room in &scene.rooms {
+        let _ = writeln!(
+            out,
+            "  {:>6} at {:>4},{:<4} role={:?} up={} down={} mark={:?} hidden_exits={}",
+            room.id.0,
+            room.at.0,
+            room.at.1,
+            room.role,
+            room.up,
+            room.down,
+            room.mark,
+            room.hidden_exits
+        );
+    }
+    out.push_str("\nlinks:\n");
+    for link in &scene.links {
+        let _ = writeln!(out, "  {:?} step {:?}", link.from, link.step);
+    }
+    out
+}
+
+/// Enough to say whether the map pane could have changed, without doing
+/// any of the work of finding out what it now shows. `record` is called
+/// every frame — every keystroke, in any pane — and `map_debug_snapshot`
+/// lays out the whole area from scratch and writes a line per room and
+/// per link; on a busy area that is real work to redo on every character
+/// typed into an unrelated session.
+///
+/// A room discovered without the current room changing (a passage
+/// revealed while standing still) will not flip this key, so a snapshot
+/// for it can be missed — a session that only walks to see the picture
+/// change never hits that gap, and it is a small loss for a debug tool
+/// against a real per-keystroke cost.
+#[derive(Clone, PartialEq, Eq)]
+struct MapDebugKey {
+    session: String,
+    current_room: Option<crate::map::RoomId>,
+    corpse: Option<crate::map::RoomId>,
+    cursor: Option<crate::map::RoomId>,
+    has_image: bool,
+}
+
+impl MapDebugKey {
+    fn of(state: &AppState, has_image: bool) -> Option<Self> {
+        let session = state.bound()?;
+        Some(Self {
+            session: session.name.clone(),
+            current_room: session.current_room,
+            corpse: session.corpse,
+            cursor: state.map_cursor,
+            has_image,
+        })
+    }
+}
+
+/// Writes a `map_debug_snapshot` to disk whenever the map pane could have
+/// changed — otherwise every keystroke in an unrelated pane would write
+/// one.
+struct MapDebugWriter {
+    dir: PathBuf,
+    count: u32,
+    last_key: Option<MapDebugKey>,
+}
+
+impl MapDebugWriter {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            count: 0,
+            last_key: None,
+        }
+    }
+
+    /// `screen_text` is lazy: building it means walking the pane's whole
+    /// buffer, and `map_debug_snapshot` does real work with it besides —
+    /// work worth skipping outright when `MapDebugKey` already says
+    /// nothing worth snapshotting has changed, rather than doing it and
+    /// throwing the result away.
+    fn record(
+        &mut self,
+        state: &AppState,
+        has_image: bool,
+        screen_text: impl FnOnce() -> String,
+    ) -> Result<()> {
+        let key = MapDebugKey::of(state, has_image);
+        if key == self.last_key {
+            return Ok(());
+        }
+        self.last_key = key;
+        let snapshot = map_debug_snapshot(state, has_image, &screen_text());
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.dir.join(format!(
+            "{:05}_{}.txt",
+            self.count,
+            chrono::Local::now().format("%Y%m%d-%H%M%S%.3f")
+        ));
+        std::fs::write(&path, &snapshot)?;
+        self.count += 1;
+        Ok(())
     }
 }
 
@@ -2010,6 +2210,7 @@ async fn event_loop(
     map_graphics: bool,
     cross_session_default: CrossSession,
     first_run_hint: bool,
+    map_debug: Option<PathBuf>,
 ) -> Result<()> {
     // Every session publishes a snapshot of its state and reads every
     // other session's (§7.5). The channels are made up front, so a session
@@ -2143,6 +2344,9 @@ async fn event_loop(
     // period away rather than at startup.
     map_saves.tick().await;
 
+    let mut map_debug = map_debug.map(MapDebugWriter::new);
+    let mut map_image_cache = ui::MapImageCache::default();
+
     let mut had_image = false;
     loop {
         // Before the frame that will draw the answer: a character who has
@@ -2151,24 +2355,48 @@ async fn event_loop(
         for name in state.refresh_distress() {
             notify(&format!("{name} needs help"));
         }
-        let mut image = None;
-        terminal.draw(|frame| image = ui::draw(frame, &state))?;
-        if let Some(image) = &image {
-            write_map_image(image)?;
-        } else if had_image {
+        let mut drawn = ui::DrawnFrame {
+            image: None,
+            image_is_fresh: true,
+            map_area: None,
+        };
+        let mut completed =
+            terminal.draw(|frame| drawn = ui::draw(frame, &state, &mut map_image_cache))?;
+        if image_presence_changed(had_image, drawn.image.is_some()) {
             // The cells under a picture are marked skipped while it is up,
-            // so the frame that stops drawing one leaves ratatui's diff
-            // nothing to repaint and the pixels stay on screen over
-            // whatever replaced them — a switch to a session with no room
-            // data yet, or the map pane going away. Clearing drops the
-            // known state, so the next frame repaints the lot.
-            terminal.clear()?;
-            terminal.draw(|frame| image = ui::draw(frame, &state))?;
-            if let Some(image) = &image {
-                write_map_image(image)?;
-            }
+            // and a skipped cell is excluded from ratatui's diff no matter
+            // which side of the transition it is on — so the frame where a
+            // picture appears leaves ratatui's diff nothing to repaint over
+            // whatever was genuinely there before (a "no room data yet"
+            // placeholder, a room's description), and the frame where one
+            // disappears leaves the pixels on screen over whatever replaced
+            // them. Clearing drops the known state, so the next frame
+            // repaints the lot.
+            //
+            // Not `Terminal::clear()`: on this backend it saves the cursor
+            // position first, which means asking the terminal where the
+            // cursor is and blocking on its answer — and a real terminal
+            // that is slow, or busy, or simply quiet about it left this
+            // hanging for two seconds before erroring out the whole
+            // client. `resize` to the unchanged area clears the same way
+            // without that round trip, because a fullscreen viewport has
+            // no cursor position worth asking for.
+            let area = terminal.get_frame().area();
+            terminal.resize(area)?;
+            completed =
+                terminal.draw(|frame| drawn = ui::draw(frame, &state, &mut map_image_cache))?;
         }
-        had_image = image.is_some();
+        if drawn.image_is_fresh
+            && let Some(image) = &drawn.image
+        {
+            write_map_image(image)?;
+        }
+        if let Some(writer) = &mut map_debug {
+            writer.record(&state, drawn.image.is_some(), || {
+                capture_map_area(completed.buffer, drawn.map_area, drawn.image.as_ref())
+            })?;
+        }
+        had_image = drawn.image.is_some();
 
         let wake = tokio::select! {
             ev = term_events.next() => Wake::Terminal(ev),
@@ -3310,6 +3538,166 @@ mod tests {
     use super::*;
     use crate::net::Security;
     use crate::scrollback::Origin;
+
+    /// A skipped cell is excluded from ratatui's diff regardless of which
+    /// side of the transition it is on, so a clear is owed whichever way
+    /// the image's presence just flipped — not only when it disappears.
+    #[test]
+    fn image_presence_changed_flags_either_transition() {
+        assert!(!image_presence_changed(false, false));
+        assert!(!image_presence_changed(true, true));
+        assert!(image_presence_changed(false, true));
+        assert!(image_presence_changed(true, false));
+    }
+
+    /// `--map-debug`'s snapshot has to carry enough to find the room again
+    /// in the saved map file, not just what a screenshot already shows.
+    #[test]
+    fn a_map_debug_snapshot_names_the_room_and_pictures_the_scene() {
+        let mut state = test_support::app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, Some("Temple"), &[("n", 2)]);
+        put_room(&mut state.sessions[0].map, 2, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        let snapshot = map_debug_snapshot(&state, true, "@ captured screen text @");
+
+        assert!(snapshot.contains("session: tank"), "{snapshot}");
+        assert!(snapshot.contains("current room: 1"), "{snapshot}");
+        assert!(snapshot.contains("Temple"), "{snapshot}");
+        assert!(
+            snapshot.contains("sixel image this frame: true"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("@ captured screen text @"),
+            "the captured screen text should be carried through verbatim: {snapshot}"
+        );
+        assert!(snapshot.contains("rooms:"), "{snapshot}");
+        assert!(snapshot.contains("links:"), "{snapshot}");
+    }
+
+    /// The snapshot's picture has to be what the real terminal actually
+    /// shows — ratatui's own buffer for the pane, not a separate re-render
+    /// sized and laid out differently, which was the bug report that led
+    /// here.
+    #[test]
+    fn capture_map_area_reads_ratatuis_own_buffer() {
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 3));
+        buffer[(2, 1)].set_symbol("@");
+        let area = ratatui::layout::Rect::new(1, 1, 4, 1);
+
+        let text = capture_map_area(&buffer, Some(area), None);
+
+        assert_eq!(
+            text, " @",
+            "only the requested area, right-trimmed: {text:?}"
+        );
+    }
+
+    /// The cells under a Sixel picture are marked skipped, so ratatui's own
+    /// buffer never learns what the terminal actually shows there — the
+    /// glyphs `write_map_image` writes afterward are the only ground truth
+    /// a text snapshot has for that region, and have to be overlaid rather
+    /// than left to whatever stale content the buffer is still holding.
+    #[test]
+    fn capture_map_area_overlays_the_glyphs_a_skipped_region_would_otherwise_hide() {
+        let buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 3));
+        let area = ratatui::layout::Rect::new(0, 0, 5, 1);
+        let image = ui::PendingImage {
+            area,
+            sixel: String::new(),
+            glyphs: vec![(2, 0, '@', ratatui::style::Style::default())],
+        };
+
+        let text = capture_map_area(&buffer, Some(area), Some(&image));
+
+        assert!(text.contains('@'), "{text}");
+    }
+
+    /// No map pane on screen this frame — the map hidden, or no room to
+    /// centre on — has to say so rather than silently showing a blank
+    /// picture that reads the same as a bug.
+    #[test]
+    fn capture_map_area_says_so_when_there_is_no_pane_to_read() {
+        let buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 3));
+        assert_eq!(
+            capture_map_area(&buffer, None, None),
+            "(map pane not shown this frame)"
+        );
+    }
+
+    /// A character who has connected but not yet had a room described is
+    /// the exact case the stale-Sixel bug hit — the snapshot has to say so
+    /// plainly rather than rendering an empty picture that looks the same
+    /// as a bug.
+    #[test]
+    fn a_map_debug_snapshot_says_when_there_is_no_room_yet() {
+        let state = test_support::app(&["tank"]);
+        let snapshot = map_debug_snapshot(&state, false, "");
+        assert!(snapshot.contains("no room data yet"), "{snapshot}");
+    }
+
+    /// The point of dedup: a `MapDebugWriter` running for a whole session
+    /// would otherwise write one file per frame, most of them identical.
+    #[test]
+    fn a_map_debug_writer_only_writes_when_the_snapshot_changes() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut writer = MapDebugWriter::new(dir.path().to_path_buf());
+        let mut state = test_support::app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        writer
+            .record(&state, false, String::new)
+            .expect("first write");
+        writer
+            .record(&state, false, String::new)
+            .expect("unchanged write");
+        writer
+            .record(&state, true, String::new)
+            .expect("changed write (image now present)");
+
+        let written: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("the debug dir should exist")
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            written.len(),
+            2,
+            "the unchanged repeat should not have written a second file"
+        );
+    }
+
+    /// The bug this pins: `record` used to lay out the whole area and
+    /// build the room/link listing on every call, keystrokes included, and
+    /// only decide afterward whether the result was worth keeping. On a
+    /// busy area that made typing sluggish. `MapDebugKey` has to reject an
+    /// unchanged frame before `screen_text` — the expensive part — is ever
+    /// called at all.
+    #[test]
+    fn an_unchanged_frame_never_pays_for_the_screen_text() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut writer = MapDebugWriter::new(dir.path().to_path_buf());
+        let mut state = test_support::app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        let calls = std::cell::Cell::new(0);
+        let screen_text = || {
+            calls.set(calls.get() + 1);
+            String::new()
+        };
+
+        writer.record(&state, false, screen_text).unwrap();
+        assert_eq!(calls.get(), 1, "the first call always has to do the work");
+
+        writer.record(&state, false, screen_text).unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "an unchanged key must skip screen_text entirely, not just skip the write"
+        );
+    }
 
     fn scrollback(session: &SessionPane) -> String {
         session
