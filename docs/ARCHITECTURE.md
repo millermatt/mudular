@@ -1309,6 +1309,23 @@ player mashing the same six characters all evening.
   wait on their respective plain feature landing and proving itself
   first.
 
+**The clock is a toggle, not a setting.** `toggle_timestamps` (`Alt+T` by
+default) stamps every character pane's lines with `HH:MM:SS`, composed at
+render time from each line's own `at` exactly as a channel pane composes
+its own (§8) — so it can be turned on to date something that has already
+scrolled past, and off again with nothing spliced into the stored text. A
+wrapped line is stamped once, on its first row.
+
+App-level rather than per pane: "when did that happen" is a question about
+the evening, not about one character. It is layout, so it lives in
+`ui_state.json` (§11.4) rather than `mudular.yaml` — a player who wants
+the clock wants it tomorrow too, and config says where a fresh install
+starts, not where you left off. Off until asked for: a MUD's output is
+dense already, and eight columns on every line is a cost paid by every
+line for the sake of one. Channel panes keep their own per-channel
+`timestamps:` (§11.1) and are unaffected — a comms pane's clock is about
+following a slow conversation, which is a different question.
+
 **Completion from the screen.** `look bull` in a room with a bullywug in
 it sends `look bullywug`. The completion appears dim past the cursor as
 you type and is accepted by `Enter` — there is no completion key, because

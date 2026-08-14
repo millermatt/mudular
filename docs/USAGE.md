@@ -220,6 +220,21 @@ raising this costs memory and lowers it again when you quit. Scrollback
 search isn't in yet — for now, `--record` or a transcript log is how you
 go looking through an old evening.
 
+`Alt+T` stamps each line in the character panes with the time it arrived:
+
+```
+21:04:17 Bob tells you hi
+```
+
+It applies to every character pane at once and is remembered for next
+launch, alongside the rest of your layout. The clock is composed when the
+pane is drawn, not stored in the line, so you can turn it on to date
+something that has already scrolled past — and turn it off again with
+nothing left behind. A wrapped line is stamped once, on its first row.
+
+Comms panes have their own `timestamps:` setting per channel (see
+[Channel panes](#channel-panes)); `Alt+T` doesn't touch them.
+
 ## Playing several characters at once
 
 Name more than one profile and each gets its own session, with its own
@@ -1126,6 +1141,7 @@ fallback.
 | `F7` | Show or hide the map column, and print where you are — the same thing `/map` does | `toggle_map` |
 | `Alt+,` / `Alt+.` | Widen / narrow the map column | `map_wider` / `map_narrower` |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
+| `Alt+T` | Show or hide the clock down the character panes | `toggle_timestamps` |
 
 `F1` shows this same list inside the client, built from your actual
 config — so it stays right even if you remap something. `/help` prints it

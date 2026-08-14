@@ -112,6 +112,10 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         ),
         row(keybinds.toggle_hud, "show or hide the party strip"),
         row(
+            keybinds.toggle_timestamps,
+            "show or hide the clock down the character panes",
+        ),
+        row(
             keybinds.who_needs_me,
             "jump to whoever is in the most trouble",
         ),
@@ -657,7 +661,17 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
             content_width,
             back_offset,
             |i, line| {
-                let rendered = ansi_lines(&line.text);
+                // Composed here from the line's own `at`, exactly as a
+                // channel pane composes its own (§8): the toggle decides at
+                // render time, and the stored line stays the text the MUD
+                // sent — so turning the clock off gives back the pane that
+                // was there before, rather than a pane with the stamps
+                // spliced in and no way out.
+                let stamp = match state.show_timestamps {
+                    true => vec![timestamp(line)],
+                    false => Vec::new(),
+                };
+                let rendered = prefixed(ansi_lines(&line.text), stamp);
                 if Some(i) != picked_line {
                     return rendered;
                 }
@@ -1063,9 +1077,7 @@ fn channel_line(
 ) -> Vec<Line<'static>> {
     let mut prefix: Vec<Span<'static>> = Vec::new();
     if timestamps {
-        // Local, not UTC: a clock silently mislabeled as local would be
-        // wrong for most players, every day, all year.
-        prefix.push(Span::raw(line.at.format("%H:%M:%S ").to_string()));
+        prefix.push(timestamp(line));
     }
     if let Origin::Session(names) = &line.origin
         && let Some((first, rest)) = names.split_first()
@@ -1091,12 +1103,24 @@ fn channel_line(
         }
         prefix.push(Span::raw("] "));
     }
+    prefixed(ansi_lines(&line.text), prefix)
+}
+
+/// The `HH:MM:SS ` a pane showing timestamps puts in front of a line.
+///
+/// Local, not UTC: a clock silently mislabeled as local would be wrong for
+/// most players, every day, all year.
+fn timestamp(line: &RetainedLine) -> Span<'static> {
+    Span::raw(line.at.format("%H:%M:%S ").to_string())
+}
+
+/// Puts `prefix` in front of a rendered line's **first row only**. A
+/// wrapped continuation is the same line, and repeating the stamp down its
+/// rows would read as several.
+fn prefixed(mut rendered: Vec<Line<'static>>, prefix: Vec<Span<'static>>) -> Vec<Line<'static>> {
     if prefix.is_empty() {
-        return ansi_lines(&line.text);
+        return rendered;
     }
-    // Only the first row is prefixed; a wrapped continuation is the same
-    // line, and repeating the stamp down its rows would read as several.
-    let mut rendered = ansi_lines(&line.text);
     match rendered.first_mut() {
         Some(first) => {
             for span in prefix.into_iter().rev() {
@@ -2022,12 +2046,13 @@ mod tests {
 
         // A row taller than the listing, so "is every binding in here"
         // stays a question about the listing rather than about scrolling —
-        // the overlay grew a row when the party alarm got its key.
-        let without = render_sized(&state, 70, 41);
+        // the overlay grew a row when the party alarm got its key, and
+        // another when the character panes got a clock.
+        let without = render_sized(&state, 70, 42);
         assert!(rows(&without).contains("forest"));
 
         state.show_help = true;
-        let with = render_sized(&state, 70, 41);
+        let with = render_sized(&state, 70, 42);
         let listing = rows(&with);
         assert!(listing.contains("Help"), "{listing}");
         assert!(listing.contains("Ctrl+C"), "{listing}");
@@ -2386,6 +2411,51 @@ mod tests {
             Some(Color::Magenta),
             "the first name is still the first character's colour"
         );
+    }
+
+    /// A character pane's clock is composed the same way a channel's is,
+    /// from the line's own arrival time — so it can be turned on for a
+    /// buffer that filled up before anybody asked for it, and turned off
+    /// again without leaving anything spliced into the text.
+    #[test]
+    fn a_character_pane_stamps_its_lines_when_the_toggle_is_on() {
+        let mut state = state();
+        let line = RetainedLine::server("Bob tells you hi");
+        let at = line.at.format("%H:%M:%S").to_string();
+        state.sessions[0].scrollback.push_back(line);
+
+        let plain: String = {
+            let buffer = render_sized(&state, 60, 10);
+            (0..10).map(|y| row(&buffer, y)).collect()
+        };
+        assert!(plain.contains("Bob tells you hi"), "{plain}");
+        assert!(!plain.contains(&at), "no clock until asked for: {plain}");
+
+        state.show_timestamps = true;
+        let stamped: String = {
+            let buffer = render_sized(&state, 60, 10);
+            (0..10).map(|y| row(&buffer, y)).collect()
+        };
+        assert!(
+            stamped.contains(&format!("{at} Bob tells you hi")),
+            "{stamped}"
+        );
+    }
+
+    /// The stamp belongs to the line, not to each row it wraps onto:
+    /// repeating it down a wrapped line would read as several lines.
+    #[test]
+    fn only_the_first_row_of_a_wrapped_line_is_stamped() {
+        let mut state = state();
+        state.show_timestamps = true;
+        let line = RetainedLine::server("word ".repeat(20).trim_end());
+        let at = line.at.format("%H:%M:%S").to_string();
+        state.sessions[0].scrollback.push_back(line);
+
+        let buffer = render_sized(&state, 40, 10);
+        let screen: String = (0..10).map(|y| row(&buffer, y)).collect();
+
+        assert_eq!(screen.matches(&at).count(), 1, "{screen}");
     }
 
     /// The timestamp is not stored in the line's text (§8): the pane owns

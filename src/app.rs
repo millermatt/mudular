@@ -643,6 +643,10 @@ pub struct AppState {
     pub show_inspector: bool,
     /// The party strip: every character's vitals side by side (§11.6).
     pub show_hud: bool,
+    /// Whether the character panes stamp each line with the time it
+    /// arrived (§11.3). App-level, not per pane: "when did that happen"
+    /// is a question about the evening, not about one character.
+    pub show_timestamps: bool,
     /// Draw the map with pixels, and how big a cell is in them (§16).
     /// `None` where the player has not asked, or the terminal never said
     /// how big its cells are — an image sized against a guess would span
@@ -2324,6 +2328,7 @@ fn current_layout(state: &AppState) -> config::UiState {
         show_map: state.show_map,
         show_inspector: state.show_inspector,
         show_hud: Some(state.show_hud),
+        show_timestamps: state.show_timestamps,
         channel_width: state.channel_width,
         map_width: state.map_width,
     }
@@ -2683,6 +2688,10 @@ async fn event_loop(
         // row spent restating the prompt. Two or more is the case it exists
         // for — the numbers a multiboxer was holding in their head.
         show_hud: multiple_characters,
+        // Off until asked for: a MUD's own output is dense enough, and a
+        // clock down every line is a cost paid on every line by someone
+        // who wanted it on one.
+        show_timestamps: false,
         map_cell_px: map_graphics.then(cell_pixels).flatten(),
         show_help: false,
         help_scroll: 0,
@@ -2722,6 +2731,7 @@ async fn event_loop(
         state.show_channels = saved.show_channels;
         state.show_map = saved.show_map;
         state.show_inspector = saved.show_inspector;
+        state.show_timestamps = saved.show_timestamps;
         // Only where the player has actually said. A saved layout that
         // predates the strip, or one from before they ever touched it,
         // leaves the count to decide.
@@ -3116,6 +3126,10 @@ fn handle_key(
         if let Some(next) = map_cursor_step(state, cursor, step) {
             state.map_cursor = Some(next);
         }
+        return true;
+    }
+    if keybinds.toggle_timestamps.matches(code, modifiers) {
+        state.show_timestamps = !state.show_timestamps;
         return true;
     }
     if keybinds.toggle_hud.matches(code, modifiers) {
@@ -3980,6 +3994,7 @@ pub(crate) mod test_support {
                 map_width: crate::ui::MAP_WIDTH,
                 show_inspector: false,
                 show_hud: false,
+                show_timestamps: false,
                 map_cell_px: None,
                 show_help: false,
                 help_scroll: 0,
@@ -7228,6 +7243,32 @@ mod tests {
         let saved = config::load_ui_state(dir.path()).expect("written on the spot");
         assert_eq!(saved.show_map, state.show_map);
         assert!(saved.show_map, "F7 turned the map column on");
+    }
+
+    /// The clock down the character panes is layout, so it is remembered
+    /// where the rest of the layout is — a player who wants timestamps
+    /// wants them tomorrow too, and re-pressing a key every launch is what
+    /// `ui_state.json` exists to spare them (§11.4).
+    #[test]
+    fn the_character_pane_clock_toggles_and_is_remembered() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.config_dir = dir.path().to_path_buf();
+        assert!(!state.show_timestamps, "off until asked for");
+
+        let before = current_layout(&state);
+        assert!(press(&mut state, KeyCode::Char('t'), KeyModifiers::ALT));
+        remember_layout_if_changed(&state, before);
+
+        assert!(state.show_timestamps);
+        assert!(
+            config::load_ui_state(dir.path())
+                .expect("written on the spot")
+                .show_timestamps
+        );
+
+        assert!(press(&mut state, KeyCode::Char('t'), KeyModifiers::ALT));
+        assert!(!state.show_timestamps, "and off again");
     }
 
     /// Reported from play: marking a room `mail` put an `S` on the map.

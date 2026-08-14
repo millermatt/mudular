@@ -598,6 +598,11 @@ pub struct UiState {
     pub show_hud: Option<bool>,
     pub show_map: bool,
     pub show_inspector: bool,
+    /// `HH:MM:SS` down the character panes (§11.3). `default` rather than
+    /// required: a file written before this existed is a layout someone
+    /// chose, and refusing to parse it would throw the rest of it away.
+    #[serde(default)]
+    pub show_timestamps: bool,
     pub channel_width: u16,
     pub map_width: u16,
 }
@@ -773,6 +778,10 @@ pub struct Keybinds {
     /// (docs/ARCHITECTURE.md §11.6).
     #[serde(default = "default_toggle_hud")]
     pub toggle_hud: KeyBinding,
+    /// Stamps each character pane's lines with the time they arrived
+    /// (docs/ARCHITECTURE.md §11.3).
+    #[serde(default = "default_toggle_timestamps")]
+    pub toggle_timestamps: KeyBinding,
     /// Jumps to whichever character is in the most trouble
     /// (docs/ARCHITECTURE.md §11.7).
     #[serde(default = "default_who_needs_me")]
@@ -798,6 +807,7 @@ impl Default for Keybinds {
             map_narrower: default_map_narrower(),
             map_cursor: default_map_cursor(),
             toggle_hud: default_toggle_hud(),
+            toggle_timestamps: default_toggle_timestamps(),
             who_needs_me: default_who_needs_me(),
         }
     }
@@ -888,6 +898,12 @@ fn default_map_cursor() -> KeyBinding {
 fn default_toggle_hud() -> KeyBinding {
     // Next free after F8, continuing the same row.
     "f9".parse().expect("built-in default keybinding")
+}
+
+fn default_toggle_timestamps() -> KeyBinding {
+    // Alt for the same reason `line_picker` takes it: the F-row is full,
+    // and a bare letter would be swallowed out of every command typed.
+    "alt+t".parse().expect("built-in default keybinding")
 }
 
 fn default_who_needs_me() -> KeyBinding {
@@ -1994,6 +2010,7 @@ mod tests {
             show_hud: Some(false),
             show_map: true,
             show_inspector: false,
+            show_timestamps: true,
             channel_width: 34,
             map_width: 30,
         };
@@ -2055,6 +2072,7 @@ mod tests {
                 show_hud: Some(true),
                 show_map: true,
                 show_inspector: false,
+                show_timestamps: false,
                 channel_width: 22,
                 map_width: 18,
             },
