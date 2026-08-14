@@ -2417,7 +2417,7 @@ mod tests {
             "the current room carries its own mark: {screen}"
         );
         assert!(
-            screen.contains('v'),
+            screen.contains('↓'),
             "the current room marks its vertical exit: {screen}"
         );
         assert!(
@@ -2600,8 +2600,8 @@ mod tests {
         let screen = rows(&render_sized(&state, 80, 24));
 
         for (glyph, meaning) in [
-            ('^', "up"),
-            ('v', "down"),
+            ('↑', "up"),
+            ('↓', "down"),
             ('↕', "up+down"),
             ('·', "more exits"),
         ] {

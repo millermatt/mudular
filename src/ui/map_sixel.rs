@@ -22,7 +22,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
-use super::map_render::{PendingImage, STEP_X, STEP_Y, palette, room_style};
+use super::map_render::{PendingImage, STEP_X, STEP_Y, exit_tick, palette, room_style};
 use super::sixel;
 use crate::map::{RoomId, Scene};
 
@@ -172,12 +172,7 @@ pub(crate) fn render(
 
         // The cells this room covers are ours now, so the letters go on
         // afterwards in the terminal's own font.
-        let tick = match (room.up, room.down) {
-            (true, true) => '↕',
-            (true, false) => '^',
-            (false, true) => 'v',
-            (false, false) => ' ',
-        };
+        let tick = exit_tick(room.up, room.down).unwrap_or(' ');
         let cells = [
             (col, tick),
             (col + 1, letter.unwrap_or(' ')),

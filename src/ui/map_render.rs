@@ -183,6 +183,25 @@ pub(super) fn marked_style(label: &str) -> (Style, Option<char>) {
     )
 }
 
+/// What a room's first cell says about exits that leave the flat grid
+/// (§16), or `None` when there are none.
+///
+/// Real arrows rather than `^` and `v`, which is what this was: `↕`
+/// already came from the Arrows block for the both-case, so ASCII for
+/// the other two was inconsistent as well as harder to read — `v` is a
+/// letter, and the cell beside it draws letters (`W` for water, `S` for
+/// a shop, a character's initial), so a `v` tick read as text. `↑` and
+/// `↓` cannot be mistaken for one, and are in at least as many fonts as
+/// the `↕` this file already relies on.
+pub(super) fn exit_tick(up: bool, down: bool) -> Option<char> {
+    match (up, down) {
+        (true, true) => Some('↕'),
+        (true, false) => Some('↑'),
+        (false, true) => Some('↓'),
+        (false, false) => None,
+    }
+}
+
 /// Another character standing in a room (§16): their initial, on a colour
 /// that is neither yours nor any label's.
 ///
@@ -244,14 +263,14 @@ pub(super) fn legend() -> Line<'static> {
     // room's *exits*, not about what kind of place it is, and giving them
     // a hue would imply otherwise.
     let (ground, _) = role_style(RoomRole::Known);
-    for (glyph, meaning) in [
-        ('^', "up"),
-        ('v', "down"),
-        ('↕', "up+down"),
-        ('·', "more exits"),
+    for (up, down, meaning) in [
+        (true, false, "up"),
+        (false, true, "down"),
+        (true, true, "up+down"),
     ] {
-        entries.push((ground, Some(glyph), meaning));
+        entries.push((ground, exit_tick(up, down), meaning));
     }
+    entries.push((ground, Some('·'), "more exits"));
 
     for label in crate::app::MARK_SUGGESTIONS {
         let (style, letter) = marked_style(label);
@@ -347,12 +366,7 @@ impl MapRenderer for CharRenderer {
             let (mut style, letter) = room_style(room);
             // Three slots: a tick for exits off the grid, the room's own
             // mark, and ground. All on one fill, so none of it crowds.
-            let tick = match (room.up, room.down) {
-                (true, true) => '↕',
-                (true, false) => '^',
-                (false, true) => 'v',
-                (false, false) => ' ',
-            };
+            let tick = exit_tick(room.up, room.down).unwrap_or(' ');
             // The third slot is the one that was ground, so nothing has to
             // give way for this: the tick and the mark both keep their
             // cell, and a room with nothing left out still draws blank
@@ -500,6 +514,36 @@ mod tests {
             assert!(
                 contrast(bg) > 60.0,
                 "{bg:?} and its ink are too close to read"
+            );
+        }
+    }
+
+    /// The tick was written out twice, once per renderer, and the legend
+    /// named its glyphs a third time — three places to keep in step. They
+    /// read one function now, so a changed arrow cannot leave the legend
+    /// describing the old one.
+    #[test]
+    fn the_legend_names_the_arrows_the_map_actually_draws() {
+        let legend = legend().to_string();
+        for (up, down) in [(true, false), (false, true), (true, true)] {
+            let drawn = exit_tick(up, down).expect("an exit that leaves the grid has a tick");
+            assert!(
+                legend.contains(drawn),
+                "the map draws `{drawn}` for up={up} down={down}, so the legend must name it: {legend}"
+            );
+        }
+        assert_eq!(exit_tick(false, false), None, "a flat room has no tick");
+    }
+
+    /// `v` is a letter, and the cell beside the tick draws letters — a
+    /// mark's initial, a character's. An arrow cannot be read as one.
+    #[test]
+    fn the_exit_ticks_are_not_letters() {
+        for (up, down) in [(true, false), (false, true), (true, true)] {
+            let tick = exit_tick(up, down).unwrap();
+            assert!(
+                !tick.is_ascii_alphabetic(),
+                "`{tick}` would read as text beside a room's letter"
             );
         }
     }
