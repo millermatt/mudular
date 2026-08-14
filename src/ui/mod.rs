@@ -861,12 +861,23 @@ fn draw_map(
             }
         };
         if let Some(image) = image {
-            // The cells under the image belong to it now: left to ratatui
-            // they would be painted over the pixels every frame.
-            for y in grid.top()..grid.bottom() {
-                for x in grid.left()..grid.right() {
-                    frame.buffer_mut()[(x, y)]
-                        .set_diff_option(ratatui::buffer::CellDiffOption::Skip);
+            // Skipped only while the terminal is already showing this
+            // picture. Then the cells under it belong to it, and left to
+            // ratatui they would be painted over the pixels every frame.
+            //
+            // On the frame it is *newly* written they are deliberately
+            // left alone, so ratatui's ordinary diff repaints the region
+            // — which erases whatever the picture is landing on, the "no
+            // room data yet" line or the letters of the previous scene,
+            // in the few cells that actually changed. That used to need
+            // clearing the whole terminal and repainting every pane,
+            // which is a visible blank on the frame a map first appears.
+            if !fresh {
+                for y in grid.top()..grid.bottom() {
+                    for x in grid.left()..grid.right() {
+                        frame.buffer_mut()[(x, y)]
+                            .set_diff_option(ratatui::buffer::CellDiffOption::Skip);
+                    }
                 }
             }
             draw_caption(frame, caption, state);

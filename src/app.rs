@@ -1876,12 +1876,17 @@ fn connect(
     }
 }
 
-/// Whether the skip-diffed region just changed shape in either direction,
-/// making the terminal's actual contents there untrustworthy against
-/// ratatui's buffer — a skipped cell is excluded from the diff no matter
-/// which side of the transition it is on.
-fn image_presence_changed(had_image: bool, has_image: bool) -> bool {
-    had_image != has_image
+/// Whether a picture that was on screen has just gone, leaving pixels
+/// ratatui will not paint over.
+///
+/// Only this direction needs the terminal cleared. A picture *arriving*
+/// used to need it too — the cells under it were skipped from the first
+/// frame, so nothing erased what it landed on — but they are only skipped
+/// once the terminal already has the picture now, which leaves the
+/// arriving frame to ratatui's ordinary diff and costs one pane's worth
+/// of repaint instead of the whole screen's.
+fn image_vanished(had_image: bool, has_image: bool) -> bool {
+    had_image && !has_image
 }
 
 /// Everything `--map-debug` writes about one moment: which session's map is
@@ -2544,7 +2549,7 @@ async fn event_loop(
         };
         let mut completed =
             terminal.draw(|frame| drawn = ui::draw(frame, &state, &mut map_image_cache))?;
-        if image_presence_changed(had_image, drawn.image.is_some()) {
+        if image_vanished(had_image, drawn.image.is_some()) {
             // The cells under a picture are marked skipped while it is up,
             // and a skipped cell is excluded from ratatui's diff no matter
             // which side of the transition it is on — so the frame where a
@@ -3791,15 +3796,20 @@ mod tests {
     use crate::net::Security;
     use crate::scrollback::Origin;
 
-    /// A skipped cell is excluded from ratatui's diff regardless of which
-    /// side of the transition it is on, so a clear is owed whichever way
-    /// the image's presence just flipped — not only when it disappears.
+    /// Only a picture *going* strands pixels ratatui will not paint over.
+    /// One arriving is handled where it lands — the cells under it are not
+    /// skipped until the terminal already has it — so clearing the whole
+    /// screen for that, and blanking every pane for a frame, bought
+    /// nothing.
     #[test]
-    fn image_presence_changed_flags_either_transition() {
-        assert!(!image_presence_changed(false, false));
-        assert!(!image_presence_changed(true, true));
-        assert!(image_presence_changed(false, true));
-        assert!(image_presence_changed(true, false));
+    fn only_a_vanished_picture_needs_the_screen_cleared() {
+        assert!(image_vanished(true, false), "gone: its pixels are stranded");
+        assert!(
+            !image_vanished(false, true),
+            "arriving: the diff repaints the region it lands on"
+        );
+        assert!(!image_vanished(false, false));
+        assert!(!image_vanished(true, true));
     }
 
     /// `--map-debug`'s snapshot has to carry enough to find the room again
