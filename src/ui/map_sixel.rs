@@ -22,9 +22,9 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
-use super::map_render::{PendingImage, STEP_X, STEP_Y, marked_style, palette, role_style};
+use super::map_render::{PendingImage, STEP_X, STEP_Y, palette, room_style};
 use super::sixel;
-use crate::map::{RoomId, RoomRole, Scene};
+use crate::map::{RoomId, Scene};
 
 /// A room is three cells wide and one tall, as it is on the character grid.
 /// Keeping the same geometry is what lets the letters written afterwards
@@ -143,13 +143,7 @@ pub(crate) fn render(
     }
 
     for room in &scene.rooms {
-        let (style, letter) = match room.role {
-            RoomRole::Known => match room.mark.as_deref() {
-                Some(mark) => marked_style(mark),
-                None => role_style(room.role),
-            },
-            _ => role_style(room.role),
-        };
+        let (style, letter) = room_style(room);
         let fill = index_of(style.bg.unwrap_or(palette::KNOWN), &mut colours);
 
         let col = origin_col + room.at.0 * STEP_X;
@@ -311,7 +305,7 @@ mod tests {
         for (from, dir, to) in edges {
             map.connect(RoomId(*from), dir, RoomId(*to));
         }
-        map.scene(RoomId(1), None)
+        map.scene(RoomId(1), None, &[])
     }
 
     /// Without a cell size an image would span the wrong number of cells and

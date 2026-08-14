@@ -1760,13 +1760,41 @@ lives in `ui`, and neither is visible from inside it.
   first load and the old file renamed, never deleted — it is exploration
   someone earned, and the rename is what makes the fold happen once
   rather than resurrecting rooms deleted later.
+- **One copy in memory, shared by every character on the world.** The
+  map lives in `AppState::maps`, keyed the same way the file is, and a
+  session holds only the key. Copying it per session was tried first and
+  drifted: the copies reconciled only through the file, so until the next
+  launch one character could unmark a room the other went on showing, or
+  walk a corridor the other could not see. Worse, `Map::merge`'s
+  never-erase rule meant the stale copy *won* — a removed mark came
+  straight back on the other character's next save, and the quit path
+  saves every session. Sharing makes that divergence unrepresentable
+  rather than something each writer must remember to fan out. What stays
+  per character is what is genuinely theirs: where they stand, where they
+  died, a walk in progress.
+- **Everyone on the world is drawn on it.** `Map::scene` takes the party's
+  positions beside the centred character's, so a multiboxer can see where
+  their other characters are without switching panes to find out — which
+  was the only way before. `PlacedRoom::party` carries *names*, not
+  glyphs: which character this is belongs to the world, how to draw them
+  is the renderer's to decide, the same split `mark` already makes.
+  `map_render::room_style` holds the one precedence rule both renderers
+  read — you, then your corpse, then whoever else is standing there, then
+  a label — so the two cannot drift apart about which fact wins a room's
+  single slot.
 - **Persistence:** `<config dir>/maps/<world>.json`, written through
   `config::atomic_write` so a crash mid-save cannot truncate a map. JSON
   rather than YAML deliberately — machine-written data, never hand-edited,
   unlike every other file in the config dir. Saves **merge** rather than
   overwrite: load, union the rooms, write, under the same never-erase rule
   `observe` uses, because two sessions on one profile would otherwise
-  silently discard each other's exploration. Loaded at connect.
+  silently discard each other's exploration, and another *process* can
+  still hold a mark this one never saw. A mark set or cleared here is
+  recorded in `WorldMap::explicit_marks` and applied authoritatively
+  rather than merged, since the never-erase rule would otherwise mean a
+  removal could never reach disk at all. Read once, by the first
+  character to arrive on the world; a later arrival joins the entry
+  rather than re-reading the file over what the run has since changed.
   `--host` sessions get no persistence, consistent with `/config` and disk
   logging both requiring a profile.
 - **`/goto <vnum | name substring>`** resolves a target, paths to it with

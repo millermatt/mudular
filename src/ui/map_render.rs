@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::map::{RoomId, RoomRole, Scene};
+use crate::map::{PlacedRoom, RoomId, RoomRole, Scene};
 
 /// A picture the terminal has to be told about directly, because it is not
 /// made of cells: the escape sequence, the pane it covers, and the glyphs
@@ -107,6 +107,11 @@ pub(super) mod palette {
     /// can never land on the same colour a curated label uses and read as
     /// one at a glance.
     pub const OTHER: Color = Color::Rgb(0x8A, 0x8D, 0x91); // neutral grey
+    /// Another character on this world. Violet because nothing else in
+    /// the pane is: `HERE` is the sky blue that means *you*, and telling
+    /// "me" from "one of mine" at a glance is the whole point of drawing
+    /// them at all.
+    pub const PARTY: Color = Color::Rgb(0xA7, 0x8B, 0xFA); // violet
     pub const INK: Color = Color::Rgb(0x0B, 0x0E, 0x11); // near-black
     pub const PAPER: Color = Color::Rgb(0xF8, 0xFA, 0xFC); // near-white
 
@@ -178,6 +183,45 @@ pub(super) fn marked_style(label: &str) -> (Style, Option<char>) {
     )
 }
 
+/// Another character standing in a room (§16): their initial, on a colour
+/// that is neither yours nor any label's.
+///
+/// The initial is a stand-in, not a decision — a per-profile marker would
+/// slot in here and nowhere else, beside the `color:` a profile already
+/// sets.
+pub(super) fn party_style(name: &str) -> (Style, Option<char>) {
+    (
+        Style::default()
+            .bg(palette::PARTY)
+            .fg(ink_for(palette::PARTY))
+            .add_modifier(Modifier::BOLD),
+        name.trim()
+            .chars()
+            .next()
+            .map(|first| first.to_ascii_uppercase()),
+    )
+}
+
+/// What a placed room draws as — every rule about which fact wins, in one
+/// place, so the two renderers cannot drift apart about it.
+///
+/// Where you are outranks everything: a map you cannot find yourself on is
+/// not a map. Your corpse comes next, because there is only ever one and
+/// it is the thing a corpse run is steering toward. Then whoever else is
+/// standing there, which changes minute to minute and is what a
+/// multiboxer is actually watching. A label loses to all three: it is
+/// still true when they have moved on, and `Map::describe` still has it.
+pub(super) fn room_style(room: &PlacedRoom) -> (Style, Option<char>) {
+    match room.role {
+        RoomRole::Here | RoomRole::Corpse => role_style(room.role),
+        RoomRole::Known => match (room.party.first(), room.mark.as_deref()) {
+            (Some(who), _) => party_style(who),
+            (None, Some(mark)) => marked_style(mark),
+            (None, None) => role_style(room.role),
+        },
+    }
+}
+
 /// What every colour and letter the map draws actually means, in the same
 /// styles the map itself uses — a swatch is only honest if it is the exact
 /// style a room would be drawn in, not a description of one (§16).
@@ -191,6 +235,8 @@ pub(super) fn legend() -> Line<'static> {
     entries.push((here_style, here_letter, "you"));
     let (corpse_style, corpse_letter) = role_style(RoomRole::Corpse);
     entries.push((corpse_style, corpse_letter, "corpse"));
+    let (party, party_letter) = party_style("party");
+    entries.push((party, party_letter, "another char"));
     for label in crate::app::MARK_SUGGESTIONS {
         let (style, letter) = marked_style(label);
         entries.push((style, letter, label));
@@ -282,15 +328,7 @@ impl MapRenderer for CharRenderer {
         for room in &scene.rooms {
             let col = origin_col + room.at.0 * STEP_X;
             let row = origin_row + room.at.1 * STEP_Y;
-            let (mut style, mut letter) = role_style(room.role);
-            // Where the player is, and where their corpse is, outrank a
-            // label: both are things they are looking for right now, and a
-            // room has one slot to say it with.
-            if room.role == RoomRole::Known
-                && let Some(mark) = room.mark.as_deref()
-            {
-                (style, letter) = marked_style(mark);
-            }
+            let (mut style, letter) = room_style(room);
             // Three slots: a tick for exits off the grid, the room's own
             // mark, and ground. All on one fill, so none of it crowds.
             let tick = match (room.up, room.down) {
@@ -441,12 +479,73 @@ mod tests {
             palette::CORPSE,
             palette::KNOWN,
             palette::OTHER,
+            palette::PARTY,
         ]) {
             assert!(
                 contrast(bg) > 60.0,
                 "{bg:?} and its ink are too close to read"
             );
         }
+    }
+
+    /// The precedence both renderers now share, stated once. Where you
+    /// are and where your corpse is are singular and are what you steer
+    /// by; who else is standing somewhere changes minute to minute and is
+    /// what a multiboxer watches; a label is still true tomorrow.
+    #[test]
+    fn a_party_marker_beats_a_label_but_not_you_or_your_corpse() {
+        let placed = |role, party: &[&str], mark: Option<&str>| PlacedRoom {
+            id: RoomId(1),
+            at: (0, 0),
+            role,
+            up: false,
+            down: false,
+            mark: mark.map(str::to_string),
+            party: party.iter().map(|name| name.to_string()).collect(),
+            hidden_exits: false,
+        };
+
+        assert_eq!(
+            room_style(&placed(RoomRole::Known, &["saihtam"], Some("shop"))).1,
+            Some('S'),
+            "an ally's initial, not the shop's"
+        );
+        assert_eq!(
+            room_style(&placed(RoomRole::Known, &["saihtam"], Some("shop")))
+                .0
+                .bg,
+            Some(palette::PARTY),
+            "and unmistakably not a shop's colour"
+        );
+        assert_eq!(
+            room_style(&placed(RoomRole::Here, &["saihtam"], None)).0.bg,
+            Some(palette::HERE),
+            "standing together still shows you where *you* are"
+        );
+        assert_eq!(
+            room_style(&placed(RoomRole::Corpse, &["saihtam"], None))
+                .0
+                .bg,
+            Some(palette::CORPSE),
+            "and an ally passing your corpse does not hide it"
+        );
+        assert_eq!(
+            room_style(&placed(RoomRole::Known, &[], Some("shop"))).0.bg,
+            marked_style("shop").0.bg,
+            "with nobody there, a label is drawn as it always was"
+        );
+    }
+
+    /// Violet is not any label's colour and not yours, so "one of mine" is
+    /// never mistaken for "a shop" or for "me".
+    #[test]
+    fn the_party_colour_is_its_own() {
+        for label in crate::app::MARK_SUGGESTIONS {
+            assert_ne!(marked_style(label).0.bg, Some(palette::PARTY), "{label}");
+        }
+        assert_ne!(palette::PARTY, palette::HERE);
+        assert_ne!(palette::PARTY, palette::OTHER);
+        assert_ne!(palette::PARTY, palette::CORPSE);
     }
 
     /// A label may never impersonate the colours that already mean
@@ -479,7 +578,7 @@ mod tests {
         for (from, dir, to) in edges {
             map.connect(RoomId(*from), dir, RoomId(*to));
         }
-        map.scene(RoomId(1), None)
+        map.scene(RoomId(1), None, &[])
     }
 
     fn render(scene: &Scene) -> String {

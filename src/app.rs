@@ -636,6 +636,27 @@ impl AppState {
         self.maps.get(&self.sessions.get(index)?.map_key)
     }
 
+    /// Where every *other* character on this session's world is standing
+    /// (§16), for a map that shows the whole party rather than only the
+    /// character being typed at.
+    ///
+    /// Characters with no room yet are absent rather than placed
+    /// anywhere: a session that has not been told where it is cannot be
+    /// drawn, and guessing would put an ally on a room they are not in.
+    pub fn party_of(&self, index: usize) -> Vec<(crate::map::RoomId, String)> {
+        let Some(session) = self.sessions.get(index) else {
+            return Vec::new();
+        };
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, other)| other)
+            .filter(|other| !other.map_key.is_empty() && other.map_key == session.map_key)
+            .filter_map(|other| Some((other.current_room?, other.name.clone())))
+            .collect()
+    }
+
     /// The bound session's map — what the map pane draws.
     pub fn bound_map(&self) -> Option<&crate::map::Map> {
         self.map_of(self.input_session)
@@ -1955,7 +1976,7 @@ fn map_debug_snapshot(state: &AppState, has_image: bool, screen_text: &str) -> S
     let Some(map) = state.map_of(state.input_session) else {
         return out;
     };
-    let scene = map.scene(current, session.corpse);
+    let scene = map.scene(current, session.corpse, &[]);
     out.push_str("\n\nrooms:\n");
     for room in &scene.rooms {
         let _ = writeln!(
@@ -3336,7 +3357,9 @@ fn map_cursor_step(
     let session = state.bound()?;
     let scene = state
         .map_of(state.input_session)?
-        .scene(session.current_room?, session.corpse);
+        // No party: stepping the cursor only reads where rooms are, and
+        // who is standing in one has no bearing on which room is next.
+        .scene(session.current_room?, session.corpse, &[]);
     let at = scene.rooms.iter().find(|room| room.id == from)?.at;
     let wanted = (at.0 + step.0, at.1 + step.1);
     scene
@@ -7030,7 +7053,10 @@ mod tests {
                 .as_deref(),
             Some("shop")
         );
-        let scene = state.map_of(0).unwrap().scene(crate::map::RoomId(1), None);
+        let scene = state
+            .map_of(0)
+            .unwrap()
+            .scene(crate::map::RoomId(1), None, &[]);
         assert_eq!(
             scene.rooms[0].mark.as_deref(),
             Some("shop"),
@@ -7076,6 +7102,40 @@ mod tests {
             None,
             "the removal must already be on disk with no save step run here"
         );
+    }
+
+    /// Who goes on the map beside you (§16): the others on this world,
+    /// never yourself — you are already `RoomRole::Here` — and never a
+    /// character on a different MUD, whose room numbers mean nothing here.
+    #[test]
+    fn the_party_is_the_others_on_this_world_only() {
+        let (mut state, _rx) = app(&["mathias", "saihtam", "elsewhere"]);
+        for (index, key) in [(0, "hercmud.net"), (1, "hercmud.net"), (2, "other.mud")] {
+            state.sessions[index].map_key = key.to_string();
+            state.sessions[index].current_room = Some(crate::map::RoomId(index as i64 + 1));
+        }
+
+        let party = state.party_of(0);
+
+        assert_eq!(
+            party,
+            vec![(crate::map::RoomId(2), "saihtam".to_string())],
+            "only the other character on this world"
+        );
+    }
+
+    /// A character who has connected but has not been placed yet cannot be
+    /// drawn anywhere, and guessing would put them in a room they are not
+    /// in.
+    #[test]
+    fn a_character_with_no_room_yet_is_not_on_the_map() {
+        let (mut state, _rx) = app(&["mathias", "saihtam"]);
+        for session in &mut state.sessions {
+            session.map_key = "hercmud.net".to_string();
+        }
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        assert!(state.party_of(0).is_empty());
     }
 
     /// The property the shared map exists for, stated directly: what one

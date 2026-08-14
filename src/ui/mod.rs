@@ -812,7 +812,10 @@ fn draw_map(
     let Some(map) = state.bound_map() else {
         return (None, true);
     };
-    let scene = map.scene(current, session.corpse);
+    // Everyone on this world, not only the character being typed at
+    // (§16) — the map is of the world, and they are all on it.
+    let party = state.party_of(state.input_session);
+    let scene = map.scene(current, session.corpse, &party);
     // Pixels where the terminal takes them, cells everywhere else — the
     // same scene either way (§16).
     if let Some(cell) = state.map_cell_px {
@@ -2601,6 +2604,44 @@ mod tests {
             "the full prompt should be on screen, not cut off: {screen}"
         );
         assert!(screen.contains("what is this room for?"), "{screen}");
+    }
+
+    /// The whole point, drawn: switching characters used to be the only
+    /// way to find out where the other one was, and now both are on the
+    /// one map at once.
+    #[test]
+    fn the_map_draws_the_other_character_too() {
+        use crate::map::{RoomId, RoomInfo};
+        use std::collections::BTreeMap;
+
+        let mut state = test_support::app(&["mathias", "saihtam"]);
+        let mut map = crate::map::Map::default();
+        for id in [1, 2] {
+            map.observe(&RoomInfo {
+                id: RoomId(id),
+                name: None,
+                area: Some("Midgaard".to_string()),
+                exits: BTreeMap::new(),
+            });
+        }
+        map.connect(RoomId(1), "e", RoomId(2));
+        map.connect(RoomId(2), "w", RoomId(1));
+        for session in &mut state.sessions {
+            session.map_key = "hercmud.net".to_string();
+        }
+        state.world_mut(0).map = map;
+        state.sessions[0].current_room = Some(RoomId(1));
+        state.sessions[1].current_room = Some(RoomId(2));
+        state.show_map = true;
+        state.map_width = MAP_WIDTH;
+
+        let screen = rows(&render_sized(&state, 80, 20));
+
+        assert!(screen.contains('@'), "you are still on it: {screen}");
+        assert!(
+            screen.contains('S'),
+            "and saihtam's initial marks where they are: {screen}"
+        );
     }
 
     /// Before the server has placed the character there is nothing to draw,

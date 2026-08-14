@@ -17,7 +17,7 @@
 
 mod scene;
 
-pub use scene::{RoomRole, Scene};
+pub use scene::{PlacedRoom, RoomRole, Scene};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 

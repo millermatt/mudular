@@ -46,6 +46,18 @@ pub struct PlacedRoom {
     /// tell `shop` from `smith`, which share a letter, and deciding how to
     /// show that is a presentation question the map has no view on.
     pub mark: Option<String>,
+    /// The *other* characters standing here, by name (§16).
+    ///
+    /// Deliberately names rather than a glyph or a colour, for the same
+    /// reason `mark` is the whole label: which character this is belongs
+    /// to the world, how to draw them is the renderer's to decide. Empty
+    /// for almost every room, which is why this is a `Vec` rather than
+    /// something every room pays for.
+    ///
+    /// Never contains the character the scene is centred on — they are
+    /// `RoomRole::Here`, and listing them as their own company would make
+    /// every renderer filter them back out.
+    pub party: Vec<String>,
     /// Whether this room has an exit the picture could not draw — one the
     /// layout could not honour, or one leading to a room that lost its
     /// cell. Filtering those out of `links` is right (§16: a wrong edge is
@@ -85,7 +97,17 @@ impl Map {
     /// Rooms that lost a coordinate collision, or sit in another area, are
     /// simply absent — they stay in the graph and stay pathable, which is
     /// why the drawn map is never what `/goto` consults (§16).
-    pub fn scene(&self, current: RoomId, corpse: Option<RoomId>) -> Scene {
+    /// `party` is where the *other* characters on this world are standing
+    /// — one entry per character, in whatever order the caller holds them.
+    /// A character in the same room as `current` is still listed, so a
+    /// renderer can say "you are together" rather than silently dropping
+    /// them.
+    pub fn scene(
+        &self,
+        current: RoomId,
+        corpse: Option<RoomId>,
+        party: &[(RoomId, String)],
+    ) -> Scene {
         let coords = self.layout_area(current);
         let mut rooms: Vec<PlacedRoom> = Vec::with_capacity(coords.len());
         let mut links = Vec::new();
@@ -132,6 +154,11 @@ impl Map {
             rooms.push(PlacedRoom {
                 id: *id,
                 at: *at,
+                party: party
+                    .iter()
+                    .filter(|(where_they_are, _)| where_they_are == id)
+                    .map(|(_, who)| who.clone())
+                    .collect(),
                 role: match Some(*id) {
                     _ if *id == current => RoomRole::Here,
                     c if c == corpse => RoomRole::Corpse,
@@ -185,7 +212,7 @@ mod tests {
     fn places_rooms_and_links_around_the_centred_room() {
         let map = map_of(&[1, 2], &[(1, "e", 2)]);
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         assert_eq!(scene.rooms.len(), 2);
         assert_eq!(
@@ -215,7 +242,7 @@ mod tests {
         // diagonally apart.
         let map = map_of(&[1, 2, 4], &[(1, "e", 2), (1, "n", 4), (2, "s", 4)]);
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         assert!(
             scene.links.iter().all(|l| l.step.0 == 0 || l.step.1 == 0),
@@ -239,7 +266,7 @@ mod tests {
     fn a_room_whose_exit_could_not_be_drawn_says_so() {
         let map = map_of(&[1, 2, 4], &[(1, "e", 2), (1, "n", 4), (2, "s", 4)]);
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         let room = |id: i64| {
             scene
@@ -266,7 +293,7 @@ mod tests {
     fn an_exit_into_a_room_that_lost_its_cell_is_marked_too() {
         let map = map_of(&[1, 2, 3], &[(1, "n", 2), (2, "s", 3)]);
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         let two = scene.rooms.iter().find(|r| r.id == RoomId(2)).unwrap();
         assert!(
@@ -285,7 +312,7 @@ mod tests {
     fn a_vertical_exit_is_not_a_hidden_one() {
         let map = map_of(&[1, 2], &[(1, "u", 2)]);
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         let here = scene.rooms.iter().find(|r| r.id == RoomId(1)).unwrap();
         assert!(here.up);
@@ -310,7 +337,7 @@ mod tests {
         }
         map.connect(RoomId(1), "e", RoomId(2));
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         assert_eq!(scene.rooms.len(), 1, "the other area is not drawn");
         assert!(!scene.rooms[0].hidden_exits);
@@ -334,7 +361,7 @@ mod tests {
             exits,
         });
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         assert!(!scene.rooms[0].hidden_exits);
     }
@@ -342,6 +369,50 @@ mod tests {
     /// An exit the map has never walked has no destination to hide. The
     /// flag says "known and not shown", so an unexplored exit — which
     /// `describe` reports in prose — must not raise it.
+    /// The map is of the world, so everyone on it belongs on the picture
+    /// — not only the character being typed at (§16).
+    #[test]
+    fn another_character_is_placed_in_the_room_they_are_standing_in() {
+        let map = map_of(&[1, 2], &[(1, "e", 2)]);
+
+        let scene = map.scene(RoomId(1), None, &[(RoomId(2), "saihtam".to_string())]);
+
+        let party = |id: i64| {
+            scene
+                .rooms
+                .iter()
+                .find(|room| room.id == RoomId(id))
+                .map(|room| room.party.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(party(2), vec!["saihtam".to_string()]);
+        assert!(party(1).is_empty(), "and nobody is invented elsewhere");
+    }
+
+    /// Two characters in one room is the ordinary case when multiboxing —
+    /// they arrive together and move together — so it must not be the case
+    /// that only one of them exists.
+    #[test]
+    fn several_characters_in_one_room_are_all_listed() {
+        let map = map_of(&[1, 2], &[(1, "e", 2)]);
+
+        let scene = map.scene(
+            RoomId(1),
+            None,
+            &[
+                (RoomId(2), "saihtam".to_string()),
+                (RoomId(2), "mudd".to_string()),
+            ],
+        );
+
+        let room = scene
+            .rooms
+            .iter()
+            .find(|room| room.id == RoomId(2))
+            .unwrap();
+        assert_eq!(room.party, vec!["saihtam".to_string(), "mudd".to_string()]);
+    }
+
     #[test]
     fn an_unexplored_exit_is_not_a_hidden_one() {
         let mut map = Map::default();
@@ -354,7 +425,7 @@ mod tests {
             exits,
         });
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         assert!(!scene.rooms[0].hidden_exits);
     }
@@ -363,7 +434,7 @@ mod tests {
     fn roles_mark_the_current_room_and_the_corpse() {
         let map = map_of(&[1, 2], &[(1, "e", 2)]);
 
-        let scene = map.scene(RoomId(1), Some(RoomId(2)));
+        let scene = map.scene(RoomId(1), Some(RoomId(2)), &[]);
 
         let role = |id: i64| {
             scene
@@ -383,7 +454,7 @@ mod tests {
     fn standing_on_the_corpse_still_reads_as_here() {
         let map = map_of(&[1], &[]);
 
-        let scene = map.scene(RoomId(1), Some(RoomId(1)));
+        let scene = map.scene(RoomId(1), Some(RoomId(1)), &[]);
 
         assert_eq!(scene.rooms[0].role, RoomRole::Here);
     }
@@ -394,7 +465,7 @@ mod tests {
     fn vertical_exits_mark_the_room_and_draw_no_corridor() {
         let map = map_of(&[1, 2], &[(1, "u", 2)]);
 
-        let scene = map.scene(RoomId(1), None);
+        let scene = map.scene(RoomId(1), None, &[]);
 
         let here = scene.rooms.iter().find(|r| r.id == RoomId(1)).unwrap();
         assert!(here.up, "the room it leaves is marked");
@@ -405,7 +476,7 @@ mod tests {
     /// The shape of an area, normalised so it can be compared no matter
     /// which room the character was standing in when it was drawn.
     fn shape(map: &Map, standing_in: i64) -> Vec<(RoomId, (i32, i32))> {
-        let scene = map.scene(RoomId(standing_in), None);
+        let scene = map.scene(RoomId(standing_in), None, &[]);
         let base = scene
             .rooms
             .iter()
@@ -493,7 +564,7 @@ mod tests {
                 (50, "s", 40),
             ],
         );
-        let before = map.scene(RoomId(10), None);
+        let before = map.scene(RoomId(10), None, &[]);
 
         // Walk on and find a room the server numbers below them all.
         let mut grown = map.clone();
@@ -505,7 +576,7 @@ mod tests {
         });
         grown.connect(RoomId(50), "n", RoomId(1));
         grown.connect(RoomId(1), "s", RoomId(50));
-        let after = grown.scene(RoomId(10), None);
+        let after = grown.scene(RoomId(10), None, &[]);
 
         for room in &before.rooms {
             let still = after
@@ -544,7 +615,7 @@ mod tests {
 
         for standing_in in 1..=9 {
             assert_eq!(
-                map.scene(RoomId(standing_in), None).rooms.len(),
+                map.scene(RoomId(standing_in), None, &[]).rooms.len(),
                 9,
                 "every room walked should still be drawn from #{standing_in}"
             );
@@ -562,7 +633,7 @@ mod tests {
     fn the_player_is_drawn_even_when_their_room_lost_its_cell() {
         let map = map_of(&[1, 2, 3], &[(1, "n", 2), (2, "s", 3)]);
 
-        let scene = map.scene(RoomId(3), None);
+        let scene = map.scene(RoomId(3), None, &[]);
 
         let here = scene
             .rooms
@@ -584,7 +655,7 @@ mod tests {
         let map = map_of(&[1, 2, 3], &[(1, "e", 2), (2, "e", 3)]);
 
         for standing_in in 1..=3 {
-            let scene = map.scene(RoomId(standing_in), None);
+            let scene = map.scene(RoomId(standing_in), None, &[]);
             let here = scene
                 .rooms
                 .iter()
@@ -598,6 +669,9 @@ mod tests {
     fn a_scene_is_stable_across_runs() {
         let map = map_of(&[1, 2, 3], &[(1, "e", 2), (1, "s", 3)]);
 
-        assert_eq!(map.scene(RoomId(1), None), map.scene(RoomId(1), None));
+        assert_eq!(
+            map.scene(RoomId(1), None, &[]),
+            map.scene(RoomId(1), None, &[])
+        );
     }
 }
