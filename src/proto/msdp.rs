@@ -90,7 +90,19 @@ pub fn report_requests() -> Vec<Vec<u8>> {
         "MOVEMENT_MAX",
     ]
     .into_iter()
-    .map(|variable| encode_pair("REPORT", variable))
+    // `REPORT` subscribes to *changes*, and a server that has already
+    // sent the login room has nothing to report until something moves.
+    // That left the map and the party strip blank on arrival, filling in
+    // only once the player walked — the map looked like it needed a move
+    // to exist. `SEND` asks for the value as it stands right now, which
+    // is the other half of the same question, and a server without the
+    // variable ignores it exactly as it ignores the `REPORT`.
+    .flat_map(|variable| {
+        [
+            encode_pair("REPORT", variable),
+            encode_pair("SEND", variable),
+        ]
+    })
     .collect()
 }
 
@@ -396,6 +408,34 @@ mod tests {
 
     /// An emptied MSDP array reports its length and nothing else — the
     /// only signal that the indices it used to have are gone.
+    /// The bug this pins: `REPORT` subscribes to *changes*, so a server
+    /// that already sent the login room had nothing more to say until the
+    /// player walked — the map and the party strip stayed empty on
+    /// arrival and filled in a move later. `SEND` asks for the value as
+    /// it stands, and both go out for every variable.
+    #[test]
+    fn subscribing_also_asks_for_the_value_as_it_stands() {
+        let requests = report_requests();
+
+        assert!(
+            requests.contains(&[&[VAR][..], b"REPORT", &[VAL][..], b"ROOM"].concat()),
+            "the subscription"
+        );
+        assert!(
+            requests.contains(&[&[VAR][..], b"SEND", &[VAL][..], b"ROOM"].concat()),
+            "and the room as it is right now, without waiting for a move"
+        );
+        assert!(
+            requests.contains(&[&[VAR][..], b"SEND", &[VAL][..], b"HEALTH"].concat()),
+            "the strip has the same problem, so it gets the same answer"
+        );
+        assert_eq!(
+            requests.len() % 2,
+            0,
+            "one REPORT and one SEND each: {requests:?}"
+        );
+    }
+
     #[test]
     fn an_emptied_msdp_array_still_reports_its_length() {
         let mut out = Flattened::default();
