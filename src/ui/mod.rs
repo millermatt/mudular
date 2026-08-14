@@ -739,6 +739,28 @@ fn draw_hud(frame: &mut Frame, area: Rect, state: &AppState) {
                 gauge_style(gauge),
             ));
         }
+
+        // Experience is last, and reads differently from the three above
+        // it in both of the ways that matter.
+        //
+        // A **percentage**, where they show the number itself: `27` hp is
+        // a fact a player acts on, where experience-within-a-level is a
+        // six-digit number whose meaning is entirely in how far along it
+        // is. Percent is the short way to say that, and the only reason
+        // the bar is drawn at all.
+        //
+        // And **never `gauge_style`**, whose whole vocabulary is danger —
+        // red at a quarter, amber at a half. A character 10% into a level
+        // is not in trouble, they have just levelled; painting that red
+        // would say the opposite of what happened, in a strip whose red
+        // means "go and help them" (§11.7).
+        if let Some(experience) = vitals.experience {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("xp {}%", (experience.fraction() * 100.0).floor() as u8),
+                Style::default().fg(Color::Rgb(0x64, 0x74, 0x8B)),
+            ));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1567,6 +1589,57 @@ mod tests {
     }
 
     /// The point of the strip is noticing trouble without reading it.
+    /// Experience reads as a percentage rather than the raw number the
+    /// other gauges show: `4500` means nothing without the ceiling beside
+    /// it, and how far along the level is what the number is for.
+    #[test]
+    fn the_strip_shows_experience_as_progress_through_the_level() {
+        let mut state = test_support::app(&["tank"]);
+        state.show_hud = true;
+        publish_vitals(
+            &mut state,
+            "tank",
+            &[("EXPERIENCE", "4500"), ("EXPERIENCE_MAX", "9000")],
+        );
+
+        let screen = rows(&render_sized(&state, 70, 12));
+
+        assert!(screen.contains("xp 50%"), "{screen}");
+    }
+
+    /// The bug this pins: `gauge_style` speaks danger — red at a quarter,
+    /// amber at a half — and a character 10% into a level has just
+    /// levelled, not nearly died. Painting that the colour the strip uses
+    /// for "go and help them" (§11.7) would say the opposite of what
+    /// happened.
+    #[test]
+    fn a_barely_started_level_is_never_painted_as_danger() {
+        let mut state = test_support::app(&["tank"]);
+        state.show_hud = true;
+        publish_vitals(
+            &mut state,
+            "tank",
+            &[
+                ("HEALTH", "100"),
+                ("HEALTH_MAX", "100"),
+                ("EXPERIENCE", "1"),
+                ("EXPERIENCE_MAX", "9000"),
+            ],
+        );
+
+        let buffer = render_sized(&state, 70, 12);
+        let xp = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .find(|(x, y)| {
+                buffer.cell((*x, *y)).unwrap().symbol() == "x"
+                    && buffer.cell((x + 1, *y)).unwrap().symbol() == "p"
+            })
+            .map(|(x, y)| buffer.cell((x, y)).unwrap().fg)
+            .expect("the strip should show experience");
+
+        assert_ne!(xp, ALARM, "1% of a level is not a character in trouble");
+    }
+
     #[test]
     fn a_character_in_trouble_is_coloured_for_it() {
         let mut state = test_support::app(&["tank"]);

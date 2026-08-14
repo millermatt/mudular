@@ -38,12 +38,19 @@ pub struct Vitals {
     pub health: Option<Gauge>,
     pub mana: Option<Gauge>,
     pub movement: Option<Gauge>,
+    /// Progress through the current level, not experience earned in total
+    /// — a total has no ceiling, and a bar needs both ends. The servers
+    /// that report this report the pair.
+    pub experience: Option<Gauge>,
 }
 
 impl Vitals {
     /// True when the server has said nothing worth drawing.
     pub fn is_empty(&self) -> bool {
-        self.health.is_none() && self.mana.is_none() && self.movement.is_none()
+        self.health.is_none()
+            && self.mana.is_none()
+            && self.movement.is_none()
+            && self.experience.is_none()
     }
 
     /// How much trouble this character is in, or `None` for none — the
@@ -88,6 +95,20 @@ const MANA: (&[&str], &[&str]) = (
     &["Char.Vitals.mp", "MANA"],
     &["Char.Vitals.maxmp", "MANA_MAX"],
 );
+/// Progress through the current level.
+///
+/// Only where a server reports the ceiling. A DikuMUD's `EXPERIENCE` is
+/// the *cumulative* total earned since birth, which has no end to draw a
+/// bar against — hercmud advertises an "Exp TNL" gauge over these two and
+/// then never sets `EXPERIENCE_MAX`, so the pair arrives as `0`/`0`. That
+/// is the "both ends or nothing" rule meeting a server that means well,
+/// and the honest answer is to show nothing rather than a percentage of
+/// an unknown whole. The GMCP spellings follow the convention of the rows
+/// above rather than any sighting.
+const EXPERIENCE: (&[&str], &[&str]) = (
+    &["Char.Vitals.xp", "EXPERIENCE"],
+    &["Char.Vitals.maxxp", "EXPERIENCE_MAX"],
+);
 const MOVEMENT: (&[&str], &[&str]) = (
     &["Char.Vitals.mv", "Char.Vitals.moves", "MOVEMENT"],
     &["Char.Vitals.maxmv", "Char.Vitals.maxmoves", "MOVEMENT_MAX"],
@@ -100,6 +121,7 @@ pub fn from_server_data(data: &HashMap<String, String>) -> Vitals {
         health: gauge(data, HEALTH),
         mana: gauge(data, MANA),
         movement: gauge(data, MOVEMENT),
+        experience: gauge(data, EXPERIENCE),
     }
 }
 
@@ -107,9 +129,18 @@ fn gauge(data: &HashMap<String, String>, (now, max): (&[&str], &[&str])) -> Opti
     // Both ends or nothing: a current value with no ceiling cannot be drawn
     // as a bar, and guessing one would be inventing the number that decides
     // whether a character looks safe.
-    Some(Gauge {
+    //
+    // A ceiling of *zero* is that same case wearing a number, and a worse
+    // one, because it parses. `fraction` answers 0.0 for it — so a server
+    // that declares a variable and never sets it, which is exactly what
+    // hercmud does with `EXPERIENCE_MAX`, would have drawn every character
+    // as empty. On health that is not merely a wrong bar: `distress` reads
+    // the same fraction, so every character on such a server would be
+    // marked as needing help, ring the bell, and wear the `!` (§11.7).
+    let max = number(data, max)?;
+    (max > 0).then_some(Gauge {
         now: number(data, now)?,
-        max: number(data, max)?,
+        max,
     })
 }
 
@@ -211,6 +242,77 @@ mod tests {
     #[test]
     fn a_server_that_says_nothing_shows_nothing() {
         assert!(from_server_data(&store(&[("Room.Info.num", "1")])).is_empty());
+    }
+
+    /// The MSDP pair a DikuMUD-derived server sends, and what it means:
+    /// progress through the level, not experience earned since birth.
+    /// The bug this pins: a declared-but-never-set variable arrives as
+    /// `0`, which parses, so "both ends" was satisfied by a ceiling of
+    /// nothing. `fraction` answers 0.0 to that — and `distress` reads the
+    /// same fraction, so a server like hercmud, which advertises an
+    /// experience gauge and never sets its maximum, would have marked
+    /// every character as dying: bell, `!`, the lot.
+    #[test]
+    fn a_ceiling_of_zero_is_not_a_gauge() {
+        let vitals = from_server_data(&store(&[
+            ("HEALTH", "0"),
+            ("HEALTH_MAX", "0"),
+            ("EXPERIENCE", "1200"),
+            ("EXPERIENCE_MAX", "0"),
+        ]));
+
+        assert_eq!(vitals.health, None, "not a bar, and not a dying character");
+        assert_eq!(
+            vitals.experience, None,
+            "a total with no end is not progress"
+        );
+        assert_eq!(
+            vitals.distress(),
+            None,
+            "so nothing to raise the alarm about"
+        );
+        assert!(vitals.is_empty());
+    }
+
+    #[test]
+    fn reads_experience_as_progress_through_the_level() {
+        let vitals = from_server_data(&store(&[
+            ("EXPERIENCE", "4500"),
+            ("EXPERIENCE_MAX", "9000"),
+        ]));
+
+        assert_eq!(
+            vitals.experience,
+            Some(Gauge {
+                now: 4500,
+                max: 9000
+            })
+        );
+        assert_eq!(vitals.experience.unwrap().fraction(), 0.5);
+    }
+
+    /// A server that reports experience and nothing else still has
+    /// something worth drawing, so the strip must not call it empty.
+    #[test]
+    fn experience_alone_is_not_an_empty_character() {
+        let vitals = from_server_data(&store(&[("EXPERIENCE", "10"), ("EXPERIENCE_MAX", "100")]));
+
+        assert!(!vitals.is_empty());
+    }
+
+    /// Ten percent into a level is not a character about to die. The
+    /// alarm is health alone, and adding a fourth gauge must not change
+    /// that.
+    #[test]
+    fn a_barely_started_level_is_not_trouble() {
+        let fresh = from_server_data(&store(&[
+            ("HEALTH", "100"),
+            ("HEALTH_MAX", "100"),
+            ("EXPERIENCE", "1"),
+            ("EXPERIENCE_MAX", "9000"),
+        ]));
+
+        assert_eq!(fresh.distress(), None);
     }
 
     #[test]

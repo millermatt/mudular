@@ -88,6 +88,8 @@ pub fn report_requests() -> Vec<Vec<u8>> {
         "MANA_MAX",
         "MOVEMENT",
         "MOVEMENT_MAX",
+        "EXPERIENCE",
+        "EXPERIENCE_MAX",
     ]
     .into_iter()
     // `REPORT` subscribes to *changes*, and a server that has already
