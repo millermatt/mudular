@@ -2565,6 +2565,13 @@ async fn event_loop(
             // no cursor position worth asking for.
             let area = terminal.get_frame().area();
             terminal.resize(area)?;
+            // The clear took the picture off the screen with everything
+            // else, so the cache's claim that the terminal already has it
+            // is now false. Without this the redraw below reuses it,
+            // reports it as unchanged, and nothing writes it back — the
+            // map stayed blank until something moved and forced a fresh
+            // one, which read as "the map needs two moves to appear".
+            map_image_cache.forget();
             completed =
                 terminal.draw(|frame| drawn = ui::draw(frame, &state, &mut map_image_cache))?;
         }

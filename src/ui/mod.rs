@@ -292,6 +292,20 @@ pub struct MapImageCache {
     image: Option<map_render::PendingImage>,
 }
 
+impl MapImageCache {
+    /// Drops what the cache believes is on screen.
+    ///
+    /// The cache does not really hold a picture, it holds the claim that
+    /// the terminal is already showing one — which is why a reused
+    /// picture is not written again. Anything that clears the terminal
+    /// makes that claim false, so the caller has to say so, or the next
+    /// frame reuses a picture that is no longer anywhere.
+    pub fn forget(&mut self) {
+        self.key = None;
+        self.image = None;
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct MapImageCacheKey {
     scene: crate::map::Scene,
@@ -2510,6 +2524,62 @@ mod tests {
         assert!(
             third.image_is_fresh,
             "moving the cursor changes the scene the cache key covers"
+        );
+    }
+
+    /// The bug this pins: `image_is_fresh` is what the event loop uses to
+    /// decide whether to write the picture to the terminal, so it has to
+    /// mean "the terminal needs this", not merely "we re-rasterised".
+    /// Clearing the screen — which the loop does the moment a picture
+    /// appears, to erase the "no room data yet" underneath it — takes the
+    /// picture with it. Reusing the cache across that clear reported the
+    /// picture as unchanged, nothing wrote it back, and the map stayed
+    /// blank until a move forced a fresh one: the map appeared a move
+    /// late.
+    #[test]
+    fn a_cleared_terminal_makes_the_next_frame_write_the_picture_again() {
+        use crate::map::{RoomId, RoomInfo};
+
+        let mut state = state();
+        let mut map = crate::map::Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: None,
+            area: Some("Midgaard".to_string()),
+            exits: Default::default(),
+        });
+        state.world_mut(0).map = map;
+        state.sessions[0].current_room = Some(RoomId(1));
+        state.show_map = true;
+        state.map_width = MAP_WIDTH;
+        state.map_cell_px = Some((8, 16));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut cache = MapImageCache::default();
+        let mut draw_once = |cache: &mut MapImageCache| {
+            let mut drawn = DrawnFrame {
+                image: None,
+                image_is_fresh: true,
+                map_area: None,
+            };
+            terminal
+                .draw(|frame| drawn = draw(frame, &state, cache))
+                .unwrap();
+            drawn
+        };
+
+        assert!(draw_once(&mut cache).image_is_fresh, "the first frame");
+        assert!(
+            !draw_once(&mut cache).image_is_fresh,
+            "an unchanged frame reuses it, which is the point of the cache"
+        );
+
+        cache.forget();
+        let after_clear = draw_once(&mut cache);
+        assert!(after_clear.image.is_some(), "there is still a picture");
+        assert!(
+            after_clear.image_is_fresh,
+            "and the terminal no longer has it, so it must be written again"
         );
     }
 
