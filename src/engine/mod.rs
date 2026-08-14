@@ -525,6 +525,38 @@ impl Engine {
         self.peers.insert(name, rx);
     }
 
+    /// Takes over the live connection's state from the engine a `/reload`
+    /// is replacing (§7.3).
+    ///
+    /// A reload recompiles rules, and rules are all it recompiles. What the
+    /// *wire* taught the old engine — the merged GMCP/MSDP store, which of
+    /// its keys GMCP owns, and the peer receivers — is not something a
+    /// config file can rebuild, and dropping it does not merely blank the
+    /// data for a moment: MSDP transmits only variables that **changed**
+    /// since it last did, and a ceiling like `HEALTH_MAX` does not change
+    /// while a character stands still. So a discarded store is never
+    /// refilled by asking again. It stays empty until the next reconnect,
+    /// taking every gauge (§11.6) and every `when:` guard that reads one
+    /// down with it — silently, because an unresolvable term is false.
+    ///
+    /// Deliberately *not* carried:
+    ///
+    /// - `script_timers`, which belong to the VMs being thrown away. The
+    ///   fresh hosts re-arm from their own `on_connect`, which is what
+    ///   `/reload` calls next (§7.4).
+    /// - `peers_seen`, so the newly loaded scripts get told the current
+    ///   state of each peer rather than only what moves afterwards. That
+    ///   matches what a script sees at connect, which is the moment a
+    ///   reload is meant to look like.
+    pub fn adopt_connection_state(&mut self, previous: &mut Engine) {
+        self.server_data = std::mem::take(&mut previous.server_data);
+        self.gmcp_keys = std::mem::take(&mut previous.gmcp_keys);
+        self.peers = std::mem::take(&mut previous.peers);
+        // The merged layers just reset `variables` to their defaults, which
+        // is a change peers are entitled to see.
+        self.changed = true;
+    }
+
     /// This session's state to publish, or `None` if nothing has changed
     /// since the last call — peers hold the previous value either way, so
     /// republishing an identical snapshot would only wake them.
@@ -3345,6 +3377,98 @@ triggers:
         assert!(
             matches!(&err, EngineError::UnknownScriptLanguage { script, .. } if script == "combat.rb"),
             "{err}"
+        );
+    }
+
+    // ---- `/reload` keeps what the wire taught us (§7.3) ----
+
+    /// The reload bug: recompiling produced a fresh engine with an empty
+    /// server-data store, and MSDP never re-sends an unchanged variable, so
+    /// a ceiling like `HEALTH_MAX` stayed gone until the next reconnect.
+    /// Every gauge and every guard that read one went quiet.
+    #[test]
+    fn a_reload_keeps_the_server_data_the_wire_provided() {
+        let yaml = r#"
+            name: test
+            triggers:
+              - pattern: '^hit$'
+                when: '${HEALTH} < ${HEALTH_MAX}'
+                send: ["heal me"]
+        "#;
+        let mut live = engine(yaml);
+        live.update_server_data_from_msdp("HEALTH", "10".to_string());
+        live.update_server_data_from_msdp("HEALTH_MAX", "30".to_string());
+        assert_eq!(live.process_line("hit").sends, vec!["heal me"]);
+
+        // What `/reload` does: compile the same layers afresh, then adopt.
+        let mut reloaded = engine(yaml);
+        assert!(
+            reloaded.process_line("hit").sends.is_empty(),
+            "a bare recompile has no server data, which is the bug"
+        );
+        reloaded.adopt_connection_state(&mut live);
+
+        assert_eq!(
+            reloaded.server_data().get("HEALTH_MAX"),
+            Some(&"30".to_string())
+        );
+        assert_eq!(
+            reloaded.process_line("hit").sends,
+            vec!["heal me"],
+            "the guard has to keep working across a reload"
+        );
+        assert!(
+            live.server_data().is_empty(),
+            "moved, not cloned: the outgoing engine is dropped"
+        );
+    }
+
+    /// The same swap lost the peer receivers, so `${@name.key}` and
+    /// `mud.session(name)` came back empty after every reload.
+    #[test]
+    fn a_reload_keeps_the_peer_receivers() {
+        let yaml = r#"
+            name: test
+            triggers:
+              - pattern: '^check$'
+                when: '${@tank.HEALTH} < 50'
+                send: ["cast heal tank"]
+        "#;
+        let mut live = with_peer(yaml, "tank", snapshot(&[], &[("HEALTH", "20")]));
+        assert_eq!(live.process_line("check").sends, vec!["cast heal tank"]);
+
+        let mut reloaded = engine(yaml);
+        assert!(reloaded.process_line("check").sends.is_empty());
+        reloaded.adopt_connection_state(&mut live);
+        assert_eq!(
+            reloaded.process_line("check").sends,
+            vec!["cast heal tank"],
+            "the peer has to survive a reload"
+        );
+    }
+
+    /// GMCP wins over MSDP for a key a server sends both ways (§6.3). That
+    /// ownership is wire state too — losing it would let an MSDP update
+    /// quietly overwrite a GMCP-sourced value after a reload.
+    #[test]
+    fn a_reload_keeps_gmcp_ownership_of_a_key() {
+        let yaml = "name: test\n";
+        let mut live = engine(yaml);
+        live.update_server_data_from_gmcp("Char.Vitals.hp", "90".to_string());
+        live.update_server_data_from_msdp("Char.Vitals.hp", "10".to_string());
+        assert_eq!(
+            live.server_data().get("Char.Vitals.hp"),
+            Some(&"90".to_string()),
+            "GMCP wins while the session is live"
+        );
+
+        let mut reloaded = engine(yaml);
+        reloaded.adopt_connection_state(&mut live);
+        reloaded.update_server_data_from_msdp("Char.Vitals.hp", "10".to_string());
+        assert_eq!(
+            reloaded.server_data().get("Char.Vitals.hp"),
+            Some(&"90".to_string()),
+            "and has to keep winning after a reload"
         );
     }
 

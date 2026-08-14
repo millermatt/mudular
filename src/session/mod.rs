@@ -383,7 +383,7 @@ async fn wait_to_retry(
                 // `/reload` still lands: the reconnect runs the new rules'
                 // `on_connect` and starts their timers, as a reload against
                 // a live socket does (§7.4).
-                Some(SessionCommand::SetRules(rules)) => *engine = *rules,
+                Some(SessionCommand::SetRules(rules)) => swap_rules(engine, rules),
                 Some(SessionCommand::Resize { cols, rows }) => *window = Some((cols, rows)),
                 // A peer added while this session is mid-backoff must not
                 // be lost by the time the connection comes back (§7.5).
@@ -986,7 +986,7 @@ async fn run_connection(
                         }
                     }
                     Some(SessionCommand::SetRules(rules)) => {
-                        *engine = *rules;
+                        swap_rules(engine, rules);
                         engine.start_timers(Instant::now());
                         // Freshly loaded scripts have not seen this
                         // connection come up, so `/reload` is their
@@ -1197,6 +1197,16 @@ async fn emit_cross_sends(
             .await?;
     }
     Ok(())
+}
+
+/// Swaps freshly compiled rules in without losing what the connection taught
+/// the old engine — see [`Engine::adopt_connection_state`]. Both `SetRules`
+/// arms go through here so they cannot drift apart: the one that runs against
+/// a live socket, and the one that runs mid-backoff.
+fn swap_rules(engine: &mut Engine, rules: Box<Engine>) {
+    let mut fresh = *rules;
+    fresh.adopt_connection_state(engine);
+    *engine = fresh;
 }
 
 /// Write each command as its own CRLF-terminated line.
