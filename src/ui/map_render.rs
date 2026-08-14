@@ -237,6 +237,22 @@ pub(super) fn legend() -> Line<'static> {
     entries.push((corpse_style, corpse_letter, "corpse"));
     let (party, party_letter) = party_style("party");
     entries.push((party, party_letter, "another char"));
+
+    // The two slots either side of the room's own letter. Drawn on plain
+    // room ground rather than a colour of their own, because that is
+    // exactly how they appear on the map — they say something about the
+    // room's *exits*, not about what kind of place it is, and giving them
+    // a hue would imply otherwise.
+    let (ground, _) = role_style(RoomRole::Known);
+    for (glyph, meaning) in [
+        ('^', "up"),
+        ('v', "down"),
+        ('↕', "up+down"),
+        ('·', "more exits"),
+    ] {
+        entries.push((ground, Some(glyph), meaning));
+    }
+
     for label in crate::app::MARK_SUGGESTIONS {
         let (style, letter) = marked_style(label);
         entries.push((style, letter, label));

@@ -923,9 +923,14 @@ fn described_height(state: &AppState, inner: Rect) -> u16 {
     wanted.clamp(1, inner.height / 2)
 }
 
-/// Splits the legend's row(s) off the bottom of the map pane. Wrapping
-/// rather than clipping, so a narrow pane still shows every entry — just
-/// over more rows — instead of quietly cutting the list short.
+/// Splits the legend's row(s) off the bottom of the map pane.
+///
+/// Wrapped rather than truncated, so a narrow pane spends more rows on
+/// the legend instead of cutting entries off the end of a line — but
+/// never more than half the pane, because the map is still the point. A
+/// pane short enough that the legend wants more than that shows as much
+/// as fits and loses the tail; the alternative is a legend that crowds
+/// out the thing it is explaining.
 fn split_legend(inner: Rect) -> (Rect, Rect) {
     let width = map_render::legend().width() as u16;
     let rows = width
@@ -2401,7 +2406,7 @@ mod tests {
         state.show_map = true;
         state.map_width = MAP_WIDTH;
 
-        let drawn = render_sized(&state, 80, 20);
+        let drawn = render_sized(&state, 80, 32);
         let screen = rows(&drawn);
         assert!(
             screen.contains("Midgaard"),
@@ -2540,7 +2545,7 @@ mod tests {
         state.show_map = true;
         state.map_width = MAP_WIDTH;
 
-        let drawn = render_sized(&state, 80, 20);
+        let drawn = render_sized(&state, 80, 32);
         let screen = rows(&drawn);
         assert!(screen.contains('@'), "the current room is drawn: {screen}");
         assert_eq!(
@@ -2581,6 +2586,37 @@ mod tests {
             populated.contains("shop") && populated.contains("you"),
             "the legend should stay put once the map has something to show: {populated}"
         );
+    }
+
+    /// The legend explained every colour but neither of the glyphs beside
+    /// the room's own letter, so `^`, `v`, `↕` and `·` were on the map
+    /// with nothing anywhere saying what they meant.
+    #[test]
+    fn the_legend_explains_the_exit_glyphs_too() {
+        let mut state = state();
+        state.show_map = true;
+        state.map_width = MAP_WIDTH;
+
+        let screen = rows(&render_sized(&state, 80, 24));
+
+        for (glyph, meaning) in [
+            ('^', "up"),
+            ('v', "down"),
+            ('↕', "up+down"),
+            ('·', "more exits"),
+        ] {
+            // The glyph as well as the words: with no room data there is
+            // no map drawn, so a `^` on screen can only have come from the
+            // legend — which is what makes this more than a spellcheck.
+            assert!(
+                screen.contains(glyph),
+                "`{glyph}` should appear in the legend: {screen}"
+            );
+            assert!(
+                screen.contains(meaning),
+                "`{glyph}` should be explained as `{meaning}`: {screen}"
+            );
+        }
     }
 
     /// The bug this pins: the box was a fixed 24 columns, sized for the
