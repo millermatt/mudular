@@ -2289,6 +2289,52 @@ fn open_world(maps: &mut HashMap<String, WorldMap>, config_dir: &Path, key: &str
     );
 }
 
+/// A channel pane's starting contents: what the last run left, where the
+/// channel persists at all (§11.1).
+///
+/// The restored block is closed with a marker naming when it ends. Without
+/// one, a tell from last Tuesday sits directly above tonight's first line
+/// and reads as new — the pane draws arrival order, not elapsed time, and
+/// a channel with `timestamps: false` shows no clock to correct the
+/// impression.
+fn restored_comms(
+    config_dir: &Path,
+    channel: &Channel,
+    scrollback_size: usize,
+) -> VecDeque<RetainedLine> {
+    if !channel.persist {
+        return VecDeque::new();
+    }
+    let mut lines = config::load_comms(config_dir, &channel.name);
+    // The file's bound and the pane's are set independently, so the file
+    // may hold more than this pane is willing to keep.
+    let over = lines.len().saturating_sub(scrollback_size);
+    let mut lines: VecDeque<RetainedLine> = lines.drain(over..).collect();
+    if let Some(last) = lines.back().map(|line| line.at) {
+        lines.push_back(RetainedLine::client(format!(
+            "** end of saved comms — the line above arrived {}",
+            last.format("%Y-%m-%d %H:%M")
+        )));
+    }
+    lines
+}
+
+/// Writes every persisting channel pane on the way out (§11.1). Only on
+/// the way out: a busy gossip channel would otherwise rewrite the file on
+/// every line, and unlike a map — which is exploration that cost someone an
+/// evening — a lost tail of chat costs the session it was in.
+fn save_comms_panes(state: &AppState) {
+    for pane in &state.channels {
+        if !pane.config.persist {
+            continue;
+        }
+        if let Err(err) = config::save_comms(&state.config_dir, &pane.config.name, &pane.lines) {
+            // Nowhere to show a notice — the client is already leaving.
+            tracing::warn!("could not save the {} pane: {err}", pane.config.name);
+        }
+    }
+}
+
 fn save_world_map(state: &mut AppState, key: &str) -> bool {
     // A `--host` session saves too: it has no profile, but the world it is
     // in has a name all the same (§16). An empty key is a session with no
@@ -2491,8 +2537,8 @@ async fn event_loop(
         channels: channels
             .iter()
             .map(|config| ChannelPane {
+                lines: restored_comms(&config_dir, config, scrollback_size),
                 config: config.clone(),
-                lines: VecDeque::new(),
                 unread: 0,
                 scrollback_limit: scrollback_size,
                 back_offset: 0,
@@ -2659,6 +2705,7 @@ async fn event_loop(
                 let layout_before = current_layout(&state);
                 if keybinds.quit.matches(key.code, key.modifiers) {
                     save_all_maps(&mut state);
+                    save_comms_panes(&state);
                     return Ok(());
                 }
                 let area_width = terminal.get_frame().area().width;
@@ -3837,6 +3884,10 @@ pub(crate) mod test_support {
             keep_in_main: false,
             timestamps: false,
             session: None,
+            // Off unless a test says otherwise: nothing here should reach
+            // the real config dir, and a test that means to exercise
+            // persistence sets it and points at a temp dir.
+            persist: false,
         }
     }
 }
@@ -4653,6 +4704,105 @@ mod tests {
         route(&mut state, 0, "Bob gossips hi");
 
         assert_eq!(state.channels[0].lines.len(), 2);
+    }
+
+    // ---- comms that survive a restart (§11.1) ----
+
+    fn persisting(name: &str) -> Channel {
+        Channel {
+            persist: true,
+            ..channel(name)
+        }
+    }
+
+    /// A tell you got ten minutes before quitting is still there when you
+    /// come back (#56), closed by a marker saying where it ends: the pane
+    /// draws arrival order, not elapsed time, so without one a week-old
+    /// tell sits above tonight's first line and reads as new.
+    #[test]
+    fn a_restored_pane_says_where_the_saved_lines_end() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut saved = VecDeque::new();
+        saved.push_back(RetainedLine::server("Bob tells you hi"));
+        config::save_comms(dir.path(), "comms", &saved).unwrap();
+
+        let lines = restored_comms(dir.path(), &persisting("comms"), 10_000);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "Bob tells you hi");
+        assert_eq!(lines[1].origin, Origin::Client);
+        assert!(
+            lines[1].text.starts_with("** end of saved comms"),
+            "{}",
+            lines[1].text
+        );
+    }
+
+    /// Nothing saved is not the same as something saved and empty: an
+    /// unused channel opens as it always did, with no marker announcing
+    /// history that isn't there.
+    #[test]
+    fn a_pane_with_nothing_saved_opens_empty() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        assert!(restored_comms(dir.path(), &persisting("comms"), 10_000).is_empty());
+    }
+
+    /// `persist: false` is how a channel carrying private conversation
+    /// stays out of the config dir — including on the way back in, where a
+    /// file written before the setting changed must not be read anyway.
+    #[test]
+    fn a_channel_that_does_not_persist_starts_empty() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut saved = VecDeque::new();
+        saved.push_back(RetainedLine::server("Bob tells you hi"));
+        config::save_comms(dir.path(), "comms", &saved).unwrap();
+
+        assert!(restored_comms(dir.path(), &channel("comms"), 10_000).is_empty());
+    }
+
+    /// The file's bound and the pane's are set independently, so restoring
+    /// must not hand a pane more lines than it is willing to hold.
+    #[test]
+    fn restoring_respects_the_panes_own_scrollback_bound() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let saved: VecDeque<RetainedLine> = (0..50)
+            .map(|n| RetainedLine::server(format!("line {n}")))
+            .collect();
+        config::save_comms(dir.path(), "comms", &saved).unwrap();
+
+        let lines = restored_comms(dir.path(), &persisting("comms"), 10);
+
+        assert_eq!(lines.len(), 11, "ten lines and the marker");
+        assert_eq!(lines[0].text, "line 40", "the newest ten, not the oldest");
+    }
+
+    /// The other end of the round trip: what the quit path writes is what
+    /// the next launch reads, and a channel that opted out is not written
+    /// at all.
+    #[test]
+    fn quitting_writes_the_persisting_panes_and_only_those() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        state.config_dir = dir.path().to_path_buf();
+        with_channel(&mut state, "comms", false);
+        with_channel(&mut state, "private", false);
+        state.channels[0].config.persist = true;
+        route(&mut state, 0, "Bob gossips hi");
+        state.push_routed(1, "private", "Bob tells you a secret".to_string());
+
+        save_comms_panes(&state);
+
+        let comms = config::load_comms(dir.path(), "comms");
+        assert_eq!(comms.len(), 1);
+        assert_eq!(comms[0].text, "Bob gossips hi");
+        assert!(
+            config::load_comms(dir.path(), "private").is_empty(),
+            "a pane that opted out leaves nothing behind"
+        );
+        assert!(
+            !config::comms_path(dir.path(), "private").exists(),
+            "not even an empty file"
+        );
     }
 
     /// A line routed to a channel that isn't declared must not panic or

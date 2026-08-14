@@ -269,10 +269,22 @@ channels:
       - '^\w+ tells you'
     keep_in_main: false   # false (default) moves the line; true copies it
     timestamps: true
+    persist: true         # true (default) — the pane survives a restart
 ```
 
 `timestamps: true` prefixes each line with `HH:MM:SS` in your system's
 local time (not the MUD server's time, and not UTC).
+
+`persist: true` is the default: the pane's last 500 lines are written to
+`comms/<channel>.json` in your config dir when you quit, and restored the
+next time you start, closed by a line saying when the saved part ends. The
+file is owner-only, but it is still a plain-text record of everything that
+reached the pane — set `persist: false` on a channel carrying private
+conversation you would rather not keep. Masked lines (`mask:`) never reach
+a pane at all, so they cannot arrive in the file by this route.
+
+One broadcast heard by several of your characters is stored, and restored,
+as the single line the pane shows.
 
 The panes dock in a column beside the character panes; `F4` shows or hides
 them. With more than one character connected, lines are tagged with the

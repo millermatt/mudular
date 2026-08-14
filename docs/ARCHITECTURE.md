@@ -1141,6 +1141,7 @@ spam — and conversely, so slow conversations stay visible.
       match: ['^\[gossip\]', '^\w+ tells you']
       keep_in_main: false     # move (default) or copy
       timestamps: true
+      persist: true           # survives a restart (default)
   ```
 
   `match` is sugar that compiles to ordinary route triggers, so channel
@@ -1164,6 +1165,31 @@ spam — and conversely, so slow conversations stay visible.
   copies do not read the same. Names rather than a count because *which*
   characters heard it is occasionally the information — one outside the
   clan does not hear clan chat.
+- **Persistence:** a pane's tail is written to `comms/<channel>.json` on
+  the way out and restored at the next launch — machine-written JSON in
+  the config dir, the third of the same shape after `ui_state.json` (§11.4)
+  and `maps/` (§16), and owner-only like a profile.
+
+  Keyed by the channel's *name*, not by world or character: channels are
+  app-level and aggregate across characters, so neither is the axis the
+  data has. A config dir used for two MUDs therefore restores both worlds'
+  gossip into the one pane — the same mixing that pane already does live.
+
+  On by default, with `persist: false` to opt a channel out: a pane exists
+  so a tell does not scroll away, and one emptied by every restart only
+  half does that. Per channel because that is the grain the decision has —
+  a gossip pane and a tells pane are not the same question. Masked lines
+  never reach scrollback (§13), so they cannot leak in by this route.
+
+  Bounded at 500 lines, independently of `scrollback_size`: raising the
+  pane's memory bound is not a request for a file to match. Written only
+  at exit — a busy channel would otherwise rewrite the file per line, and
+  unlike a map, a lost tail of chat costs only the session it was in.
+
+  The restored block is closed with a client-origin marker naming when it
+  ends. A pane draws arrival order, not elapsed time, so without one a
+  week-old tell sits directly above tonight's first line and reads as new.
+  The marker is not itself persisted, or every launch would stack another.
 - **Move vs copy:** `keep_in_main: false` gags the line from the source
   session's main scrollback (the WoW-like default); `true` mirrors it to
   both.

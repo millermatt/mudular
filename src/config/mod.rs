@@ -193,6 +193,107 @@ pub fn save_map(
     Ok(())
 }
 
+/// Where a channel pane's saved contents live (§11.1) — its own
+/// subdirectory of the config dir, the same layout `maps/` and `logs/` use.
+///
+/// Keyed by the channel's name, which is what the pane *is*: channels are
+/// app-level and aggregate across characters, so there is no one world or
+/// character whose file this could be. The consequence is worth naming: a
+/// config dir used for two MUDs restores both worlds' gossip into the one
+/// pane — which is the same mixing that pane already does live.
+pub fn comms_path(dir: &Path, channel: &str) -> PathBuf {
+    // The same sanitising `map_key` applies, and for the same reason: a
+    // channel name is whatever the player typed in `mudular.yaml`, and it
+    // is about to become a filename.
+    let key: String = channel
+        .chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
+                true => c,
+                false => '_',
+            },
+        )
+        .collect();
+    dir.join("comms").join(format!("{key}.json"))
+}
+
+/// How many lines of a channel are kept on disk. Independent of
+/// `scrollback_size`, which bounds the pane in memory: a player who raises
+/// that to keep a long evening in view has not asked for a file that grows
+/// to match.
+const PERSISTED_LINES: usize = 500;
+
+/// One line as the file holds it. `plain` is absent by design — it is
+/// derived from `text` on the way back in (`RetainedLine::restored`).
+#[derive(Serialize, Deserialize)]
+struct SavedLine {
+    text: String,
+    at: chrono::DateTime<chrono::Local>,
+    origin: crate::scrollback::Origin,
+}
+
+/// Reads a channel pane's saved contents, or nothing where there are none.
+///
+/// Lenient like `load_ui_state` rather than careful like `save_map`'s read:
+/// comms are a record of what was said, not something a player can lose
+/// work on, so a file that cannot be read is fairly an empty pane.
+pub fn load_comms(dir: &Path, channel: &str) -> Vec<crate::scrollback::RetainedLine> {
+    let path = comms_path(dir, channel);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let saved: Vec<SavedLine> = match serde_json::from_str(&text) {
+        Ok(saved) => saved,
+        Err(err) => {
+            tracing::warn!(
+                "could not parse {}: {err}; starting with an empty pane",
+                path.display()
+            );
+            return Vec::new();
+        }
+    };
+    saved
+        .into_iter()
+        .map(|line| crate::scrollback::RetainedLine::restored(line.text, line.at, line.origin))
+        .collect()
+}
+
+/// Writes a channel pane's tail. Plain overwrite, not `save_map`'s merge:
+/// this is one ordered buffer with one writer, and merging two runs'
+/// conversations by timestamp would interleave them into something neither
+/// player saw.
+pub fn save_comms(
+    dir: &Path,
+    channel: &str,
+    lines: &std::collections::VecDeque<crate::scrollback::RetainedLine>,
+) -> Result<()> {
+    let keep: Vec<&crate::scrollback::RetainedLine> = lines
+        .iter()
+        // The client's own notices are this run's furniture — the marker
+        // saying where restored history ended, above all. Keeping them
+        // would stack a fresh one under the last one at every launch.
+        .filter(|line| line.origin != crate::scrollback::Origin::Client)
+        .collect();
+    let tail = &keep[keep.len().saturating_sub(PERSISTED_LINES)..];
+    if tail.is_empty() {
+        return Ok(());
+    }
+    let saved: Vec<SavedLine> = tail
+        .iter()
+        .map(|line| SavedLine {
+            text: line.text.clone(),
+            at: line.at,
+            origin: line.origin.clone(),
+        })
+        .collect();
+    let path = comms_path(dir, channel);
+    let json = serde_json::to_string_pretty(&saved).context("serializing the channel")?;
+    // `atomic_write` creates the directory and the file owner-only, which
+    // is the mode this one wants: a tells pane is private mail.
+    atomic_write(&path, json.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -407,6 +508,20 @@ pub struct Channel {
     /// Pins the channel to one session instead of aggregating across all.
     #[serde(default)]
     pub session: Option<String>,
+    /// Whether the pane's contents survive a restart (§11.1). On by
+    /// default: a comms pane exists so a tell does not scroll away, and one
+    /// emptied by every restart only half does that job.
+    ///
+    /// Off is how a channel carrying private conversation stays out of the
+    /// config dir. It is per channel rather than global because that is the
+    /// grain the decision has — a gossip pane and a tells pane are not the
+    /// same question.
+    #[serde(default = "default_persist")]
+    pub persist: bool,
+}
+
+fn default_persist() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -2590,7 +2705,105 @@ triggers:
             keep_in_main,
             timestamps: false,
             session: None,
+            persist: false,
         }
+    }
+
+    // ---- persisted comms (§11.1) ----
+
+    use crate::scrollback::{Origin, RetainedLine};
+
+    #[test]
+    fn a_channel_pane_round_trips_through_its_file() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut lines = std::collections::VecDeque::new();
+        lines.push_back(RetainedLine::server("\x1b[36mBob gossips hi\x1b[0m"));
+        lines.push_back(RetainedLine::with_origin(
+            "Bob gossips bye",
+            Origin::Session(vec!["tank".to_string(), "cleric".to_string()]),
+        ));
+
+        save_comms(dir.path(), "comms", &lines).unwrap();
+        let restored = load_comms(dir.path(), "comms");
+
+        assert_eq!(restored, Vec::from(lines.clone()));
+        assert_eq!(
+            restored[0].plain(),
+            "Bob gossips hi",
+            "the plain projection is recomputed, not read back"
+        );
+        assert_eq!(
+            restored[1].origin,
+            Origin::Session(vec!["tank".to_string(), "cleric".to_string()]),
+            "everyone a collapsed line names survives the trip"
+        );
+    }
+
+    /// The pane's arrival times are the point — a restored line stamped
+    /// with the time it was *read* would say a week-old tell just came in.
+    #[test]
+    fn a_restored_line_keeps_the_time_it_arrived() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut line = RetainedLine::server("Bob tells you hi");
+        line.at -= chrono::TimeDelta::days(7);
+        let lines = std::collections::VecDeque::from(vec![line.clone()]);
+
+        save_comms(dir.path(), "comms", &lines).unwrap();
+
+        assert_eq!(load_comms(dir.path(), "comms")[0].at, line.at);
+    }
+
+    /// The file has its own bound: a player who raised `scrollback_size` to
+    /// keep a long evening in view has not asked for a file to match.
+    #[test]
+    fn only_the_newest_lines_are_persisted() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let lines: std::collections::VecDeque<RetainedLine> = (0..PERSISTED_LINES + 100)
+            .map(|n| RetainedLine::server(format!("line {n}")))
+            .collect();
+
+        save_comms(dir.path(), "comms", &lines).unwrap();
+        let restored = load_comms(dir.path(), "comms");
+
+        assert_eq!(restored.len(), PERSISTED_LINES);
+        assert_eq!(restored[0].text, "line 100", "the tail, not the head");
+    }
+
+    /// The marker closing a restored block is this run's furniture. Saving
+    /// it would stack a fresh one under the last one at every launch.
+    #[test]
+    fn the_clients_own_notices_are_not_persisted() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut lines = std::collections::VecDeque::new();
+        lines.push_back(RetainedLine::server("Bob gossips hi"));
+        lines.push_back(RetainedLine::client("** end of saved comms"));
+
+        save_comms(dir.path(), "comms", &lines).unwrap();
+        let restored = load_comms(dir.path(), "comms");
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].text, "Bob gossips hi");
+    }
+
+    /// Comms are a record of what was said, not work a player can lose, so
+    /// a file that cannot be read is fairly an empty pane rather than a
+    /// reason the client will not start.
+    #[test]
+    fn an_unparsable_file_is_an_empty_pane() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let path = comms_path(dir.path(), "comms");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+
+        assert!(load_comms(dir.path(), "comms").is_empty());
+    }
+
+    /// A channel name is whatever the player typed in `mudular.yaml`, and
+    /// it becomes a filename — so it must not be able to name a path.
+    #[test]
+    fn a_channel_name_cannot_escape_the_comms_directory() {
+        let path = comms_path(Path::new("/config"), "../../etc/passwd");
+        assert_eq!(path, Path::new("/config/comms/.._.._etc_passwd.json"));
     }
 
     /// `match:` is sugar for route triggers, so classification gets the

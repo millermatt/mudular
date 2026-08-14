@@ -16,6 +16,7 @@
 //! data the client did not author.
 
 use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
 
 /// One retained line. `text` is the line as it should read — server ANSI
 /// with `highlight:` splices already applied (§7.7) — and never carries
@@ -40,7 +41,11 @@ pub struct RetainedLine {
 /// Who put a line in the buffer. Server text and the client's own notices
 /// are the same bytes in the same deque otherwise, which is what makes a
 /// missed warning unrecoverable once it scrolls (docs/UX_REVIEW.md D).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized as part of a persisted channel pane (§11.1), so renaming a
+/// variant renames it on disk — `config::load_comms` is lenient about a
+/// file it cannot parse, which turns such a rename into silently dropped
+/// history rather than an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Origin {
     /// The MUD sent it.
     Server,
@@ -86,6 +91,21 @@ impl RetainedLine {
 
     pub fn from_session(name: impl Into<String>, text: impl Into<String>) -> Self {
         Self::new(text, Origin::Session(vec![name.into()]))
+    }
+
+    /// Rebuilds a line read back off disk (§11.1's persisted comms), with
+    /// the time it arrived rather than the time it was read — a restored
+    /// pane whose every line was stamped "now" would say a week-old tell
+    /// had just come in.
+    ///
+    /// `plain` is recomputed rather than stored: it is derived from `text`,
+    /// and a file able to disagree with its own text would be a second
+    /// source of truth for what a line says.
+    pub fn restored(text: impl Into<String>, at: DateTime<Local>, origin: Origin) -> Self {
+        Self {
+            at,
+            ..Self::new(text, origin)
+        }
     }
 
     fn new(text: impl Into<String>, origin: Origin) -> Self {

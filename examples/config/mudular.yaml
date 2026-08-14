@@ -32,6 +32,7 @@ channels:
       - '^\w+ tells you'
     keep_in_main: false   # false (default) moves the line; true copies it
     timestamps: true
+    persist: true         # true (default) — the pane survives a restart
     # session: kestrel    # pin to one character instead of aggregating
 
 # What happens when another character's rules inject a command into a
