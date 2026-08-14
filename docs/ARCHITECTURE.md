@@ -1309,6 +1309,44 @@ player mashing the same six characters all evening.
   wait on their respective plain feature landing and proving itself
   first.
 
+**Completion from the screen.** `look bull` in a room with a bullywug in
+it sends `look bullywug`. The completion appears dim past the cursor as
+you type and is accepted by `Enter` — there is no completion key, because
+the keystroke a completion is meant to save should not be replaced by a
+different one.
+
+- **The screen is the vocabulary.** GMCP's `Room.Chars` would name what is
+  in the room, but almost nothing sends it and MSDP has no room contents
+  at all; what every MUD does is *print* the names. So `complete` keeps a
+  bounded recency list of the words each session has seen the server
+  print, and completes the word under the cursor from it. No per-MUD
+  parsing, and it reaches player names, items and exits as readily as
+  mobs — they were all printed too.
+- **Recency is the ranking.** The room description is the most recent
+  thing on screen, so what is in front of you outranks an hour-old
+  `bullhorn` without anything in `complete` knowing what a room is. This
+  is why it is a list and not a set.
+- **A word the MUD printed whole is not extended.** `kill bat`, in a room
+  with a bat, must not become `kill battlemage` because a battlemage was
+  mentioned earlier — so the most recent match decides both ways, and a
+  match equal to what was typed means "no completion". In a game where the
+  wrong answer gets attacked, this is the rule that makes the feature
+  safe enough to be on by default; the length of the guess is not.
+- **Bounded to where a guess is safe:** at least three characters typed,
+  the last word only, the cursor at the end of the line, and never while
+  the server is masking input (§13) — a ghost drawn past the asterisks
+  would be guessing at a password out loud. Only what the *server* said is
+  learned: not our own echo, not the client's notices.
+- **`Escape` sends what you typed**, for exactly the line it was pressed
+  on — typing another character changes the question and the suggestion is
+  welcome again. `autocomplete: false` in `mudular.yaml` turns the whole
+  path off, which is what a player who wants none of it needs rather than
+  a per-line key.
+- **History stores what was sent**, `look bullywug`, not `look bull`. This
+  is not a contradiction of "what is stored is what was typed": that rule
+  is about not recording an alias's *expansion*, and the completion is
+  not an expansion — it was on screen, and pressing `Enter` accepted it.
+
 Built early for the same reason as §11.2: it is small, it is table stakes,
 and the client is already usable enough that its absence is felt every
 session.

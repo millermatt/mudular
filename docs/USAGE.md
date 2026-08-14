@@ -1171,6 +1171,36 @@ input masked, nothing is stored and `Up` does nothing, so an old command
 can't be sent as your password. History is kept in memory only and is
 gone when you quit; nothing is written to disk.
 
+## Completion
+
+Type `look bull` in a room with a bullywug in it and the rest of the name
+appears dimmed after the cursor. Press `Enter` and `look bullywug` is what
+gets sent — there is no completion key to press.
+
+Mudular has no list of what a MUD contains, so it completes from what the
+MUD has printed: names, items, exits, players, anything that has been on
+your screen recently. The most recent match wins, which is why what is in
+the room with you beats something mentioned half an hour ago.
+
+Two things it deliberately will not do:
+
+- If the MUD has printed the word you typed *whole*, it is left alone.
+  `kill bat` in a room with a bat stays `kill bat` even if a battlemage
+  was mentioned earlier.
+- It never completes while the server has your input masked, so it cannot
+  guess at a password.
+
+It needs three characters before it will guess, only completes the last
+word, and only when the cursor is at the end of the line. `Escape` drops
+the suggestion for that line — press it and `Enter` sends exactly what you
+typed. To turn it off entirely:
+
+```yaml
+autocomplete: false
+```
+
+Recall (`Up`) gives back the command that was *sent*, `look bullywug`.
+
 `channel_width:` (default 28) sets how wide the comms column starts.
 `Alt+-`/`Alt+=` resize it live for the rest of the session; neither the
 keys nor a terminal resize ever rewrite this file, so it's just the

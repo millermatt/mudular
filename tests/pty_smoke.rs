@@ -78,6 +78,27 @@ fn quits_on_the_key_even_while_output_is_flooding_in() {
     app.expect_exit("the quit key should work under a flood of output");
 }
 
+/// Completion changes what reaches the server, so the assembly worth
+/// proving end to end is exactly that: what the MUD printed, through the
+/// vocabulary, onto the input line, and back out as a different command
+/// than the one that was typed.
+#[test]
+fn sends_the_completion_of_what_the_mud_printed() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the screen");
+
+    mud.send_line("A bullywug is here.");
+    app.wait_for("bullywug", "the room's occupant should reach the screen");
+
+    app.type_line("look bull");
+
+    mud.wait_for_command("look bullywug", "Enter should send the completed line");
+}
+
 #[test]
 fn honours_a_remapped_quit_key() {
     let mud = FakeMud::start();

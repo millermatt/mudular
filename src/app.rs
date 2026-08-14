@@ -119,6 +119,20 @@ pub struct SessionPane {
     /// Text pinned above the input line; empty means no prompt.
     pub prompt: String,
     pub input: Input,
+    /// Words this MUD has printed, ranked by recency (§11.3). Per session,
+    /// because each character is standing somewhere else.
+    vocabulary: crate::complete::Vocabulary,
+    /// The rest of the word the input line would complete to — drawn as a
+    /// ghost past the cursor, and appended to what is sent. Kept rather
+    /// than recomputed where it is drawn, so what the player is looking at
+    /// and what Enter sends cannot be two different answers.
+    pub suggestion: Option<String>,
+    /// The input value Escape was pressed on. A dismissal lasts exactly as
+    /// long as that line does: type another character and the suggestion is
+    /// welcome again, because the question has changed.
+    dismissed: Option<String>,
+    /// `autocomplete:` — off makes this whole path inert (§11.3).
+    autocomplete: bool,
     pub status: String,
     /// Server took over echoing (Telnet ECHO): hide what we type.
     pub masked: bool,
@@ -332,6 +346,73 @@ pub struct Walk {
 }
 
 impl SessionPane {
+    /// Adds a line's words to what this session can complete from, and
+    /// re-answers the input line's question in their light — a name that
+    /// arrives while you are half-way through typing it is exactly the
+    /// case worth catching.
+    ///
+    /// Only what the *server* said. The client's own notices, a rule's
+    /// echo, and our own commands coming back are not names the MUD
+    /// knows, and a warning's vocabulary completing into a command is
+    /// noise at best.
+    fn learn_words(&mut self, text: &str, origin: &Origin) {
+        if !self.autocomplete || *origin != Origin::Server {
+            return;
+        }
+        self.vocabulary.learn(&crate::scrollback::strip_ansi(text));
+        self.refresh_suggestion();
+    }
+
+    /// Recomputes what the input line would complete to (§11.3).
+    ///
+    /// Called after anything that could change the answer — a keystroke, a
+    /// history walk, or a line arriving that teaches a new name — rather
+    /// than at render time, because the same answer has to serve the ghost
+    /// on screen and the text Enter actually sends.
+    fn refresh_suggestion(&mut self) {
+        self.suggestion = self.completion();
+    }
+
+    fn completion(&self) -> Option<String> {
+        if !self.autocomplete {
+            return None;
+        }
+        // Never into a password. The server is hiding this line, the
+        // scrollback never saw it, and a ghost drawn past the asterisks
+        // would be guessing at it out loud (§13).
+        if self.masked {
+            return None;
+        }
+        let value = self.input.value();
+        if self.dismissed.as_deref() == Some(value) {
+            return None;
+        }
+        // Only at the end of the line. Completing a word in the middle
+        // would have to decide what happens to the text after it, and
+        // there is no answer to that which is obvious enough to do silently.
+        if self.input.cursor() != value.chars().count() {
+            return None;
+        }
+        // The trailing run of non-space, which is empty when the line ends
+        // in a space — a word not yet begun is not a prefix.
+        let word = value.rsplit(char::is_whitespace).next()?;
+        self.vocabulary.suggest(word)
+    }
+
+    /// Escape: send what I typed, not what you guessed.
+    fn dismiss_suggestion(&mut self) {
+        self.dismissed = Some(self.input.value().to_string());
+        self.suggestion = None;
+    }
+
+    /// What the input line means, ghost included — what Enter sends.
+    fn completed_input(&self) -> String {
+        match &self.suggestion {
+            Some(rest) => format!("{}{rest}", self.input.value()),
+            None => self.input.value().to_string(),
+        }
+    }
+
     fn push_line(&mut self, line: RetainedLine) {
         if let Some(log) = &mut self.log {
             use std::io::Write as _;
@@ -636,6 +717,8 @@ pub struct AppState {
     /// handed once at launch.
     history_size: usize,
     scrollback_size: usize,
+    /// `autocomplete:` — on the same terms, and read by `connect` (§11.3).
+    autocomplete: bool,
     /// The install-wide `cross_session:` default, before a profile's own
     /// override — `/connect` needs it for the same reason it needs
     /// `history_size`/`scrollback_size`.
@@ -1033,6 +1116,7 @@ fn apply_session_event(
     match ev {
         SessionEvent::Line { text, origin } => {
             let session = &mut state.sessions[index];
+            session.learn_words(&text, &origin);
             session.push_line(RetainedLine::with_origin(text, origin));
             if !focused {
                 session.unread += 1;
@@ -1040,6 +1124,10 @@ fn apply_session_event(
             (false, Vec::new())
         }
         SessionEvent::Route { channel, text } => {
+            // Before routing, which moves the line out of this session's
+            // scrollback: a name is worth completing wherever the line it
+            // was in ended up (§11.3).
+            state.sessions[index].learn_words(&text, &Origin::Server);
             state.push_routed(index, &channel, text);
             (false, Vec::new())
         }
@@ -1731,6 +1819,7 @@ pub async fn run(
     channel_width: u16,
     map_width: u16,
     map_graphics: bool,
+    autocomplete: bool,
     cross_session_default: CrossSession,
     first_run_hint: bool,
     map_debug: Option<PathBuf>,
@@ -1747,6 +1836,7 @@ pub async fn run(
         channel_width,
         map_width,
         map_graphics,
+        autocomplete,
         cross_session_default,
         first_run_hint,
         map_debug,
@@ -1856,6 +1946,7 @@ fn connect(
     target: ConnectTarget,
     history_limit: usize,
     scrollback_limit: usize,
+    autocomplete: bool,
     peers: PeerLinks,
 ) -> SessionPane {
     // Taken before the target is consumed by `spawn` below.
@@ -1925,7 +2016,39 @@ fn connect(
         current_room: None,
         corpse: None,
         walk: None,
+        vocabulary: crate::complete::Vocabulary::default(),
+        suggestion: None,
+        dismissed: None,
+        autocomplete,
     }
+}
+
+/// A keystroke that reached the bare input line — nothing above it wanted
+/// it — and what the completion makes of the result (§11.3).
+///
+/// Its own function so it can be tested: everything else on this path is
+/// inside `event_loop`, which owns a real terminal and cannot be driven
+/// from a test.
+fn type_into_input(session: &mut SessionPane, key: crossterm::event::KeyEvent) {
+    // Escape means "send what I typed, not what you guessed" here, which
+    // it is free to mean only because every overlay that wants Escape has
+    // already had its chance at this key.
+    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        session.dismiss_suggestion();
+        return;
+    }
+    // Up/Down are built-in and unremappable (§11.3): on a single-line
+    // input they have no other meaning, and they are the one binding every
+    // user arrives knowing.
+    let walked = match key.code {
+        KeyCode::Up if key.modifiers.is_empty() => session.walk_history(true),
+        KeyCode::Down if key.modifiers.is_empty() => session.walk_history(false),
+        _ => false,
+    };
+    if !walked {
+        session.input.handle_event(&Event::Key(key));
+    }
+    session.refresh_suggestion();
 }
 
 /// Whether a picture that was on screen has just gone, leaving pixels
@@ -2485,6 +2608,7 @@ async fn event_loop(
     channel_width: u16,
     map_width: u16,
     map_graphics: bool,
+    autocomplete: bool,
     cross_session_default: CrossSession,
     first_run_hint: bool,
     map_debug: Option<PathBuf>,
@@ -2526,7 +2650,7 @@ async fn event_loop(
                 publish: Some(publish),
                 others,
             };
-            connect(target, history_size, scrollback_size, links)
+            connect(target, history_size, scrollback_size, autocomplete, links)
         })
         .collect();
     let has_sessions = !sessions.is_empty();
@@ -2575,6 +2699,7 @@ async fn event_loop(
         peer_registry: receivers.into_iter().collect(),
         history_size,
         scrollback_size,
+        autocomplete,
         cross_session_default,
     };
     // Each world read off disk once, by whichever character reaches it
@@ -2748,17 +2873,7 @@ async fn event_loop(
                     // so no NAWS report follows.
                     state.scroll_focused(key.code);
                 } else if let Some(session) = state.bound_mut() {
-                    // Up/Down are built-in and unremappable (§11.3): on a
-                    // single-line input they have no other meaning, and
-                    // they are the one binding every user arrives knowing.
-                    let walked = match key.code {
-                        KeyCode::Up if key.modifiers.is_empty() => session.walk_history(true),
-                        KeyCode::Down if key.modifiers.is_empty() => session.walk_history(false),
-                        _ => false,
-                    };
-                    if !walked {
-                        session.input.handle_event(&Event::Key(key));
-                    }
+                    type_into_input(session, key);
                 }
                 remember_layout_if_changed(&state, layout_before);
             }
@@ -3230,8 +3345,12 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     let Some(session) = state.bound_mut() else {
         return;
     };
-    let line = session.input.value().to_string();
+    // The ghost is part of the line: what is on screen is what gets sent,
+    // which is the whole bargain of an inline completion (§11.3).
+    let line = session.completed_input();
     session.input.reset();
+    session.suggestion = None;
+    session.dismissed = None;
     // Player intervention always wins over an in-flight `/goto` (§16): a
     // gate the walk hasn't discovered yet, or the player simply changing
     // their mind, is their call, not a queued route's — checked before the
@@ -3755,7 +3874,13 @@ async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &
         publish: Some(publish_tx),
         others,
     };
-    let session = connect(target, state.history_size, state.scrollback_size, links);
+    let session = connect(
+        target,
+        state.history_size,
+        state.scrollback_size,
+        state.autocomplete,
+        links,
+    );
     let key = session.map_key.clone();
     state.sessions.push(session);
     open_world(&mut state.maps, &state.config_dir, &key);
@@ -3820,6 +3945,12 @@ pub(crate) mod test_support {
                 // mention maps do not write files or report failing to.
                 map_key: String::new(),
                 walk: None,
+                vocabulary: crate::complete::Vocabulary::default(),
+                suggestion: None,
+                dismissed: None,
+                // On, so a test that means to exercise completion only has
+                // to teach the pane a word.
+                autocomplete: true,
             },
             rx,
         )
@@ -3865,6 +3996,7 @@ pub(crate) mod test_support {
                 peer_registry: crate::engine::Peers::new(),
                 history_size: 500,
                 scrollback_size: 10_000,
+                autocomplete: true,
                 cross_session_default: CrossSession::default(),
             },
             receivers,
@@ -5417,6 +5549,170 @@ mod tests {
         // Wide enough that the channel-width clamp never binds by accident;
         // the tests that care about the ceiling pass their own width.
         handle_key(state, &Keybinds::default(), code, modifiers, 120, &[])
+    }
+
+    // ---- completing from what the MUD said (§11.3) ----
+
+    fn typed(session: &mut SessionPane, text: &str) {
+        for c in text.chars() {
+            type_into_input(
+                session,
+                crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+    }
+
+    fn heard(session: &mut SessionPane, line: &str) {
+        session.learn_words(line, &Origin::Server);
+    }
+
+    /// The ask: with a bullywug in the room, typing `look bull` sends
+    /// `look bullywug` — no completion key, the guess is simply part of
+    /// the line by the time Enter is pressed.
+    #[test]
+    fn typing_a_prefix_completes_from_what_the_mud_just_said() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+
+        typed(&mut session, "look bull");
+
+        assert_eq!(session.suggestion.as_deref(), Some("ywug"));
+        assert_eq!(session.completed_input(), "look bullywug");
+    }
+
+    /// A word arriving mid-keystroke is the case worth catching: you start
+    /// typing at what you can see, and the room finishes loading.
+    #[test]
+    fn a_name_that_arrives_while_you_type_completes_what_is_already_there() {
+        let (mut session, _rx) = test_support::pane("tank");
+        typed(&mut session, "look bull");
+        assert_eq!(session.suggestion, None);
+
+        heard(&mut session, "A bullywug is here.");
+
+        assert_eq!(session.suggestion.as_deref(), Some("ywug"));
+    }
+
+    /// Escape is the way out for one line: what you typed is what is sent.
+    #[test]
+    fn escape_dismisses_the_guess_for_that_line() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        typed(&mut session, "look bull");
+
+        type_into_input(
+            &mut session,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        assert_eq!(session.suggestion, None);
+        assert_eq!(session.completed_input(), "look bull");
+    }
+
+    /// ...and only for that line. Typing on changes the question, so the
+    /// dismissal does not silently outlive what it was about.
+    #[test]
+    fn typing_after_a_dismissal_asks_again() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        typed(&mut session, "look bull");
+        type_into_input(
+            &mut session,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        typed(&mut session, "y");
+
+        assert_eq!(session.suggestion.as_deref(), Some("wug"));
+    }
+
+    /// Never into a password. The server is hiding this line and the
+    /// scrollback never saw it; a ghost past the asterisks would be
+    /// guessing at it out loud (§13).
+    #[test]
+    fn a_masked_line_is_never_completed() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        session.masked = true;
+
+        typed(&mut session, "bull");
+
+        assert_eq!(session.suggestion, None);
+    }
+
+    /// Only what the MUD said. Our own echo and the client's notices are
+    /// not names the server knows.
+    #[test]
+    fn only_the_servers_own_words_are_learned() {
+        let (mut session, _rx) = test_support::pane("tank");
+        session.learn_words("** the bullywug warning", &Origin::Client);
+        session.learn_words("> look bullywug", &Origin::Echo);
+
+        typed(&mut session, "bull");
+
+        assert_eq!(session.suggestion, None);
+    }
+
+    /// Colour is not part of a name: a MUD that tints the mob's name must
+    /// not teach an escape sequence as a word.
+    #[test]
+    fn colour_is_stripped_before_words_are_learned() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A \x1b[1;32mbullywug\x1b[0m is here.");
+
+        typed(&mut session, "bull");
+
+        assert_eq!(session.suggestion.as_deref(), Some("ywug"));
+    }
+
+    /// Completing a word in the middle of a line would have to decide what
+    /// happens to the text after it, and no answer to that is obvious
+    /// enough to do silently.
+    #[test]
+    fn nothing_is_completed_away_from_the_end_of_the_line() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        typed(&mut session, "look bull");
+
+        type_into_input(
+            &mut session,
+            crossterm::event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
+
+        assert_eq!(session.suggestion, None);
+    }
+
+    /// `autocomplete: false` makes the whole path inert — nothing learned,
+    /// nothing guessed.
+    #[test]
+    fn the_switch_turns_it_off() {
+        let (mut session, _rx) = test_support::pane("tank");
+        session.autocomplete = false;
+        heard(&mut session, "A bullywug is here.");
+
+        typed(&mut session, "look bull");
+
+        assert_eq!(session.suggestion, None);
+        assert_eq!(session.completed_input(), "look bull");
+    }
+
+    /// The end of the bargain: what is on screen is what gets sent, and
+    /// what is remembered is what was sent — recalling the command must
+    /// give back the one the MUD was asked, not the half of it that was
+    /// typed.
+    #[tokio::test]
+    async fn enter_sends_the_line_the_ghost_completed() {
+        let (mut state, _rx) = app(&["tank"]);
+        heard(&mut state.sessions[0], "A bullywug is here.");
+        typed(&mut state.sessions[0], "look bull");
+
+        submit_input(&mut state, &[]).await;
+
+        let echoed = &state.sessions[0].scrollback[0];
+        assert_eq!(echoed.text, "> look bullywug");
+        assert_eq!(state.sessions[0].suggestion, None, "and it is spent");
+        state.sessions[0].walk_history(true);
+        assert_eq!(state.sessions[0].input.value(), "look bullywug");
     }
 
     // ---- who needs me? (docs/ARCHITECTURE.md §11.7) ----

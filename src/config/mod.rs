@@ -662,6 +662,16 @@ pub struct AppConfig {
     /// without Sixel, and most are — GNOME Terminal among them.
     #[serde(default)]
     pub map_graphics: bool,
+    /// Complete what you type from what the MUD just printed (§11.3).
+    ///
+    /// On by default, and it changes what gets sent — the guess is
+    /// accepted by pressing Enter, not by a separate key. It is bounded to
+    /// where a guess is safe (a word the MUD has not printed whole, at
+    /// the end of the line, at least three characters in) and Escape
+    /// dismisses one line's worth, but a player who wants none of it wants
+    /// a switch, not a rule.
+    #[serde(default = "default_autocomplete")]
+    pub autocomplete: bool,
 }
 
 fn default_map_width() -> u16 {
@@ -682,8 +692,13 @@ impl Default for AppConfig {
             channel_width: default_channel_width(),
             map_width: default_map_width(),
             map_graphics: false,
+            autocomplete: default_autocomplete(),
         }
     }
+}
+
+fn default_autocomplete() -> bool {
+    true
 }
 
 fn default_history_size() -> usize {

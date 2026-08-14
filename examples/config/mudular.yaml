@@ -16,6 +16,11 @@ keybinds:
 # typed at every prompt, passwords included.
 history_size: 500
 
+# Complete what you type from what the MUD just printed: type "look bull"
+# with a bullywug in the room and Enter sends "look bullywug". Escape drops
+# one line's suggestion; this turns it off for good.
+autocomplete: true
+
 # How many lines each pane's scrollback keeps, session panes and channel
 # panes alike. PgUp/PgDn/Home/End scroll back through it; oldest lines drop
 # first once the buffer is full.

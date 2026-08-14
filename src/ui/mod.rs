@@ -1307,7 +1307,15 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
             session.name, state.keybinds.quit
         )
     };
-    let input_line = Paragraph::new(value).block(
+    // The completion is drawn past the cursor rather than inserted (§11.3):
+    // dim, so it reads as the client's guess rather than as something you
+    // typed, and behind the cursor, so the cursor still sits where the next
+    // character will land.
+    let mut spans = vec![Span::raw(value)];
+    if let Some(rest) = &session.suggestion {
+        spans.push(Span::styled(rest.clone(), Style::new().dim()));
+    }
+    let input_line = Paragraph::new(Line::from(spans)).block(
         Block::bordered()
             .title(title)
             .border_style(Style::new().dim()),
@@ -1388,6 +1396,7 @@ mod tests {
     use super::*;
     use crate::app::{ChannelPane, test_support};
     use crate::config::Channel;
+    use tui_input::Input;
 
     /// A 30x10 terminal splits into a 6-tall output pane (4 content rows
     /// inside its border), a 1-row prompt, and a 3-tall input box. Content
@@ -2229,6 +2238,54 @@ mod tests {
         assert!(joined.contains("Bob tells you hi"), "{joined}");
     }
 
+    /// The completion is shown before it is sent, dim and past the cursor:
+    /// it is the client's guess, and a player who does not want it has to
+    /// be able to see it is there (§11.3).
+    #[test]
+    fn the_input_line_shows_the_completion_as_a_dim_ghost() {
+        let mut state = state();
+        state.sessions[0].input = Input::default().with_value("look bull".into());
+        state.sessions[0].suggestion = Some("ywug".to_string());
+
+        let buffer = render_sized(&state, 40, 8);
+        let screen: String = (0..8).map(|y| row(&buffer, y)).collect();
+        assert!(screen.contains("look bullywug"), "{screen}");
+
+        let ghost = (0..8)
+            .flat_map(|y| (0..40).map(move |x| (x, y)))
+            .find(|(x, y)| {
+                buffer.cell((*x, *y)).unwrap().symbol() == "y"
+                    && buffer.cell((x + 1, *y)).unwrap().symbol() == "w"
+            })
+            .map(|(x, y)| buffer.cell((x, y)).unwrap().modifier);
+
+        assert_eq!(
+            ghost.map(|m| m.contains(Modifier::DIM)),
+            Some(true),
+            "the guessed half is dim: {screen}"
+        );
+    }
+
+    /// The cursor stays where the next character lands — in front of the
+    /// ghost, not past it.
+    #[test]
+    fn the_cursor_sits_before_the_ghost() {
+        let mut state = state();
+        state.sessions[0].input = Input::default().with_value("look bull".into());
+        state.sessions[0].suggestion = Some("ywug".to_string());
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        let mut cache = MapImageCache::default();
+        terminal
+            .draw(|frame| {
+                draw(frame, &state, &mut cache);
+            })
+            .unwrap();
+
+        // One for the border, nine for `look bull`.
+        assert_eq!(terminal.get_cursor_position().unwrap().x, 1 + 9);
+    }
+
     /// A comms pane aggregates several characters, so the `[name]` tag is
     /// the only thing saying who spoke — in that character's own colour,
     /// the same one tinting their pane border and tab (§11), so the pane
@@ -2337,10 +2394,11 @@ mod tests {
     #[test]
     fn a_timestamped_channel_composes_the_clock_from_the_lines_arrival_time() {
         let stored = "Bob tells you hi";
-        let at = RetainedLine::server(stored)
-            .at
-            .format("%H:%M:%S")
-            .to_string();
+        // One line, reused: building a second one to render would take its
+        // own `Local::now()`, and a second ticking over between the two
+        // made this fail at random.
+        let line = RetainedLine::server(stored);
+        let at = line.at.format("%H:%M:%S").to_string();
 
         for timestamps in [false, true] {
             let mut state = state();
@@ -2354,7 +2412,7 @@ mod tests {
                 scrollback_limit: 10_000,
                 back_offset: 0,
             };
-            channel.lines.push_back(RetainedLine::server(stored));
+            channel.lines.push_back(line.clone());
             state.channels.push(channel);
             state.show_channels = true;
 
