@@ -224,6 +224,21 @@ pub struct SessionPane {
     /// has changed is just disk churn, and a map that never changes should
     /// never be rewritten.
     pub map_dirty: bool,
+    /// Rooms whose mark this session explicitly set or cleared since the
+    /// last successful save (§16).
+    ///
+    /// A save merges into whatever another session already wrote, and
+    /// that merge must not erase a mark this session never touched —
+    /// otherwise a second character loading a stale copy would blank out
+    /// the first character's label just by autosaving. But the same "never
+    /// erase" rule then means `None` can never win against an existing
+    /// `Some`, so *removing* a mark could never actually reach disk: every
+    /// save re-merged this session's "no mark" against the on-disk mark
+    /// that was still there, and the mark always survived. This is the
+    /// list of rooms where the absence is not "I never knew," it is "I
+    /// just cleared it" — `config::save_map` applies those authoritatively
+    /// instead of merging them.
+    pub explicit_marks: HashSet<crate::map::RoomId>,
     /// A `/goto` walk in progress (§16). `None` when nothing is walking.
     pub walk: Option<Walk>,
 }
@@ -1074,9 +1089,10 @@ fn apply_session_event(
             // as this arrives is the one the line was about.
             match session.current_room {
                 Some(at) => {
-                    if session.map.set_mark(at, Some(label.clone())) {
-                        session.map_dirty = true;
-                        session.push_line(RetainedLine::client(format!(
+                    // Through the same door as `/mark`, so a trigger's
+                    // label reaches this world's other characters too.
+                    if set_mark_across_world(&mut state.sessions, index, at, Some(label.clone())) {
+                        state.sessions[index].push_line(RetainedLine::client(format!(
                             "** marked #{} as `{label}`",
                             at.0
                         )));
@@ -1776,6 +1792,7 @@ fn connect(
         corpse: None,
         map_dirty: false,
         map_save_failed: false,
+        explicit_marks: HashSet::new(),
         walk: None,
     }
 }
@@ -2085,18 +2102,25 @@ fn save_dirty_maps(sessions: &mut [SessionPane]) {
     }
 }
 
-fn save_session_map(session: &mut SessionPane) {
+/// Returns whether the map actually reached disk, so a caller can tell
+/// "written" from "there was nowhere to write it" as well as from a
+/// failure.
+fn save_session_map(session: &mut SessionPane) -> bool {
     let (config_dir, _) = &session.rules;
     // A `--host` session saves too now: it has no profile, but the world it
     // is in has a name all the same (§16).
     let key = session.map_key.clone();
     if key.is_empty() {
-        return;
+        return false;
     }
-    match config::save_map(config_dir, &key, &session.map) {
+    match config::save_map(config_dir, &key, &session.map, &session.explicit_marks) {
         Ok(()) => {
             // Working again, so a later failure is news once more.
             session.map_save_failed = false;
+            // Reached disk, authoritatively — the next save is a plain
+            // merge again until something is explicitly marked or cleared.
+            session.explicit_marks.clear();
+            true
         }
         Err(err) => {
             tracing::warn!("could not save map for {key}: {err:#}");
@@ -2116,6 +2140,7 @@ fn save_session_map(session: &mut SessionPane) {
                     "** could not save the map: {err:#} — exploration since the last save is not on disk"
                 )));
             }
+            false
         }
     }
 }
@@ -3179,6 +3204,65 @@ fn map_cursor_step(
 /// name, area and exits and nothing about what a room is *for* — no shop
 /// flag, no terrain — so the only honest source for "this is the baker's"
 /// is the person who walked in and read the sign.
+/// Writes a mark to every session that shares this world's map, and puts
+/// it on disk once. Returns whether anything actually changed.
+///
+/// A map belongs to the world, not the character (§16): every character on
+/// one MUD reads and writes one file. So a mark set or cleared through one
+/// pane is not that pane's private business. Its siblings hold their own
+/// in-memory copy of the same rooms, and `Map::merge`'s never-erase rule
+/// means a sibling saving afterwards puts a *removed* mark straight back
+/// from its stale copy — and the quit path saves every session
+/// unconditionally, so quitting guaranteed it. That is the whole of the
+/// "unmarking does not stick" bug: the removal did reach disk, and the
+/// other character then undid it on the way out.
+///
+/// Recording the change in each sibling, `explicit_marks` included, is
+/// what makes it stay: whichever of them saves next now carries the same
+/// answer rather than an older one. It also keeps the two panes agreeing
+/// about what the room is, which they otherwise would not.
+fn set_mark_across_world(
+    sessions: &mut [SessionPane],
+    from: usize,
+    at: crate::map::RoomId,
+    mark: Option<String>,
+) -> bool {
+    let Some(world) = sessions.get(from).map(|session| session.map_key.clone()) else {
+        return false;
+    };
+
+    let mut changed = false;
+    for (index, session) in sessions.iter_mut().enumerate() {
+        // An empty key is a session with no world to share — two of them
+        // are not siblings just for both being nameless, so only the one
+        // the change came from is touched.
+        let shares = !world.is_empty() && session.map_key == world;
+        if index != from && !shares {
+            continue;
+        }
+        if session.map.set_mark(at, mark.clone()) {
+            session.explicit_marks.insert(at);
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+
+    // One write rather than one per character: they share the file, and
+    // every session that could save next now carries the change, so none
+    // of them can merge it away. Immediate rather than left to the next
+    // periodic tick or a clean quit, since a process that dies first
+    // takes both of those with it.
+    if let Some(session) = sessions.get_mut(from) {
+        // Dirty exactly when the write did not happen — a failure, or a
+        // session with no world to write to — so the periodic tick still
+        // owes it a retry in both cases and in neither other.
+        session.map_dirty = !save_session_map(session);
+    }
+    true
+}
+
 fn mark_current_room(state: &mut AppState, label: &str) {
     let Some(session) = state.bound_mut() else {
         return;
@@ -3214,12 +3298,13 @@ fn mark_current_room(state: &mut AppState, label: &str) {
         Some(old) if old == label => format!("** #{} is already marked `{label}`", at.0),
         _ => format!("** marked #{} as `{label}`", at.0),
     };
-    let wanted = Some(label.to_string());
-    // Marks live in the map file, so a change is worth writing out — the
-    // player typed it, and losing it to a crash would be worse than losing
-    // a room they can simply walk back into.
-    session.map_dirty |= session.map.set_mark(at, wanted);
-    session.push_line(RetainedLine::client(notice));
+    // Every character on this world, not only the one who typed it — see
+    // `set_mark_across_world`.
+    let from = state.input_session;
+    set_mark_across_world(&mut state.sessions, from, at, Some(label.to_string()));
+    if let Some(session) = state.bound_mut() {
+        session.push_line(RetainedLine::client(notice));
+    }
 }
 
 /// Writes what the `/mark` chooser landed on, and closes it.
@@ -3248,15 +3333,20 @@ fn apply_mark_menu(state: &mut AppState) {
         },
     };
     let menu = state.mark_menu.take().expect("just checked");
-    let Some(session) = state.bound_mut() else {
+    if state.bound().is_none() {
         return;
-    };
+    }
     let notice = match &chosen {
         Some(label) => format!("** marked #{} as `{label}`", menu.at.0),
         None => format!("** unmarked #{}", menu.at.0),
     };
-    session.map_dirty |= session.map.set_mark(menu.at, chosen);
-    session.push_line(RetainedLine::client(notice));
+    // Removing is exactly the case `set_mark_across_world` exists for: a
+    // sibling still holding the old label would otherwise write it back.
+    let from = state.input_session;
+    set_mark_across_world(&mut state.sessions, from, menu.at, chosen);
+    if let Some(session) = state.bound_mut() {
+        session.push_line(RetainedLine::client(notice));
+    }
 }
 
 /// `/corpse` (§16): retraces the way back to the room a `corpse:` trigger
@@ -3460,6 +3550,7 @@ pub(crate) mod test_support {
                 corpse: None,
                 map_dirty: false,
                 map_save_failed: false,
+                explicit_marks: HashSet::new(),
                 // Empty on purpose: a test pane saves nothing unless it
                 // says which world it belongs to, so tests that never
                 // mention maps do not write files or report failing to.
@@ -6040,6 +6131,44 @@ mod tests {
         );
     }
 
+    /// The end-to-end version of the bug report: mark a room, save, unmark
+    /// it, save again — the second save used to lose the race against its
+    /// own earlier one, because merging the session's "no mark" into a
+    /// file that still had the old mark always kept the old mark.
+    /// `explicit_marks` is what makes an intentional removal actually
+    /// survive a restart rather than quietly reviving on the next launch.
+    #[test]
+    fn unmarking_a_room_survives_a_reload_after_it_was_already_saved_once() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        mark_current_room(&mut state, "shop");
+        save_dirty_maps(&mut state.sessions);
+        assert_eq!(
+            config::load_map(dir.path(), "tank").rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("shop"),
+            "the mark should have reached disk"
+        );
+
+        mark_current_room(&mut state, "");
+        let remove_row = state.mark_menu.as_ref().unwrap().entries().len() - 1;
+        state.mark_menu.as_mut().unwrap().selected = remove_row;
+        apply_mark_menu(&mut state);
+        save_dirty_maps(&mut state.sessions);
+
+        assert_eq!(
+            config::load_map(dir.path(), "tank").rooms[&crate::map::RoomId(1)].mark,
+            None,
+            "the removal should also have reached disk, not been merged away"
+        );
+    }
+
     /// The point of the flag: a tick that finds nothing new must not
     /// rewrite the file. Otherwise idling in one room churns the disk
     /// every interval, forever.
@@ -6785,18 +6914,184 @@ mod tests {
         assert!(scrollback(&state.sessions[0]).contains("marked #1 as `shop`"));
     }
 
-    /// A mark is something the player typed, so losing it to a crash would
-    /// be worse than losing a room they can walk back into.
+    /// The exact bug report this closes: mark a room, save reaches disk,
+    /// unmark it and walk away — then the process dies (killed, crashed,
+    /// or simply raced by a driver that stops it before its own exit
+    /// handlers finish) with no periodic tick and no clean quit ever
+    /// running. The removal still has to be there, because it was written
+    /// the moment it happened, not queued for later.
     #[tokio::test]
-    async fn marking_a_room_makes_the_map_worth_saving() {
+    async fn a_removed_mark_is_on_disk_even_if_the_process_dies_right_after() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
         put_room(&mut state.sessions[0].map, 1, None, &[]);
         state.sessions[0].current_room = Some(crate::map::RoomId(1));
-        state.sessions[0].map_dirty = false;
+
+        submit(&mut state, "/mark shop").await;
+        assert_eq!(
+            config::load_map(dir.path(), "tank").rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("shop")
+        );
+
+        submit(&mut state, "/mark").await;
+        let remove_row = state.mark_menu.as_ref().unwrap().entries().len() - 1;
+        state.mark_menu.as_mut().unwrap().selected = remove_row;
+        apply_mark_menu(&mut state);
+        state.sessions[0].current_room = Some(crate::map::RoomId(2));
+
+        // No `save_dirty_maps`, no quit key — reading straight from disk,
+        // as if the process had just been killed.
+        assert_eq!(
+            config::load_map(dir.path(), "tank").rooms[&crate::map::RoomId(1)].mark,
+            None,
+            "the removal must already be on disk with no save step run here"
+        );
+    }
+
+    /// The bug two earlier fixes both missed, because both looked at one
+    /// session in isolation: a map belongs to the *world*, so two
+    /// characters on one MUD share the file, and each holds its own
+    /// in-memory copy. Unmarking through one pane left the other still
+    /// holding the label, and `Map::merge`'s never-erase rule meant that
+    /// sibling's next save — guaranteed on quit, where every session is
+    /// written unconditionally — put the mark straight back. The removal
+    /// really did reach disk; the other character undid it on the way out,
+    /// so it was back at the next launch.
+    #[tokio::test]
+    async fn unmarking_is_not_undone_by_another_character_on_the_same_world() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+
+        // A room labelled in some earlier run, already on disk — so both
+        // characters load it at connect time, which is how they really
+        // both come to be holding it.
+        let mut saved = crate::map::Map::default();
+        put_room(&mut saved, 1, None, &[]);
+        saved.set_mark(crate::map::RoomId(1), Some("shop".to_string()));
+        config::save_map(
+            dir.path(),
+            "hercmud.net",
+            &saved,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+
+        let (mut state, _rx) = app(&["mathias", "saihtam"]);
+        for session in &mut state.sessions {
+            session.rules = (dir.path().to_path_buf(), None);
+            session.map_key = "hercmud.net".to_string();
+            session.map = config::load_map(dir.path(), "hercmud.net");
+            session.current_room = Some(crate::map::RoomId(1));
+        }
+        assert_eq!(
+            state.sessions[1].map.rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("shop"),
+            "both characters start out holding the label"
+        );
+
+        // One of them takes it off.
+        submit(&mut state, "/mark").await;
+        let remove_row = state.mark_menu.as_ref().unwrap().entries().len() - 1;
+        state.mark_menu.as_mut().unwrap().selected = remove_row;
+        apply_mark_menu(&mut state);
+
+        assert_eq!(
+            state.sessions[1].map.rooms[&crate::map::RoomId(1)].mark,
+            None,
+            "the sibling must not still be holding the old label"
+        );
+
+        // Quitting: every session is written, siblings included. This is
+        // the write that used to resurrect it.
+        for session in &mut state.sessions {
+            save_session_map(session);
+        }
+
+        assert_eq!(
+            config::load_map(dir.path(), "hercmud.net").rooms[&crate::map::RoomId(1)].mark,
+            None,
+            "the removal must survive the other character's save on the way out"
+        );
+    }
+
+    /// A mark is something the player typed, so losing it to a crash would
+    /// be worse than losing a room they can walk back into — worse still,
+    /// a process that dies before the *next* periodic tick or a clean quit
+    /// would lose it under the old deferred-save design. Marking now
+    /// writes to disk immediately, so the map is clean again right away
+    /// rather than merely flagged for later.
+    #[tokio::test]
+    async fn marking_a_room_saves_immediately_rather_than_waiting() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
+        state.sessions[0].map_key = "tank".to_string();
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark well").await;
 
-        assert!(state.sessions[0].map_dirty);
+        assert!(
+            !state.sessions[0].map_dirty,
+            "the write already happened, so there is nothing left owed to a later tick"
+        );
+        assert_eq!(
+            config::load_map(dir.path(), "tank").rooms[&crate::map::RoomId(1)]
+                .mark
+                .as_deref(),
+            Some("well"),
+            "the mark should be on disk without a periodic tick or a quit"
+        );
+    }
+
+    /// The half of the fix that lives in `app.rs`: `config::save_map` can
+    /// only apply a removal authoritatively if it is told which room to
+    /// apply it to, and this is where that room gets named.
+    #[tokio::test]
+    async fn marking_and_removing_both_record_the_room_as_explicitly_touched() {
+        let (mut state, _rx) = app(&["tank"]);
+        put_room(&mut state.sessions[0].map, 1, None, &[]);
+        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+
+        submit(&mut state, "/mark shop").await;
+        assert!(
+            state.sessions[0]
+                .explicit_marks
+                .contains(&crate::map::RoomId(1)),
+            "setting a mark should record the room"
+        );
+
+        // A save happened in between — the set is cleared once the mark
+        // has actually reached disk.
+        state.sessions[0].explicit_marks.clear();
+
+        state.mark_menu = Some(MarkMenu {
+            at: crate::map::RoomId(1),
+            selected: 0,
+            existing: Some("shop".to_string()),
+            typing: None,
+        });
+        // The last row is "remove" whenever the room already has a label.
+        let remove_row = state.mark_menu.as_ref().unwrap().entries().len() - 1;
+        state.mark_menu.as_mut().unwrap().selected = remove_row;
+        apply_mark_menu(&mut state);
+
+        assert_eq!(
+            state.sessions[0].map.rooms[&crate::map::RoomId(1)].mark,
+            None,
+            "the mark should be gone from the in-memory map"
+        );
+        assert!(
+            state.sessions[0]
+                .explicit_marks
+                .contains(&crate::map::RoomId(1)),
+            "removing a mark should record the room just as setting one does"
+        );
     }
 
     /// Opening the chooser is not itself a change: a stray `/mark` on a

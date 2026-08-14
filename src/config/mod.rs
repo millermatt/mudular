@@ -97,7 +97,10 @@ pub fn adopt_legacy_map(dir: &Path, legacy_keys: &[String], key: &str) -> Result
         }
         let inherited = load_map(dir, legacy_key);
         if !inherited.rooms.is_empty() {
-            save_map(dir, key, &inherited)?;
+            // A plain merge, not an authoritative one: adopting a legacy
+            // file is not a player clearing a mark, so nothing here should
+            // override what the current file already has.
+            save_map(dir, key, &inherited, &std::collections::HashSet::new())?;
         }
         std::fs::rename(&legacy, legacy.with_extension("json.migrated"))
             .with_context(|| format!("setting aside {}", legacy.display()))?;
@@ -140,7 +143,12 @@ pub fn load_map(dir: &Path, profile: &str) -> crate::map::Map {
 /// silently discard the other's half of the map. JSON, not YAML like the
 /// rest of this directory: unlike everything else in the config dir, this
 /// file is only ever machine-written and machine-read, never hand-edited.
-pub fn save_map(dir: &Path, profile: &str, map: &crate::map::Map) -> Result<()> {
+pub fn save_map(
+    dir: &Path,
+    profile: &str,
+    map: &crate::map::Map,
+    explicit_marks: &std::collections::HashSet<crate::map::RoomId>,
+) -> Result<()> {
     let path = map_path(dir, profile);
     // Deliberately *not* `load_map`: that one answers "what can this
     // session start with", where anything unreadable is fairly an empty
@@ -168,6 +176,18 @@ pub fn save_map(dir: &Path, profile: &str, map: &crate::map::Map) -> Result<()> 
         }
     };
     on_disk.merge(map.clone());
+    // `merge` never lets an absent mark erase one already on disk — right
+    // for a session that simply never saw this room, wrong for one that
+    // just cleared it on purpose. For the rooms this session actually
+    // touched, its own answer is authoritative regardless of what merge
+    // would otherwise keep.
+    for room in explicit_marks {
+        if let Some(mark) = map.rooms.get(room).map(|room| room.mark.clone())
+            && let Some(on_disk_room) = on_disk.rooms.get_mut(room)
+        {
+            on_disk_room.mark = mark;
+        }
+    }
     let json = serde_json::to_string_pretty(&on_disk).context("serializing the map")?;
     atomic_write(&path, json.as_bytes()).context("writing the map")?;
     Ok(())
@@ -1454,6 +1474,7 @@ fn apply_channel_defaults(layer: &mut RuleModule, channels: &[Channel]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn parses_full_profile() {
@@ -1737,10 +1758,10 @@ mod tests {
         let mut hers = crate::map::Map::default();
         hers.observe(&sample_room(1, "Temple Square"));
         hers.set_mark(crate::map::RoomId(1), Some("shop".to_string()));
-        save_map(dir.path(), "mathias", &hers).unwrap();
+        save_map(dir.path(), "mathias", &hers, &HashSet::new()).unwrap();
         let mut his = crate::map::Map::default();
         his.observe(&sample_room(2, "The Docks"));
-        save_map(dir.path(), "saihtam", &his).unwrap();
+        save_map(dir.path(), "saihtam", &his, &HashSet::new()).unwrap();
 
         adopt_legacy_map(dir.path(), &["mathias".to_string()], "world").unwrap();
         adopt_legacy_map(dir.path(), &["saihtam".to_string()], "world").unwrap();
@@ -1765,7 +1786,7 @@ mod tests {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
         let mut old = crate::map::Map::default();
         old.observe(&sample_room(1, "Temple Square"));
-        save_map(dir.path(), "mathias", &old).unwrap();
+        save_map(dir.path(), "mathias", &old, &HashSet::new()).unwrap();
 
         adopt_legacy_map(dir.path(), &["mathias".to_string()], "world").unwrap();
 
@@ -1819,7 +1840,7 @@ mod tests {
         map.observe(&sample_room(1, "Temple Square"));
         map.connect(crate::map::RoomId(1), "n", crate::map::RoomId(2));
 
-        save_map(dir.path(), "kestrel", &map).unwrap();
+        save_map(dir.path(), "kestrel", &map, &HashSet::new()).unwrap();
         let loaded = load_map(dir.path(), "kestrel");
 
         assert_eq!(loaded, map);
@@ -1926,7 +1947,7 @@ mod tests {
 
         let mut session = crate::map::Map::default();
         session.observe(&sample_room(1, "Temple Square"));
-        let err = save_map(dir.path(), "kestrel", &session).unwrap_err();
+        let err = save_map(dir.path(), "kestrel", &session, &HashSet::new()).unwrap_err();
 
         assert!(
             format!("{err:#}").contains("parsing the map already at"),
@@ -1946,7 +1967,7 @@ mod tests {
         let mut session = crate::map::Map::default();
         session.observe(&sample_room(1, "Temple Square"));
 
-        save_map(dir.path(), "kestrel", &session).unwrap();
+        save_map(dir.path(), "kestrel", &session, &HashSet::new()).unwrap();
 
         assert!(
             load_map(dir.path(), "kestrel")
@@ -1961,11 +1982,11 @@ mod tests {
 
         let mut first = crate::map::Map::default();
         first.observe(&sample_room(1, "Temple Square"));
-        save_map(dir.path(), "kestrel", &first).unwrap();
+        save_map(dir.path(), "kestrel", &first, &HashSet::new()).unwrap();
 
         let mut second = crate::map::Map::default();
         second.observe(&sample_room(2, "The Docks"));
-        save_map(dir.path(), "kestrel", &second).unwrap();
+        save_map(dir.path(), "kestrel", &second, &HashSet::new()).unwrap();
 
         let loaded = load_map(dir.path(), "kestrel");
         assert_eq!(
@@ -1982,6 +2003,67 @@ mod tests {
                 .get(&crate::map::RoomId(2))
                 .map(|r| r.name.as_deref()),
             Some(Some("The Docks"))
+        );
+    }
+
+    /// The bug this pins: a plain merge never lets an absent mark erase
+    /// one already on disk — right for a session that simply never saw
+    /// the room, wrong for a player who just removed the label on purpose.
+    /// Every save re-merged the session's "no mark" against the disk's
+    /// still-there mark, and the mark won every time — so `/mark` could
+    /// set a label, but nothing could ever take one off, not even across
+    /// a restart. `explicit_marks` names the room the session actually
+    /// touched, so its answer — including "gone" — is authoritative for
+    /// that room specifically, while every other room still gets the safe
+    /// merge that protects against a stale session blanking it out.
+    #[test]
+    fn removing_a_mark_survives_a_save_even_though_disk_still_has_it() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+
+        let mut marked = crate::map::Map::default();
+        marked.observe(&sample_room(1, "Temple Square"));
+        marked.set_mark(crate::map::RoomId(1), Some("shop".to_string()));
+        save_map(dir.path(), "kestrel", &marked, &HashSet::new()).unwrap();
+
+        // A fresh in-memory copy — as if the player had just unmarked the
+        // room this session, with the map already reflecting the removal
+        // but the file on disk still holding the old label.
+        let mut unmarked = marked.clone();
+        unmarked.set_mark(crate::map::RoomId(1), None);
+        let touched = HashSet::from([crate::map::RoomId(1)]);
+        save_map(dir.path(), "kestrel", &unmarked, &touched).unwrap();
+
+        let loaded = load_map(dir.path(), "kestrel");
+        assert_eq!(
+            loaded.rooms[&crate::map::RoomId(1)].mark,
+            None,
+            "the removal should have reached disk"
+        );
+    }
+
+    /// The other half of the same rule: a room this session never touched
+    /// must still be protected by the ordinary merge — `explicit_marks`
+    /// naming *a* room must not turn into forgetting the never-erase rule
+    /// for every room.
+    #[test]
+    fn a_room_outside_explicit_marks_still_keeps_its_disk_mark() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+
+        let mut marked = crate::map::Map::default();
+        marked.observe(&sample_room(1, "Temple Square"));
+        marked.set_mark(crate::map::RoomId(1), Some("shop".to_string()));
+        save_map(dir.path(), "kestrel", &marked, &HashSet::new()).unwrap();
+
+        // A second session that has never even heard of this room's mark.
+        let mut other = crate::map::Map::default();
+        other.observe(&sample_room(2, "The Docks"));
+        save_map(dir.path(), "kestrel", &other, &HashSet::new()).unwrap();
+
+        let loaded = load_map(dir.path(), "kestrel");
+        assert_eq!(
+            loaded.rooms[&crate::map::RoomId(1)].mark.as_deref(),
+            Some("shop"),
+            "a session that never touched the mark must not erase it"
         );
     }
 
