@@ -25,7 +25,7 @@ use ratatui::style::Color;
 use crate::config::{self, Channel, CrossSession, Keybinds};
 use crate::engine::{Engine, PeerSnapshot};
 use crate::proto::charset::Charset;
-use crate::scrollback::RetainedLine;
+use crate::scrollback::{Origin, RetainedLine};
 use crate::session::{self, PeerLinks, SessionCommand, SessionEvent};
 use crate::ui;
 
@@ -465,12 +465,55 @@ pub struct ChannelPane {
     pub back_offset: usize,
 }
 
+/// How far back a copy of a broadcast may lag its siblings and still be
+/// recognised as the same message. The copies are one server write fanned
+/// out over several sockets, so they arrive milliseconds apart; the seconds
+/// here are headroom for a session that stalled, not a guess at the gap.
+const HEARD_TOGETHER: chrono::TimeDelta = chrono::TimeDelta::seconds(2);
+
 impl ChannelPane {
     fn push(&mut self, line: RetainedLine) {
         self.lines.push_back(line);
         if self.lines.len() > self.scrollback_limit {
             self.lines.pop_front();
         }
+    }
+
+    /// Records `name` on an entry this line is a duplicate of, if there is
+    /// one, and reports whether it did (§11.1). One gossip heard by three
+    /// characters is one message: three sessions each parse their own copy,
+    /// and appending all three says the same sentence three times.
+    ///
+    /// Sameness is the plain-text projection — the copies may be coloured
+    /// differently per character, and that must not make them different
+    /// messages. A MUD that substitutes the recipient's name into the text
+    /// defeats this, and correctly so: those copies genuinely do not read
+    /// the same, and guessing which differences are cosmetic would collapse
+    /// lines that are not duplicates at all.
+    ///
+    /// Requiring a *different* character is what keeps a genuine repeat
+    /// apart — someone saying "hi" twice reaches the same session twice, so
+    /// the second copy finds itself already listed and lands as its own
+    /// entry. That, rather than the width of the window, is what does most
+    /// of the work here.
+    fn collapse_into_recent(&mut self, line: &RetainedLine, name: &str) -> bool {
+        for existing in self.lines.iter_mut().rev() {
+            if line.at.signed_duration_since(existing.at) > HEARD_TOGETHER {
+                return false;
+            }
+            if existing.plain() != line.plain() {
+                continue;
+            }
+            let Origin::Session(heard_by) = &mut existing.origin else {
+                continue;
+            };
+            if heard_by.iter().any(|who| who == name) {
+                return false;
+            }
+            heard_by.push(name.to_string());
+            return true;
+        }
+        false
     }
 }
 
@@ -831,10 +874,19 @@ impl AppState {
         };
         let focused = self.focus == Focus::Channel(index);
         let pane = &mut self.channels[index];
-        pane.push(match tag {
-            Some(tag) => RetainedLine::from_session(tag, text),
+        let line = match &tag {
+            Some(tag) => RetainedLine::from_session(tag.clone(), text),
             None => RetainedLine::server(text),
-        });
+        };
+        // A broadcast the other characters have already delivered is not a
+        // new line, so it neither appends nor counts: three sessions hearing
+        // one gossip must leave the pane one unread, not three.
+        if let Some(tag) = &tag
+            && pane.collapse_into_recent(&line, tag)
+        {
+            return;
+        }
+        pane.push(line);
         if !focused {
             pane.unread += 1;
         }
@@ -4460,7 +4512,7 @@ mod tests {
         assert_eq!(state.channels[0].lines[0].text, "Bob tells you hi");
         assert_eq!(
             state.channels[0].lines[0].origin,
-            Origin::Session("cleric".to_string())
+            Origin::Session(vec!["cleric".to_string()])
         );
         assert_eq!(state.channels[0].unread, 1);
         assert!(
@@ -4487,6 +4539,120 @@ mod tests {
 
         assert_eq!(state.channels[0].lines[0].text, "Bob tells you hi");
         assert_eq!(state.channels[0].lines[0].origin, Origin::Server);
+    }
+
+    fn route(state: &mut AppState, from: usize, text: &str) {
+        apply_session_event(
+            state,
+            from,
+            SessionEvent::Route {
+                channel: "comms".into(),
+                text: text.into(),
+            },
+        );
+    }
+
+    /// One gossip heard by two characters is one message (#57). Both parsed
+    /// it out of their own stream, so the pane is handed it twice — and
+    /// saying the same sentence twice is exactly what the aggregating pane
+    /// exists to avoid.
+    #[test]
+    fn one_broadcast_heard_by_two_characters_is_one_line() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        with_channel(&mut state, "comms", false);
+
+        route(&mut state, 0, "Bob gossips hi");
+        route(&mut state, 1, "Bob gossips hi");
+
+        assert_eq!(state.channels[0].lines.len(), 1);
+        assert_eq!(
+            state.channels[0].lines[0].origin,
+            Origin::Session(vec!["tank".to_string(), "cleric".to_string()]),
+            "the entry names everyone who heard it, in arrival order"
+        );
+        assert_eq!(
+            state.channels[0].unread, 1,
+            "one message is one unread, however many characters heard it"
+        );
+    }
+
+    /// Colour is the difference most likely to separate two copies of one
+    /// broadcast — a MUD may tint a channel per character — so sameness is
+    /// the plain projection, not the bytes.
+    #[test]
+    fn copies_that_differ_only_in_colour_still_collapse() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        with_channel(&mut state, "comms", false);
+
+        route(&mut state, 0, "Bob gossips hi");
+        route(&mut state, 1, "\x1b[36mBob gossips hi\x1b[0m");
+
+        assert_eq!(state.channels[0].lines.len(), 1);
+        assert_eq!(
+            state.channels[0].lines[0].text, "Bob gossips hi",
+            "the first copy to arrive is the one kept"
+        );
+    }
+
+    /// Someone saying the same thing twice is two messages. The second copy
+    /// reaches the same character, which is what tells it apart from a
+    /// sibling's copy of the first.
+    #[test]
+    fn a_character_hearing_the_same_line_twice_keeps_both() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        with_channel(&mut state, "comms", false);
+
+        route(&mut state, 0, "Bob gossips hi");
+        route(&mut state, 0, "Bob gossips hi");
+
+        assert_eq!(state.channels[0].lines.len(), 2);
+        assert_eq!(state.channels[0].unread, 2);
+    }
+
+    /// Both characters hearing both of a repeated pair leaves two entries,
+    /// each naming both — the collapse must pair the copies up, not fold
+    /// all four into one.
+    #[test]
+    fn a_repeat_both_characters_heard_stays_two_entries() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        with_channel(&mut state, "comms", false);
+
+        route(&mut state, 0, "Bob gossips hi");
+        route(&mut state, 1, "Bob gossips hi");
+        route(&mut state, 0, "Bob gossips hi");
+        route(&mut state, 1, "Bob gossips hi");
+
+        let both = Origin::Session(vec!["tank".to_string(), "cleric".to_string()]);
+        assert_eq!(state.channels[0].lines.len(), 2);
+        assert_eq!(state.channels[0].lines[0].origin, both);
+        assert_eq!(state.channels[0].lines[1].origin, both);
+    }
+
+    /// The window is what stops an identical line said an hour later from
+    /// being folded into a stale entry no one is looking at any more.
+    #[test]
+    fn an_old_entry_is_not_collapsed_into() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        with_channel(&mut state, "comms", false);
+
+        route(&mut state, 0, "Bob gossips hi");
+        state.channels[0].lines[0].at -= chrono::TimeDelta::hours(1);
+        route(&mut state, 1, "Bob gossips hi");
+
+        assert_eq!(state.channels[0].lines.len(), 2);
+    }
+
+    /// Only the aggregating case duplicates: one character parses one copy,
+    /// so a repeat there is genuinely a repeat.
+    #[test]
+    fn a_single_session_never_collapses_its_own_repeats() {
+        let (mut state, _rx) = app(&["tank"]);
+        with_channel(&mut state, "comms", false);
+
+        route(&mut state, 0, "Bob gossips hi");
+        route(&mut state, 0, "Bob gossips hi");
+
+        assert_eq!(state.channels[0].lines.len(), 2);
     }
 
     /// A line routed to a channel that isn't declared must not panic or
@@ -4526,7 +4692,7 @@ mod tests {
         assert!(commands.is_empty(), "{commands:?}");
         let line = state.sessions[1].scrollback.back().expect("the echo");
         assert_eq!(line.text, "[from tank] he is about to fall");
-        assert_eq!(line.origin, Origin::Session("tank".to_string()));
+        assert_eq!(line.origin, Origin::Session(vec!["tank".to_string()]));
         assert!(state.sessions[0].scrollback.is_empty(), "not the sender");
         assert!(state.sessions[2].scrollback.is_empty(), "not a bystander");
     }

@@ -137,7 +137,7 @@ impl SessionEvent {
 
     /// Another character's session put it here (§7.5).
     pub fn from_session(name: impl Into<String>, text: impl Into<String>) -> Self {
-        Self::line(text, Origin::Session(name.into()))
+        Self::line(text, Origin::Session(vec![name.into()]))
     }
 
     fn line(text: impl Into<String>, origin: Origin) -> Self {
@@ -3263,7 +3263,7 @@ mod tests {
             next_line_with_origin(&mut events).await,
             (
                 "[from tank] hh".to_string(),
-                Origin::Session("tank".to_string())
+                Origin::Session(vec!["tank".to_string()])
             )
         );
     }

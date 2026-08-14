@@ -1151,6 +1151,19 @@ spam — and conversely, so slow conversations stay visible.
   with more than one active session, lines carry an origin tag
   (`[kestrel] Bob tells you …`). A channel pins to a single session with
   `session: tank` when isolation is wanted.
+- **One broadcast is one line:** every character on the MUD parses its own
+  copy of a gossip, so the pane is handed the same sentence once per
+  character. Copies are collapsed into a single entry whose tag names
+  everyone who heard it (`[kestrel+tank] Bob gossips …`), counting one
+  unread rather than one per character. Sameness is the plain-text
+  projection (colour may differ per character) arriving within seconds
+  *from a character not already on the entry* — that last part, not the
+  window, is what keeps a genuine repeat from collapsing, since a second
+  "hi" reaches the same character again. A MUD that substitutes the
+  recipient's name into the text defeats the match, and should: those
+  copies do not read the same. Names rather than a count because *which*
+  characters heard it is occasionally the information — one outside the
+  clan does not hear clan chat.
 - **Move vs copy:** `keep_in_main: false` gags the line from the source
   session's main scrollback (the WoW-like default); `true` mirrors it to
   both.

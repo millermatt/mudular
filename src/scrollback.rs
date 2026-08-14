@@ -56,10 +56,15 @@ pub enum Origin {
     Rule,
     /// A command of ours, echoed locally as it was sent.
     Echo,
-    /// Text that reached this pane from another session — a cross-session
-    /// `echo_to` (§7.5), or a channel route naming the session it arrived
-    /// in (§11.1).
-    Session(String),
+    /// The sessions a line involves — a cross-session `echo_to` (§7.5),
+    /// which is always the one it came from, or a channel route naming the
+    /// characters it arrived in (§11.1).
+    ///
+    /// Several, because one broadcast heard by three characters is one
+    /// message: the channel pane collapses the copies into a single entry
+    /// and lists everyone who heard it, rather than repeating the sentence
+    /// once per character.
+    Session(Vec<String>),
 }
 
 impl RetainedLine {
@@ -80,7 +85,7 @@ impl RetainedLine {
     }
 
     pub fn from_session(name: impl Into<String>, text: impl Into<String>) -> Self {
-        Self::new(text, Origin::Session(name.into()))
+        Self::new(text, Origin::Session(vec![name.into()]))
     }
 
     fn new(text: impl Into<String>, origin: Origin) -> Self {

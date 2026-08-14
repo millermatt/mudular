@@ -1067,16 +1067,29 @@ fn channel_line(
         // wrong for most players, every day, all year.
         prefix.push(Span::raw(line.at.format("%H:%M:%S ").to_string()));
     }
-    if let Origin::Session(name) = &line.origin {
+    if let Origin::Session(names) = &line.origin
+        && let Some((first, rest)) = names.split_first()
+    {
         // The character's own colour, the same one that tints their pane
         // border and tab (§11), so a channel that several characters talk
         // into can be read by who is talking rather than by squinting at
         // names. Uncoloured profiles keep the plain tag.
-        let tag = format!("[{name}] ");
-        prefix.push(match tint(name) {
-            Some(color) => Span::styled(tag, Style::default().fg(color)),
-            None => Span::raw(tag),
-        });
+        //
+        // Several names when one broadcast reached several characters. They
+        // are named rather than counted because *which* characters heard it
+        // is occasionally the information: a character outside the clan
+        // does not hear clan chat, and `[2]` would hide that.
+        let name = |name: &str| match tint(name) {
+            Some(color) => Span::styled(name.to_string(), Style::default().fg(color)),
+            None => Span::raw(name.to_string()),
+        };
+        prefix.push(Span::raw("["));
+        prefix.push(name(first));
+        for also in rest {
+            prefix.push(Span::raw("+"));
+            prefix.push(name(also));
+        }
+        prefix.push(Span::raw("] "));
     }
     if prefix.is_empty() {
         return ansi_lines(&line.text);
@@ -2239,17 +2252,23 @@ mod tests {
         state.show_channels = true;
 
         let buffer = render_sized(&state, 70, 12);
-        let tagged = (0..12)
-            .flat_map(|y| (0..70).map(move |x| (x, y)))
-            .find(|(x, y)| buffer.cell((*x, *y)).unwrap().symbol() == "[")
-            .map(|(x, y)| buffer.cell((x, y)).unwrap().fg);
 
         assert_eq!(
-            tagged,
+            tag_colour(&buffer, 70, 12),
             Some(Color::Magenta),
             "the tag should carry the character's colour: {}",
             (0..12).map(|y| row(&buffer, y)).collect::<String>()
         );
+    }
+
+    /// The colour is on the name, not on the brackets around it — with
+    /// several names in one tag they are each their own character's colour,
+    /// so the separators cannot belong to any of them.
+    fn tag_colour(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Option<Color> {
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .find(|(x, y)| buffer.cell((*x, *y)).unwrap().symbol() == "[")
+            .map(|(x, y)| buffer.cell((x + 1, y)).unwrap().fg)
     }
 
     /// A profile with no colour set keeps a plain tag rather than picking
@@ -2273,12 +2292,43 @@ mod tests {
         state.show_channels = true;
 
         let buffer = render_sized(&state, 70, 12);
-        let tagged = (0..12)
-            .flat_map(|y| (0..70).map(move |x| (x, y)))
-            .find(|(x, y)| buffer.cell((*x, *y)).unwrap().symbol() == "[")
-            .map(|(x, y)| buffer.cell((x, y)).unwrap().fg);
 
-        assert_eq!(tagged, Some(Color::Reset));
+        assert_eq!(tag_colour(&buffer, 70, 12), Some(Color::Reset));
+    }
+
+    /// A broadcast several characters heard is one entry naming all of them
+    /// (#57) — the sentence is not repeated once per character, and each
+    /// name keeps its own colour so the tag can still be read at a glance.
+    #[test]
+    fn a_line_several_characters_heard_names_them_all_in_one_tag() {
+        let mut state = state();
+        state.sessions[0].color = Some(Color::Magenta);
+        let mut channel = ChannelPane {
+            config: test_support::channel("comms"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        };
+        channel.lines.push_back(RetainedLine::with_origin(
+            "Bob gossips hi",
+            Origin::Session(vec![state.sessions[0].name.clone(), "cleric".to_string()]),
+        ));
+        state.channels.push(channel);
+        state.show_channels = true;
+
+        let buffer = render_sized(&state, 70, 12);
+        let screen: String = (0..12).map(|y| row(&buffer, y)).collect();
+
+        assert!(
+            screen.contains("[kestrel+cleric] Bob"),
+            "both names on one entry: {screen}"
+        );
+        assert_eq!(
+            tag_colour(&buffer, 70, 12),
+            Some(Color::Magenta),
+            "the first name is still the first character's colour"
+        );
     }
 
     /// The timestamp is not stored in the line's text (§8): the pane owns
