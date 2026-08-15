@@ -43,6 +43,20 @@ git_only = true
 # grouped by conventional-commit type.
 changelog_update = true
 
+# Only open a release PR when something a player would notice has landed.
+#
+# Without this every commit qualifies, so a README tweak proposed a release of
+# its own — v0.3.1 was very nearly a docs-only release. Commits that do not
+# match still appear in the changelog of the next real release; they just no
+# longer trigger one, which is the difference between "worth telling people
+# about" and "happened".
+#
+# Known gap, and it is the honest one: a breaking change expressed *only* as
+# a `BREAKING CHANGE:` footer on some other type will not trigger a release by
+# itself. In practice such a change always arrives with a feat or a fix, and
+# the `!?` here catches the `feat!:` / `fix!:` spelling.
+release_commits = "^(feat|fix|perf)(\\(.*\\))?!?:"
+
 # A `feat:` bumps the minor version even while this is 0.x.
 #
 # The default is the Cargo reading of semver, where `y` in `0.y.z` is the
