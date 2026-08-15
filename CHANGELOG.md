@@ -8,6 +8,19 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/millermatt/mudular/compare/v0.3.1...v0.4.0) - 2026-08-15
+
+### Added
+
+- *(config)* write a commented mudular.yaml on first run
+
+### Other
+
+- licence the project GPL-3.0-or-later
+- say where mudular.yaml goes, and get the Windows path right
+- lead the README with the thing it opens by promising
+- *(release)* only propose a release for changes worth one
+
 ## [0.3.1](https://github.com/millermatt/mudular/compare/v0.3.0...v0.3.1) - 2026-08-15
 
 ### Fixed
