@@ -1,0 +1,30 @@
+# Release automation (release-plz). See .github/workflows/release-plz.yml.
+#
+# The division of labour with dist matters and is the reason for the first
+# setting below: release-plz decides the version from the conventional-commit
+# history, writes CHANGELOG.md, and tags. `dist` (dist-workspace.toml) reacts
+# to that tag by building the five targets and their installers, and it is
+# what creates the GitHub Release so the artifacts land on it. Two tools both
+# creating a release would collide, so release-plz is told not to.
+[workspace]
+# dist creates the GitHub Release from the tag; release-plz must not.
+git_release_enable = false
+
+# Tag, so dist has something to react to.
+git_tag_enable = true
+
+# Already the default for a single-crate repo, and stated anyway because the
+# whole chain hinges on it: release.yml only fires for tags matching
+# `**[0-9]+.[0-9]+.[0-9]+*`, and v0.1.0/v0.2.0 set the convention. If this
+# ever became a cargo workspace the default would silently change to
+# `{{ package }}-v{{ version }}`, which is a shape dist reads as a package
+# name rather than a plain version.
+git_tag_name = "v{{ version }}"
+
+# mudular is a binary, not a library anyone depends on from crates.io.
+# Without this release-plz would try to `cargo publish` on every release.
+publish = false
+
+# The point of the exercise: CHANGELOG.md written from the commit history,
+# grouped by conventional-commit type.
+changelog_update = true

@@ -1,0 +1,77 @@
+# Release automation, the "release PR" half. Settings live in release-plz.toml.
+#
+# How a release happens now:
+#
+#   1. Conventional commits land on main.
+#   2. `release-plz-pr` keeps one open PR that bumps the version and writes
+#      the CHANGELOG.md entry for everything unreleased. It is rewritten as
+#      more work lands, so it is always the release you would get right now.
+#   3. Merging that PR runs `release-plz-release`, which tags the new version.
+#   4. The tag triggers release.yml (dist), which builds the five targets and
+#      their installers and creates the GitHub Release holding them.
+#
+# So shipping is: read the PR, merge the PR.
+#
+# THE TOKEN IS LOAD-BEARING. A tag pushed using the default GITHUB_TOKEN does
+# not trigger other workflows -- GitHub deliberately refuses to let a workflow
+# start another one that way. Left on GITHUB_TOKEN, step 3 tags and step 4
+# never runs, so you get a release with no binaries on it. RELEASE_PLZ_TOKEN
+# should be a PAT (or GitHub App token) with `contents: write` and
+# `pull-requests: write`. The fallback below keeps this working without the
+# secret -- the PR half is unaffected -- but until it is set you would have to
+# push the tag by hand to get artifacts.
+name: Release-plz
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  push:
+    branches:
+      - main
+
+# Never two of these at once: both jobs write to the same branch and tags.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Tags when the merged commit carries a version this repo has not released.
+  # On an ordinary commit it finds nothing to do and exits.
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  # Opens or refreshes the release PR.
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5.131
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
