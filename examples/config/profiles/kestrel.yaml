@@ -1,4 +1,7 @@
-# Example character profile. Real location: ~/.config/mudular/profiles/
+# Example character profile. Real location, in the config dir:
+#   Linux:   ~/.config/mudular/profiles/
+#   macOS:   ~/Library/Application Support/mudular/profiles/
+#   Windows: %APPDATA%\mudular\config\profiles\
 name: kestrel
 host: underworld.example.org
 port: 4443

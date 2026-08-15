@@ -1,4 +1,7 @@
-# Example shared rule module. Real location: ~/.config/mudular/modules/
+# Example shared rule module. Real location, in the config dir:
+#   Linux:   ~/.config/mudular/modules/
+#   macOS:   ~/Library/Application Support/mudular/modules/
+#   Windows: %APPDATA%\mudular\config\modules\
 #
 # Modules are listed by name in a profile's `modules:` and applied in that
 # order. Giving a rule an `id` lets a profile override or disable it later

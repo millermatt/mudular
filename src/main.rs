@@ -116,6 +116,26 @@ async fn main() -> Result<()> {
     // do now" gap for a first-time player.
     let mut first_run_hint = false;
 
+    // Leave a commented `mudular.yaml` behind on a fresh install, so the
+    // settings that are not per-character have somewhere findable to be. It
+    // is inert — every line is a comment — so this changes nothing about how
+    // this launch behaves; the point is that the file is *there* to be found
+    // next to `profiles/`, which is where somebody looking for it looks.
+    //
+    // Gated on the same "no profiles yet" signal §15 uses for the wizard, and
+    // placed before it so it lands even if the form is backed out of. That
+    // also means deleting the file later does not resurrect it: an
+    // established config is not a first run.
+    //
+    // Non-fatal. A config dir we cannot write to is worth knowing about, but
+    // not worth refusing to start a client over — `--host` needs no config at
+    // all.
+    if !config::has_profiles(&dir)
+        && let Err(err) = config::write_starter_app_config(&dir)
+    {
+        tracing::warn!("could not write a starter mudular.yaml: {err:#}");
+    }
+
     // First run (docs/ARCHITECTURE.md §15): nothing named on the command
     // line and no profile saved yet, so there is nothing this launch could
     // possibly connect to without either a form or a text editor.

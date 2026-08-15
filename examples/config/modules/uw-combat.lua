@@ -1,5 +1,8 @@
--- Example script for the uw-combat module. Real location:
--- ~/.config/mudular/modules/uw-combat.lua, beside the YAML that lists it
+-- Example script for the uw-combat module. Real location, beside the YAML
+-- that lists it, in the config dir:
+--   Linux:   ~/.config/mudular/modules/uw-combat.lua
+--   macOS:   ~/Library/Application Support/mudular/modules/uw-combat.lua
+--   Windows: %APPDATA%\mudular\config\modules\uw-combat.lua
 -- in `scripts:`.
 --
 -- Everything a script can do arrives through the `mud` table: there is no

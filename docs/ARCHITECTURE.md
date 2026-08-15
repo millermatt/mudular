@@ -948,12 +948,15 @@ send UTF-8 unprompted.
 
 ## 10. Configuration & Profiles (`config`)
 
-Location: platform config dir (`~/.config/mudular/`), overridable with
+Location: platform config dir — `~/.config/mudular/` on Linux,
+`~/Library/Application Support/mudular/` on macOS,
+`%APPDATA%\mudular\config\` on Windows — overridable with
 `--config-dir`. All YAML.
 
 ```
-~/.config/mudular/
+<config dir>/
   mudular.yaml        # app settings: keybinds, theme, scrollback/history size
+                      # written commented-out on first run (§15)
   global.yaml         # global default rules (scope layer 1)
   modules/*.yaml      # shared rule modules (scope layer 2)
   profiles/*.yaml     # one file per character (scope layer 3)

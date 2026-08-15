@@ -1,4 +1,7 @@
-# Example app settings. Real location: ~/.config/mudular/mudular.yaml
+# Example app settings. Real location, in the config dir:
+#   Linux:   ~/.config/mudular/mudular.yaml
+#   macOS:   ~/Library/Application Support/mudular/mudular.yaml
+#   Windows: %APPDATA%\mudular\config\mudular.yaml
 # Entirely optional — with no file, or no keybinds section, quit defaults
 # to ctrl+c.
 keybinds:

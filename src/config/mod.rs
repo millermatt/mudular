@@ -1006,6 +1006,95 @@ impl<'de> Deserialize<'de> for KeyBinding {
 /// Loads `mudular.yaml` from the config dir, or the defaults if it (or the
 /// dir) doesn't exist yet — the common case before a first-run wizard
 /// exists (§15).
+/// The starter `mudular.yaml` written on first run (§15).
+///
+/// **Every line is a comment**, deliberately. It therefore parses to exactly
+/// the same `AppConfig::default()` as having no file at all, so writing it
+/// changes nothing about how the client behaves — its entire job is to exist
+/// and be readable. The settings that are not per-character had no
+/// discoverable home before it: the first person to install Mudular went
+/// looking for this file, did not find it, and reasonably concluded something
+/// had failed.
+///
+/// Values shown are the defaults, so uncommenting a line without editing it
+/// is a no-op rather than a surprise.
+const STARTER_APP_CONFIG: &str = r#"# Mudular's own settings — the ones that belong to the client rather than to
+# any one character. Per-character settings (host, port, triggers, aliases)
+# live in profiles/<name>.yaml instead.
+#
+# Everything here is commented out, and every value shown is already the
+# default, so this file currently changes nothing. Uncomment a line to take
+# it over. Type /reload in the client, or restart, to pick up changes.
+
+# Remap any key. A binding is like "ctrl+q", "alt+n", "f7".
+#keybinds:
+#  quit: ctrl+c                 # Ctrl+C by default
+#  help: f1                     # the in-client key and command listing
+#  server_data_inspector: f2    # raw GMCP/MSDP the server is sending
+#  cycle_layout: f3             # tabs <-> side-by-side panes
+#  toggle_channels: f4          # show or hide the comms column
+#  config_editor: f5            # edit this character's profile in-client
+#  reload: f6                   # recompile rules and scripts from disk
+#  toggle_map: f7               # show or hide the map column
+#  map_cursor: f8               # focus the map; arrows read rooms, Enter walks
+#  toggle_hud: f9               # show or hide the party strip
+#  who_needs_me: f10            # jump to whoever is in the most trouble
+#  toggle_timestamps: alt+t     # a clock down the character panes
+#  line_picker: alt+v           # pick a scrollback line into a new trigger
+#  focus_next: ctrl+tab         # cycle characters (Alt+1..9 jumps directly)
+#  channel_wider: alt+-
+#  channel_narrower: alt+=
+#  map_wider: alt+,
+#  map_narrower: alt+.
+
+# Pull tells and chat out of the main text into their own pane, so they do
+# not scroll away under combat. Each entry becomes one pane, aggregated
+# across every character unless pinned with `session:`.
+#channels:
+#  - name: comms
+#    match:
+#      - '^\w+ tells you'
+#      - '^\[gossip\]'
+#    keep_in_main: false   # false moves the line, true copies it
+#    timestamps: true
+#    persist: true         # keep the last 500 lines across restarts
+
+# How many lines each character pane remembers.
+#scrollback_size: 10000
+
+# How many lines of your own typing to keep for Up/Down.
+#history_size: 500
+
+# Starting width of the two side columns, in characters.
+#map_width: 24
+#channel_width: 28
+
+# Complete what you type from words the MUD just printed.
+#autocomplete: true
+
+# Draw the map with pixel graphics where the terminal supports them.
+#map_graphics: false
+"#;
+
+/// Writes the starter [`STARTER_APP_CONFIG`] if there is no `mudular.yaml`
+/// yet, reporting whether it created one.
+///
+/// Never touches an existing file, including one the user has emptied — an
+/// empty file is an answer, and overwriting it would be this function
+/// arguing. Callers decide *when* first run is; §15 makes that "no profiles
+/// saved yet", which is also why deleting the file later does not bring it
+/// back.
+pub fn write_starter_app_config(dir: &Path) -> Result<bool> {
+    let path = dir.join("mudular.yaml");
+    if path.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::write(&path, STARTER_APP_CONFIG)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
 pub fn load_app_config(dir: &Path) -> Result<AppConfig> {
     let path = dir.join("mudular.yaml");
     match std::fs::read_to_string(&path) {
@@ -2668,6 +2757,79 @@ triggers:
             ..Trigger::default()
         }];
         assert!(check_trigger_hygiene(&triggers).is_ok());
+    }
+
+    /// The starter file has to be *inert*. Every line is a comment, so it
+    /// must parse to exactly what no file at all parses to — otherwise
+    /// writing it on first run would quietly change the client's behaviour
+    /// for someone who never asked it to.
+    #[test]
+    fn the_starter_app_config_parses_to_the_same_defaults_as_no_file() {
+        let from_starter: AppConfig =
+            serde_yaml::from_str(STARTER_APP_CONFIG).expect("the starter file must parse");
+        let default = AppConfig::default();
+        assert_eq!(from_starter.scrollback_size, default.scrollback_size);
+        assert_eq!(from_starter.history_size, default.history_size);
+        assert_eq!(from_starter.map_width, default.map_width);
+        assert_eq!(from_starter.channel_width, default.channel_width);
+        assert_eq!(from_starter.autocomplete, default.autocomplete);
+        assert_eq!(from_starter.map_graphics, default.map_graphics);
+        assert!(
+            from_starter.channels.is_empty(),
+            "the commented channels example must not create a real pane"
+        );
+        assert_eq!(from_starter.keybinds.quit, default.keybinds.quit);
+    }
+
+    /// Every value the starter file shows is meant to already be the default,
+    /// so uncommenting a line without editing it is a no-op. Uncomment the
+    /// whole thing and it still has to agree with `AppConfig::default()`.
+    #[test]
+    fn the_starter_app_configs_shown_values_are_the_real_defaults() {
+        let uncommented: String = STARTER_APP_CONFIG
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                // The prose header is `# word`; the settings are `#key:` or
+                // `#  key:` with no space after the hash.
+                t.starts_with('#') && !t.starts_with("# ") && t != "#"
+            })
+            .map(|line| line.replacen('#', "", 1) + "\n")
+            .collect();
+        let parsed: AppConfig = serde_yaml::from_str(&uncommented)
+            .unwrap_or_else(|e| panic!("uncommented starter must parse:\n{uncommented}\n{e}"));
+        let default = AppConfig::default();
+        assert_eq!(parsed.scrollback_size, default.scrollback_size);
+        assert_eq!(parsed.history_size, default.history_size);
+        assert_eq!(parsed.map_width, default.map_width);
+        assert_eq!(parsed.channel_width, default.channel_width);
+        assert_eq!(parsed.autocomplete, default.autocomplete);
+        assert_eq!(parsed.map_graphics, default.map_graphics);
+        assert_eq!(parsed.keybinds.quit, default.keybinds.quit);
+        assert_eq!(parsed.keybinds.toggle_map, default.keybinds.toggle_map);
+    }
+
+    /// Writes once, and never argues with a file that is already there —
+    /// including one the user has deliberately emptied.
+    #[test]
+    fn write_starter_app_config_does_not_overwrite() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = dir.path();
+
+        assert!(write_starter_app_config(dir).expect("first write"));
+        let path = dir.join("mudular.yaml");
+        assert!(path.exists());
+
+        std::fs::write(&path, "").expect("empty it, as a user might");
+        assert!(
+            !write_starter_app_config(dir).expect("second write"),
+            "an existing file must be left alone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("still readable"),
+            "",
+            "an emptied file is an answer, not an invitation to rewrite it"
+        );
     }
 
     /// Wired into the save-time validator a profile session actually uses,

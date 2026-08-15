@@ -123,6 +123,9 @@ File Explorer window to land in the right folder:
 %APPDATA%\mudular\config\profiles
 ```
 
+On a Mac that folder is `~/Library/Application Support/mudular/profiles`, and
+on Linux `~/.config/mudular/profiles`.
+
 A small example — press `k` to attack, and eat when you get hungry:
 
 ```yaml
@@ -153,11 +156,17 @@ rather than to a character, and live in a file next to `profiles`:
 %APPDATA%\mudular\config\mudular.yaml
 ```
 
-**That file does not exist until you create it** — Mudular never writes one,
-and runs on sensible defaults without it, so an empty-looking `config` folder
-is normal rather than a sign something failed. There's a commented starter to
-copy in the repository at
-[`examples/config/mudular.yaml`](examples/config/mudular.yaml).
+On a Mac that's `~/Library/Application Support/mudular/mudular.yaml`, and on
+Linux `~/.config/mudular/mudular.yaml`.
+
+Mudular writes that file for you the first time it runs, with **every line
+commented out** — so it changes nothing until you uncomment something, and
+every value it shows is already the default. Open it to see what there is to
+change. If you installed before this existed, copy
+[`examples/config/mudular.yaml`](examples/config/mudular.yaml) into the folder
+above instead.
+
+Type `/reload`, or restart, to pick up changes.
 
 That's the shallow end. Triggers can also highlight text, hide it, play a
 sound, route it to a chat pane, or run a Lua script — and one character's

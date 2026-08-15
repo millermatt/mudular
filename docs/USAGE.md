@@ -49,7 +49,9 @@ flags every time. Profiles live at
 `<config dir>/profiles/<name>.yaml`:
 
 ```yaml
-# ~/.config/mudular/profiles/kestrel.yaml
+# Linux:   ~/.config/mudular/profiles/kestrel.yaml
+# macOS:   ~/Library/Application Support/mudular/profiles/kestrel.yaml
+# Windows: %APPDATA%\mudular\config\profiles\kestrel.yaml
 name: kestrel
 host: mud.example.org
 port: 4443
@@ -1165,7 +1167,9 @@ Optional app-wide settings live at `<config dir>/mudular.yaml`. Every key
 in the table above with a name in the last column can be remapped there:
 
 ```yaml
-# ~/.config/mudular/mudular.yaml
+# Linux:   ~/.config/mudular/mudular.yaml
+# macOS:   ~/Library/Application Support/mudular/mudular.yaml
+# Windows: %APPDATA%\mudular\config\mudular.yaml
 keybinds:
   quit: ctrl+q
   focus_next: alt+tab
