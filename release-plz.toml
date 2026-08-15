@@ -42,3 +42,17 @@ git_only = true
 # The point of the exercise: CHANGELOG.md written from the commit history,
 # grouped by conventional-commit type.
 changelog_update = true
+
+# A `feat:` bumps the minor version even while this is 0.x.
+#
+# The default is the Cargo reading of semver, where `y` in `0.y.z` is the
+# breaking position, so a non-breaking feature is only a patch: 71 commits
+# adding the map pane, the party strip, comms panes and autocomplete came out
+# as 0.2.1. That is defensible for a library, whose version answers "will
+# this break my build". mudular is a terminal application with no public API
+# for anyone to depend on, so its version is only ever telling a human how
+# much changed, and a patch bump tells them the wrong thing.
+#
+# Breaking markers still outrank this: `feat!:` or a `BREAKING CHANGE:`
+# trailer moves the minor position on its own.
+features_always_increment_minor = true
