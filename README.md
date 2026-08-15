@@ -200,3 +200,14 @@ The binary lands in `target/release/mudular`.
 - **[docs/USAGE.md](docs/USAGE.md)** — everything you can configure, in depth
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how it's built and why
 - **[CHANGELOG.md](CHANGELOG.md)** — what changed in each release
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — if you want to send a patch
+
+## Licence
+
+**GPL-3.0-or-later** — see [LICENSE](LICENSE). Use it, change it, share it; if
+you distribute a modified version, it carries the same licence and its source
+goes with it.
+
+There are no per-file licence headers: the licence covers the whole work, and
+this is a small enough project that a notice in every file would be more noise
+than information.
