@@ -677,6 +677,18 @@ pub struct AppConfig {
     /// a switch, not a rule.
     #[serde(default = "default_autocomplete")]
     pub autocomplete: bool,
+
+    /// Ask GitHub at startup whether a newer Mudular exists, and say so in
+    /// the first pane if one does (§15).
+    ///
+    /// On by default. Off would be the more cautious default for a network
+    /// request nobody asked for, but a player who does not know the setting
+    /// exists is exactly the player who ends up running a build with a bug
+    /// that was fixed months ago — which is how this came to be written. It
+    /// is one request to a public API, it never blocks startup, and nothing
+    /// is downloaded or changed without the player typing `/update`.
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
 }
 
 fn default_map_width() -> u16 {
@@ -698,11 +710,16 @@ impl Default for AppConfig {
             map_width: default_map_width(),
             map_graphics: false,
             autocomplete: default_autocomplete(),
+            check_for_updates: default_check_for_updates(),
         }
     }
 }
 
 fn default_autocomplete() -> bool {
+    true
+}
+
+fn default_check_for_updates() -> bool {
     true
 }
 
@@ -1071,6 +1088,10 @@ const STARTER_APP_CONFIG: &str = r#"# Mudular's own settings — the ones that b
 
 # Complete what you type from words the MUD just printed.
 #autocomplete: true
+
+# Ask GitHub at startup whether a newer Mudular exists, and say so if one
+# does. Nothing is downloaded or changed until you type /update.
+#check_for_updates: true
 
 # Draw the map with pixel graphics where the terminal supports them.
 #map_graphics: false
@@ -2773,6 +2794,7 @@ triggers:
         assert_eq!(from_starter.map_width, default.map_width);
         assert_eq!(from_starter.channel_width, default.channel_width);
         assert_eq!(from_starter.autocomplete, default.autocomplete);
+        assert_eq!(from_starter.check_for_updates, default.check_for_updates);
         assert_eq!(from_starter.map_graphics, default.map_graphics);
         assert!(
             from_starter.channels.is_empty(),
@@ -2804,6 +2826,7 @@ triggers:
         assert_eq!(parsed.map_width, default.map_width);
         assert_eq!(parsed.channel_width, default.channel_width);
         assert_eq!(parsed.autocomplete, default.autocomplete);
+        assert_eq!(parsed.check_for_updates, default.check_for_updates);
         assert_eq!(parsed.map_graphics, default.map_graphics);
         assert_eq!(parsed.keybinds.quit, default.keybinds.quit);
         assert_eq!(parsed.keybinds.toggle_map, default.keybinds.toggle_map);

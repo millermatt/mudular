@@ -8,6 +8,7 @@ mod proto;
 mod scrollback;
 mod session;
 mod ui;
+mod update;
 mod vitals;
 
 use std::path::PathBuf;
@@ -202,6 +203,30 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Off the startup path entirely: its answer reaches the event loop whenever
+    // it arrives. Launching must not wait on GitHub — the player asked to play
+    // a MUD, not to be told about software.
+    //
+    // A plain OS thread rather than `spawn_blocking`, and the two are not
+    // interchangeable here. Dropping the Tokio runtime *waits* for its blocking
+    // tasks, so a check still in flight when the player quit held the process
+    // open for the rest of its timeout — TUI already torn down, terminal
+    // apparently wedged. Measured at 3.5s against a blackholed address; a
+    // detached thread is 0.0s, because it is not the runtime's to wait for, and
+    // dying mid-syscall costs nothing since it only ever reads.
+    //
+    // Worth being precise about when that bit: a network that *drops* packets,
+    // like a captive portal or a DROP firewall. A cleanly offline machine fails
+    // DNS immediately and never noticed.
+    let update_check = app_config.check_for_updates.then(|| {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::check(&current));
+        });
+        rx
+    });
+
     app::run(
         dir,
         targets,
@@ -216,6 +241,7 @@ async fn main() -> Result<()> {
         app_config.cross_session,
         first_run_hint,
         cli.map_debug,
+        update_check,
     )
     .await
 }

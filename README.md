@@ -45,6 +45,21 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/millermatt/mudular/rele
 Same idea: installs to `~/.cargo/bin` and puts it on your PATH. Open a new
 terminal, then run `mudular`.
 
+## Keeping it up to date
+
+Mudular checks for a newer version when it starts, and mentions it in the first
+pane if there is one. Nothing is downloaded until you ask, by typing:
+
+```
+/update
+```
+
+Then restart it. To stop it checking, put `check_for_updates: false` in
+`mudular.yaml` (see [below](#settings-that-arent-about-one-character)).
+
+If you used the `.msi` rather than the one-liner, `/update` can't help — it
+will point you at the download page instead.
+
 ## Your first connection
 
 The first time you run it with nothing saved, Mudular shows a short form

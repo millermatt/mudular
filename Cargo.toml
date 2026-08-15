@@ -48,6 +48,7 @@ tokio-rustls = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tui-input = { version = "0.15", default-features = false, features = ["crossterm"] }
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 webpki-roots = "0.26"
 
 # One native credential store per platform, so no OS pulls in another's

@@ -53,6 +53,10 @@ const RELOAD_COMMAND: &str = "/reload";
 const HELP_COMMAND: &str = "/help";
 /// Opens the in-client profile editor (§10.2) — the same thing `F5` does.
 const CONFIG_COMMAND: &str = "/config";
+/// Installs a newer release, having been told one exists (§15). Applying
+/// is delegated to `mudular-update`, which knows how this copy was
+/// installed; see `crate::update`.
+const UPDATE_COMMAND: &str = "/update";
 /// Opens the same form the first-run screen shows, reachable any time
 /// rather than only at zero-profile startup (§15, UX_REVIEW.md B).
 const NEWPROFILE_COMMAND: &str = "/newprofile";
@@ -1831,6 +1835,7 @@ pub async fn run(
     cross_session_default: CrossSession,
     first_run_hint: bool,
     map_debug: Option<PathBuf>,
+    update_check: Option<tokio::sync::oneshot::Receiver<Option<crate::update::Available>>>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let result = event_loop(
@@ -1848,6 +1853,7 @@ pub async fn run(
         cross_session_default,
         first_run_hint,
         map_debug,
+        update_check,
     )
     .await;
     ratatui::restore();
@@ -2603,6 +2609,9 @@ enum Wake {
     Session(usize, Option<SessionEvent>),
     /// Time to flush any exploration that isn't on disk yet.
     SaveMaps,
+    /// The startup update check came back. `None` means "no news", which
+    /// includes every way it could have failed (§15).
+    Update(Option<crate::update::Available>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2621,6 +2630,7 @@ async fn event_loop(
     cross_session_default: CrossSession,
     first_run_hint: bool,
     map_debug: Option<PathBuf>,
+    mut update_check: Option<tokio::sync::oneshot::Receiver<Option<crate::update::Available>>>,
 ) -> Result<()> {
     // Every session publishes a snapshot of its state and reads every
     // other session's (§7.5). The channels are made up front, so a session
@@ -2833,6 +2843,15 @@ async fn event_loop(
             ev = term_events.next() => Wake::Terminal(ev),
             (index, ev) = next_session_event(&mut state.sessions) => Wake::Session(index, ev),
             _ = map_saves.tick() => Wake::SaveMaps,
+            // Guarded: a oneshot that has already produced its value resolves
+            // instantly on every later poll, which would spin the loop. The
+            // guard retires the branch after it fires.
+            found = async { update_check.as_mut().expect("guarded").await },
+                if update_check.is_some() =>
+            {
+                update_check = None;
+                Wake::Update(found.ok().flatten())
+            }
         };
 
         match wake {
@@ -2903,6 +2922,20 @@ async fn event_loop(
             Wake::Terminal(Some(Ok(_))) => {}
             Wake::Terminal(Some(Err(err))) => return Err(err.into()),
             Wake::Terminal(None) => return Ok(()),
+            Wake::Update(Some(available)) => {
+                // Into the focused pane, the way the first-run F1 hint goes
+                // into the first one: it is a client notice, not something a
+                // MUD said, and it must not look like one.
+                let version = available.version;
+                if let Some(session) = state.sessions.first_mut() {
+                    session.push_line(RetainedLine::client(format!(
+                        "Mudular {version} is available — type /update to install it                          (set check_for_updates: false in mudular.yaml to stop looking)"
+                    )));
+                }
+            }
+            // No news, or the check failed. Either way there is nothing to say
+            // — an error here is not the player's problem.
+            Wake::Update(None) => {}
             Wake::SaveMaps => {
                 // Blocking I/O on the loop thread, as the quit path already
                 // does: a map is a few tens of kilobytes of JSON, and the
@@ -3408,6 +3441,23 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         let notice = reload_rules(state, channels).await;
         if let Some(session) = state.bound_mut() {
             session.push_line(RetainedLine::client(notice));
+        }
+        return;
+    }
+    if line.trim() == UPDATE_COMMAND {
+        // Runs off the loop thread, but awaited here, so the pane stops
+        // redrawing until the updater finishes — a few seconds of download.
+        // Accepted deliberately: the player typed this, a progress bar would
+        // need state on AppState for a command used once a month, and sessions
+        // keep reading their sockets throughout because they are separate
+        // tasks. Nothing is lost, it just looks still.
+        let report = tokio::task::spawn_blocking(crate::update::apply)
+            .await
+            .unwrap_or_else(|_| vec!["the updater could not be started".to_string()]);
+        if let Some(session) = state.bound_mut() {
+            for text in report {
+                session.push_line(RetainedLine::client(text));
+            }
         }
         return;
     }

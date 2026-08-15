@@ -164,6 +164,42 @@ File Explorer's address bar to land in it.
 Override it with `--config-dir <path>` (useful for testing, or running
 multiple isolated configs).
 
+### Staying up to date
+
+At startup Mudular asks GitHub whether a newer release exists, and if one does
+it says so once, in the first pane:
+
+```
+Mudular 0.5.0 is available — type /update to install it
+```
+
+Nothing is downloaded and nothing changes until you type:
+
+```
+/update
+```
+
+That runs `mudular-update`, the updater installed alongside the client, which
+knows how this copy arrived because the installer left a receipt beside it. It
+reports what it did; restart to run the new version. The pane stops redrawing
+for the few seconds the download takes — your sessions stay connected
+throughout, it just looks still.
+
+If Mudular was installed from the `.msi`, or with `cargo install`, there is no
+receipt and no updater, so `/update` says so and points at the release page
+instead. The shell and PowerShell installers are the ones that support
+updating.
+
+To stop it looking, in `mudular.yaml`:
+
+```yaml
+check_for_updates: false
+```
+
+The check is one request to a public API, it never delays startup, and every
+way it can fail — no network, a rate limit, an unparseable reply — is treated
+as "no news" rather than reported.
+
 ### Saving a transcript
 
 Add `log: true` to a profile and everything that reaches that character's
