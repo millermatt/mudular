@@ -8,6 +8,16 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1](https://github.com/millermatt/mudular/compare/v0.3.0...v0.3.1) - 2026-08-15
+
+### Fixed
+
+- *(config)* stop the editor refusing profiles it should accept
+
+### Other
+
+- rewrite the README for someone installing it for the first time
+
 ## [0.3.0](https://github.com/millermatt/mudular/compare/v0.2.0...v0.3.0) - 2026-08-15
 
 ### Added
