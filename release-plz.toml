@@ -25,6 +25,20 @@ git_tag_name = "v{{ version }}"
 # Without this release-plz would try to `cargo publish` on every release.
 publish = false
 
+# Take the last released version from the git tags, not from crates.io.
+#
+# This is not optional here, and the first run proved it: release-plz's
+# baseline is the cargo registry, so for a package that was never published
+# it sees no previous release at all. It read Cargo.toml's 0.2.0 as the
+# version still to be released, decided "next version is 0.2.0", found
+# nothing to change and opened no PR -- the 71 commits and the v0.2.0 tag
+# were both invisible to it. Reading tags instead is what makes an
+# unpublished binary work, and it pairs with `git_tag_name` above, which is
+# the template used to parse them.
+#
+# Mutually exclusive with `publish = true`; release-plz rejects the pair.
+git_only = true
+
 # The point of the exercise: CHANGELOG.md written from the commit history,
 # grouped by conventional-commit type.
 changelog_update = true
