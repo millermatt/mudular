@@ -8,6 +8,85 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/millermatt/mudular/compare/v0.2.0...v0.3.0) - 2026-08-15
+
+### Added
+
+- /comms shows or hides the comms column
+- a clock down the character panes, on a key
+- complete what you type from what the MUD just printed
+- comms panes that survive a restart
+- one comms line per broadcast, however many characters heard it
+- experience in the party strip, where a server reports its ceiling
+- every character on the world, on the one map
+- a legend on the map, and a colour custom marks cannot borrow
+- say who needs you, when you are looking somewhere else
+- draw the map with pixels where the terminal takes them
+- one map per MUD, not per character
+- reach the map with Alt+<n>, like any other pane
+- scrollbars that say how much is out of sight
+- show the party strip by default when playing several characters
+- a party strip showing every character's vitals
+- give every map label its own colour, from a designed palette
+- a map cursor that reads rooms and walks to them
+- mark rooms whose exits the map could not draw
+- remember which panes were up, and how wide
+- tag comms lines in the speaking character's own colour
+- a chooser for /mark, and let triggers write the label
+- label rooms yourself with /mark
+- flush exploration to disk while you play, not only on quit
+- draw map rooms as filled ground, behind a swappable renderer
+- walk back to where you died with /corpse
+- add the map pane, and a form of the map that reads aloud
+- add /goto, walking a known route one step at a time
+- make the F2 inspector show MSDP as well as GMCP
+- keep a character's map between sessions
+- report which room a character is in, and how they got there
+- add the room graph behind the auto-mapper
+- hint that F1 exists on a first-run session's opening screen
+- add a default keybind for /reload
+
+### Fixed
+
+- *(release)* read the last version from git tags, not crates.io
+- a reload keeps the state the wire taught the engine
+- ask MSDP for the room as it stands, not only when it changes
+- no full-screen blank when the map appears
+- the map appears as soon as there is a room, not a move later
+- a legend that wraps at entries, not mid-entry
+- real arrows for exits that leave the flat grid
+- the legend names the exit glyphs too
+- unmarking a room sticks, even with another character connected
+- stop the sixel map from hanging, ghosting, and stalling typing
+- the map's pixels go away when the map does
+- a map letter no longer punches a hole in the map
+- typing a word into the mark chooser writes that word
+- the last three findings from the mapper review
+- exits replace the room's list whatever order they arrive in
+- anchor the map on its best-connected room, not its lowest vnum
+- never drop the room the player is standing in
+- a walk whose route the world invalidated stops, not panics
+- a new room no longer inherits the last room's exits
+- stop the map reshaping when the player moves
+- draw a corridor's direction, not the gap between two rooms
+- rebind the map column resize keys off the brackets
+- subscribe to MSDP ROOM, and only after agreeing to the option
+- treat a room vnum of zero as no room at all
+- an arrival a walk did not predict no longer teaches the map
+- stop a summon or an auto-flee from inventing an exit
+- resolve GHSA-rhfx-m35p-ff5j by upgrading ratatui to 0.30
+
+### Other
+
+- *(release)* bump the minor version for features while 0.x
+- *(release)* automate releases from the commit history
+- one map per world, shared by every character on it
+- promote the auto-mapper from a designed-for extension to §16
+- ignore .vscode
+- a step typed mid-walk cancels it, and the walk cannot resume
+- pin what a walk broken part way through does to the map
+- lock in that the unread badge already matches the pane color
+
 ## [0.2.0] - 2026-08-09
 
 ### Added
