@@ -8,6 +8,17 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/millermatt/mudular/compare/v0.4.0...v0.5.0) - 2026-08-15
+
+### Added
+
+- say when a new version exists, and install it on request
+
+### Other
+
+- say what %APPDATA% is, once, and keep using %APPDATA%
+- install in one line, now that the repo is public
+
 ## [0.4.0](https://github.com/millermatt/mudular/compare/v0.3.1...v0.4.0) - 2026-08-15
 
 ### Added
