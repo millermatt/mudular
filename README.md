@@ -139,8 +139,15 @@ File Explorer window to land in the right folder:
 %APPDATA%\mudular\config\profiles
 ```
 
+(`%APPDATA%` is your **Roaming** folder — `C:\Users\<you>\AppData\Roaming` —
+and works typed literally in the address bar.)
+
 On a Mac that folder is `~/Library/Application Support/mudular/profiles`, and
 on Linux `~/.config/mudular/profiles`.
+
+Alongside `profiles` you may also see `maps`, and a `modules` folder if you
+have made one — shared rule files live there, and Mudular does not create it
+until you do.
 
 A small example — press `k` to attack, and eat when you get hungry:
 

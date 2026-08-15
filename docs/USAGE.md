@@ -156,10 +156,18 @@ By default, the platform config directory:
 - macOS: `~/Library/Application Support/mudular/`
 - Windows: `%APPDATA%\mudular\config\`
 
-Note the extra `config` on Windows — that is what the platform's own
-convention puts there, so `~/.config/mudular/mudular.yaml` elsewhere in this
-document is `%APPDATA%\mudular\config\mudular.yaml` there. Paste the path into
-File Explorer's address bar to land in it.
+`%APPDATA%` is your **Roaming** folder — `C:\Users\<you>\AppData\Roaming` —
+and can be typed literally into File Explorer's address bar. It is written that
+way throughout this document.
+
+Note the extra `config` on Windows: that is what the platform's own convention
+puts there, so `~/.config/mudular/mudular.yaml` elsewhere in this document is
+`%APPDATA%\mudular\config\mudular.yaml` there.
+
+Only `profiles/` is created for you, alongside `mudular.yaml` and whatever
+state builds up (`maps/`, `comms/`). `modules/` is optional and Mudular never
+creates it: make it yourself the first time you want to share rules between
+characters.
 
 Override it with `--config-dir <path>` (useful for testing, or running
 multiple isolated configs).
