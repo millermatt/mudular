@@ -144,6 +144,21 @@ triggers:
 
 Type `/reload` in the client to pick up changes without reconnecting.
 
+### Settings that aren't about one character
+
+Keybindings, chat panes, and how much scrollback to keep belong to the client
+rather than to a character, and live in a file next to `profiles`:
+
+```
+%APPDATA%\mudular\config\mudular.yaml
+```
+
+**That file does not exist until you create it** — Mudular never writes one,
+and runs on sensible defaults without it, so an empty-looking `config` folder
+is normal rather than a sign something failed. There's a commented starter to
+copy in the repository at
+[`examples/config/mudular.yaml`](examples/config/mudular.yaml).
+
 That's the shallow end. Triggers can also highlight text, hide it, play a
 sound, route it to a chat pane, or run a Lua script — and one character's
 rules can command another, which is how a warrior gets healed by a cleric
