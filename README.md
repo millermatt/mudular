@@ -7,42 +7,43 @@ without you typing anything.
 
 ![Two characters side by side, each in its own colour, with both their vitals in the party strip along the bottom](docs/images/multisession.png)
 
-## Getting it running on Windows
+## Installing it
 
-You need to be **signed in to GitHub** in your browser first — this repository
-is private, so downloads only work for people invited to it. If the links
-below give you a 404, that's what it means.
+### Windows
 
-**1. Download the installer.** Go to the
-[latest release](https://github.com/millermatt/mudular/releases/latest) and
-download the file ending in **`.msi`**:
+Open **Windows Terminal** — press Start, type `terminal`, open it. (It ships
+with Windows 11. On Windows 10 search for `powershell` instead.) Paste this in
+and press Enter:
 
-```
-mudular-x86_64-pc-windows-msvc.msi
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/millermatt/mudular/releases/latest/download/mudular-installer.ps1 | iex"
 ```
 
-**2. Run it.** Double-click the downloaded file. Windows will almost certainly
-say **"Windows protected your PC"** — that's only because this installer isn't
-signed by a company Microsoft recognises, not because anything is wrong with
-it. Click **More info**, then **Run anyway**.
+That's the whole install. It puts Mudular in `%USERPROFILE%\.cargo\bin` and
+adds that to your PATH.
 
-**3. Click through the installer.** The defaults are what you want. In
-particular leave the option to add Mudular to your **PATH** switched on, which
-is what lets you start it by name in the next step. It installs to
-`C:\Program Files\mudular\`.
-
-**4. Open Windows Terminal.** Press the Start button, type `terminal`, and open
-**Windows Terminal**. (It comes with Windows 11. On Windows 10, PowerShell
-works too — search for `powershell` instead.)
-
-**5. Start it.** Type this and press Enter:
+**Then close the terminal and open a new one** — a fresh window is what picks
+up the PATH change. Now type:
 
 ```
 mudular
 ```
 
-If you get `mudular is not recognized`, close the terminal window and open a
-new one — a fresh terminal is needed to notice the PATH change from step 3.
+If you'd rather have a traditional double-click installer, there's an `.msi` on
+the [latest release](https://github.com/millermatt/mudular/releases/latest).
+Windows will warn you it's from an unrecognised publisher (**More info** →
+**Run anyway**), because the installer isn't signed by a company Microsoft
+knows. The one-liner above avoids that warning and is the better bet if you
+ever want Mudular to update itself.
+
+### macOS and Linux
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/millermatt/mudular/releases/latest/download/mudular-installer.sh | sh
+```
+
+Same idea: installs to `~/.cargo/bin` and puts it on your PATH. Open a new
+terminal, then run `mudular`.
 
 ## Your first connection
 
@@ -179,8 +180,8 @@ it, with examples.
 - **Boxes or question marks instead of the map** — your terminal font is
   missing the characters it draws with. Windows Terminal's default (Cascadia
   Mono) is fine; older fonts may not be.
-- **`mudular is not recognized`** — open a new terminal window (see step 5).
-- **Downloads 404** — sign in to GitHub; the repository is private.
+- **`mudular is not recognized`** — close the terminal and open a new one; the
+  installer changed your PATH and only a fresh window sees it.
 - **Anything else** — open an issue on the repository with what you did and
   what you saw.
 
