@@ -5,7 +5,7 @@ in split panes, draws a map of where you've been as you walk, and can react to
 what the game says — heal when you're hurt, loot a corpse, answer a tell —
 without you typing anything.
 
-![Playing with the map column open, rooms labelled shop/rent/forge/healer, and the party strip along the bottom](docs/images/overview.png)
+![Two characters side by side, each in its own colour, with both their vitals in the party strip along the bottom](docs/images/multisession.png)
 
 ## Getting it running on Windows
 
@@ -105,7 +105,10 @@ the panes apart at a glance. `Ctrl+Tab` moves between them, and a character you
 aren't looking at shows a dot and a count when something new arrives.
 
 The map builds itself as you walk — nothing to set up. `F8` moves a cursor
-over it, and pressing Enter on a room walks you there one step at a time.
+over it, and pressing Enter on a room walks you there one step at a time. You
+can label rooms yourself, so the shop and the healer stay findable:
+
+![One character with the map column open, rooms labelled shop, rent, forge and healer](docs/images/overview.png)
 
 ## Making it do things for you
 
