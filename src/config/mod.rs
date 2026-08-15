@@ -1537,12 +1537,23 @@ pub fn validate_profile_rules(
 ///   editing) and confusing to debug later, since nothing in the editor
 ///   flags it as inert.
 fn check_trigger_hygiene(triggers: &[Trigger]) -> Result<()> {
-    let mut seen_patterns = std::collections::HashSet::new();
+    let mut seen_ids = std::collections::HashSet::new();
     for trigger in triggers {
-        if let Some(pattern) = &trigger.pattern
-            && !seen_patterns.insert(pattern.as_str())
+        // Sharing a *pattern* is fine, and used deliberately: one anchor can
+        // drive several reactions that differ only in their `when:` guard.
+        // This used to reject that, which made a hand-written profile
+        // impossible to save through the editor.
+        //
+        // Sharing an `id` is not fine. An id is the handle a later layer
+        // uses to override or disable a rule, and two rules answering to one
+        // name make it ambiguous which gets reached.
+        if let Some(id) = &trigger.id
+            && !seen_ids.insert(id.as_str())
         {
-            bail!("two triggers share the pattern `{pattern}`");
+            bail!(
+                "two triggers share the id `{id}` — ids have to be unique, \
+                 since that is how a rule is overridden or disabled later"
+            );
         }
         let no_action = trigger.send.is_none()
             && trigger.send_to.is_none()
@@ -1552,7 +1563,14 @@ fn check_trigger_hygiene(triggers: &[Trigger]) -> Result<()> {
             && trigger.route.is_none()
             && trigger.highlight.is_none()
             && trigger.bell != Some(true);
-        if no_action {
+        // An override is not a rule of its own, so the action lives in the
+        // layer it patches, not here. `id` + `enabled: false` is the
+        // documented way to switch off a shared module's rule (§7.3), and a
+        // pattern-less rule is an override by the engine's own definition —
+        // `merge_layer` already rejects one that patches nothing. Demanding
+        // an action from either made the documented shape unsaveable.
+        let is_override = trigger.enabled == Some(false) || trigger.pattern.is_none();
+        if no_action && !is_override {
             let label = trigger
                 .id
                 .as_deref()
@@ -2560,8 +2578,13 @@ triggers:
         assert!(check_trigger_hygiene(&triggers).is_ok());
     }
 
+    /// One anchor, several reactions: two triggers may watch the same line
+    /// and do different things, and needing an `id` to say so would make
+    /// `id` mandatory for a shape that does not otherwise want one. The
+    /// editor refused to save this, which made a hand-written profile
+    /// unsaveable through the UI.
     #[test]
-    fn check_trigger_hygiene_rejects_a_duplicate_pattern() {
+    fn check_trigger_hygiene_allows_two_triggers_to_share_a_pattern() {
         let triggers = vec![
             Trigger {
                 send: Some(vec!["look".to_string()]),
@@ -2572,8 +2595,27 @@ triggers:
                 ..trigger("rat")
             },
         ];
+        assert!(check_trigger_hygiene(&triggers).is_ok());
+    }
+
+    /// An `id`, though, is how a later layer reaches back to override or
+    /// disable a rule, so two rules cannot answer to one name.
+    #[test]
+    fn check_trigger_hygiene_rejects_a_duplicate_id() {
+        let triggers = vec![
+            Trigger {
+                id: Some("autoloot".to_string()),
+                send: Some(vec!["get all corpse".to_string()]),
+                ..trigger("is dead")
+            },
+            Trigger {
+                id: Some("autoloot".to_string()),
+                gag: Some(true),
+                ..trigger("something else")
+            },
+        ];
         let err = check_trigger_hygiene(&triggers).unwrap_err();
-        assert!(format!("{err:#}").contains("rat"), "{err:#}");
+        assert!(format!("{err:#}").contains("autoloot"), "{err:#}");
     }
 
     #[test]
@@ -2611,6 +2653,20 @@ triggers:
                 ..Trigger::default()
             },
         ];
+        assert!(check_trigger_hygiene(&triggers).is_ok());
+    }
+
+    /// Turning off a shared module's rule is `id` + `enabled: false` and
+    /// nothing else (§7.3). The action belongs to the rule being patched, so
+    /// insisting on one here rejected the documented way to disable one —
+    /// which made any profile using it unsaveable through the editor.
+    #[test]
+    fn check_trigger_hygiene_allows_an_override_that_only_disables() {
+        let triggers = vec![Trigger {
+            id: Some("autoloot".to_string()),
+            enabled: Some(false),
+            ..Trigger::default()
+        }];
         assert!(check_trigger_hygiene(&triggers).is_ok());
     }
 

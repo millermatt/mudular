@@ -1110,12 +1110,24 @@ fn merge_layer<T: Layered>(
     incoming: &[T],
     module: &str,
 ) -> Result<(), EngineError> {
+    // Shadowing is a thing later layers do to earlier ones (§7.3), so only
+    // what this layer inherited is a candidate. Searching the whole
+    // accumulator also matched rules this same layer had just added, which
+    // meant two rules in one file sharing a pattern — one anchor, two
+    // reactions, told apart by their `when:` — silently collapsed into one,
+    // the second overwriting the first. Two rules an author wrote side by
+    // side are two rules; an `id` is for reaching across layers, and should
+    // not be the price of writing them.
+    let inherited = acc.len();
     for rule in incoming {
         if !rule.has_identity() {
             return Err(rule.identity_error(module));
         }
 
-        match acc.iter().position(|existing| same_rule(existing, rule)) {
+        match acc[..inherited]
+            .iter()
+            .position(|existing| same_rule(existing, rule))
+        {
             Some(pos) => {
                 let mut patched = rule.clone();
                 patched.fill_from(&acc[pos]);
@@ -3469,6 +3481,60 @@ triggers:
             reloaded.server_data().get("Char.Vitals.hp"),
             Some(&"90".to_string()),
             "and has to keep winning after a reload"
+        );
+    }
+
+    // ---- layering keeps a file's own rules distinct (§7.3) ----
+
+    /// One anchor driving two reactions, in one file, with no ids. Shadowing
+    /// searched the whole accumulator including rules the same layer had just
+    /// added, so the second overwrote the first and only one of them ever
+    /// fired — silently, since nothing reported a rule had been dropped.
+    #[test]
+    fn two_rules_in_one_layer_sharing_a_pattern_both_fire() {
+        let mut engine = engine(
+            r#"
+            name: test
+            triggers:
+              - pattern: 'hits you'
+                send: ["heal me"]
+              - pattern: 'hits you'
+                send: ["assist tank"]
+            "#,
+        );
+        assert_eq!(
+            engine.process_line("the goblin hits you hard.").sends,
+            vec!["heal me", "assist tank"],
+            "both rules an author wrote side by side have to survive"
+        );
+    }
+
+    /// The other half: shadowing across layers still works, which is what
+    /// the accumulator search is actually for. A later layer's id-less rule
+    /// replaces an earlier layer's rule with the same pattern.
+    #[test]
+    fn a_later_layer_still_shadows_an_earlier_pattern() {
+        let base = module(
+            r#"
+            name: base
+            triggers:
+              - pattern: 'hits you'
+                send: ["flee"]
+            "#,
+        );
+        let over = module(
+            r#"
+            name: over
+            triggers:
+              - pattern: 'hits you'
+                send: ["stand and fight"]
+            "#,
+        );
+        let mut engine = Engine::compile(&[base, over]).expect("compiles");
+        assert_eq!(
+            engine.process_line("the goblin hits you hard.").sends,
+            vec!["stand and fight"],
+            "a later layer must still override an earlier same-pattern rule"
         );
     }
 
