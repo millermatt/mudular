@@ -220,7 +220,14 @@ fn creates_a_profile_from_the_wizard_and_connects() {
     // A single unspaced token: ratatui writes cells in diff order, so a
     // multi-word phrase can reach the terminal split across writes (see
     // the module doc comment on `BANNER`).
-    app.wait_for("YAML", "the wizard should appear on first run");
+    // Keyed on the wizard's own furniture rather than its intro sentence: the
+    // blurb is copy that gets reworded (it used to advertise "no YAML
+    // required"), and a test that pins the wording fails for a change that
+    // broke nothing.
+    // A single unspaced token, per the BANNER note above: the wizard's intro
+    // sentence is copy that gets reworded (it used to say "no YAML
+    // required"), and a spaced phrase can arrive split by cursor moves.
+    app.wait_for("profile", "the wizard should appear on first run");
 
     app.type_line("tank");
     app.type_line("127.0.0.1");

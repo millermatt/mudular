@@ -1,65 +1,175 @@
 # Mudular
 
-A modern, keyboard-centric terminal MUD client: a lightweight, high-performance
-alternative to desktop clients like Mudlet, with multi-character sessions in
-split panes or tabs — strictly in the terminal.
+A MUD client that lives in your terminal. It plays several characters at once
+in split panes, draws a map of where you've been as you walk, and can react to
+what the game says — heal when you're hurt, loot a corpse, answer a tell —
+without you typing anything.
 
-**Status:** M0–M5 done. You can log in and play over plain Telnet or TLS,
-with full option negotiation (NAWS, TTYPE/MTTS, CHARSET, ECHO password
-masking, EOR/GA prompts), MCCP2 stream compression, TLS with pinning for
-self-signed certs, config-file profiles with legacy charset fallback
-(Latin-1, CP437), and automation: aliases, triggers, variables, and timers
-in shareable YAML modules with global → module → profile scoping and
-`/reload`. See the roadmap in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-(§14) for what's next — GMCP/MSDP, scripting, and multi-character play are
-not implemented yet.
+![Playing with the map column open, rooms labelled shop/rent/forge/healer, and the party strip along the bottom](docs/images/overview.png)
 
-## Highlights
+## Getting it running on Windows
 
-Done:
+You need to be **signed in to GitHub** in your browser first — this repository
+is private, so downloads only work for people invited to it. If the links
+below give you a 404, that's what it means.
 
-- Plain Telnet and TLS ("STelnet") connections, fully async
-- Full Telnet negotiation (NAWS, TTYPE/MTTS, CHARSET, ECHO, EOR/GA prompts)
-- MCCP2 compression, including the mid-stream switchover
-- TLS with full/pinned/insecure verification modes; TOFU pinning for the
-  self-signed certificates many MUDs run
-- Config-file profiles, remappable keybinds
-- Triggers, aliases, variables, and timers in shareable YAML modules with
-  global → module → profile scoping and live `/reload`
-- Unicode done right: UTF-8, grapheme-aware wrapping, legacy charset
-  fallback (Latin-1, CP437) for MUDs that predate it
+**1. Download the installer.** Go to the
+[latest release](https://github.com/millermatt/mudular/releases/latest) and
+download the file ending in **`.msi`**:
 
-Planned:
-
-- GMCP + MSDP out-of-band data
-- Multi-engine scripting behind one API: Lua first, JavaScript next,
-  more embeddable engines pluggable
-- True multi-character play: split panes/tabs, instant hotkey focus
-  switching, unread indicators, strictly isolated session buffers
-- Cross-session automation: one character's triggers/scripts can command
-  or observe another's session (tank auto-calls the cleric's heals)
-- Channel panes: tells/gossip/group chat routed to their own panes with
-  unread badges, aggregated across characters, WoW-style
-- Ships as a single static binary — no runtime dependencies
-
-## Build & run
-
-```sh
-cargo build
-cargo test
-cargo run -- --host mud.example.org --port 4000
+```
+mudular-x86_64-pc-windows-msvc.msi
 ```
 
-See [docs/USAGE.md](docs/USAGE.md) for connecting, profiles, TLS
-verification modes, charsets, keybind remapping, and the full flag
-reference. Example configuration lives in
-[`examples/config/`](examples/config/); the real config directory is
-`~/.config/mudular/` (or platform equivalent — see docs/USAGE.md).
+**2. Run it.** Double-click the downloaded file. Windows will almost certainly
+say **"Windows protected your PC"** — that's only because this installer isn't
+signed by a company Microsoft recognises, not because anything is wrong with
+it. Click **More info**, then **Run anyway**.
 
-## Architecture
+**3. Click through the installer.** The defaults are what you want. In
+particular leave the option to add Mudular to your **PATH** switched on, which
+is what lets you start it by name in the next step. It installs to
+`C:\Program Files\mudular\`.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full technical
-architecture document: stack rationale, session pipeline design, protocol
-layer, automation engine, Unicode strategy, and the milestone roadmap.
-Development-process notes (including AI model guidance per milestone) live
-in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+**4. Open Windows Terminal.** Press the Start button, type `terminal`, and open
+**Windows Terminal**. (It comes with Windows 11. On Windows 10, PowerShell
+works too — search for `powershell` instead.)
+
+**5. Start it.** Type this and press Enter:
+
+```
+mudular
+```
+
+If you get `mudular is not recognized`, close the terminal window and open a
+new one — a fresh terminal is needed to notice the PATH change from step 3.
+
+## Your first connection
+
+The first time you run it with nothing saved, Mudular shows a short form
+instead of an empty screen. It asks four things:
+
+| Field | What to put |
+|---|---|
+| Name | Anything you like — it's just a label for this game, e.g. `hercmud` |
+| Host | The MUD's address, e.g. `hercmud.net` |
+| Port | The number the MUD listens on, e.g. `4443` |
+| TLS | `yes` if the MUD uses an encrypted connection, `no` otherwise |
+
+![The new-profile form asking for a character or profile name](docs/images/first-run.png)
+
+Press Enter after each one. `Esc` backs out without saving.
+
+That's it — it connects straight away and remembers the game, so next time you
+can just run:
+
+```
+mudular hercmud
+```
+
+Type a line and press Enter to send it to the game, exactly as you would in any
+MUD client. Passwords are hidden as you type them.
+
+## The keys worth knowing
+
+**Press `F1` for help at any time** — it lists every key, so you don't have to
+remember this table.
+
+| Key | Does |
+|---|---|
+| `F1` | Help — all keys, always available |
+| `F7` | Show or hide the **map** |
+| `F8` | Move a cursor around the map to read room names, and walk there |
+| `F9` | Show or hide the **party strip** (everyone's health along the bottom) |
+| `F4` | Show or hide the **chat panes** (tells and channels, kept out of the main text) |
+| `F3` | Switch between side-by-side panes and tabs |
+| `Ctrl+Tab` | Jump to your next character |
+| `Alt+1`, `Alt+2` … | Jump straight to a character by number |
+| `F10` | Jump to whichever character is in trouble |
+| `Alt+T` | Timestamp every line |
+| `F5` | Edit the current character's settings, in the client |
+| `Ctrl+C` | Quit |
+
+![The F1 help overlay listing every key](docs/images/help.png)
+
+## Playing more than one character
+
+Name more than one game or character and each gets its own pane:
+
+```
+mudular mathias saihtam
+```
+
+Each has its own text, its own input line, and its own colour so you can tell
+the panes apart at a glance. `Ctrl+Tab` moves between them, and a character you
+aren't looking at shows a dot and a count when something new arrives.
+
+The map builds itself as you walk — nothing to set up. `F8` moves a cursor
+over it, and pressing Enter on a room walks you there one step at a time.
+
+## Making it do things for you
+
+Every character has a settings file where you can teach it to react. The
+easiest way in is **`F5`**, which opens an editor for the current character
+right inside the client — no hunting for files.
+
+If you'd rather edit the file directly, paste this into the address bar of a
+File Explorer window to land in the right folder:
+
+```
+%APPDATA%\mudular\config\profiles
+```
+
+A small example — press `k` to attack, and eat when you get hungry:
+
+```yaml
+name: mathias
+host: hercmud.net
+port: 4443
+
+variables:
+  target: rat
+
+aliases:
+  - pattern: '^k$'
+    send: ["kill ${target}"]
+
+triggers:
+  - pattern: '^You are hungry\.$'
+    send: ["eat bread"]
+```
+
+Type `/reload` in the client to pick up changes without reconnecting.
+
+That's the shallow end. Triggers can also highlight text, hide it, play a
+sound, route it to a chat pane, or run a Lua script — and one character's
+rules can command another, which is how a warrior gets healed by a cleric
+without either player typing. **[docs/USAGE.md](docs/USAGE.md)** covers all of
+it, with examples.
+
+## If something looks wrong
+
+- **Boxes or question marks instead of the map** — your terminal font is
+  missing the characters it draws with. Windows Terminal's default (Cascadia
+  Mono) is fine; older fonts may not be.
+- **`mudular is not recognized`** — open a new terminal window (see step 5).
+- **Downloads 404** — sign in to GitHub; the repository is private.
+- **Anything else** — open an issue on the repository with what you did and
+  what you saw.
+
+## Building it yourself
+
+If you'd rather build from source, you need [Rust](https://rustup.rs):
+
+```sh
+cargo build --release
+cargo test
+```
+
+The binary lands in `target/release/mudular`.
+
+## For the curious
+
+- **[docs/USAGE.md](docs/USAGE.md)** — everything you can configure, in depth
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how it's built and why
+- **[CHANGELOG.md](CHANGELOG.md)** — what changed in each release

@@ -554,7 +554,11 @@ pub fn draw_new_profile_wizard(
 ) {
     let area = frame.area();
     let mut lines = vec![
-        "Let's connect to a MUD — no YAML required.".to_string(),
+        // Says what is about to happen, and how long it will take. The old
+        // copy here advertised "no YAML required", which only means anything
+        // to somebody who already knew there was YAML to be afraid of — the
+        // one reader this screen is not for.
+        "Four questions and you're playing.".to_string(),
         String::new(),
     ];
     for (label, value) in answered {
