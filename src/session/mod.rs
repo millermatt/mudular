@@ -3669,16 +3669,24 @@ mod tests {
 
             script(sock).await;
 
-            // The script's handle is gone; this is the last one, so this is
-            // the close that decides between FIN and RST. Empty the receive
-            // buffer first, and only then let it go.
+            // The script's handle is gone, so this is the last one and this is
+            // the close that decides between FIN and RST. Close it in the order
+            // that keeps it a FIN: say we are done writing, which the client
+            // reads as end of stream, and only then read out what it left
+            // behind — until *it* closes, rather than for some interval and
+            // hoping. Draining for a fixed 50ms fixed seven of the nine
+            // Windows failures and left two, which is exactly what losing a
+            // race looks like: negotiation arriving just after the drain gave
+            // up put unread data back in the buffer before the close.
+            //
+            // Bounded anyway. A client that ignored end-of-stream would
+            // otherwise park this task forever, and a test harness that can
+            // hang is worse than one that closes abruptly.
+            let _ = spare.shutdown().await;
             let mut buf = [0u8; 4096];
-            while let Ok(Ok(read)) = timeout(Duration::from_millis(50), spare.read(&mut buf)).await
-            {
-                if read == 0 {
-                    break;
-                }
-            }
+            let drained =
+                async { while matches!(spare.read(&mut buf).await, Ok(read) if read > 0) {} };
+            let _ = timeout(Duration::from_secs(2), drained).await;
         });
 
         spawn(

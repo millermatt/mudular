@@ -689,7 +689,19 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Reap it, but keep draining while we do, and give up rather than wait
+        // forever — for the reason `expect_exit` documents at length: a client
+        // blocked writing into a full pty is not going anywhere, and a bare
+        // `wait()` here hung a macOS CI job for 36 minutes on the one test
+        // that leaves teardown to this rather than quitting explicitly.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            self.pump();
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 

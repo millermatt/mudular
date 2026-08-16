@@ -37,6 +37,9 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A hung test cost a macOS job 36 minutes of a 6-hour default before
+    # anyone noticed. The whole job takes about four minutes cold.
+    timeout-minutes: 20
     strategy:
       # Finish the others: "does this fail everywhere or only on Windows" is
       # the first question about a failure, and cancelling siblings hides it.
@@ -60,6 +63,7 @@ jobs:
   lint:
     name: Format and clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
@@ -80,6 +84,7 @@ jobs:
   features:
     name: Feature combinations
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
