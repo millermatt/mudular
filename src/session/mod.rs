@@ -1550,8 +1550,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
+            let (sock, _) = listener.accept().await.unwrap();
+            // This test builds its own listener, to pass `spawn` a record
+            // path, so it needs the graceful close spelled out too.
+            let (mut sock, spare) = two_handles(sock);
             sock.write_all(b"hi\r\n").await.unwrap();
+            drop(sock);
+            close_gracefully(spare).await;
         });
 
         let (mut events, _commands) = spawn(
@@ -3646,7 +3651,19 @@ mod tests {
         tokio::spawn(async move {
             let listener = TcpListener::from_std(listener).unwrap();
             let (sock, _) = listener.accept().await.unwrap();
+            // One connection per scripted server, and the port has to stop
+            // answering the moment it is taken. Tests about reconnection rely
+            // on a retry being *refused* — leaving this bound while the close
+            // below tidies up meant a retry landed in the backlog instead,
+            // read as a successful reconnect, and the backoff started over.
+            drop(listener);
+
+            // A second handle on the same socket, so it can be closed properly
+            // once the script has had its turn with the first one.
+            let (sock, spare) = two_handles(sock);
+
             script(sock).await;
+            close_gracefully(spare).await;
         });
 
         spawn(
@@ -3662,18 +3679,72 @@ mod tests {
         )
     }
 
+    /// Two handles on one socket: the one a script gets, and one kept back for
+    /// [`close_gracefully`] to use after the script has dropped its own.
+    fn two_handles(sock: tokio::net::TcpStream) -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let std_sock = sock.into_std().unwrap();
+        let spare = std_sock.try_clone().unwrap();
+        spare.set_nonblocking(true).unwrap();
+        (
+            tokio::net::TcpStream::from_std(std_sock).unwrap(),
+            tokio::net::TcpStream::from_std(spare).unwrap(),
+        )
+    }
+
+    /// Closes a scripted server's socket the way a real server would, which is
+    /// not what dropping it does.
+    ///
+    /// Closing a socket whose receive buffer still holds unread data sends RST
+    /// rather than FIN (RFC 1122 §4.2.2.13), and an RST discards whatever is
+    /// still queued to *send* — so the lines a script wrote just before
+    /// returning never arrive at all, the session emits nothing, and the test
+    /// times out in `next_matching`. Almost every script here writes and
+    /// returns without ever reading, leaving the client's Telnet negotiation
+    /// unread, which is exactly that case. Linux delivers the data regardless;
+    /// macOS and Windows do not, which is how this surfaced (#73).
+    ///
+    /// So: FIN first, which the client reads as end of stream and answers by
+    /// closing, and only then read out what it left behind — until it has
+    /// actually closed, rather than for some interval and hoping. Draining for
+    /// a fixed 50ms fixed seven of nine Windows failures and left two, which
+    /// is what losing a race looks like.
+    ///
+    /// Bounded anyway: a client that ignored end-of-stream would otherwise park
+    /// this forever, and a harness that can hang is worse than one that closes
+    /// abruptly.
+    async fn close_gracefully(mut sock: tokio::net::TcpStream) {
+        let _ = sock.shutdown().await;
+        let mut buf = [0u8; 4096];
+        let drained = async { while matches!(sock.read(&mut buf).await, Ok(read) if read > 0) {} };
+        let _ = timeout(Duration::from_secs(2), drained).await;
+    }
+
+    /// Waits for the event a test is actually about, skipping the rest.
+    ///
+    /// The wait is generous because it only costs anything when something is
+    /// already broken, and because these tests wait on real sockets on three
+    /// platforms — a bound tight enough to be a stopwatch is a bound that
+    /// fails on whichever runner is slowest today.
+    ///
+    /// Says what it *did* see when it gives up. "Timed out waiting for a
+    /// session event" is the same sentence whether nothing arrived at all or
+    /// nine of the wrong thing did, and telling those apart from a CI log on a
+    /// platform you cannot run is most of the work (#73).
     async fn next_matching(
         events: &mut mpsc::Receiver<SessionEvent>,
         want: impl Fn(&SessionEvent) -> bool,
     ) -> SessionEvent {
+        let mut skipped: Vec<SessionEvent> = Vec::new();
         loop {
-            let event = timeout(Duration::from_secs(2), events.recv())
-                .await
-                .expect("timed out waiting for session event")
-                .expect("session event stream ended early");
+            let event = match timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => panic!("the session ended early; saw {skipped:?}"),
+                Err(_) => panic!("timed out waiting for a session event; saw {skipped:?}"),
+            };
             if want(&event) {
                 return event;
             }
+            skipped.push(event);
         }
     }
 

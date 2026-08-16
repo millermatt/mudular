@@ -81,7 +81,7 @@ pub fn apply_highlights(raw: &str, spans: &[(Range<usize>, String)]) -> String {
         .collect();
     // Highest offset first: each insertion then leaves the raw offsets of
     // the spans still to come untouched.
-    mapped.sort_by(|a, b| b.0.cmp(&a.0));
+    mapped.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
 
     let mut out = raw.to_string();
     for (start, end, sgr) in mapped {

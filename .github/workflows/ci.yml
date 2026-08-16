@@ -1,0 +1,97 @@
+# The checks that used to live only on a maintainer's laptop.
+#
+# Until this existed the sole check on a pull request was release-plz's `plan`
+# job, which says nothing about whether the code compiles — so a red suite
+# reached `main` if whoever pushed had not run it. That was survivable while
+# the repo was one person; it is not now that it takes contributions.
+#
+# Everything here is what CLAUDE.md already asks for before a commit, plus the
+# two configurations a laptop tends not to try: the other platforms, and the
+# feature combinations that are not the default.
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# A branch that gets a second push does not need the first run finished.
+# `main` is exempt: those runs are the record of what the released commit
+# actually did.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning in CI output nobody reads is a warning that stays. This makes
+  # the build itself the thing that refuses.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The gate: what a contributor is asked to run, run for them.
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # A hung test cost a macOS job 36 minutes of a 6-hour default before
+    # anyone noticed. The whole job takes about four minutes cold.
+    timeout-minutes: 20
+    strategy:
+      # Finish the others: "does this fail everywhere or only on Windows" is
+      # the first question about a failure, and cancelling siblings hides it.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Bare, not `--all-targets`: this crate is a binary with no library
+      # target, so there is nothing for `cargo test --doc` to run, and
+      # `--all-targets` would only mean typing more for the same thing.
+      - name: Test
+        run: cargo test
+
+  # Formatting and lints once, rather than three times: neither can differ by
+  # platform, and the point of a matrix is to catch what does.
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+  # The script engines are feature-gated (docs/ARCHITECTURE.md §7.4), so the
+  # default build is not the only one that has to work. `js` is nobody's
+  # default and would rot unnoticed; a build without `lua` is what proves the
+  # `ScriptHost` seam is real rather than decorative.
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: No scripting at all
+        run: cargo test --no-default-features
+      - name: Every engine
+        run: cargo test --all-features
