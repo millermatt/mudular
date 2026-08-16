@@ -9,6 +9,14 @@
 //! remapped key, and one that proves two characters run at once with a rule
 //! crossing between them. Behaviour worth asserting in detail belongs in the
 //! fast tests next to the code that implements it.
+//!
+//! Unix only, and not because the client is: it drives the real binary through
+//! `forkpty`, which Windows has no equivalent of (a ConPTY harness would be a
+//! second implementation of this whole file). Gated at the crate root so the
+//! rest of the suite — the part that does run everywhere, and where the
+//! platform differences that matter actually live — still runs on Windows
+//! rather than failing to compile.
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
