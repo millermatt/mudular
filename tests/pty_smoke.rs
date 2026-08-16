@@ -574,7 +574,12 @@ impl App {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                // `TIOCSCTTY` is a `c_ulong` on Linux and a `u32` on the
+                // BSDs, so the constant needs widening to whatever `ioctl`
+                // takes here or macOS will not compile it.
+                #[allow(clippy::useless_conversion)]
+                let set_controlling_tty = libc::TIOCSCTTY.into();
+                if libc::ioctl(slave_fd, set_controlling_tty, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
