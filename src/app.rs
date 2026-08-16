@@ -78,6 +78,11 @@ const MAP_COMMAND: &str = "/map";
 /// `toggle_channels` does, for players who reach for a command before a
 /// function key.
 const COMMS_COMMAND: &str = "/comms";
+/// Runs a command as another character without switching to their pane
+/// (§7.5) — a character name, or `*`, then the command. The ad-hoc form of a
+/// rule's `send_to:`, for the times the player did not decide in advance that
+/// this was a thing they would want to do.
+const SEND_COMMAND: &str = "/send";
 
 /// `send_to` address meaning "every other session" (§7.5).
 const ALL_SESSIONS: &str = "*";
@@ -1037,17 +1042,22 @@ impl AppState {
         }
     }
 
+    /// `label` names whatever asked for the delivery — `send_to` for a rule,
+    /// `/send` for the player — because the pane reports failures back and a
+    /// notice about `send_to:` after typing `/send` sends the player looking
+    /// through their config for a rule that does not exist.
     fn route_send_to(
         &mut self,
         from: usize,
         target: &str,
         lines: Vec<String>,
         hops: u8,
+        label: &str,
     ) -> Vec<(usize, SessionCommand)> {
         let matched = self.addressed(from, target);
 
         if matched.is_empty() {
-            let notice = format!("** send_to: no session named `{target}`");
+            let notice = format!("** {label}: no session named `{target}`");
             self.sessions[from].push_line(RetainedLine::client(notice));
             return Vec::new();
         }
@@ -1059,7 +1069,7 @@ impl AppState {
             let session = &self.sessions[index];
             if !session.connected {
                 notices.push(format!(
-                    "** send_to `{}`: not connected, dropped {} command(s)",
+                    "** {label} `{}`: not connected, dropped {} command(s)",
                     session.name,
                     lines.len()
                 ));
@@ -1070,7 +1080,7 @@ impl AppState {
             // may reach it.
             if hops > session.cross.max_hops {
                 notices.push(format!(
-                    "** send_to `{}`: hop limit ({}) reached, dropped",
+                    "** {label} `{}`: hop limit ({}) reached, dropped",
                     session.name, session.cross.max_hops
                 ));
                 continue;
@@ -1147,7 +1157,10 @@ fn apply_session_event(
             target,
             lines,
             hops,
-        } => (false, state.route_send_to(index, &target, lines, hops)),
+        } => (
+            false,
+            state.route_send_to(index, &target, lines, hops, "send_to"),
+        ),
         SessionEvent::EchoTo { target, text } => {
             state.route_echo_to(index, &target, text);
             (false, Vec::new())
@@ -3509,7 +3522,64 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
         mark_current_room(state, label);
         return;
     }
+    if trimmed == SEND_COMMAND || trimmed.starts_with("/send ") {
+        let args = trimmed.strip_prefix(SEND_COMMAND).unwrap_or("").trim();
+        send_as_other_session(state, args).await;
+        return;
+    }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
+}
+
+/// `/send <character> <command>` — run something as another character without
+/// leaving this pane (§7.5).
+///
+/// The routing is a rule's `send_to:`, reached from the keyboard instead of
+/// from YAML: the same addressing (a name, or `*` for everyone else), the same
+/// reporting when it goes nowhere, and the same rule about the far end. What
+/// arrives there is verbatim unless *that* character's config asked for
+/// `cross_session: expand_aliases`, so `/send` cannot come to mean something
+/// different depending on who it is aimed at.
+///
+/// Semicolons split here rather than at the far end, because this is a line
+/// the player typed and that is what typing `;` does everywhere else in the
+/// client (`Engine::expand_input`). Without it `/send * wake;stand` would
+/// arrive as one nonsense command on a config that expands nothing.
+async fn send_as_other_session(state: &mut AppState, args: &str) {
+    let (target, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    let lines: Vec<String> = rest
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    if target.is_empty() || lines.is_empty() {
+        if let Some(session) = state.bound_mut() {
+            session.push_line(RetainedLine::client(
+                "** /send needs a character and a command, as in \
+                 `/send cleric drink well` (or `*` for everyone else)",
+            ));
+        }
+        return;
+    }
+
+    let from = state.input_session;
+    // Aiming it at the pane you are already typing in is not a delivery
+    // failure, and must not be reported as one — `addressed` excludes the
+    // sender, so without this it would come back "no session named `tank`"
+    // about a character plainly on screen. Not silently sent locally either:
+    // a local send would run through this session's aliases when the same
+    // command aimed anywhere else would not, which is exactly the "means
+    // something different depending on the target" trap above.
+    if state.sessions[from].name == target {
+        let notice = format!("** /send: `{target}` is the character you are typing as");
+        state.sessions[from].push_line(RetainedLine::client(notice));
+        return;
+    }
+
+    let injections = state.route_send_to(from, target, lines, crate::session::FIRST_HOP, "/send");
+    for (index, command) in injections {
+        let _ = state.sessions[index].commands.send(command).await;
+    }
 }
 
 /// Shows or hides the comms column, from either the key or `/comms`
@@ -5225,6 +5295,127 @@ mod tests {
 
         assert!(injections.is_empty());
         assert!(scrollback(&state.sessions[0]).contains("no session named"));
+    }
+
+    // ---- /send (§7.5, issue #68) ----
+
+    /// Helper: type a line and press Enter, as the bound session.
+    async fn enter_line(state: &mut AppState, line: &str) {
+        state.sessions[state.input_session].input = Input::default().with_value(line.to_string());
+        submit_input(state, &[]).await;
+    }
+
+    /// The whole point: a command runs as another character, from the pane the
+    /// player is already in, without switching to theirs.
+    #[tokio::test]
+    async fn send_runs_a_command_as_the_named_character() {
+        let (mut state, mut receivers) = app(&["tank", "cleric"]);
+
+        enter_line(&mut state, "/send cleric drink well").await;
+
+        match receivers[1].try_recv().expect("the cleric is asked") {
+            SessionCommand::Inject { from, lines, hops } => {
+                assert_eq!(from, "tank");
+                assert_eq!(lines, &["drink well".to_string()]);
+                assert_eq!(hops, crate::session::FIRST_HOP);
+            }
+            other => panic!("expected Inject, got {other:?}"),
+        }
+        // Nothing goes to the MUD this character is talking to.
+        assert!(receivers[0].try_recv().is_err());
+        // And the player can see what they typed.
+        assert!(
+            scrollback(&state.sessions[0]).contains("> /send cleric drink well"),
+            "{:?}",
+            scrollback(&state.sessions[0])
+        );
+    }
+
+    /// `*` is the TinTin `#all` idiom players arrive looking for, and a
+    /// semicolon means what it means everywhere else in the client — so
+    /// `wake;stand` is two commands at each of them, not one nonsense one.
+    #[tokio::test]
+    async fn send_to_a_star_reaches_everyone_else_and_splits_on_semicolons() {
+        let (mut state, mut receivers) = app(&["tank", "cleric", "mage"]);
+
+        enter_line(&mut state, "/send * wake;stand").await;
+
+        for index in [1, 2] {
+            match receivers[index].try_recv().expect("delivered") {
+                SessionCommand::Inject { lines, .. } => {
+                    assert_eq!(lines, &["wake".to_string(), "stand".to_string()]);
+                }
+                other => panic!("expected Inject, got {other:?}"),
+            }
+        }
+        assert!(receivers[0].try_recv().is_err(), "never back to the sender");
+    }
+
+    /// A name that is not there has to say so. Silence would leave the player
+    /// believing the drink happened.
+    #[tokio::test]
+    async fn send_to_an_unknown_character_says_so() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        enter_line(&mut state, "/send athos drink well").await;
+
+        let notice = scrollback(&state.sessions[0]);
+        assert!(notice.contains("no session named `athos`"), "{notice}");
+        // Reported as the command that was typed, not as the YAML field that
+        // shares its plumbing.
+        assert!(!notice.contains("send_to"), "{notice}");
+    }
+
+    /// Aiming it at yourself is a mistake worth naming, not a delivery
+    /// failure — `addressed` excludes the sender, so the untreated case
+    /// reports "no session named" about a character on screen.
+    #[tokio::test]
+    async fn send_to_yourself_says_what_is_wrong_with_it() {
+        let (mut state, mut receivers) = app(&["tank"]);
+
+        enter_line(&mut state, "/send tank look").await;
+
+        let notice = scrollback(&state.sessions[0]);
+        assert!(
+            notice.contains("the character you are typing as"),
+            "{notice}"
+        );
+        assert!(!notice.contains("no session named"), "{notice}");
+        assert!(receivers[0].try_recv().is_err(), "and it is not sent");
+    }
+
+    /// A disconnected target already reports through the shared path; what
+    /// matters here is that it is reported as `/send`.
+    #[tokio::test]
+    async fn send_to_a_disconnected_character_says_so_as_send() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        state.sessions[1].connected = false;
+
+        enter_line(&mut state, "/send cleric drink well").await;
+
+        let notice = scrollback(&state.sessions[0]);
+        assert!(notice.contains("/send `cleric`"), "{notice}");
+        assert!(notice.contains("not connected"), "{notice}");
+    }
+
+    /// A name with no command, or no name at all, must not reach the MUD as
+    /// literal text — the player would see the server reject `/send` and have
+    /// no idea the client owns that word.
+    #[tokio::test]
+    async fn send_without_a_command_explains_itself() {
+        for line in ["/send", "/send cleric", "/send cleric   "] {
+            let (mut state, mut receivers) = app(&["tank", "cleric"]);
+
+            enter_line(&mut state, line).await;
+
+            let notice = scrollback(&state.sessions[0]);
+            assert!(notice.contains("/send needs"), "{line}: {notice}");
+            assert!(receivers[0].try_recv().is_err(), "{line} reached the MUD");
+            assert!(
+                receivers[1].try_recv().is_err(),
+                "{line} reached the cleric"
+            );
+        }
     }
 
     // ---- input submission ----

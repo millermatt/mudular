@@ -548,6 +548,21 @@ the target pane locally echoes `[from tank] cast 'major heal' Grunk` so
 nothing happens invisibly. If the target session isn't connected, the
 action is dropped with a warning in the *originating* pane.
 
+**`/send <character> <command>`.** The same routing, typed instead of
+configured: the client command splits the name off the front and hands the
+rest to `route_send_to`, so addressing (`*` included), the hop count, the
+receiver's `expand_aliases` choice, the `[from tank]` echo and the
+undeliverable warnings are all the ones above rather than a second set.
+Semicolons are split by the hub, not the receiver, because this is a line the
+player typed and `;` separates commands everywhere else they type
+(`Engine::expand_input`); without it `/send * wake;stand` would arrive as one
+command at a receiver that expands nothing. Aiming it at the pane you are
+typing in is reported as such rather than run locally: `send_to`'s addressing
+excludes the sender, and a local send would pass through *this* session's
+aliases when the identical command aimed anywhere else would not — the same
+"means something different depending on the target" hazard the receiver-side
+opt-in exists to avoid.
+
 **Peeking: peer state snapshots (M8).** Each session continuously publishes
 a read-only snapshot — its exported variables plus its server-data map
 (GMCP/MSDP: vitals, affects, room) — over a `tokio::sync::watch` channel;

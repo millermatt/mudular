@@ -321,6 +321,21 @@ already see it — `${@cleric.hp}` and `send_to: {cleric: [...]}` work from
 the moment it connects, in both directions. Nothing else's scrollback is
 touched.
 
+Need one of the others to do something *right now*, without deciding in
+advance that you'd want to? `/send` takes a character and a command:
+
+```
+/send cleric drink well
+/send * wake;stand          # everyone except you
+```
+
+The command runs in their session — you'll see `[from tank] drink well` in
+their pane, so it's never a mystery how it got there — and if the name
+isn't there, or that character isn't connected, your own pane says so
+rather than swallowing it. What arrives is sent as typed, unless that
+character's profile asked for `cross_session: expand_aliases`; their
+aliases are their call, not yours.
+
 ### Channel panes
 
 Tells and chat can be pulled out of the main scrollback into their own

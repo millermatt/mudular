@@ -138,6 +138,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/update", "install a newer Mudular, if one was announced"),
         row("/newprofile", "create another character's profile"),
         row("/connect", "add a character to this running instance"),
+        row("/send", "run one command as another character, or `*`"),
         row("/goto", "walk to a known room, one step at a time"),
         row("/corpse", "walk back to where you last died"),
         row(
@@ -2054,12 +2055,13 @@ mod tests {
         // stays a question about the listing rather than about scrolling —
         // the overlay grew a row when the party alarm got its key, another
         // when the character panes got a clock, another when `/comms`
-        // joined the command list, and another for `/update`.
-        let without = render_sized(&state, 70, 44);
+        // joined the command list, another for `/update`, and another for
+        // `/send`.
+        let without = render_sized(&state, 70, 45);
         assert!(rows(&without).contains("forest"));
 
         state.show_help = true;
-        let with = render_sized(&state, 70, 44);
+        let with = render_sized(&state, 70, 45);
         let listing = rows(&with);
         assert!(listing.contains("Help"), "{listing}");
         assert!(listing.contains("Ctrl+C"), "{listing}");
