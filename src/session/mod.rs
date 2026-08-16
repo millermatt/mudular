@@ -1550,8 +1550,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
+            let (sock, _) = listener.accept().await.unwrap();
+            // This test builds its own listener, to pass `spawn` a record
+            // path, so it needs the graceful close spelled out too.
+            let (mut sock, spare) = two_handles(sock);
             sock.write_all(b"hi\r\n").await.unwrap();
+            drop(sock);
+            close_gracefully(spare).await;
         });
 
         let (mut events, _commands) = spawn(
@@ -3646,47 +3651,19 @@ mod tests {
         tokio::spawn(async move {
             let listener = TcpListener::from_std(listener).unwrap();
             let (sock, _) = listener.accept().await.unwrap();
+            // One connection per scripted server, and the port has to stop
+            // answering the moment it is taken. Tests about reconnection rely
+            // on a retry being *refused* — leaving this bound while the close
+            // below tidies up meant a retry landed in the backlog instead,
+            // read as a successful reconnect, and the backoff started over.
+            drop(listener);
 
-            // A second handle on the same socket, so this can be tidied up
-            // after the script has had its turn with the first one.
-            //
-            // Necessary, not tidy-minded. Closing a socket whose receive
-            // buffer still holds unread data sends RST rather than FIN
-            // (RFC 1122 §4.2.2.13), and an RST discards whatever is still
-            // queued to *send* — so the lines a script wrote just before
-            // returning never arrive, the session emits nothing, and the
-            // test times out waiting for it. Almost every script here writes
-            // and returns without ever reading, leaving the client's Telnet
-            // negotiation unread, which is exactly that case. Linux delivers
-            // the data anyway; macOS and Windows do not, which is how this
-            // surfaced (#73) — nine tests on Windows, one on macOS, all of
-            // them timing out in `next_matching`.
-            let std_sock = sock.into_std().unwrap();
-            let spare = std_sock.try_clone().unwrap();
-            spare.set_nonblocking(true).unwrap();
-            let sock = tokio::net::TcpStream::from_std(std_sock).unwrap();
-            let mut spare = tokio::net::TcpStream::from_std(spare).unwrap();
+            // A second handle on the same socket, so it can be closed properly
+            // once the script has had its turn with the first one.
+            let (sock, spare) = two_handles(sock);
 
             script(sock).await;
-
-            // The script's handle is gone, so this is the last one and this is
-            // the close that decides between FIN and RST. Close it in the order
-            // that keeps it a FIN: say we are done writing, which the client
-            // reads as end of stream, and only then read out what it left
-            // behind — until *it* closes, rather than for some interval and
-            // hoping. Draining for a fixed 50ms fixed seven of the nine
-            // Windows failures and left two, which is exactly what losing a
-            // race looks like: negotiation arriving just after the drain gave
-            // up put unread data back in the buffer before the close.
-            //
-            // Bounded anyway. A client that ignored end-of-stream would
-            // otherwise park this task forever, and a test harness that can
-            // hang is worse than one that closes abruptly.
-            let _ = spare.shutdown().await;
-            let mut buf = [0u8; 4096];
-            let drained =
-                async { while matches!(spare.read(&mut buf).await, Ok(read) if read > 0) {} };
-            let _ = timeout(Duration::from_secs(2), drained).await;
+            close_gracefully(spare).await;
         });
 
         spawn(
@@ -3700,6 +3677,46 @@ mod tests {
             login,
             peers,
         )
+    }
+
+    /// Two handles on one socket: the one a script gets, and one kept back for
+    /// [`close_gracefully`] to use after the script has dropped its own.
+    fn two_handles(sock: tokio::net::TcpStream) -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let std_sock = sock.into_std().unwrap();
+        let spare = std_sock.try_clone().unwrap();
+        spare.set_nonblocking(true).unwrap();
+        (
+            tokio::net::TcpStream::from_std(std_sock).unwrap(),
+            tokio::net::TcpStream::from_std(spare).unwrap(),
+        )
+    }
+
+    /// Closes a scripted server's socket the way a real server would, which is
+    /// not what dropping it does.
+    ///
+    /// Closing a socket whose receive buffer still holds unread data sends RST
+    /// rather than FIN (RFC 1122 §4.2.2.13), and an RST discards whatever is
+    /// still queued to *send* — so the lines a script wrote just before
+    /// returning never arrive at all, the session emits nothing, and the test
+    /// times out in `next_matching`. Almost every script here writes and
+    /// returns without ever reading, leaving the client's Telnet negotiation
+    /// unread, which is exactly that case. Linux delivers the data regardless;
+    /// macOS and Windows do not, which is how this surfaced (#73).
+    ///
+    /// So: FIN first, which the client reads as end of stream and answers by
+    /// closing, and only then read out what it left behind — until it has
+    /// actually closed, rather than for some interval and hoping. Draining for
+    /// a fixed 50ms fixed seven of nine Windows failures and left two, which
+    /// is what losing a race looks like.
+    ///
+    /// Bounded anyway: a client that ignored end-of-stream would otherwise park
+    /// this forever, and a harness that can hang is worse than one that closes
+    /// abruptly.
+    async fn close_gracefully(mut sock: tokio::net::TcpStream) {
+        let _ = sock.shutdown().await;
+        let mut buf = [0u8; 4096];
+        let drained = async { while matches!(sock.read(&mut buf).await, Ok(read) if read > 0) {} };
+        let _ = timeout(Duration::from_secs(2), drained).await;
     }
 
     async fn next_matching(
