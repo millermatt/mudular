@@ -29,7 +29,6 @@ const CTRL_C: &[u8] = b"\x03";
 const CTRL_Q: &[u8] = b"\x11";
 const CTRL_S: &[u8] = b"\x13";
 const DOWN: &[u8] = b"\x1b[B";
-const ESC: &[u8] = b"\x1b";
 
 #[test]
 fn plays_from_a_profile_with_its_rules_and_quits() {
@@ -152,12 +151,8 @@ fn adds_a_trigger_through_the_config_editor_and_saves_it_live() {
         "saving should report success and where the backup went",
     );
 
-    // Two bare `Esc` presses sent back to back can be read by crossterm as
-    // one Alt-modified key rather than two separate ones; a short pause
-    // between them keeps the pty's raw bytes unambiguous.
-    app.send(ESC); // form -> browse (the rule is no longer blank)
-    std::thread::sleep(Duration::from_millis(100));
-    app.send(ESC); // browse -> close (nothing left unsaved)
+    app.press_esc(None); // form -> browse (the rule is no longer blank)
+    app.press_esc(None); // browse -> close (nothing left unsaved)
 
     app.wait_for("reloaded", "saving should reload the live session's rules");
 
@@ -191,7 +186,7 @@ fn picks_a_scrollback_line_into_a_new_trigger_pattern() {
     mud.send_line("A rat scurries by.");
     app.wait_for("scurries", "the server's line should reach the pane");
 
-    app.send(b"\x1bv"); // Alt+V: enter the line-cursor
+    app.press_esc(Some(b'v')); // Alt+V: enter the line-cursor
     app.send(b"\r"); // pick the last line
 
     app.wait_for(
@@ -283,6 +278,49 @@ fn plays_two_characters_and_routes_a_trigger_across_them() {
     assert!(
         !tank_saw.contains("major heal"),
         "a cross-session action must not reach its own server: {tank_saw:?}"
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// `/send` (§7.5): the ad-hoc form of the same routing, driven from the
+/// keyboard rather than from a rule. Worth its own pass through the real
+/// binary, because the whole feature is a typed line — a unit test can call
+/// the handler, but only this proves the client claims the word `/send`
+/// rather than passing it to the MUD as text.
+#[test]
+fn sends_one_command_as_another_character() {
+    let tank_mud = FakeMud::start();
+    let cleric_mud = FakeMud::start();
+    let config = TempDir::new();
+    write_two_profiles(config.path(), tank_mud.port, cleric_mud.port);
+
+    let mut app = App::launch(&["tank", "cleric", "--config-dir", config.path_str()]);
+    app.wait_for(
+        BANNER,
+        "the focused session's banner should reach the screen",
+    );
+    app.wait_for("cleric", "the second session should appear in the tab bar");
+
+    app.type_line("/send cleric drink well");
+
+    cleric_mud.wait_for_command(
+        "drink well",
+        "the typed command should run in the other character's session",
+    );
+    // The receiving pane says where it came from, so a command appearing in
+    // someone else's session is never mysterious. Its pane is the hidden one
+    // in tabs mode, so this has to go and look at it.
+    app.press_esc(Some(b'2')); // Alt+2: focus the cleric
+    app.wait_for(
+        "[from tank]",
+        "the injected command should be attributed in the pane it landed in",
+    );
+    let tank_saw = String::from_utf8_lossy(&tank_mud.received.lock().unwrap()).into_owned();
+    assert!(
+        !tank_saw.contains("drink well") && !tank_saw.contains("/send"),
+        "nothing should reach the sender's own server: {tank_saw:?}"
     );
 
     app.send(CTRL_C);
@@ -560,6 +598,22 @@ impl App {
     fn type_line(&mut self, line: &str) {
         self.send(line.as_bytes());
         self.send(b"\r");
+    }
+
+    /// Presses an `Esc`-prefixed key: bare `Esc` (`None`), or `Alt+<c>`.
+    ///
+    /// The pause is the whole point. crossterm reads an `Esc` byte that
+    /// arrives in the same read as the bytes before it as one Alt-modified
+    /// key, not as the start of a new press — so `Esc` straight after a
+    /// `\r`, or two `Esc`s back to back, are ambiguous at the pty. Every
+    /// site that pressed one of these keys raw learned that separately, one
+    /// of them only under a loaded test run, which is why it lives here now.
+    fn press_esc(&mut self, then: Option<u8>) {
+        std::thread::sleep(Duration::from_millis(200));
+        match then {
+            Some(c) => self.send(&[0x1b, c]),
+            None => self.send(&[0x1b]),
+        }
     }
 
     fn pump(&mut self) {

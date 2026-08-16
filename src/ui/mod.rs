@@ -138,6 +138,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/update", "install a newer Mudular, if one was announced"),
         row("/newprofile", "create another character's profile"),
         row("/connect", "add a character to this running instance"),
+        row("/send", "run one command as another character, or `*`"),
         row("/goto", "walk to a known room, one step at a time"),
         row("/corpse", "walk back to where you last died"),
         row(
@@ -2039,6 +2040,37 @@ mod tests {
         );
     }
 
+    /// A terminal the whole help listing fits inside, with a few rows and
+    /// columns to spare so there are still panes visible around it. Mirrors
+    /// `draw_help`'s own sizing, so adding a row or a longer description
+    /// cannot silently push part of the listing out of a test's view.
+    fn overlay_fits(keybinds: &Keybinds) -> (u16, u16) {
+        let lines = help_lines(keybinds);
+        let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        (widest as u16 + 4 + 10, lines.len() as u16 + 2 + 6)
+    }
+
+    /// The overlay is as wide as its longest row, capped at the terminal —
+    /// so one over-long description does not just look cramped, it silently
+    /// truncates *every* row for anyone on a narrow terminal. 80 columns is
+    /// the width to hold, being the one a default terminal still opens at.
+    #[test]
+    fn no_help_row_is_too_long_for_an_eighty_column_terminal() {
+        let lines = help_lines(&Keybinds::default());
+        let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let longest = lines
+            .iter()
+            .max_by_key(|l| l.chars().count())
+            .map(String::as_str)
+            .unwrap_or("");
+        // +4: a border column and a space either side, as `draw_help` adds.
+        assert!(
+            widest + 4 <= 80,
+            "the help listing needs {} columns; shorten this row:\n{longest}",
+            widest + 4
+        );
+    }
+
     /// The overlay covers what is under it — a listing rendered over live
     /// scrollback would be unreadable (docs/ARCHITECTURE.md §11.2).
     #[test]
@@ -2050,16 +2082,18 @@ mod tests {
                 .push_back(RetainedLine::server("You are in a forest."));
         }
 
-        // A row taller than the listing, so "is every binding in here"
-        // stays a question about the listing rather than about scrolling —
-        // the overlay grew a row when the party alarm got its key, another
-        // when the character panes got a clock, another when `/comms`
-        // joined the command list, and another for `/update`.
-        let without = render_sized(&state, 70, 44);
+        // Big enough for the whole listing plus room around it, *derived*
+        // from the listing rather than tuned to it. Hand-tuned numbers here
+        // were bumped five separate times — once per row the help grew (the
+        // party alarm's key, the panes' clock, `/comms`, `/update`, `/send`)
+        // — and each time the failure looked like a rendering bug rather
+        // than "the overlay outgrew the test's terminal".
+        let (width, height) = overlay_fits(&state.keybinds);
+        let without = render_sized(&state, width, height);
         assert!(rows(&without).contains("forest"));
 
         state.show_help = true;
-        let with = render_sized(&state, 70, 44);
+        let with = render_sized(&state, width, height);
         let listing = rows(&with);
         assert!(listing.contains("Help"), "{listing}");
         assert!(listing.contains("Ctrl+C"), "{listing}");

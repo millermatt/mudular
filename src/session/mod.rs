@@ -1176,8 +1176,10 @@ fn publish(engine: &mut Engine, publish_to: &Option<watch::Sender<PeerSnapshot>>
 }
 
 /// A cross-session action a session raised itself is the first hop; the
-/// counter only grows when one injection sets off another (§7.5).
-const FIRST_HOP: u8 = 1;
+/// counter only grows when one injection sets off another (§7.5). Shared with
+/// the hub, because a command the player types (`/send`) is a first hop by the
+/// same reasoning, and two definitions of "first" would eventually disagree.
+pub(crate) const FIRST_HOP: u8 = 1;
 
 /// Hand the hub the cross-session actions a rule produced, tagged with the
 /// hop they would be. The hub owns addressing and the hop limit, since only
