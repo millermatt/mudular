@@ -3646,7 +3646,39 @@ mod tests {
         tokio::spawn(async move {
             let listener = TcpListener::from_std(listener).unwrap();
             let (sock, _) = listener.accept().await.unwrap();
+
+            // A second handle on the same socket, so this can be tidied up
+            // after the script has had its turn with the first one.
+            //
+            // Necessary, not tidy-minded. Closing a socket whose receive
+            // buffer still holds unread data sends RST rather than FIN
+            // (RFC 1122 §4.2.2.13), and an RST discards whatever is still
+            // queued to *send* — so the lines a script wrote just before
+            // returning never arrive, the session emits nothing, and the
+            // test times out waiting for it. Almost every script here writes
+            // and returns without ever reading, leaving the client's Telnet
+            // negotiation unread, which is exactly that case. Linux delivers
+            // the data anyway; macOS and Windows do not, which is how this
+            // surfaced (#73) — nine tests on Windows, one on macOS, all of
+            // them timing out in `next_matching`.
+            let std_sock = sock.into_std().unwrap();
+            let spare = std_sock.try_clone().unwrap();
+            spare.set_nonblocking(true).unwrap();
+            let sock = tokio::net::TcpStream::from_std(std_sock).unwrap();
+            let mut spare = tokio::net::TcpStream::from_std(spare).unwrap();
+
             script(sock).await;
+
+            // The script's handle is gone; this is the last one, so this is
+            // the close that decides between FIN and RST. Empty the receive
+            // buffer first, and only then let it go.
+            let mut buf = [0u8; 4096];
+            while let Ok(Ok(read)) = timeout(Duration::from_millis(50), spare.read(&mut buf)).await
+            {
+                if read == 0 {
+                    break;
+                }
+            }
         });
 
         spawn(
