@@ -1261,7 +1261,11 @@ gone when you quit; nothing is written to disk.
 
 Type `look bull` in a room with a bullywug in it and the rest of the name
 appears dimmed after the cursor. Press `Enter` and `look bullywug` is what
-gets sent — there is no completion key to press.
+gets sent — there is no completion key you have to press.
+
+`Tab` takes the guess anyway, if you want it in the line for real: the
+dimmed text becomes typed text with the cursor after it, so you can keep
+going — `Tab` then `s` gives you `look bullywugs`.
 
 Mudular has no list of what a MUD contains, so it completes from what the
 MUD has printed: names, items, exits, players, anything that has been on
