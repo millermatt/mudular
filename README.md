@@ -16,11 +16,15 @@ with Windows 11. On Windows 10 search for `powershell` instead.) Paste this in
 and press Enter:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/millermatt/mudular/releases/latest/download/mudular-installer.ps1 | iex"
+irm https://github.com/millermatt/mudular/releases/latest/download/mudular-installer.ps1 | iex
 ```
 
 That's the whole install. It puts Mudular in `%USERPROFILE%\.cargo\bin` and
 adds that to your PATH.
+
+**Don't run it as administrator.** Mudular installs into your own user folder,
+so an elevated window installs it for the wrong account and your normal prompt
+won't find it afterwards. A plain window is what you want.
 
 **Then close the terminal and open a new one** — a fresh window is what picks
 up the PATH change. Now type:
