@@ -29,7 +29,6 @@ const CTRL_C: &[u8] = b"\x03";
 const CTRL_Q: &[u8] = b"\x11";
 const CTRL_S: &[u8] = b"\x13";
 const DOWN: &[u8] = b"\x1b[B";
-const ESC: &[u8] = b"\x1b";
 
 #[test]
 fn plays_from_a_profile_with_its_rules_and_quits() {
@@ -152,12 +151,8 @@ fn adds_a_trigger_through_the_config_editor_and_saves_it_live() {
         "saving should report success and where the backup went",
     );
 
-    // Two bare `Esc` presses sent back to back can be read by crossterm as
-    // one Alt-modified key rather than two separate ones; a short pause
-    // between them keeps the pty's raw bytes unambiguous.
-    app.send(ESC); // form -> browse (the rule is no longer blank)
-    std::thread::sleep(Duration::from_millis(100));
-    app.send(ESC); // browse -> close (nothing left unsaved)
+    app.press_esc(None); // form -> browse (the rule is no longer blank)
+    app.press_esc(None); // browse -> close (nothing left unsaved)
 
     app.wait_for("reloaded", "saving should reload the live session's rules");
 
@@ -191,7 +186,7 @@ fn picks_a_scrollback_line_into_a_new_trigger_pattern() {
     mud.send_line("A rat scurries by.");
     app.wait_for("scurries", "the server's line should reach the pane");
 
-    app.send(b"\x1bv"); // Alt+V: enter the line-cursor
+    app.press_esc(Some(b'v')); // Alt+V: enter the line-cursor
     app.send(b"\r"); // pick the last line
 
     app.wait_for(
@@ -317,13 +312,7 @@ fn sends_one_command_as_another_character() {
     // The receiving pane says where it came from, so a command appearing in
     // someone else's session is never mysterious. Its pane is the hidden one
     // in tabs mode, so this has to go and look at it.
-    //
-    // The pause is the same hazard the editor test documents: an `Esc` byte
-    // landing in the same read as what came before it is read as one
-    // Alt-modified key rather than the start of `Alt+2`, which under a loaded
-    // test run made this fail while passing on its own.
-    std::thread::sleep(Duration::from_millis(200));
-    app.send(b"\x1b2"); // Alt+2: focus the cleric
+    app.press_esc(Some(b'2')); // Alt+2: focus the cleric
     app.wait_for(
         "[from tank]",
         "the injected command should be attributed in the pane it landed in",
@@ -609,6 +598,22 @@ impl App {
     fn type_line(&mut self, line: &str) {
         self.send(line.as_bytes());
         self.send(b"\r");
+    }
+
+    /// Presses an `Esc`-prefixed key: bare `Esc` (`None`), or `Alt+<c>`.
+    ///
+    /// The pause is the whole point. crossterm reads an `Esc` byte that
+    /// arrives in the same read as the bytes before it as one Alt-modified
+    /// key, not as the start of a new press — so `Esc` straight after a
+    /// `\r`, or two `Esc`s back to back, are ambiguous at the pty. Every
+    /// site that pressed one of these keys raw learned that separately, one
+    /// of them only under a loaded test run, which is why it lives here now.
+    fn press_esc(&mut self, then: Option<u8>) {
+        std::thread::sleep(Duration::from_millis(200));
+        match then {
+            Some(c) => self.send(&[0x1b, c]),
+            None => self.send(&[0x1b]),
+        }
     }
 
     fn pump(&mut self) {
