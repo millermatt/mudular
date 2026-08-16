@@ -82,6 +82,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         "Typing".to_string(),
         row("Enter", "send the line — on an empty box a bare"),
         row("", "return, for \"press return to continue\""),
+        row("Tab", "accept the dimmed completion, if there is one"),
         row("Up / Down", "walk this character's history"),
         row("PgUp / PgDn", "scroll the focused pane back / forward"),
         row("Home / End", "jump to the oldest / newest line"),

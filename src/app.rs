@@ -412,6 +412,29 @@ impl SessionPane {
         self.vocabulary.suggest(word)
     }
 
+    /// Tab: take the guess — put it in the line for real, cursor after it.
+    ///
+    /// Enter already sends the ghost (§11.3), so this changes nothing about
+    /// what a completed line means; what it changes is that you can *keep
+    /// typing*. Until now the only way to extend a guessed word was to type
+    /// the rest of it yourself, because the ghost was not text you had a
+    /// cursor in.
+    ///
+    /// Says whether it accepted anything, so a Tab with no guess can fall
+    /// through to meaning whatever it meant before.
+    fn accept_suggestion(&mut self) -> bool {
+        let Some(rest) = self.suggestion.take() else {
+            return false;
+        };
+        // `with_value` leaves the cursor at the end, which is where accepting
+        // a completion has to put it.
+        self.input = Input::default().with_value(format!("{}{rest}", self.input.value()));
+        // A word completed can still be the prefix of a longer one, so ask
+        // again rather than assuming this was the last word it could be.
+        self.refresh_suggestion();
+        true
+    }
+
     /// Escape: send what I typed, not what you guessed.
     fn dismiss_suggestion(&mut self) {
         self.dismissed = Some(self.input.value().to_string());
@@ -2062,6 +2085,13 @@ fn type_into_input(session: &mut SessionPane, key: crossterm::event::KeyEvent) {
     // already had its chance at this key.
     if key.code == KeyCode::Esc && key.modifiers.is_empty() {
         session.dismiss_suggestion();
+        return;
+    }
+    // Tab takes the guess. Only when there is one: with nothing to accept it
+    // falls through, where `tui-input` ignores it — a literal tab in a line
+    // bound for the MUD is never what was meant. `Ctrl+Tab` is a different
+    // key here (it cycles panes), which the modifier check keeps out.
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() && session.accept_suggestion() {
         return;
     }
     // Up/Down are built-in and unremappable (§11.3): on a single-line
@@ -5874,6 +5904,80 @@ mod tests {
         heard(&mut session, "A bullywug is here.");
 
         assert_eq!(session.suggestion.as_deref(), Some("ywug"));
+    }
+
+    /// Tab takes the guess and puts it in the line for real, with the cursor
+    /// after it — so the next thing typed continues the word rather than
+    /// landing in the middle of it.
+    #[test]
+    fn tab_accepts_the_guess_and_leaves_the_cursor_at_the_end() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        typed(&mut session, "look bull");
+
+        press_tab(&mut session);
+
+        assert_eq!(session.input.value(), "look bullywug");
+        assert_eq!(
+            session.input.cursor(),
+            "look bullywug".chars().count(),
+            "the cursor belongs after what was just accepted"
+        );
+        // The ghost has become the line, so there is nothing left to draw
+        // dimmed after it.
+        assert_eq!(session.suggestion, None);
+        assert_eq!(session.completed_input(), "look bullywug");
+    }
+
+    /// Typing on after Tab extends the accepted word instead of overwriting
+    /// it, which is the whole point of where the cursor ends up.
+    #[test]
+    fn typing_after_tab_continues_the_accepted_word() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        typed(&mut session, "look bull");
+        press_tab(&mut session);
+
+        typed(&mut session, "s");
+
+        assert_eq!(session.input.value(), "look bullywugs");
+    }
+
+    /// With nothing to accept, Tab does what it did before this existed:
+    /// nothing. Never a literal tab character in a line bound for the MUD.
+    #[test]
+    fn tab_with_no_guess_leaves_the_line_alone() {
+        let (mut session, _rx) = test_support::pane("tank");
+        typed(&mut session, "look bull");
+        assert_eq!(session.suggestion, None, "nothing heard, nothing to guess");
+
+        press_tab(&mut session);
+
+        assert_eq!(session.input.value(), "look bull");
+    }
+
+    /// A dismissed guess stays dismissed. Escape said "send what I typed",
+    /// and Tab must not resurrect what that ruled out.
+    #[test]
+    fn tab_after_escape_has_nothing_to_accept() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        typed(&mut session, "look bull");
+        type_into_input(
+            &mut session,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        press_tab(&mut session);
+
+        assert_eq!(session.input.value(), "look bull");
+    }
+
+    fn press_tab(session: &mut SessionPane) {
+        type_into_input(
+            session,
+            crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
     }
 
     /// Escape is the way out for one line: what you typed is what is sent.

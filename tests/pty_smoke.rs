@@ -106,6 +106,33 @@ fn sends_the_completion_of_what_the_mud_printed() {
     mud.wait_for_command("look bullywug", "Enter should send the completed line");
 }
 
+/// `Tab` accepts the suggestion into the line, and the cursor lands after it —
+/// which is only observable by typing on and seeing the word extend rather
+/// than be interrupted. Worth doing through the real binary because the whole
+/// feature is one key: nothing else proves the key is not eaten on its way to
+/// the input line.
+#[test]
+fn tab_accepts_the_suggestion_and_typing_continues_it() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the screen");
+
+    mud.send_line("A bullywug is here.");
+    app.wait_for("bullywug", "the room's occupant should reach the screen");
+
+    app.send(b"look bull");
+    app.send(b"\t");
+    app.type_line("s");
+
+    mud.wait_for_command(
+        "look bullywugs",
+        "Tab should accept the guess with the cursor after it, so `s` extends it",
+    );
+}
+
 #[test]
 fn honours_a_remapped_quit_key() {
     let mud = FakeMud::start();
