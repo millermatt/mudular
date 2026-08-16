@@ -8,6 +8,18 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/millermatt/mudular/compare/v0.5.0...v0.6.0) - 2026-08-16
+
+### Added
+
+- *(ui)* Tab accepts the suggested completion ([#74](https://github.com/millermatt/mudular/pull/74))
+- *(session)* /send <character> <command> without switching panes ([#70](https://github.com/millermatt/mudular/pull/70))
+
+### Other
+
+- run the tests, lints and feature combinations on every push and PR ([#72](https://github.com/millermatt/mudular/pull/72))
+- drop the nested powershell from the Windows install line
+
 ## [0.5.0](https://github.com/millermatt/mudular/compare/v0.4.0...v0.5.0) - 2026-08-15
 
 ### Added
