@@ -3719,18 +3719,32 @@ mod tests {
         let _ = timeout(Duration::from_secs(2), drained).await;
     }
 
+    /// Waits for the event a test is actually about, skipping the rest.
+    ///
+    /// The wait is generous because it only costs anything when something is
+    /// already broken, and because these tests wait on real sockets on three
+    /// platforms — a bound tight enough to be a stopwatch is a bound that
+    /// fails on whichever runner is slowest today.
+    ///
+    /// Says what it *did* see when it gives up. "Timed out waiting for a
+    /// session event" is the same sentence whether nothing arrived at all or
+    /// nine of the wrong thing did, and telling those apart from a CI log on a
+    /// platform you cannot run is most of the work (#73).
     async fn next_matching(
         events: &mut mpsc::Receiver<SessionEvent>,
         want: impl Fn(&SessionEvent) -> bool,
     ) -> SessionEvent {
+        let mut skipped: Vec<SessionEvent> = Vec::new();
         loop {
-            let event = timeout(Duration::from_secs(2), events.recv())
-                .await
-                .expect("timed out waiting for session event")
-                .expect("session event stream ended early");
+            let event = match timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => panic!("the session ended early; saw {skipped:?}"),
+                Err(_) => panic!("timed out waiting for a session event; saw {skipped:?}"),
+            };
             if want(&event) {
                 return event;
             }
+            skipped.push(event);
         }
     }
 
