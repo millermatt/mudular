@@ -6,6 +6,8 @@ mod map;
 mod net;
 mod scrollback;
 mod session;
+#[cfg(test)]
+mod test_support;
 mod ui;
 mod update;
 mod vitals;

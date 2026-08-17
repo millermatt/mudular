@@ -103,8 +103,8 @@ fn write_pins(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub mod tests {
     use super::*;
 
-    fn store() -> (PinStore, tempdir::TempDir) {
-        let dir = tempdir::TempDir::new();
+    fn store() -> (PinStore, crate::test_support::TempDir) {
+        let dir = crate::test_support::TempDir::new();
         let store = PinStore::new(dir.path().join("nested").join("known_certs"));
         (store, dir)
     }
@@ -193,37 +193,5 @@ pub mod tests {
             Some("abcd".to_string())
         );
         drop(dir);
-    }
-
-    /// Minimal scratch directory that cleans up after itself; the `tempfile`
-    /// crate would be a dependency for one test helper.
-    pub mod tempdir {
-        use std::path::{Path, PathBuf};
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-        pub struct TempDir(PathBuf);
-
-        impl TempDir {
-            #[allow(clippy::new_without_default)]
-            pub fn new() -> Self {
-                let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let path = std::env::temp_dir()
-                    .join(format!("mudular-pins-{}-{unique}", std::process::id()));
-                std::fs::create_dir_all(&path).unwrap();
-                Self(path)
-            }
-
-            pub fn path(&self) -> &Path {
-                &self.0
-            }
-        }
-
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).ok();
-            }
-        }
     }
 }
