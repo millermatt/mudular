@@ -34,11 +34,17 @@ scrollback_size: 10000
 # their own pane, so slow conversation stays readable under combat spam.
 # Each `match` compiles to an ordinary route trigger, so a rule anywhere
 # can also route a line explicitly with `route: comms`.
+#
+# A channel classifies with the same two keys a rule matches with:
+# `pattern` is plain (the text as it appears, `{name}` and `*` for the
+# parts that vary), `regex` takes regexes. A channel may use both.
 channels:
   - name: comms
-    match:
-      - '^\[gossip\]'
-      - '^\w+ tells you'
+    pattern:
+      - '[gossip]'
+      - '{who} tells you'
+    # regex:
+    #   - '^\[(gossip|auction)\]'
     keep_in_main: false   # false (default) moves the line; true copies it
     timestamps: true
     persist: true         # true (default) — the pane survives a restart

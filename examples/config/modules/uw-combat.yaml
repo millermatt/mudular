@@ -6,6 +6,13 @@
 # Modules are listed by name in a profile's `modules:` and applied in that
 # order. Giving a rule an `id` lets a profile override or disable it later
 # without repeating the pattern — see profiles/kestrel.yaml.
+#
+# A `pattern:` is the text as it appears on your screen. `{name}` captures
+# the part that varies and binds `${name}`; `*` captures one positionally,
+# as `${1}`; a `\` makes the next character literal. Everything else means
+# itself, so a `.` is a full stop. An alias matches the whole command you
+# typed; a trigger matches anywhere in the line the MUD sent. Use `regex:`
+# instead of `pattern:` for what plain patterns cannot say.
 name: uw-combat
 description: Combat reactions shared by all Underworld characters
 # Scripts pick up where YAML stops. They live beside this file and share
@@ -16,26 +23,27 @@ variables:
   greeting: "well met"
 aliases:
   - id: quickkill
-    pattern: '^k$'
+    pattern: 'k'
     send: ["kill ${target}"]
   - id: getwear
-    pattern: '^gh (.+)$'
+    pattern: 'gh *'
     send: ["get ${1}", "wear ${1}"]
 triggers:
   - id: greet-arrival
-    pattern: '^(?P<who>\p{L}+) has arrived\.$'
+    pattern: '{who} has arrived.'
     send: ["look ${who}"]
   - id: autoloot
-    pattern: '(?P<victim>.+) is DEAD!'
+    pattern: '{victim} is DEAD!'
     send: ["get all corpse"]
   # Hand the match to a function in the script above — for anything a
   # `send:` list cannot express.
   - id: tally-kills
-    pattern: '(?P<victim>.+) is DEAD!'
+    pattern: '{victim} is DEAD!'
     script: {file: uw-combat.lua, fn: on_death}
-  # Remember what we are fighting, so `k` targets it.
+  # Remember what we are fighting, so `k` targets it. `regex:` is the
+  # escape hatch: only a regex can say "one word, and stop there".
   - id: track-target
-    pattern: '^You are now fighting (?P<foe>\w+)'
+    regex: '^You are now fighting (?P<foe>\w+)'
     set:
       target: "${foe}"
 timers:

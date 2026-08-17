@@ -137,6 +137,10 @@ login:
   password_prompt: '^Speak the word'
 ```
 
+These two stay regular expressions, unlike a rule's `pattern:` — they are
+matched once per connection against text you can see in front of you, and
+there is nothing to share them with.
+
 The password step also fires whenever the server hides your typing, so on
 MUDs that mask the password prompt the wording doesn't matter.
 
@@ -345,9 +349,11 @@ pane, so they don't scroll away under combat spam. Declare them in
 ```yaml
 channels:
   - name: comms
-    match:
-      - '^\[gossip\]'
-      - '^\w+ tells you'
+    pattern:              # plain patterns, same key a rule uses
+      - '[gossip]'
+      - '{who} tells you'
+    regex:                # and regexes, for what those can't say
+      - '^\[(gossip|auction)\]'
     keep_in_main: false   # false (default) moves the line; true copies it
     timestamps: true
     persist: true         # true (default) — the pane survives a restart
@@ -397,7 +403,7 @@ expands the same as if you'd typed it directly:
 
 ```yaml
 aliases:
-  - pattern: '^home$'
+  - pattern: 'home'
     send: [".2s1w"]
 ```
 
@@ -675,17 +681,17 @@ variables:
   target: rat
 
 aliases:            # rewrite what you type
-  - pattern: '^k$'
+  - pattern: 'k'
     send: ["kill ${target}"]
-  - pattern: '^gh (.+)$'
+  - pattern: 'gh *'
     send: ["get ${1}", "wear ${1}"]
 
 triggers:           # react to what the server sends
-  - pattern: '^(?P<who>\w+) has arrived\.$'
+  - pattern: '{who} has arrived.'
     send: ["say welcome ${who}"]
   - pattern: 'is DEAD'
     send: ["get all corpse"]
-  - pattern: '\[gossip\]'
+  - pattern: '[gossip]'
     gag: true       # hide the line entirely
 
 timers:             # act on a schedule
@@ -695,19 +701,85 @@ timers:             # act on a schedule
     send: ["stand"]
 ```
 
-- **Patterns** are regular expressions, matched against the line with
-  colour codes already stripped — so a pattern never has to account for
-  ANSI escapes.
-- **`${...}`** substitutes a capture group (`${1}`, or `${name}` for a
-  named group like `(?P<who>...)`), a variable, or a value the server sent
-  over GMCP/MSDP (`${Char.Vitals.hp}`). A name that resolves to none of
-  them is left as-is, so a typo is visible rather than silently blank.
+- **Patterns are the text as you see it.** Write the line the way the MUD
+  prints it; punctuation means itself, so a `.` is a full stop and
+  `[gossip]` is `[gossip]`. Three things are syntax:
+
+  | | |
+  |---|---|
+  | `{name}` | captures the part that varies, and binds `${name}` |
+  | `*` | captures one without naming it — `${1}`, then `${2}`, … |
+  | `\` | makes the next character literal: `\*`, `\{`, `\}`, `\\` |
+
+  A capture stops at whatever text follows it, so `{who} tells you '{msg}'`
+  splits where you'd expect; a capture at the end takes the rest of the
+  line. Matching is against the line with colour codes already stripped, so
+  a pattern never has to account for ANSI escapes.
+- **An alias matches the whole command; a trigger matches part of a line.**
+  The alias `k` fires on `k` and not on `kick door`, because you typed the
+  whole thing. The trigger `is DEAD` fires on `The rat is DEAD!!`, because
+  the MUD decides what surrounds it.
+- **`regex:` instead of `pattern:`** when a plain pattern can't say it —
+  `regex: '^You are now fighting (?P<foe>\w+)'` to capture one word and
+  stop. It's an ordinary regular expression, with named groups read back as
+  `${foe}`. A rule can have `pattern:` or `regex:`, never both.
+- **`${...}`** substitutes a capture (`${name}`, or `${1}` for a `*`), a
+  variable, or a value the server sent over GMCP/MSDP
+  (`${Char.Vitals.hp}`). A name that resolves to none of them is left
+  as-is, so a typo is visible rather than silently blank.
 - **`set:`** on any rule updates a variable, so a trigger can record
   something (say, your current target) for a later alias to use.
 - **Typing several commands at once**: `north; k; look` is split on `;`
   and each part expanded separately. Alias output is never re-expanded,
   so aliases cannot loop.
 - **Durations** need a unit: `500ms`, `30s`, `5m`, `2h`.
+
+### Bringing an older config forward
+
+Before 0.7.0, a rule's `pattern:` meant a regular expression and a
+channel's `match:` was a list of them. Both are plain now, and regexes
+live under `regex:` in either place. Nothing translates itself: a config
+written for the old meaning still loads, but its patterns are read as
+literal text, so a rule with `^` or `\.` in it quietly stops matching.
+
+So the migration is one rename, twice: `pattern:` → `regex:` on a rule,
+`match:` → `regex:` on a channel. That keeps every rule you already have
+working exactly as it did — the regexes are untouched, only the key they
+sit under changes. Both commands below copy your config directory first;
+run them with the client closed.
+
+On Linux and macOS:
+
+```sh
+cd ~/.config/mudular                     # macOS: ~/Library/Application\ Support/mudular
+cp -a . ../mudular.backup
+find . -name '*.yaml' -exec sed -i -E \
+  's/^([[:space:]]*)(- )?pattern:/\1\2regex:/
+   s/^([[:space:]]*)match:[[:space:]]*$/\1regex:/' {} +
+```
+
+macOS ships BSD `sed`, which wants an argument to `-i`: write `sed -i ''`
+there.
+
+On Windows, in PowerShell:
+
+```powershell
+$dir = "$env:APPDATA\mudular\config"
+Copy-Item $dir "$dir.backup" -Recurse
+# UTF-8 without a BOM, read and written whole: Set-Content would re-encode
+# the file, and a BOM in front of `name:` is a config the client can't read.
+$utf8 = New-Object System.Text.UTF8Encoding $false
+Get-ChildItem $dir -Recurse -Filter *.yaml | ForEach-Object {
+  $text = [IO.File]::ReadAllText($_.FullName, $utf8)
+  $text = [regex]::Replace($text, '(?m)^([ \t]*)(- )?pattern:', '$1$2regex:')
+  $text = [regex]::Replace($text, '(?m)^([ \t]*)match:[ \t]*\r?$', '$1regex:')
+  [IO.File]::WriteAllText($_.FullName, $text, $utf8)
+}
+```
+
+Then rewrite the ones you'd rather read as plain patterns, at your own
+pace — the two spellings live side by side, and a rule that stays a
+`regex:` forever is a perfectly good rule.
 
 ### Asking for more server data
 
@@ -742,10 +814,10 @@ variables:
   heal_at: 40
 
 triggers:
-  - pattern: '^Your health: (?P<hp>\d+)%'
+  - regex: '^Your health: (?P<hp>\d+)%'
     when: '${hp} < ${heal_at}'
     send: ["quaff heal"]
-  - pattern: '^(?P<who>\w+) tells you'
+  - pattern: '{who} tells you'
     when: '${Char.Status.combat} == "0" and ${who} != "Bob"'
     send: ["reply on my way"]
 ```
@@ -783,10 +855,10 @@ chat:
 
 ```yaml
 triggers:
-  - pattern: '\bKestrel\b'
+  - pattern: 'Kestrel'
     highlight: {fg: bright_yellow, bold: true}
   - id: low-hp
-    pattern: '^You are bleeding'
+    pattern: 'You are bleeding'
     highlight: {fg: white, bg: red, whole_line: true}
 ```
 
@@ -833,14 +905,14 @@ With more than one character connected, a rule can send commands to a
 ```yaml
 # tank profile — get healed when I drop below 40%
 triggers:
-  - pattern: '^HP: (?P<hp>\d+)%'
+  - regex: '^HP: (?P<hp>\d+)%'
     when: '${hp} < 40'
     send_to:
       cleric: ["cast 'major heal' Grunk"]
 
 # an alias that moves the whole group
 aliases:
-  - pattern: '^gn$'
+  - pattern: 'gn'
     send: ["north"]
     send_to:
       '*': ["north"]        # `*` means every *other* session
@@ -878,7 +950,7 @@ any rule can read a peer's with `${@name.key}`:
 ```yaml
 # cleric profile — the reaction lives with the character that acts
 triggers:
-  - pattern: '^You finish your prayer'
+  - pattern: 'You finish your prayer'
     when: '${@tank.Char.Vitals.hp} < 50'
     send: ["cast 'major heal' Grunk"]
 ```
@@ -1083,7 +1155,7 @@ function:
 ```yaml
 triggers:
   - id: tally-kills
-    pattern: '(?P<victim>.+) is DEAD!'
+    pattern: '{victim} is DEAD!'
     script: {file: uw-combat.lua, fn: on_death}
 ```
 

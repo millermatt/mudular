@@ -496,7 +496,7 @@ impl ConfigEditorState {
                     prompt: delete_prompt(
                         "alias",
                         rule.id.as_deref(),
-                        rule.pattern.as_deref(),
+                        rule.pattern.as_deref().or(rule.regex.as_deref()),
                         has_advanced_alias(rule),
                     ),
                     action: PendingAction::DeleteRule {
@@ -511,7 +511,7 @@ impl ConfigEditorState {
                     prompt: delete_prompt(
                         "trigger",
                         rule.id.as_deref(),
-                        rule.pattern.as_deref(),
+                        rule.pattern.as_deref().or(rule.regex.as_deref()),
                         has_advanced_trigger(rule),
                     ),
                     action: PendingAction::DeleteRule {
@@ -1018,7 +1018,8 @@ impl ConfigEditorState {
     ) -> Result<(), String> {
         let name = kind.fields()[field];
         if name == "pattern" && !value.is_empty() {
-            regex::Regex::new(value).map_err(|err| format!("invalid pattern: {err}"))?;
+            crate::engine::check_pattern(value, kind == RuleKind::Alias)
+                .map_err(|reason| format!("invalid pattern: {reason}"))?;
         }
         if name == "route" && !value.is_empty() && !self.channel_names.iter().any(|c| c == value) {
             return Err(format!(
@@ -1290,7 +1291,7 @@ impl ConfigEditorState {
                 .iter()
                 .map(|r| {
                     (
-                        rule_summary(r.id.as_deref(), r.pattern.as_deref()),
+                        rule_summary(r.id.as_deref(), r.pattern.as_deref().or(r.regex.as_deref())),
                         has_advanced_alias(r),
                     )
                 })
@@ -1301,7 +1302,7 @@ impl ConfigEditorState {
                 .iter()
                 .map(|r| {
                     (
-                        rule_summary(r.id.as_deref(), r.pattern.as_deref()),
+                        rule_summary(r.id.as_deref(), r.pattern.as_deref().or(r.regex.as_deref())),
                         has_advanced_trigger(r),
                     )
                 })
@@ -1418,7 +1419,7 @@ fn delete_prompt(noun: &str, id: Option<&str>, key: Option<&str>, advanced: bool
 }
 
 fn has_advanced_alias(rule: &Alias) -> bool {
-    rule.send_to.is_some() || rule.set.is_some() || rule.script.is_some()
+    rule.send_to.is_some() || rule.set.is_some() || rule.script.is_some() || rule.regex.is_some()
 }
 
 fn has_advanced_trigger(rule: &Trigger) -> bool {
@@ -1426,6 +1427,10 @@ fn has_advanced_trigger(rule: &Trigger) -> bool {
         || rule.set.is_some()
         || rule.script.is_some()
         || rule.highlight.is_some()
+        // The editor's `pattern` field is plain (§7.1). A rule that matches
+        // by `regex:` instead is edited in the file, and marking it says so
+        // rather than showing it as a rule with no pattern at all.
+        || rule.regex.is_some()
 }
 
 fn has_advanced_timer(rule: &Timer) -> bool {
@@ -1599,11 +1604,11 @@ mod tests {
         }; // pattern
         state.handle_key(KeyCode::Enter, KeyModifiers::NONE); // -> Input
         assert!(matches!(state.mode, Mode::Input { .. }));
-        for c in "^ll$".chars() {
+        for c in "ll".chars() {
             state.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
         state.handle_key(KeyCode::Enter, KeyModifiers::NONE); // commit
-        assert_eq!(state.draft.aliases[0].pattern.as_deref(), Some("^ll$"));
+        assert_eq!(state.draft.aliases[0].pattern.as_deref(), Some("ll"));
         assert!(matches!(state.mode, Mode::Form { .. }));
     }
 
@@ -1620,7 +1625,7 @@ mod tests {
             field: 1,
         };
         state.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        for c in "(unclosed".chars() {
+        for c in "{unclosed".chars() {
             state.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
         state.handle_key(KeyCode::Enter, KeyModifiers::NONE);
@@ -1636,7 +1641,7 @@ mod tests {
         let (_dir, mut state) = open_state(&minimal("kestrel"));
         state.section = Section::Triggers;
         state.draft.triggers.push(Trigger {
-            pattern: Some("hi".to_string()),
+            regex: Some("hi".to_string()),
             ..Default::default()
         });
         state.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
@@ -1664,7 +1669,7 @@ mod tests {
         let mut set = std::collections::BTreeMap::new();
         set.insert("k".to_string(), "v".to_string());
         state.draft.aliases.push(Alias {
-            pattern: Some("hi".to_string()),
+            regex: Some("hi".to_string()),
             set: Some(set),
             ..Default::default()
         });

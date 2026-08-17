@@ -23,9 +23,28 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 mod condition;
+mod pattern;
 pub mod script;
 
 use condition::Condition;
+use pattern::Anchor;
+
+/// Escapes text so a plain `pattern:` matches it literally (§7.1) — for the
+/// editor's "pick a line, get a trigger" flow, which is outside `engine` but
+/// has to write the syntax `engine` reads.
+pub fn pattern_escape(text: &str) -> String {
+    pattern::escape(text)
+}
+
+/// Checks a plain `pattern:` the way `compile` will, so the config editor
+/// can refuse a broken one at the field rather than at save (§10.2).
+pub fn check_pattern(plain: &str, alias: bool) -> Result<(), String> {
+    let anchor = match alias {
+        true => Anchor::Whole,
+        false => Anchor::Substring,
+    };
+    pattern::translate(plain, anchor).map(|_| ())
+}
 use script::{Hook, ScriptCtx, ScriptHost, ScriptOutcome, ScriptSource};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -70,8 +89,14 @@ pub struct Alias {
     /// Stable identity for shadowing across scope layers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// A plain pattern (§7.1): literal text, `{name}` and `*` captures. An
+    /// alias is a whole command, so it matches the input entire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// Raw regex, for what a plain pattern cannot say. Mutually exclusive
+    /// with `pattern:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
     /// Guard: the rule fires only if the pattern matches *and* this
     /// evaluates true (§7.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,8 +132,14 @@ pub struct Trigger {
     /// Stable identity for shadowing across scope layers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// A plain pattern (§7.1): literal text, `{name}` and `*` captures,
+    /// matched anywhere in the line the server sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// Raw regex, for what a plain pattern cannot say. Mutually exclusive
+    /// with `pattern:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
     /// Guard: the rule fires only if the pattern matches *and* this
     /// evaluates true (§7.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,12 +237,22 @@ pub struct Timer {
 
 #[derive(Debug, Error)]
 pub enum EngineError {
-    #[error("invalid pattern `{pattern}` in `{module}`: {source}")]
+    #[error("invalid `regex:` `{pattern}` in `{module}`: {source}")]
     BadPattern {
         module: String,
         pattern: String,
         source: regex::Error,
     },
+    #[error("invalid pattern `{pattern}` in `{module}`: {reason}")]
+    BadPlainPattern {
+        module: String,
+        pattern: String,
+        reason: String,
+    },
+    /// One rule, two ways of saying what it matches: refusing is the only
+    /// answer that cannot silently ignore half of what the author wrote.
+    #[error("rule `{rule}` in `{module}` sets both `pattern:` and `regex:`; it can have only one")]
+    PatternAndRegex { module: String, rule: String },
     #[error("invalid `when:` condition `{condition}` in `{module}`: {reason}")]
     BadCondition {
         module: String,
@@ -1120,6 +1161,12 @@ fn merge_layer<T: Layered>(
     // not be the price of writing them.
     let inherited = acc.len();
     for rule in incoming {
+        if let Some(rule_label) = rule.conflicting_match() {
+            return Err(EngineError::PatternAndRegex {
+                module: module.to_string(),
+                rule: rule_label,
+            });
+        }
         if !rule.has_identity() {
             return Err(rule.identity_error(module));
         }
@@ -1152,7 +1199,9 @@ fn merge_layer<T: Layered>(
 fn same_rule<T: Layered>(existing: &T, incoming: &T) -> bool {
     match (existing.id(), incoming.id()) {
         (Some(a), Some(b)) => a == b,
-        _ => match (existing.pattern(), incoming.pattern()) {
+        // Spelling counts: `pattern: 'hi.'` and `regex: 'hi.'` are two
+        // rules, because they do not match the same lines.
+        _ => match (existing.match_source(), incoming.match_source()) {
             (Some(a), Some(b)) => a == b,
             _ => false,
         },
@@ -1168,34 +1217,105 @@ fn same_rule<T: Layered>(existing: &T, incoming: &T) -> bool {
 /// something an earlier layer defined.
 trait Layered: Clone {
     fn id(&self) -> Option<&str>;
-    fn pattern(&self) -> Option<&str>;
+    fn match_source(&self) -> Option<PatternSource<'_>>;
     fn has_identity(&self) -> bool;
     fn is_definition(&self) -> bool;
     fn identity_error(&self, module: &str) -> EngineError;
     fn fill_from(&mut self, base: &Self);
+    /// The rule's label, if it sets `pattern:` and `regex:` both — the one
+    /// shape that has to be refused before anything else looks at it.
+    /// Timers match nothing, so they can never be in this state.
+    fn conflicting_match(&self) -> Option<String> {
+        None
+    }
+}
+
+/// What a rule matches on, in the spelling its author chose. Plain patterns
+/// are translated to regex at compile (§7.1); the distinction survives until
+/// then because the two spellings mean different things about the same text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternSource<'a> {
+    Plain(&'a str),
+    Regex(&'a str),
+}
+
+impl<'a> PatternSource<'a> {
+    fn of(plain: Option<&'a str>, regex: Option<&'a str>) -> Option<Self> {
+        match (plain, regex) {
+            (Some(plain), None) => Some(Self::Plain(plain)),
+            (None, Some(regex)) => Some(Self::Regex(regex)),
+            // Both set is refused at merge; neither is a rule identified by
+            // `id` alone, patching one an earlier layer defined.
+            _ => None,
+        }
+    }
+
+    fn text(&self) -> &'a str {
+        match self {
+            Self::Plain(text) | Self::Regex(text) => text,
+        }
+    }
+}
+
+/// Inherits how a rule matches from the rule it shadows — but only if this
+/// one says nothing about it at all. Filling the two keys independently
+/// would hand a patch that supplies `regex:` the base's `pattern:` as well,
+/// and a rule with both is refused: a patch that says how it matches
+/// replaces the base's way of saying it, spelling included.
+fn inherit_match(
+    pattern: &mut Option<String>,
+    regex: &mut Option<String>,
+    base_pattern: &Option<String>,
+    base_regex: &Option<String>,
+) {
+    if pattern.is_none() && regex.is_none() {
+        *pattern = base_pattern.clone();
+        *regex = base_regex.clone();
+    }
+}
+
+/// Both spellings of what a rule matches, and both is an error — reported
+/// with the label the author would recognise it by.
+fn conflicting_match(id: Option<&str>, plain: Option<&str>, regex: Option<&str>) -> Option<String> {
+    let (Some(plain), Some(_)) = (plain, regex) else {
+        return None;
+    };
+    Some(id.unwrap_or(plain).to_string())
 }
 
 impl Layered for Alias {
     fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
-    fn pattern(&self) -> Option<&str> {
-        self.pattern.as_deref()
+    fn match_source(&self) -> Option<PatternSource<'_>> {
+        PatternSource::of(self.pattern.as_deref(), self.regex.as_deref())
     }
     fn has_identity(&self) -> bool {
-        self.id.is_some() || self.pattern.is_some()
+        self.id.is_some() || self.match_source().is_some()
     }
     fn is_definition(&self) -> bool {
-        self.pattern.is_some()
+        self.match_source().is_some()
     }
     fn identity_error(&self, module: &str) -> EngineError {
         EngineError::RuleWithoutIdentity {
             module: module.to_string(),
         }
     }
+    fn conflicting_match(&self) -> Option<String> {
+        conflicting_match(
+            self.id.as_deref(),
+            self.pattern.as_deref(),
+            self.regex.as_deref(),
+        )
+    }
     fn fill_from(&mut self, base: &Self) {
         self.id = self.id.take().or_else(|| base.id.clone());
-        self.pattern = self.pattern.take().or_else(|| base.pattern.clone());
+        inherit_match(
+            &mut self.pattern,
+            &mut self.regex,
+            &base.pattern,
+            &base.regex,
+        );
         self.when = self.when.take().or_else(|| base.when.clone());
         self.send = self.send.take().or_else(|| base.send.clone());
         self.send_to = self.send_to.take().or_else(|| base.send_to.clone());
@@ -1209,23 +1329,35 @@ impl Layered for Trigger {
     fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
-    fn pattern(&self) -> Option<&str> {
-        self.pattern.as_deref()
+    fn match_source(&self) -> Option<PatternSource<'_>> {
+        PatternSource::of(self.pattern.as_deref(), self.regex.as_deref())
     }
     fn has_identity(&self) -> bool {
-        self.id.is_some() || self.pattern.is_some()
+        self.id.is_some() || self.match_source().is_some()
     }
     fn is_definition(&self) -> bool {
-        self.pattern.is_some()
+        self.match_source().is_some()
     }
     fn identity_error(&self, module: &str) -> EngineError {
         EngineError::RuleWithoutIdentity {
             module: module.to_string(),
         }
     }
+    fn conflicting_match(&self) -> Option<String> {
+        conflicting_match(
+            self.id.as_deref(),
+            self.pattern.as_deref(),
+            self.regex.as_deref(),
+        )
+    }
     fn fill_from(&mut self, base: &Self) {
         self.id = self.id.take().or_else(|| base.id.clone());
-        self.pattern = self.pattern.take().or_else(|| base.pattern.clone());
+        inherit_match(
+            &mut self.pattern,
+            &mut self.regex,
+            &base.pattern,
+            &base.regex,
+        );
         self.when = self.when.take().or_else(|| base.when.clone());
         self.send = self.send.take().or_else(|| base.send.clone());
         self.send_to = self.send_to.take().or_else(|| base.send_to.clone());
@@ -1247,7 +1379,7 @@ impl Layered for Timer {
     }
     /// Timers have no pattern, so only an explicit `id` can shadow one;
     /// an id-less timer is always a new one.
-    fn pattern(&self) -> Option<&str> {
+    fn match_source(&self) -> Option<PatternSource<'_>> {
         None
     }
     fn has_identity(&self) -> bool {
@@ -1272,9 +1404,11 @@ impl Layered for Timer {
     }
 }
 
-trait CompilableRule {
+trait CompilableRule: Layered {
+    /// Where a plain pattern of this rule kind is allowed to match: an
+    /// alias is the whole command, a trigger is part of a line (§7.1).
+    const ANCHOR: Anchor;
     fn id_label(&self) -> String;
-    fn pattern_str(&self) -> Option<&str>;
     fn when_str(&self) -> Option<&str>;
     fn enabled(&self) -> bool;
     fn sends(&self) -> Vec<String>;
@@ -1290,11 +1424,9 @@ trait CompilableRule {
 }
 
 impl CompilableRule for Alias {
+    const ANCHOR: Anchor = Anchor::Whole;
     fn id_label(&self) -> String {
         self.id.clone().unwrap_or_default()
-    }
-    fn pattern_str(&self) -> Option<&str> {
-        self.pattern.as_deref()
     }
     fn when_str(&self) -> Option<&str> {
         self.when.as_deref()
@@ -1345,11 +1477,9 @@ impl CompilableRule for Alias {
 }
 
 impl CompilableRule for Trigger {
+    const ANCHOR: Anchor = Anchor::Substring;
     fn id_label(&self) -> String {
         self.id.clone().unwrap_or_default()
-    }
-    fn pattern_str(&self) -> Option<&str> {
-        self.pattern.as_deref()
     }
     fn when_str(&self) -> Option<&str> {
         self.when.as_deref()
@@ -1400,10 +1530,27 @@ fn compile_rules<T: CompilableRule>(
 ) -> Result<Vec<CompiledRule>, EngineError> {
     let mut out = Vec::new();
     for rule in rules.iter().filter(|rule| rule.enabled()) {
-        let pattern = rule.pattern_str().ok_or_else(|| EngineError::UnknownRule {
-            module: "merged rules".to_string(),
-            id: rule.id_label(),
-        })?;
+        let source = rule
+            .match_source()
+            .ok_or_else(|| EngineError::UnknownRule {
+                module: "merged rules".to_string(),
+                id: rule.id_label(),
+            })?;
+        // The pattern as the author wrote it, for anything that has to name
+        // the rule back to them; `regex_source` is what actually compiles.
+        let pattern = source.text();
+        let regex_source = match source {
+            PatternSource::Regex(regex) => regex.to_string(),
+            PatternSource::Plain(plain) => {
+                pattern::translate(plain, T::ANCHOR).map_err(|reason| {
+                    EngineError::BadPlainPattern {
+                        module: "merged rules".to_string(),
+                        pattern: plain.to_string(),
+                        reason,
+                    }
+                })?
+            }
+        };
         let when = rule
             .when_str()
             .map(|src| {
@@ -1415,7 +1562,7 @@ fn compile_rules<T: CompilableRule>(
             })
             .transpose()?;
         out.push(CompiledRule {
-            regex: Regex::new(pattern).map_err(|source| EngineError::BadPattern {
+            regex: Regex::new(&regex_source).map_err(|source| EngineError::BadPattern {
                 module: "merged rules".to_string(),
                 pattern: pattern.to_string(),
                 source,
@@ -1870,7 +2017,7 @@ mod tests {
             r#"
             name: test
             triggers:
-              - pattern: '^(?P<who>\p{L}+) has arrived\.$'
+              - regex: '^(?P<who>\p{L}+) has arrived\.$'
                 send: ["look ${who}"]
             "#,
         );
@@ -1890,7 +2037,7 @@ mod tests {
             r#"
             name: test
             triggers:
-              - pattern: 'spam'
+              - regex: 'spam'
                 set: {seen: "yes"}
             "#,
         );
@@ -1904,7 +2051,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^gh (.+)$'
+              - regex: '^gh (.+)$'
                 send: ["get ${1}", "wear ${1}"]
             "#,
         );
@@ -1925,7 +2072,7 @@ mod tests {
             variables:
               target: rat
             aliases:
-              - pattern: '^hh$'
+              - regex: '^hh$'
                 send: ["cast heal ${target}"]
             "#,
         );
@@ -1938,7 +2085,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^t$'
+              - regex: '^t$'
                 send: ["kill ${nope}"]
             "#,
         );
@@ -1951,11 +2098,11 @@ mod tests {
             r#"
             name: test
             triggers:
-              - pattern: '^You are fighting (?P<foe>\w+)'
+              - regex: '^You are fighting (?P<foe>\w+)'
                 set:
                   target: "${foe}"
             aliases:
-              - pattern: '^k$'
+              - regex: '^k$'
                 send: ["kill ${target}"]
             "#,
         );
@@ -1974,10 +2121,10 @@ mod tests {
             r#"
             name: test
             triggers:
-              - pattern: 'fighting (?P<foe>\w+)'
+              - regex: 'fighting (?P<foe>\w+)'
                 set:
                   target: "${foe}"
-              - pattern: 'fighting'
+              - regex: 'fighting'
                 send: ["kill ${target}"]
             "#,
         );
@@ -2002,10 +2149,10 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^mark (?P<who>\w+)$'
+              - regex: '^mark (?P<who>\w+)$'
                 set:
                   target: "${who}"
-              - pattern: '^k$'
+              - regex: '^k$'
                 send: ["kill ${target}"]
             "#,
         );
@@ -2023,7 +2170,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^gh (.+)$'
+              - regex: '^gh (.+)$'
                 send: ["get ${1}", "wear ${1}"]
             "#,
         );
@@ -2093,7 +2240,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^home$'
+              - regex: '^home$'
                 send: [".2s1w"]
             "#,
         );
@@ -2116,9 +2263,9 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^a$'
+              - regex: '^a$'
                 send: ["b"]
-              - pattern: '^b$'
+              - regex: '^b$'
                 send: ["a"]
             "#,
         );
@@ -2131,7 +2278,7 @@ mod tests {
             r#"
             name: test
             triggers:
-              - pattern: 'spam'
+              - regex: 'spam'
                 gag: true
             "#,
         );
@@ -2146,7 +2293,7 @@ mod tests {
             r#"
             name: test
             triggers:
-              - pattern: 'x'
+              - regex: 'x'
                 send: ["y"]
                 enabled: false
             "#,
@@ -2162,7 +2309,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^hp$'
+              - regex: '^hp$'
                 send: ["hp is ${Char.Vitals.hp}"]
             "#,
         );
@@ -2255,7 +2402,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^hp$'
+              - regex: '^hp$'
                 send: ["hp is ${Char.Vitals.hp}"]
             "#,
         );
@@ -2274,7 +2421,7 @@ mod tests {
             variables:
               hp: unknown
             aliases:
-              - pattern: '^hp$'
+              - regex: '^hp$'
                 send: ["hp is ${hp}"]
             "#,
         );
@@ -2291,7 +2438,7 @@ mod tests {
             r#"
             name: test
             triggers:
-              - pattern: '^low hp$'
+              - regex: '^low hp$'
                 send: ["quaff heal, currently ${Char.Vitals.hp}"]
             "#,
         );
@@ -2310,11 +2457,11 @@ mod tests {
             r#"
             name: test
             triggers:
-              - pattern: '^snapshot$'
+              - regex: '^snapshot$'
                 set:
                   last_hp: "${Char.Vitals.hp}"
             aliases:
-              - pattern: '^recall$'
+              - regex: '^recall$'
                 send: ["it was ${last_hp}"]
             "#,
         );
@@ -2331,7 +2478,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^hp$'
+              - regex: '^hp$'
                 send: ["hp is ${hp}"]
             "#,
         );
@@ -2348,7 +2495,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^hp$'
+              - regex: '^hp$'
                 send: ["hp is ${hp}"]
             "#,
         );
@@ -2364,7 +2511,7 @@ mod tests {
             r#"
             name: test
             aliases:
-              - pattern: '^room$'
+              - regex: '^room$'
                 send: ["you are in ${room_name}"]
             "#,
         );
@@ -2375,13 +2522,151 @@ mod tests {
         );
     }
 
+    // ---- plain patterns (§7.1) ----
+
+    /// The end-to-end shape of #80: what an author writes is what the MUD
+    /// prints, and the capture it names is the placeholder the action uses.
+    #[test]
+    fn a_plain_trigger_pattern_matches_literally_and_binds_its_captures() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+            name: plain
+            triggers:
+              - pattern: '{who} has arrived.'
+                send: ["look ${who}"]
+            "#,
+        )])
+        .expect("compiles");
+
+        assert_eq!(
+            engine.process_line("Bob has arrived.").sends,
+            vec!["look Bob"]
+        );
+        // The `.` an author never had to escape is a full stop, so the
+        // near-miss line no longer fires the rule by accident.
+        assert!(engine.process_line("Bob has arrived!").sends.is_empty());
+    }
+
+    /// An alias is the whole command, and a trigger is part of a line: the
+    /// same plain text means different things in the two places (§7.1).
+    #[test]
+    fn a_plain_alias_matches_the_whole_command_a_trigger_matches_within() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+            name: plain
+            aliases:
+              - pattern: 'k'
+                send: ["kill rat"]
+            triggers:
+              - pattern: 'is DEAD'
+                send: ["get all corpse"]
+            "#,
+        )])
+        .expect("compiles");
+
+        assert_eq!(engine.expand_input("k").sends, vec!["kill rat"]);
+        assert_eq!(engine.expand_input("kick door").sends, vec!["kick door"]);
+        assert_eq!(
+            engine.process_line("The rat is DEAD!!").sends,
+            vec!["get all corpse"]
+        );
+    }
+
+    /// `regex:` is the escape hatch, and it still means exactly what it
+    /// always did — the translation applies to `pattern:` alone.
+    #[test]
+    fn regex_keeps_its_meaning_beside_a_plain_pattern() {
+        let mut engine = Engine::compile(&[module(
+            r#"
+            name: mixed
+            triggers:
+              - regex: '^You are now fighting (?P<foe>\w+)'
+                set:
+                  target: "${foe}"
+              - pattern: 'k'
+                send: ["kill ${target}"]
+            "#,
+        )])
+        .expect("compiles");
+
+        engine.process_line("You are now fighting a kobold");
+        assert_eq!(engine.variable("target"), Some("a"));
+    }
+
+    /// Two ways of saying what one rule matches is not a thing to guess at:
+    /// silently preferring one would make the other's edit do nothing.
+    #[test]
+    fn a_rule_with_both_pattern_and_regex_is_refused_by_name() {
+        let err = Engine::compile(&[module(
+            r#"
+            name: confused
+            triggers:
+              - id: greet
+                pattern: 'hi'
+                regex: '^hi$'
+                send: ["wave"]
+            "#,
+        )])
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("greet"), "{message}");
+        assert!(message.contains("only one"), "{message}");
+    }
+
+    /// A broken plain pattern has to name the rule's own text, not the regex
+    /// it would have become — the author never wrote that regex.
+    #[test]
+    fn a_broken_plain_pattern_reports_the_pattern_as_written() {
+        let err = Engine::compile(&[module(
+            r#"
+            name: broken
+            triggers:
+              - pattern: '{who has arrived'
+                send: ["wave"]
+            "#,
+        )])
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("{who has arrived"), "{message}");
+        assert!(message.contains("never closed"), "{message}");
+    }
+
+    /// Shadowing by `id` inherits the base's spelling along with its text —
+    /// but a patch that supplies its own spelling replaces both, or the
+    /// merged rule would carry `pattern:` and `regex:` at once and be
+    /// refused for a conflict its author never wrote.
+    #[test]
+    fn a_patch_can_swap_a_plain_pattern_for_a_regex() {
+        let mut engine = layers(&[
+            r#"
+            name: base
+            triggers:
+              - id: arrival
+                pattern: '{who} has arrived.'
+                send: ["look ${who}"]
+            "#,
+            r#"
+            name: profile
+            triggers:
+              - id: arrival
+                regex: '^(?P<who>\w+) (?:has arrived|wanders in)\.$'
+            "#,
+        ]);
+
+        assert_eq!(
+            engine.process_line("Bob wanders in.").sends,
+            vec!["look Bob"],
+            "the patch's regex replaced the base's plain pattern"
+        );
+    }
+
     #[test]
     fn bad_pattern_reports_context() {
         let err = Engine::compile(&[module(
             r#"
             name: broken
             triggers:
-              - pattern: '('
+              - regex: '('
             "#,
         )])
         .unwrap_err();
@@ -2426,16 +2711,16 @@ mod tests {
             name: module
             triggers:
               - id: greet
-                pattern: 'hello'
+                regex: 'hello'
                 send: ["wave"]
-              - pattern: 'bye'
+              - regex: 'bye'
                 send: ["farewell"]
             "#,
             r#"
             name: profile
             triggers:
               - id: greet
-                pattern: 'hello'
+                regex: 'hello'
                 send: ["bow"]
             "#,
         ]);
@@ -2449,17 +2734,17 @@ mod tests {
             name: module
             triggers:
               - id: first
-                pattern: 'x'
+                regex: 'x'
                 send: ["one"]
               - id: second
-                pattern: 'x'
+                regex: 'x'
                 send: ["two"]
             "#,
             r#"
             name: profile
             triggers:
               - id: first
-                pattern: 'x'
+                regex: 'x'
                 send: ["ONE"]
             "#,
         ]);
@@ -2483,10 +2768,10 @@ mod tests {
             name: module
             triggers:
               - id: a
-                pattern: 'x'
+                regex: 'x'
                 send: ["one"]
               - id: b
-                pattern: 'x'
+                regex: 'x'
                 send: ["two"]
             "#]);
         assert_eq!(engine.process_line("x").sends, vec!["one", "two"]);
@@ -2501,7 +2786,7 @@ mod tests {
             name: module
             triggers:
               - id: autoloot
-                pattern: 'is DEAD'
+                regex: 'is DEAD'
                 send: ["get all corpse"]
             "#,
             r#"
@@ -2521,7 +2806,7 @@ mod tests {
             name: global
             triggers:
               - id: autoloot
-                pattern: 'is DEAD'
+                regex: 'is DEAD'
                 send: ["get all corpse"]
                 enabled: false
             "#,
@@ -2546,7 +2831,7 @@ mod tests {
             name: module
             triggers:
               - id: greet
-                pattern: '^(?P<who>\w+) waves'
+                regex: '^(?P<who>\w+) waves'
                 send: ["wave ${who}"]
             "#,
             r#"
@@ -2584,11 +2869,11 @@ mod tests {
             name: module
             aliases:
               - id: shared
-                pattern: '^x$'
+                regex: '^x$'
                 send: ["alias fired"]
             triggers:
               - id: shared
-                pattern: 'x'
+                regex: 'x'
                 send: ["trigger fired"]
             "#]);
         assert_eq!(engine.expand_input("x").sends, vec!["alias fired"]);
@@ -2734,7 +3019,7 @@ mod tests {
             r#"
 name: t
 triggers:
-  - pattern: '^HP: (?P<hp>\d+)%'
+  - regex: '^HP: (?P<hp>\d+)%'
     send: ["quaff heal"]
     send_to:
       cleric: ["cast 'major heal' ${hp}"]
@@ -2763,7 +3048,7 @@ triggers:
 name: global
 triggers:
   - id: heal-me
-    pattern: 'low health'
+    regex: 'low health'
     send_to:
       cleric: ["heal tank"]
 "#,
@@ -2793,7 +3078,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'wounded'
+  - regex: 'wounded'
     send_to:
       cleric: ["heal ${Char.Base.name}"]
 "#,
@@ -2813,7 +3098,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'tells you'
+  - regex: 'tells you'
     route: comms
     gag: true
 "#,
@@ -2837,9 +3122,9 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'tells you'
+  - regex: 'tells you'
     route: comms
-  - pattern: 'Bob'
+  - regex: 'Bob'
     route: spam
 "#,
         )])
@@ -2861,7 +3146,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: '\bKestrel\b'
+  - regex: '\bKestrel\b'
     highlight: {fg: bright_yellow, bold: true}
 "#,
         )])
@@ -2880,7 +3165,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: '^You are bleeding'
+  - regex: '^You are bleeding'
     highlight: {fg: white, bg: red, whole_line: true}
 "#,
         )])
@@ -2898,7 +3183,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'rare'
+  - regex: 'rare'
     highlight: {fg: 208, bg: '#102030', underline: true}
 "#,
         )])
@@ -2919,11 +3204,11 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'Kestrel the'
+  - regex: 'Kestrel the'
     highlight: {bold: true}
-  - pattern: 'the Bold'
+  - regex: 'the Bold'
     highlight: {fg: red}
-  - pattern: 'arrives'
+  - regex: 'arrives'
     highlight: {fg: cyan}
 "#,
         )])
@@ -2944,7 +3229,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'spam'
+  - regex: 'spam'
     highlight: {bold: true}
     gag: true
 "#,
@@ -2964,7 +3249,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'You have been slain'
+  - regex: 'You have been slain'
     bell: true
 "#,
         )])
@@ -3058,7 +3343,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'lists the following items'
+  - regex: 'lists the following items'
     mark: shop
 "#,
         )])
@@ -3081,9 +3366,9 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'fountain'
+  - regex: 'fountain'
     mark: water
-  - pattern: 'bubbles'
+  - regex: 'bubbles'
     mark: landmark
 "#,
         )])
@@ -3103,7 +3388,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'You have been KILLED'
+  - regex: 'You have been KILLED'
     corpse: true
 "#,
         )])
@@ -3121,7 +3406,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'You have been KILLED'
+  - regex: 'You have been KILLED'
     gag: true
     corpse: true
 "#,
@@ -3142,7 +3427,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: 'tick'
+  - regex: 'tick'
     gag: true
     bell: true
 "#,
@@ -3161,7 +3446,7 @@ triggers:
             name: module
             triggers:
               - id: my-name
-                pattern: 'Kestrel'
+                regex: 'Kestrel'
                 highlight: {fg: bright_yellow}
             "#,
             r#"
@@ -3183,7 +3468,7 @@ triggers:
             name: module
             triggers:
               - id: my-name
-                pattern: 'Kestrel'
+                regex: 'Kestrel'
                 highlight: {fg: bright_yellow}
             "#,
             "name: profile\ntriggers:\n  - id: my-name\n    send: [\"wave\"]\n",
@@ -3200,7 +3485,7 @@ triggers:
 name: t
 triggers:
   - id: low-hp
-    pattern: 'bleeding'
+    regex: 'bleeding'
     highlight: {whole_line: true}
 "#,
         )])
@@ -3219,7 +3504,7 @@ triggers:
             r#"
 name: t
 triggers:
-  - pattern: '\bKestrel\b'
+  - regex: '\bKestrel\b'
     highlight: {fg: chartreuse}
 "#,
         )])
@@ -3241,7 +3526,7 @@ triggers:
             variables:
               heal_at: "40"
             triggers:
-              - pattern: '^Your health: (?P<hp>\d+)%'
+              - regex: '^Your health: (?P<hp>\d+)%'
                 when: '${hp} < ${heal_at}'
                 send: ["quaff heal"]
             "#,
@@ -3259,7 +3544,7 @@ triggers:
             r#"
             name: test
             triggers:
-              - pattern: 'The dragon roars'
+              - regex: 'The dragon roars'
                 when: '${Char.Vitals.hp} < 50'
                 send: ["flee"]
             "#,
@@ -3280,7 +3565,7 @@ triggers:
             variables:
               quiet: "0"
             triggers:
-              - pattern: 'tells you'
+              - regex: 'tells you'
                 when: '${quiet} == 1'
                 gag: true
                 route: comms
@@ -3302,11 +3587,11 @@ triggers:
               mounted: "0"
             aliases:
               - id: ride
-                pattern: '^go$'
+                regex: '^go$'
                 when: '${mounted} == 1'
                 send: ["ride north"]
               - id: walk
-                pattern: '^go$'
+                regex: '^go$'
                 send: ["walk north"]
             "#,
         );
@@ -3319,7 +3604,7 @@ triggers:
             r#"
             name: test
             triggers:
-              - pattern: 'The dragon roars'
+              - regex: 'The dragon roars'
                 when: '${Char.Vitals.hp} < 50'
                 send: ["flee"]
             "#,
@@ -3335,7 +3620,7 @@ triggers:
             r#"
             name: test
             triggers:
-              - pattern: 'x'
+              - regex: 'x'
                 when: '${hp} =! 40'
                 send: ["y"]
             "#,
@@ -3351,7 +3636,7 @@ triggers:
             name: base
             triggers:
               - id: heal
-                pattern: '^Your health: (?P<hp>\d+)%'
+                regex: '^Your health: (?P<hp>\d+)%'
                 when: '${hp} < 40'
                 send: ["quaff heal"]
             "#,
@@ -3403,7 +3688,7 @@ triggers:
         let yaml = r#"
             name: test
             triggers:
-              - pattern: '^hit$'
+              - regex: '^hit$'
                 when: '${HEALTH} < ${HEALTH_MAX}'
                 send: ["heal me"]
         "#;
@@ -3442,7 +3727,7 @@ triggers:
         let yaml = r#"
             name: test
             triggers:
-              - pattern: '^check$'
+              - regex: '^check$'
                 when: '${@tank.HEALTH} < 50'
                 send: ["cast heal tank"]
         "#;
@@ -3496,9 +3781,9 @@ triggers:
             r#"
             name: test
             triggers:
-              - pattern: 'hits you'
+              - regex: 'hits you'
                 send: ["heal me"]
-              - pattern: 'hits you'
+              - regex: 'hits you'
                 send: ["assist tank"]
             "#,
         );
@@ -3518,7 +3803,7 @@ triggers:
             r#"
             name: base
             triggers:
-              - pattern: 'hits you'
+              - regex: 'hits you'
                 send: ["flee"]
             "#,
         );
@@ -3526,7 +3811,7 @@ triggers:
             r#"
             name: over
             triggers:
-              - pattern: 'hits you'
+              - regex: 'hits you'
                 send: ["stand and fight"]
             "#,
         );
@@ -3573,7 +3858,7 @@ triggers:
             r#"
             name: test
             triggers:
-              - pattern: '^You feel rested'
+              - regex: '^You feel rested'
                 when: '${@tank.Char.Vitals.hp} < 40'
                 send: ["cast 'major heal' Grunk"]
             "#,
@@ -3593,7 +3878,7 @@ triggers:
             r#"
             name: test
             aliases:
-              - pattern: '^help$'
+              - regex: '^help$'
                 send: ["cast heal ${@tank.target}"]
             "#,
             "tank",
@@ -3612,10 +3897,10 @@ triggers:
             r#"
             name: test
             triggers:
-              - pattern: '^guarded$'
+              - regex: '^guarded$'
                 when: '${@ghost.hp} < 40'
                 send: ["never"]
-              - pattern: '^expanded$'
+              - regex: '^expanded$'
                 send: ["say ${@ghost.hp}/${@tank.missing}"]
             "#,
             "tank",
@@ -3639,7 +3924,7 @@ triggers:
             variables:
               hp: "90"
             aliases:
-              - pattern: '^both$'
+              - regex: '^both$'
                 send: ["say ${hp} ${@tank.hp}"]
             "#,
             "tank",
@@ -3659,7 +3944,7 @@ triggers:
             r#"
             name: test
             aliases:
-              - pattern: '^both$'
+              - regex: '^both$'
                 send: ["say ${@tank.hp} ${@cleric.hp}"]
             "#,
             "tank",
@@ -3681,7 +3966,7 @@ triggers:
             r#"
             name: test
             triggers:
-              - pattern: '^You are now fighting (?P<foe>\w+)'
+              - regex: '^You are now fighting (?P<foe>\w+)'
                 set: {target: "${foe}"}
             "#,
         );
@@ -3736,7 +4021,7 @@ triggers:
             r#"
             name: test
             triggers:
-              - pattern: '^(\w+) is DEAD!$'
+              - regex: '^(\w+) is DEAD!$'
                 script: {file: combat.js, fn: onDeath}
             "#,
         );
@@ -3797,7 +4082,7 @@ triggers:
                 variables:
                   heal_at: "40"
                 triggers:
-                  - pattern: '^Your health: (?P<hp>\d+)%'
+                  - regex: '^Your health: (?P<hp>\d+)%'
                     set: {hp: "${hp}"}
                 "#,
                 r#"
@@ -3826,7 +4111,7 @@ triggers:
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^t$'
+                  - regex: '^t$'
                     send: ["kill ${quarry}"]
                 "#,
                 r#"mud.on_line(function(line) mud.set("quarry", line) end)"#,
@@ -3886,7 +4171,7 @@ triggers:
                 r#"
                 name: test
                 triggers:
-                  - pattern: '^ouch$'
+                  - regex: '^ouch$'
                     send: ["quaff heal"]
                 "#,
                 r#"mud.on_line(function() error("boom") end)"#,
@@ -3925,7 +4210,7 @@ triggers:
                 r#"
                 name: test
                 triggers:
-                  - pattern: '^(?P<killer>\w+) killed (\w+)!$'
+                  - regex: '^(?P<killer>\w+) killed (\w+)!$'
                     script: {file: test.lua, fn: on_death}
                 "#,
                 r#"
@@ -3947,7 +4232,7 @@ triggers:
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^hunt (\w+)$'
+                  - regex: '^hunt (\w+)$'
                     script: {file: test.lua, fn: hunt}
                 "#,
                 r#"function hunt(_, caps) mud.send("kill " .. caps[1]) end"#,
@@ -3965,9 +4250,9 @@ triggers:
                 r#"
                 name: test
                 triggers:
-                  - pattern: '^You are now fighting (?P<foe>\w+)'
+                  - regex: '^You are now fighting (?P<foe>\w+)'
                     set: {target: "${foe}"}
-                  - pattern: '^You are now fighting'
+                  - regex: '^You are now fighting'
                     script: {file: test.lua, fn: engaged}
                 "#,
                 r#"function engaged() mud.send("consider " .. mud.get("target")) end"#,
@@ -4162,7 +4447,7 @@ triggers:
                 r#"
                 name: test
                 triggers:
-                  - pattern: '^Your health: (?P<hp>\d+)%'
+                  - regex: '^Your health: (?P<hp>\d+)%'
                     when: '${hp} < 40'
                     script: {file: test.lua, fn: hurt}
                 "#,
@@ -4184,7 +4469,7 @@ triggers:
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'x'
+                  - regex: 'x'
                     script: {file: test.lua, fn: on_deth}
                 "#,
             );
@@ -4206,7 +4491,7 @@ triggers:
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'x'
+                  - regex: 'x'
                     script: {file: ghost.lua, fn: boo}
                 "#,
             );

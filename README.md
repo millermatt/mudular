@@ -164,13 +164,18 @@ variables:
   target: rat
 
 aliases:
-  - pattern: '^k$'
+  - pattern: 'k'
     send: ["kill ${target}"]
 
 triggers:
-  - pattern: '^You are hungry\.$'
+  - pattern: 'You are hungry.'
     send: ["eat bread"]
 ```
+
+Patterns are the text as the MUD prints it — `{name}` captures the part
+that varies, `*` captures one without naming it, and everything else means
+itself. `regex:` takes a regular expression instead, for what that can't
+say.
 
 Type `/reload` in the client to pick up changes without reconnecting.
 
