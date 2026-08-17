@@ -8,6 +8,23 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0](https://github.com/millermatt/mudular/compare/v0.7.0...v0.8.0) - 2026-08-17
+
+### Added
+
+- *(app)* /disconnect closes the character you are typing at ([#99](https://github.com/millermatt/mudular/pull/99))
+
+### Fixed
+
+- *(ci)* exclude test-support from the workspace so release-plz runs again ([#100](https://github.com/millermatt/mudular/pull/100))
+
+### Other
+
+- *(test)* make test-support a dev-dependency crate ([#97](https://github.com/millermatt/mudular/pull/97))
+- *(engine)* make the plain-pattern error test check what it claims ([#96](https://github.com/millermatt/mudular/pull/96))
+- *(app)* give a session a stable id, not a Vec index ([#95](https://github.com/millermatt/mudular/pull/95))
+- *(app)* split what a session pane shows from what it holds ([#93](https://github.com/millermatt/mudular/pull/93))
+
 ## [0.7.0](https://github.com/millermatt/mudular/compare/v0.6.2...v0.7.0) - 2026-08-17
 
 ### Added
