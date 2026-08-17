@@ -45,6 +45,10 @@ const CHANNEL_WIDTH_STEP: u16 = 2;
 /// (docs/ARCHITECTURE.md §11.5).
 const SCROLL_PAGE: usize = 10;
 
+/// How many replies the empty client keeps on screen. Enough to see what
+/// went wrong with the last attempt and still read the hint above it.
+const SHELL_NOTICES: usize = 6;
+
 /// The client-side commands. Everything else starting with `/` is left
 /// alone, since plenty of MUDs use `/` for their own commands.
 const RELOAD_COMMAND: &str = "/reload";
@@ -772,6 +776,19 @@ pub struct AppState {
     /// coordinate would quietly come to mean a different room the moment
     /// anything moved.
     pub map_cursor: Option<crate::map::RoomId>,
+    /// The input line when no session is bound (#108).
+    ///
+    /// `SessionView` owns the ordinary one, which is right — it is that
+    /// character's line, with that character's history. But the client can
+    /// legitimately have no character at all: `mudular` run bare with a
+    /// profile saved, or the last one closed with `/disconnect`. Without a
+    /// line of its own that state swallowed every keystroke, so the one
+    /// command that could leave it — `/connect` — was untypeable.
+    pub shell_input: Input,
+    /// What the empty client has been told, since it has no scrollback to
+    /// say it in. Bounded because nothing prunes it: this is a waiting
+    /// room, not a log.
+    pub shell_notices: Vec<String>,
     /// Where the map picture sits relative to the bound character, in room
     /// steps (#58). `(0, 0)` is the historical behaviour: the character in
     /// the middle, the world sliding under them as they walk.
@@ -1064,6 +1081,29 @@ impl AppState {
             }
         }
         self.map_pan_for = Some((id, current));
+    }
+
+    /// Says something to the player wherever they can see it: the bound
+    /// character's scrollback, or the empty client's notice area when
+    /// there is no character at all (#108).
+    ///
+    /// Every `if let Some(session) = state.bound_mut()` before a
+    /// `push_line` was a silent drop waiting for the day nothing was
+    /// bound — which `/connect`'s own "no such profile" reply was, in
+    /// exactly the state a player would be typing `/connect` in.
+    pub fn tell_player(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        match self.bound_mut() {
+            Some(session) => session.push_line(RetainedLine::client(text)),
+            None => {
+                self.shell_notices.push(text);
+                // Oldest first out: the reply to what was just typed is
+                // the one worth keeping.
+                while self.shell_notices.len() > SHELL_NOTICES {
+                    self.shell_notices.remove(0);
+                }
+            }
+        }
     }
 
     pub fn focus_pane(&mut self, focus: Focus) {
@@ -2319,6 +2359,23 @@ fn connect(
 /// Its own function so it can be tested: everything else on this path is
 /// inside `event_loop`, which owns a real terminal and cannot be driven
 /// from a test.
+/// Routes a keystroke to whichever input line exists (#108).
+///
+/// Its own function for the reason `type_into_input` is: the alternative
+/// is a branch inside `event_loop`, which owns a real terminal and cannot
+/// be driven from a test — and an untested branch here is exactly how the
+/// empty client came to swallow every keystroke.
+fn type_anywhere(state: &mut AppState, key: crossterm::event::KeyEvent) {
+    match state.bound_mut() {
+        Some(session) => type_into_input(session, key),
+        // No character to type at, but the client is still running and
+        // `/connect` is still worth typing.
+        None => {
+            state.shell_input.handle_event(&Event::Key(key));
+        }
+    }
+}
+
 fn type_into_input(session: &mut SessionPane, key: crossterm::event::KeyEvent) {
     // Escape means "send what I typed, not what you guessed" here, which
     // it is free to mean only because every overlay that wants Escape has
@@ -3044,6 +3101,8 @@ async fn event_loop(
         reload_requested: false,
         line_cursor: None,
         map_cursor: None,
+        shell_input: Input::default(),
+        shell_notices: Vec::new(),
         map_pan: (0, 0),
         map_pan_for: None,
         map_grid: None,
@@ -3244,8 +3303,8 @@ async fn event_loop(
                     // (§11.1, §11.5). This changes pane content, not size,
                     // so no NAWS report follows.
                     state.scroll_focused(key.code);
-                } else if let Some(session) = state.bound_mut() {
-                    type_into_input(session, key);
+                } else {
+                    type_anywhere(&mut state, key);
                 }
                 remember_layout_if_changed(&state, layout_before);
             }
@@ -3739,6 +3798,7 @@ fn answer_password_offer(session: &mut SessionPane, save: bool) {
 /// the focused pane: focusing comms must not redirect commands (§11.1).
 async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     let Some(session) = state.bound_mut() else {
+        submit_shell_input(state, channels).await;
         return;
     };
     // The ghost is part of the line: what is on screen is what gets sent,
@@ -4353,6 +4413,43 @@ async fn walk_to(
 /// rather than only for characters named on the command line. `--record`
 /// never applies here: it is a startup flag with no CLI invocation to read
 /// from at this point.
+/// Enter in the empty client (#108).
+///
+/// Only the commands that mean something without a character: opening one
+/// (`/connect`), making one (`/newprofile`), and the help that lists them.
+/// Anything else has nowhere to go — there is no session to send it to —
+/// and saying so is the difference between an empty client and a client
+/// that appears broken.
+async fn submit_shell_input(state: &mut AppState, channels: &[Channel]) {
+    let line = state.shell_input.value().trim().to_string();
+    state.shell_input.reset();
+    if line.is_empty() {
+        return;
+    }
+
+    if line == CONNECT_COMMAND || line.starts_with("/connect ") {
+        let name = line.strip_prefix(CONNECT_COMMAND).unwrap_or("").trim();
+        if name.is_empty() {
+            state.tell_player("** /connect needs a profile name");
+            return;
+        }
+        connect_new_session(state, channels, name).await;
+        return;
+    }
+    if line == NEWPROFILE_COMMAND {
+        state.new_profile_wizard = Some(NewProfileWizard::new(state.config_dir.clone()));
+        return;
+    }
+    if line == HELP_COMMAND {
+        state.show_help = !state.show_help;
+        return;
+    }
+    state.tell_player(format!(
+        "** no character connected — {CONNECT_COMMAND} <profile> opens one, \
+         {NEWPROFILE_COMMAND} makes one"
+    ));
+}
+
 async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &str) {
     let mut taken: Vec<String> = state.sessions.iter().map(|s| s.view.name.clone()).collect();
     let target = match build_profile_target(
@@ -4365,11 +4462,11 @@ async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &
     ) {
         Ok(target) => target,
         Err(err) => {
-            if let Some(session) = state.bound_mut() {
-                session.push_line(RetainedLine::client(format!(
-                    "** could not connect `{name}`: {err:#}"
-                )));
-            }
+            // Through `tell_player`, because the empty client is exactly
+            // where `/connect` gets typed and mistyped (#108) — and a
+            // reply that goes to the bound session goes nowhere at all
+            // when there is none.
+            state.tell_player(format!("** could not connect `{name}`: {err:#}"));
             return;
         }
     };
@@ -4517,6 +4614,8 @@ pub(crate) mod test_support {
                 reload_requested: false,
                 line_cursor: None,
                 map_cursor: None,
+                shell_input: Input::default(),
+                shell_notices: Vec::new(),
                 map_pan: (0, 0),
                 map_pan_for: None,
                 map_grid: None,
@@ -8616,6 +8715,74 @@ mod tests {
     /// per-session copies this replaced only reconciled through the file,
     /// so until the next launch two panes could show different amounts of
     /// the same world — quieter than the mark bug, and the same cause.
+    /// #108, found live: `/disconnect` on the last character left a client
+    /// that swallowed every keystroke, so the one command that could leave
+    /// that state — `/connect` — was untypeable. The old test asserted
+    /// only that nothing panicked, which it did not.
+    #[tokio::test]
+    async fn the_empty_client_can_still_be_typed_into() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "/disconnect").await;
+        assert!(state.sessions.is_empty(), "the last character is gone");
+
+        for ch in "/connect cleric".chars() {
+            type_anywhere(
+                &mut state,
+                crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+
+        assert_eq!(
+            state.shell_input.value(),
+            "/connect cleric",
+            "keystrokes reach the client's own input line"
+        );
+    }
+
+    /// And the line has to do something when submitted. A profile nobody
+    /// has heard of is the reply worth checking: it goes through
+    /// `tell_player`, which used to drop it on the floor because it had no
+    /// session to write to — in precisely the state where `/connect` is
+    /// most likely to be mistyped.
+    #[tokio::test]
+    async fn the_empty_client_answers_a_connect_it_cannot_honour() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "/disconnect").await;
+
+        state.shell_input = Input::default().with_value("/connect nobody".to_string());
+        submit_input(&mut state, &[]).await;
+
+        assert!(
+            state
+                .shell_notices
+                .iter()
+                .any(|notice| notice.contains("nobody")),
+            "expected a reply naming the profile, got {:?}",
+            state.shell_notices
+        );
+        assert!(state.shell_input.value().is_empty(), "the line is consumed");
+    }
+
+    /// Anything that is not a client command has nowhere to go, and saying
+    /// so is the difference between an empty client and a broken one.
+    #[tokio::test]
+    async fn the_empty_client_says_there_is_nobody_to_send_a_line_to() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "/disconnect").await;
+
+        state.shell_input = Input::default().with_value("kill rat".to_string());
+        submit_input(&mut state, &[]).await;
+
+        assert!(
+            state
+                .shell_notices
+                .last()
+                .is_some_and(|notice| notice.contains("/connect")),
+            "expected the way out to be named, got {:?}",
+            state.shell_notices
+        );
+    }
+
     /// `/connect` could add a character and nothing could remove one (#98),
     /// so a pane opened by mistake stayed for the evening. The pane goes,
     /// and typing lands on whoever is left — which is #94's guarantee, used
