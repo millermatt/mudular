@@ -17,7 +17,13 @@ use thiserror::Error;
 
 use crate::engine::script::ScriptSource;
 use crate::engine::{Alias, Engine, RuleModule, Timer, Trigger};
-use crate::net::VerifyMode;
+/// Re-exported rather than moved: `net` is the leaf that owns the TLS
+/// vocabulary and uses it to verify a certificate, so moving the enum here
+/// would point the transport at the settings layer — and `config` sits on
+/// top of `engine`, `map` and `scrollback`. Re-exporting gives the layers
+/// above `config` (the editor draws this field) somewhere to reach it that
+/// is not a socket module (§4).
+pub use crate::net::VerifyMode;
 
 /// Where the config dir lives: `--config-dir`, or the platform default.
 pub fn config_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -698,8 +704,15 @@ pub struct AppConfig {
     pub check_for_updates: bool,
 }
 
+/// Where the docked columns start, in terminal columns. Defaults live with
+/// the settings they default, not with the code that draws them: `ui`
+/// clamps these to what the terminal can hold (`clamp_channel_width`), and
+/// the live values are `AppState::channel_width` / `map_width` (§11.4).
+pub const DEFAULT_CHANNEL_WIDTH: u16 = 28;
+pub const DEFAULT_MAP_WIDTH: u16 = 24;
+
 fn default_map_width() -> u16 {
-    crate::ui::MAP_WIDTH
+    DEFAULT_MAP_WIDTH
 }
 
 /// Hand-written rather than derived: a derived `Default` would give a
@@ -739,7 +752,7 @@ fn default_scrollback_size() -> usize {
 }
 
 fn default_channel_width() -> u16 {
-    crate::ui::CHANNEL_WIDTH
+    DEFAULT_CHANNEL_WIDTH
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3542,7 +3555,7 @@ triggers:
         let mut profile = minimal_profile("kestrel", "underworld.example.org");
         profile.tls = TlsSettings {
             enabled: true,
-            verify: crate::net::VerifyMode::Pinned,
+            verify: VerifyMode::Pinned,
         };
         profile.color = Some(ratatui::style::Color::Cyan);
         profile.login = Some(Login {
