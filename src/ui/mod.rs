@@ -315,19 +315,19 @@ pub struct DrawnFrame {
     pub map_grid: Option<Rect>,
 }
 
-/// Brightens the middle of each border side that has undrawn rooms beyond
-/// it (#55).
+/// Marks each border side that has undrawn rooms beyond it, with an arrow
+/// pointing that way (#55, made legible in #113).
 ///
-/// The border rather than the grid, for two reasons. The cells are already
-/// spoken for by chrome, so nothing has to give way for the mark — and
-/// both renderers get it for free, since the sixel path draws a picture
-/// inside a border ratatui still owns.
+/// The first version restyled the border instead — brighter and bold, no
+/// glyph, on the reasoning that #50 confined the map's marks to characters
+/// present in every monospace font. That was true and it did not matter:
+/// a slightly brighter run of `│` among a border made of `│` is not a
+/// mark, it is a shade, and in use it read as nothing at all.
 ///
-/// Restyled rather than re-glyphed: #50 left the map's marks confined to
-/// glyphs present in every monospace font measured, and "brighter and
-/// bold" needs no glyph at all. The run is the middle third of the side so
-/// that it reads as deliberate; a single cell looks like a rendering
-/// artifact, and a fully lit side looks like a focus highlight.
+/// `<`, `>`, `^` and `v` are plain ASCII, so they clear the portability
+/// bar by a wider margin than the box-drawing set ever did, and they say
+/// which way rather than merely that something is there. Bright and bold
+/// as well, since the border they replace is dim.
 fn mark_edges(frame: &mut Frame, area: Rect, beyond: &map_render::Beyond) {
     if area.width < 3 || area.height < 3 || !beyond.any() {
         return;
@@ -335,8 +335,10 @@ fn mark_edges(frame: &mut Frame, area: Rect, beyond: &map_render::Beyond) {
     let lit = Style::new()
         .fg(map_render::palette::PAPER)
         .add_modifier(Modifier::BOLD);
+    // Half the side rather than a third: this is the pane saying part of
+    // the world is missing, which is worth more than a hint.
     let run = |span: u16| {
-        let length = (span / 3).max(1);
+        let length = (span / 2).max(1);
         let start = span.saturating_sub(length) / 2;
         (start, length)
     };
@@ -346,10 +348,14 @@ fn mark_edges(frame: &mut Frame, area: Rect, beyond: &map_render::Beyond) {
         for offset in 0..length {
             let x = area.left() + 1 + start + offset;
             if beyond.up {
-                frame.buffer_mut()[(x, area.top())].set_style(lit);
+                frame.buffer_mut()[(x, area.top())]
+                    .set_symbol("^")
+                    .set_style(lit);
             }
             if beyond.down {
-                frame.buffer_mut()[(x, area.bottom() - 1)].set_style(lit);
+                frame.buffer_mut()[(x, area.bottom() - 1)]
+                    .set_symbol("v")
+                    .set_style(lit);
             }
         }
     }
@@ -358,10 +364,14 @@ fn mark_edges(frame: &mut Frame, area: Rect, beyond: &map_render::Beyond) {
         for offset in 0..length {
             let y = area.top() + 1 + start + offset;
             if beyond.left {
-                frame.buffer_mut()[(area.left(), y)].set_style(lit);
+                frame.buffer_mut()[(area.left(), y)]
+                    .set_symbol("<")
+                    .set_style(lit);
             }
             if beyond.right {
-                frame.buffer_mut()[(area.right() - 1, y)].set_style(lit);
+                frame.buffer_mut()[(area.right() - 1, y)]
+                    .set_symbol(">")
+                    .set_style(lit);
             }
         }
     }
@@ -2291,10 +2301,7 @@ mod tests {
             let buffer = terminal.backend().buffer().clone();
             // The middle of the right-hand border, which is where a run
             // lands on a nine-row pane.
-            buffer[(area.right() - 1, area.top() + 4)]
-                .style()
-                .add_modifier
-                .contains(Modifier::BOLD)
+            buffer[(area.right() - 1, area.top() + 4)].symbol() == ">"
         };
 
         assert!(

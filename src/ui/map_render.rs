@@ -373,8 +373,8 @@ pub(super) fn legend(width: u16) -> Vec<Line<'static>> {
     // player will see it rather than on any room.
     entries.push((
         Style::new().fg(palette::PAPER).add_modifier(Modifier::BOLD),
-        Some('│'),
-        "more this way",
+        Some('>'),
+        "more map",
         3,
     ));
 
