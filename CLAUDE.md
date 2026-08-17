@@ -85,6 +85,29 @@ repo. So:
 - Never `git pull` without `--ff-only`: an accidental merge commit on `main`
   clutters the changelog release-plz generates from these commits.
 
+**Let release-plz go quiet before merging its release PR.**
+
+```sh
+gh run list --workflow=Release-plz --json status \
+  -q '[.[]|select(.status!="completed")]|length'   # must be 0
+```
+
+The workflow serializes runs on purpose (`concurrency`, `cancel-in-progress:
+false`), and that is what creates the trap: a queued run finishes *after* the
+release PR is already on screen, and it was computed from an older `main`. Two
+PRs merged close together, then a prompt merge of the release PR, is enough.
+
+v0.6.1 is the worked example. #78 and #79 merged 21 seconds apart; the run for
+#78 opened the release PR from a tree that predated #79, so its changelog was
+stale the moment it existed. The run for #79 was still executing when that PR
+was merged, found the branch it meant to refresh deleted, and opened a second
+"release v0.6.1" PR — which then conflicted, because `main` was already 0.6.1.
+The release shipped a commit its changelog did not mention (fixed in #83), and
+the duplicate had to be closed by hand (#82).
+
+Merging the release PR is the one irreversible step here: it tags, and the tag
+is what dist builds from. Waiting costs a couple of minutes.
+
 Test names, doc comments and commit bodies carry the *reason* here, not just
 the change. When a fix is subtle, the comment explaining why is part of it.
 
