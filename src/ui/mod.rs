@@ -139,6 +139,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("/update", "install a newer Mudular, if one was announced"),
         row("/newprofile", "create another character's profile"),
         row("/connect", "add a character to this running instance"),
+        row("/disconnect", "close the character you are typing at"),
         row("/send", "run one command as another character, or `*`"),
         row("/goto", "walk to a known room, one step at a time"),
         row("/corpse", "walk back to where you last died"),

@@ -181,10 +181,9 @@ pub enum SessionCommand {
     /// Pane was resized; renegotiate NAWS.
     Resize { cols: u16, rows: u16 },
     /// End the session for good, cancelling any pending reconnect. No UI
-    /// affordance sends it yet — per-pane connect/disconnect control is not
-    /// part of any milestone so far — but it is what tells the retry loop
-    /// the player is done, as against a connection that merely dropped.
-    #[allow(dead_code)]
+    /// Sent by `/disconnect` (#98): it is what tells the retry loop the
+    /// player is done, as against a connection that merely dropped. Without
+    /// it a closed pane would come back as a reconnect.
     Disconnect,
 }
 
