@@ -45,9 +45,14 @@ const CHANNEL_WIDTH_STEP: u16 = 2;
 /// (docs/ARCHITECTURE.md §11.5).
 const SCROLL_PAGE: usize = 10;
 
-/// How many replies the empty client keeps on screen. Enough to see what
-/// went wrong with the last attempt and still read the hint above it.
-const SHELL_NOTICES: usize = 6;
+/// How many replies the empty client keeps on screen.
+///
+/// Sized for the largest thing that lands there rather than for a typical
+/// error: `/help` works without a character (#7) and prints the whole
+/// keybind listing, and a cap that clipped it to the last few rows would
+/// make the one command a stuck player is most likely to reach for the
+/// one that answers worst.
+const SHELL_NOTICES: usize = 24;
 
 /// The client-side commands. Everything else starting with `/` is left
 /// alone, since plenty of MUDs use `/` for their own commands.
@@ -3848,97 +3853,151 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
              so it logs you in next time? (y/n)"
         )));
     }
-    if line.trim() == HELP_COMMAND {
-        let lines = ui::help_lines(&state.keybinds);
-        if let Some(session) = state.bound_mut() {
-            for line in lines {
-                session.push_line(RetainedLine::client(line));
-            }
-        }
-        return;
-    }
-    if line.trim() == RELOAD_COMMAND {
-        let notice = reload_rules(state, channels).await;
-        if let Some(session) = state.bound_mut() {
-            session.push_line(RetainedLine::client(notice));
-        }
-        return;
-    }
-    if line.trim() == UPDATE_COMMAND {
-        // Runs off the loop thread, but awaited here, so the pane stops
-        // redrawing until the updater finishes — a few seconds of download.
-        // Accepted deliberately: the player typed this, a progress bar would
-        // need state on AppState for a command used once a month, and sessions
-        // keep reading their sockets throughout because they are separate
-        // tasks. Nothing is lost, it just looks still.
-        let report = tokio::task::spawn_blocking(crate::update::apply)
-            .await
-            .unwrap_or_else(|_| vec!["the updater could not be started".to_string()]);
-        if let Some(session) = state.bound_mut() {
-            for text in report {
-                session.push_line(RetainedLine::client(text));
-            }
-        }
-        return;
-    }
-    if line.trim() == CONFIG_COMMAND {
-        open_config_editor(state, channels);
-        return;
-    }
-    if line.trim() == NEWPROFILE_COMMAND {
-        state.new_profile_wizard = Some(NewProfileWizard::new(state.config_dir.clone()));
-        return;
-    }
-    let trimmed = line.trim();
-    if trimmed == CONNECT_COMMAND || trimmed.starts_with("/connect ") {
-        // Not `trimmed.strip_prefix(CONNECT_COMMAND_PREFIX)`: trimming the
-        // whole line first already ate a lone trailing space, so
-        // "/connect " (no name) would otherwise miss its own prefix check
-        // and fall through to the server as literal text instead of
-        // reporting the missing name below.
-        let name = trimmed.strip_prefix(CONNECT_COMMAND).unwrap_or("").trim();
-        if name.is_empty() {
-            if let Some(session) = state.bound_mut() {
-                session.push_line(RetainedLine::client("** /connect needs a profile name"));
-            }
-            return;
-        }
-        connect_new_session(state, channels, name).await;
-        return;
-    }
-    if trimmed == DISCONNECT_COMMAND {
-        disconnect_bound_session(state).await;
-        return;
-    }
-    if trimmed == MAP_COMMAND {
-        state.show_map = !state.show_map;
-        describe_current_room(state);
-        return;
-    }
-    if trimmed == COMMS_COMMAND {
-        toggle_comms(state);
-        return;
-    }
-    if trimmed == GOTO_COMMAND || trimmed.starts_with("/goto ") {
-        let arg = trimmed.strip_prefix(GOTO_COMMAND).unwrap_or("").trim();
-        start_goto(state, arg).await;
-        return;
-    }
-    if trimmed == CORPSE_COMMAND {
-        start_corpse_run(state).await;
-        return;
-    }
-    if trimmed == MARK_COMMAND || trimmed.starts_with("/mark ") {
-        let label = trimmed.strip_prefix(MARK_COMMAND).unwrap_or("").trim();
-        mark_current_room(state, label);
-        return;
-    }
-    if trimmed == SEND_COMMAND || trimmed.starts_with("/send ") {
-        let args = trimmed.strip_prefix(SEND_COMMAND).unwrap_or("").trim();
-        send_as_other_session(state, args).await;
+    // One parser, one match (#7). An unknown `/word` parses as nothing and
+    // goes to the MUD, which is why this cannot simply refuse anything
+    // starting with a slash: plenty of MUDs use `/` for their own commands.
+    if let Some(command) = ClientCommand::parse(&line) {
+        run_client_command(state, channels, command).await;
         return;
     }
     let _ = session.commands.send(SessionCommand::SendLine(line)).await;
+}
+
+/// Every client command, as one type (#7).
+///
+/// `submit_input` grew from three `line.trim() ==` comparisons to twelve,
+/// and #108 added a second dispatcher beside it for the empty client —
+/// two if-chains over the same vocabulary, which is exactly how a command
+/// comes to work in one place and not the other. One enum, one parser, and
+/// matches the compiler checks for exhaustiveness: a new command cannot be
+/// added and then forgotten in the other dispatcher, because the code will
+/// not build until every arm exists.
+///
+/// Not a table of function pointers. The bodies are `async`, take
+/// different arguments, and half of them need `&mut AppState` across an
+/// await — boxing a future per command to fit them into one signature
+/// would cost more than the if-chain ever did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientCommand {
+    Help,
+    Reload,
+    Update,
+    Config,
+    NewProfile,
+    Connect(String),
+    Disconnect,
+    Map,
+    Comms,
+    Goto(String),
+    Corpse,
+    Mark(String),
+    Send(String),
+}
+
+impl ClientCommand {
+    /// The line, or `None` if it is not a client command at all — in which
+    /// case it belongs to the MUD, which is why an unknown `/word` is left
+    /// alone rather than refused: plenty of MUDs use `/` themselves.
+    ///
+    /// The argument is whatever follows the first space, trimmed. Commands
+    /// that take none ignore it, which keeps `/map ` (a stray space) doing
+    /// what `/map` does rather than falling through to the server.
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let rest = rest.trim().to_string();
+        Some(match word {
+            HELP_COMMAND => Self::Help,
+            RELOAD_COMMAND => Self::Reload,
+            UPDATE_COMMAND => Self::Update,
+            CONFIG_COMMAND => Self::Config,
+            NEWPROFILE_COMMAND => Self::NewProfile,
+            CONNECT_COMMAND => Self::Connect(rest),
+            DISCONNECT_COMMAND => Self::Disconnect,
+            MAP_COMMAND => Self::Map,
+            COMMS_COMMAND => Self::Comms,
+            GOTO_COMMAND => Self::Goto(rest),
+            CORPSE_COMMAND => Self::Corpse,
+            MARK_COMMAND => Self::Mark(rest),
+            SEND_COMMAND => Self::Send(rest),
+            _ => return None,
+        })
+    }
+
+    /// Whether this means anything with no character connected (#108).
+    ///
+    /// Exhaustive on purpose: the empty client used to have its own list
+    /// of three commands, and the honest way to keep the two in step is to
+    /// make the compiler ask about every command, once, here.
+    fn needs_a_character(&self) -> bool {
+        match self {
+            // Opening or making one, and the listing that names them.
+            Self::Connect(_) | Self::NewProfile | Self::Help => false,
+            Self::Reload
+            | Self::Update
+            | Self::Config
+            | Self::Disconnect
+            | Self::Map
+            | Self::Comms
+            | Self::Goto(_)
+            | Self::Corpse
+            | Self::Mark(_)
+            | Self::Send(_) => true,
+        }
+    }
+}
+
+/// Runs a parsed command. One match, so every command's body has exactly
+/// one home whichever dispatcher reached it.
+async fn run_client_command(state: &mut AppState, channels: &[Channel], command: ClientCommand) {
+    match command {
+        ClientCommand::Help => {
+            let lines = ui::help_lines(&state.keybinds);
+            for line in lines {
+                state.tell_player(line);
+            }
+        }
+        ClientCommand::Reload => {
+            let notice = reload_rules(state, channels).await;
+            state.tell_player(notice);
+        }
+        ClientCommand::Update => {
+            // Runs off the loop thread, but awaited here, so the pane stops
+            // redrawing until the updater finishes — a few seconds of
+            // download. Accepted deliberately: the player typed this, a
+            // progress bar would need state on AppState for a command used
+            // once a month, and sessions keep reading their sockets
+            // throughout because they are separate tasks. Nothing is lost,
+            // it just looks still.
+            let report = tokio::task::spawn_blocking(crate::update::apply)
+                .await
+                .unwrap_or_else(|_| vec!["the updater could not be started".to_string()]);
+            for text in report {
+                state.tell_player(text);
+            }
+        }
+        ClientCommand::Config => open_config_editor(state, channels),
+        ClientCommand::NewProfile => {
+            state.new_profile_wizard = Some(NewProfileWizard::new(state.config_dir.clone()));
+        }
+        ClientCommand::Connect(name) => {
+            if name.is_empty() {
+                state.tell_player("** /connect needs a profile name");
+                return;
+            }
+            connect_new_session(state, channels, &name).await;
+        }
+        ClientCommand::Disconnect => disconnect_bound_session(state).await,
+        ClientCommand::Map => {
+            state.show_map = !state.show_map;
+            describe_current_room(state);
+        }
+        ClientCommand::Comms => toggle_comms(state),
+        ClientCommand::Goto(target) => start_goto(state, &target).await,
+        ClientCommand::Corpse => start_corpse_run(state).await,
+        ClientCommand::Mark(label) => mark_current_room(state, &label),
+        ClientCommand::Send(args) => send_as_other_session(state, &args).await,
+    }
 }
 
 /// `/send <character> <command>` — run something as another character without
@@ -4438,27 +4497,22 @@ async fn submit_shell_input(state: &mut AppState, channels: &[Channel]) {
         return;
     }
 
-    if line == CONNECT_COMMAND || line.starts_with("/connect ") {
-        let name = line.strip_prefix(CONNECT_COMMAND).unwrap_or("").trim();
-        if name.is_empty() {
-            state.tell_player("** /connect needs a profile name");
-            return;
+    // The same parser the bound path uses (#7). What differs is only which
+    // commands mean anything here, and that is the enum's own answer
+    // rather than a second list kept in step by hand — the second list is
+    // what this dispatcher was when #108 added it.
+    match ClientCommand::parse(&line) {
+        Some(command) if !command.needs_a_character() => {
+            run_client_command(state, channels, command).await;
         }
-        connect_new_session(state, channels, name).await;
-        return;
+        Some(_) => state.tell_player(format!(
+            "** `{line}` needs a character — {CONNECT_COMMAND} <profile> opens one"
+        )),
+        None => state.tell_player(format!(
+            "** no character connected — {CONNECT_COMMAND} <profile> opens one, \
+             {NEWPROFILE_COMMAND} makes one"
+        )),
     }
-    if line == NEWPROFILE_COMMAND {
-        state.new_profile_wizard = Some(NewProfileWizard::new(state.config_dir.clone()));
-        return;
-    }
-    if line == HELP_COMMAND {
-        state.show_help = !state.show_help;
-        return;
-    }
-    state.tell_player(format!(
-        "** no character connected — {CONNECT_COMMAND} <profile> opens one, \
-         {NEWPROFILE_COMMAND} makes one"
-    ));
 }
 
 async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &str) {
@@ -8727,6 +8781,79 @@ mod tests {
     /// per-session copies this replaced only reconciled through the file,
     /// so until the next launch two panes could show different amounts of
     /// the same world — quieter than the mark bug, and the same cause.
+    /// #7. An unknown `/word` is not a client command and must reach the
+    /// MUD — plenty of them use `/` themselves, and a client that refused
+    /// every slash would be unusable on those.
+    #[test]
+    fn an_unknown_slash_command_belongs_to_the_mud() {
+        assert_eq!(ClientCommand::parse("/quaff potion"), None);
+        assert_eq!(ClientCommand::parse("look"), None);
+        assert_eq!(ClientCommand::parse(""), None);
+    }
+
+    /// The argument is what follows the first space, and a command that
+    /// takes none must not be broken by a stray one — `/map ` is still
+    /// `/map`, not a line for the server.
+    #[test]
+    fn a_commands_argument_is_whatever_follows_it() {
+        assert_eq!(
+            ClientCommand::parse("/connect cleric"),
+            Some(ClientCommand::Connect("cleric".to_string()))
+        );
+        assert_eq!(
+            ClientCommand::parse("  /send cleric drink well  "),
+            Some(ClientCommand::Send("cleric drink well".to_string())),
+            "the line is trimmed, the argument keeps its own spaces"
+        );
+        assert_eq!(ClientCommand::parse("/map "), Some(ClientCommand::Map));
+        assert_eq!(
+            ClientCommand::parse("/connect"),
+            Some(ClientCommand::Connect(String::new())),
+            "a missing argument is the command's problem to report, not the parser's"
+        );
+    }
+
+    /// The property that made this worth building (#7, #108): the empty
+    /// client and the bound client read the same parser, so a command
+    /// cannot work in one and be missing from the other. Every command
+    /// answers `needs_a_character`, and the compiler will not accept a new
+    /// one until it does.
+    #[tokio::test]
+    async fn the_empty_client_and_a_bound_one_share_one_vocabulary() {
+        for line in ["/map", "/goto square", "/send cleric hi", "/corpse"] {
+            let command = ClientCommand::parse(line).expect("a client command");
+            assert!(
+                command.needs_a_character(),
+                "{line} does something to a character, so the empty client must refuse it"
+            );
+        }
+        for line in ["/connect tank", "/newprofile", "/help"] {
+            let command = ClientCommand::parse(line).expect("a client command");
+            assert!(
+                !command.needs_a_character(),
+                "{line} is how you get a character, so it has to work without one"
+            );
+        }
+    }
+
+    /// And the refusal has to say what to do instead, rather than looking
+    /// like the client ignored it.
+    #[tokio::test]
+    async fn the_empty_client_refuses_a_command_that_needs_a_character() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "/disconnect").await;
+
+        state.shell_input = Input::default().with_value("/goto square".to_string());
+        submit_input(&mut state, &[]).await;
+
+        let notice = state.shell_notices.last().expect("a reply");
+        assert!(notice.contains("/goto square"), "{notice}");
+        assert!(
+            notice.contains("/connect"),
+            "the way out is named: {notice}"
+        );
+    }
+
     /// #108, found live: `/disconnect` on the last character left a client
     /// that swallowed every keystroke, so the one command that could leave
     /// that state — `/connect` — was untypeable. The old test asserted
