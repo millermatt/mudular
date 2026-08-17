@@ -126,26 +126,33 @@ pub struct Rules {
 
 /// Everything one character's pane needs. Nothing here is shared: buffer
 /// isolation between sessions is structural (docs/ARCHITECTURE.md §3).
-pub struct SessionPane {
+/// What a session pane *shows*: the state `ui` reads to draw it, and
+/// nothing else (#11, docs/ARCHITECTURE.md §4).
+///
+/// Split out of `SessionPane` because that struct had grown to 38 fields
+/// holding a socket's command sender, an open transcript file and a
+/// plaintext password alongside the scrollback — so every feature that drew
+/// something new (the party HUD, the map column) reached past a password to
+/// get at it. Nothing here is a handle, a file, or a secret: the type
+/// carries only what a renderer needs, which is what makes it safe to hand
+/// to one.
+///
+/// `SessionPane` still owns this and still writes it — `push_line` and the
+/// history walk stay whole, on the far side of the boundary, because they
+/// are also where masked input is kept out of the scrollback and the
+/// transcript at one choke point (§13).
+#[derive(Debug)]
+pub struct SessionView {
     pub name: String,
     pub scrollback: VecDeque<RetainedLine>,
     /// Text pinned above the input line; empty means no prompt.
     pub prompt: String,
     pub input: Input,
-    /// Words this MUD has printed, ranked by recency (§11.3). Per session,
-    /// because each character is standing somewhere else.
-    vocabulary: crate::complete::Vocabulary,
     /// The rest of the word the input line would complete to — drawn as a
     /// ghost past the cursor, and appended to what is sent. Kept rather
     /// than recomputed where it is drawn, so what the player is looking at
     /// and what Enter sends cannot be two different answers.
     pub suggestion: Option<String>,
-    /// The input value Escape was pressed on. A dismissal lasts exactly as
-    /// long as that line does: type another character and the suggestion is
-    /// welcome again, because the question has changed.
-    dismissed: Option<String>,
-    /// `autocomplete:` — off makes this whole path inert (§11.3).
-    autocomplete: bool,
     pub status: String,
     /// Server took over echoing (Telnet ECHO): hide what we type.
     pub masked: bool,
@@ -163,13 +170,6 @@ pub struct SessionPane {
     /// Raw server-data lines, newest last, each tagged `[GMCP]` or `[MSDP]`
     /// by origin — the inspector view (docs/ARCHITECTURE.md §6.3, §14 M6).
     pub inspector_log: VecDeque<String>,
-    /// Whether a GMCP message has reached this session — drives the
-    /// inspector's title (§6.3): a client that only ever names GMCP would
-    /// look broken on an MSDP-only MUD, so the title says what actually
-    /// showed up rather than what the client merely supports.
-    gmcp_seen: bool,
-    /// The MSDP twin of `gmcp_seen`.
-    msdp_seen: bool,
     /// Lines that arrived while the pane was not focused (§11).
     pub unread: usize,
     /// How much trouble this character is in, if any — the fraction of
@@ -184,6 +184,45 @@ pub struct SessionPane {
     /// The profile's `color:`, if it set one — the pane border and this
     /// session's tab entry are drawn in it (§11).
     pub color: Option<Color>,
+    /// Distance back from the tail, in wrapped rows: 0 is pinned to the
+    /// newest content, larger is further back in history. Storing distance
+    /// rather than an absolute position means a new line arriving needs no
+    /// compensation to keep a scrolled reader's view stable — the buffer
+    /// grows underneath the same offset (docs/ARCHITECTURE.md §11.5).
+    pub back_offset: usize,
+    /// Where on the world's map this character is standing (§16).
+    ///
+    /// The map itself is *not* here: it belongs to the world, and lives in
+    /// `AppState::maps` keyed by [`SessionPane::map_key`]. Where a
+    /// character stands is the part that is genuinely theirs.
+    pub current_room: Option<crate::map::RoomId>,
+    /// Where this character died last, for `/corpse` (§16). Set by a
+    /// trigger's `corpse:`, never cleared: a corpse run that reaches the
+    /// body leaves the mark behind rather than forgetting a room the
+    /// player may still be walking back and forth to, and the next death
+    /// overwrites it anyway.
+    pub corpse: Option<crate::map::RoomId>,
+}
+
+pub struct SessionPane {
+    /// Everything `ui` draws from (#11).
+    pub view: SessionView,
+    /// Words this MUD has printed, ranked by recency (§11.3). Per session,
+    /// because each character is standing somewhere else.
+    vocabulary: crate::complete::Vocabulary,
+    /// The input value Escape was pressed on. A dismissal lasts exactly as
+    /// long as that line does: type another character and the suggestion is
+    /// welcome again, because the question has changed.
+    dismissed: Option<String>,
+    /// `autocomplete:` — off makes this whole path inert (§11.3).
+    autocomplete: bool,
+    /// Whether a GMCP message has reached this session — drives the
+    /// inspector's title (§6.3): a client that only ever names GMCP would
+    /// look broken on an MSDP-only MUD, so the title says what actually
+    /// showed up rather than what the client merely supports.
+    gmcp_seen: bool,
+    /// The MSDP twin of `gmcp_seen`.
+    msdp_seen: bool,
     /// Commands typed here, oldest first, exactly as typed — before alias
     /// expansion and `;` splitting, because the alias is what the player is
     /// choosing to repeat (docs/ARCHITECTURE.md §11.3).
@@ -222,24 +261,6 @@ pub struct SessionPane {
     /// choke point that already keeps masked lines out of scrollback keeps
     /// them out of the transcript, for free (§13).
     log: Option<std::io::BufWriter<std::fs::File>>,
-    /// Distance back from the tail, in wrapped rows: 0 is pinned to the
-    /// newest content, larger is further back in history. Storing distance
-    /// rather than an absolute position means a new line arriving needs no
-    /// compensation to keep a scrolled reader's view stable — the buffer
-    /// grows underneath the same offset (docs/ARCHITECTURE.md §11.5).
-    pub back_offset: usize,
-    /// Where on the world's map this character is standing (§16).
-    ///
-    /// The map itself is *not* here: it belongs to the world, and lives in
-    /// `AppState::maps` keyed by [`SessionPane::map_key`]. Where a
-    /// character stands is the part that is genuinely theirs.
-    pub current_room: Option<crate::map::RoomId>,
-    /// Where this character died last, for `/corpse` (§16). Set by a
-    /// trigger's `corpse:`, never cleared: a corpse run that reaches the
-    /// body leaves the mark behind rather than forgetting a room the
-    /// player may still be walking back and forth to, and the next death
-    /// overwrites it anyway.
-    pub corpse: Option<crate::map::RoomId>,
     /// Which world's map this session reads and writes (§16) — the key
     /// into `AppState::maps`. Held rather than recomputed because the pane
     /// outlives the target it came from.
@@ -383,7 +404,7 @@ impl SessionPane {
     /// than at render time, because the same answer has to serve the ghost
     /// on screen and the text Enter actually sends.
     fn refresh_suggestion(&mut self) {
-        self.suggestion = self.completion();
+        self.view.suggestion = self.completion();
     }
 
     fn completion(&self) -> Option<String> {
@@ -393,17 +414,17 @@ impl SessionPane {
         // Never into a password. The server is hiding this line, the
         // scrollback never saw it, and a ghost drawn past the asterisks
         // would be guessing at it out loud (§13).
-        if self.masked {
+        if self.view.masked {
             return None;
         }
-        let value = self.input.value();
+        let value = self.view.input.value();
         if self.dismissed.as_deref() == Some(value) {
             return None;
         }
         // Only at the end of the line. Completing a word in the middle
         // would have to decide what happens to the text after it, and
         // there is no answer to that which is obvious enough to do silently.
-        if self.input.cursor() != value.chars().count() {
+        if self.view.input.cursor() != value.chars().count() {
             return None;
         }
         // The trailing run of non-space, which is empty when the line ends
@@ -423,12 +444,12 @@ impl SessionPane {
     /// Says whether it accepted anything, so a Tab with no guess can fall
     /// through to meaning whatever it meant before.
     fn accept_suggestion(&mut self) -> bool {
-        let Some(rest) = self.suggestion.take() else {
+        let Some(rest) = self.view.suggestion.take() else {
             return false;
         };
         // `with_value` leaves the cursor at the end, which is where accepting
         // a completion has to put it.
-        self.input = Input::default().with_value(format!("{}{rest}", self.input.value()));
+        self.view.input = Input::default().with_value(format!("{}{rest}", self.view.input.value()));
         // A word completed can still be the prefix of a longer one, so ask
         // again rather than assuming this was the last word it could be.
         self.refresh_suggestion();
@@ -437,15 +458,15 @@ impl SessionPane {
 
     /// Escape: send what I typed, not what you guessed.
     fn dismiss_suggestion(&mut self) {
-        self.dismissed = Some(self.input.value().to_string());
-        self.suggestion = None;
+        self.dismissed = Some(self.view.input.value().to_string());
+        self.view.suggestion = None;
     }
 
     /// What the input line means, ghost included — what Enter sends.
     fn completed_input(&self) -> String {
-        match &self.suggestion {
-            Some(rest) => format!("{}{rest}", self.input.value()),
-            None => self.input.value().to_string(),
+        match &self.view.suggestion {
+            Some(rest) => format!("{}{rest}", self.view.input.value()),
+            None => self.view.input.value().to_string(),
         }
     }
 
@@ -462,9 +483,9 @@ impl SessionPane {
                 self.log = None;
             }
         }
-        self.scrollback.push_back(line);
-        if self.scrollback.len() > self.scrollback_limit {
-            self.scrollback.pop_front();
+        self.view.scrollback.push_back(line);
+        if self.view.scrollback.len() > self.scrollback_limit {
+            self.view.scrollback.pop_front();
         }
     }
 
@@ -476,7 +497,7 @@ impl SessionPane {
         // Nothing to recall from an empty line, and a masked line is a
         // password: it stays out of history for the same reason it stays out
         // of scrollback (§13).
-        if line.is_empty() || self.masked || self.history_limit == 0 {
+        if line.is_empty() || self.view.masked || self.history_limit == 0 {
             return;
         }
         // Only *consecutive* duplicates collapse: a spammed `look` costs one
@@ -496,13 +517,13 @@ impl SessionPane {
     fn walk_history(&mut self, back: bool) -> bool {
         // Recall into a masked prompt would send an old command as the
         // password, in the clear, to whatever is listening.
-        if self.masked || self.history.is_empty() {
+        if self.view.masked || self.history.is_empty() {
             return false;
         }
         let next = match (self.history_pos, back) {
             // Starting a walk: stash the live line before it is overwritten.
             (None, true) => {
-                self.history_draft = self.input.value().to_string();
+                self.history_draft = self.view.input.value().to_string();
                 Some(self.history.len() - 1)
             }
             (None, false) => return false,
@@ -518,7 +539,7 @@ impl SessionPane {
         };
         self.history_pos = next;
         // A recalled entry is a copy — editing it must never rewrite history.
-        self.input = Input::new(line);
+        self.view.input = Input::new(line);
         true
     }
 
@@ -549,9 +570,9 @@ impl SessionPane {
         // sequence and the terminal (§13). Shown, not stripped: this view
         // exists to reveal exactly what arrived.
         let line = crate::scrollback::escape_controls(&format!("[{tag}] {line}"));
-        self.inspector_log.push_back(line);
-        if self.inspector_log.len() > INSPECTOR_LOG_LIMIT {
-            self.inspector_log.pop_front();
+        self.view.inspector_log.push_back(line);
+        if self.view.inspector_log.len() > INSPECTOR_LOG_LIMIT {
+            self.view.inspector_log.pop_front();
         }
     }
 
@@ -819,7 +840,7 @@ impl AppState {
             .filter(|(other, _)| *other != index)
             .map(|(_, other)| other)
             .filter(|other| !other.map_key.is_empty() && other.map_key == session.map_key)
-            .filter_map(|other| Some((other.current_room?, other.name.clone())))
+            .filter_map(|other| Some((other.view.current_room?, other.view.name.clone())))
             .collect()
     }
 
@@ -855,7 +876,7 @@ impl AppState {
         match focus {
             Focus::Session(index) => {
                 if let Some(session) = self.sessions.get_mut(index) {
-                    session.unread = 0;
+                    session.view.unread = 0;
                 }
                 self.input_session = index;
             }
@@ -868,7 +889,7 @@ impl AppState {
             // what the arrows will move from. Typing stays bound where it
             // was, as it does for a comms pane.
             Focus::Map => {
-                self.map_cursor = self.bound().and_then(|session| session.current_room);
+                self.map_cursor = self.bound().and_then(|session| session.view.current_room);
             }
         }
     }
@@ -916,15 +937,15 @@ impl AppState {
         for index in 0..self.sessions.len() {
             let now = self
                 .peer_registry
-                .get(&self.sessions[index].name)
+                .get(&self.sessions[index].view.name)
                 .and_then(|peer| crate::vitals::from_server_data(&peer.borrow().data).distress());
-            let was = self.sessions[index].distress.is_some();
+            let was = self.sessions[index].view.distress.is_some();
             // Not while the player is already looking at them: the pane
             // they are reading needs no bell to point at itself.
             let unwatched = !self.is_focused(index);
-            self.sessions[index].distress = now;
+            self.sessions[index].view.distress = now;
             if now.is_some() && !was && unwatched {
-                newly_in_trouble.push(self.sessions[index].name.clone());
+                newly_in_trouble.push(self.sessions[index].view.name.clone());
             }
         }
         newly_in_trouble
@@ -937,7 +958,7 @@ impl AppState {
         self.sessions
             .iter()
             .enumerate()
-            .filter_map(|(index, session)| session.distress.map(|left| (index, left)))
+            .filter_map(|(index, session)| session.view.distress.map(|left| (index, left)))
             .min_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(index, _)| index)
     }
@@ -967,7 +988,10 @@ impl AppState {
     /// adjusts the stored distance from the tail.
     fn scroll_focused(&mut self, code: KeyCode) {
         let back_offset = match self.focus {
-            Focus::Session(index) => self.sessions.get_mut(index).map(|s| &mut s.back_offset),
+            Focus::Session(index) => self
+                .sessions
+                .get_mut(index)
+                .map(|s| &mut s.view.back_offset),
             Focus::Channel(index) => self.channels.get_mut(index).map(|c| &mut c.back_offset),
             // The map holds no buffer: it is a view on the world recomputed
             // each frame, and it moves by walking rather than scrolling.
@@ -991,7 +1015,9 @@ impl AppState {
     /// front of it — `ui::draw_channel` composes both from the pane's own
     /// `timestamps:` setting at render time (§8).
     fn push_routed(&mut self, from: usize, channel: &str, text: String) {
-        let tag = self.aggregating().then(|| self.sessions[from].name.clone());
+        let tag = self
+            .aggregating()
+            .then(|| self.sessions[from].view.name.clone());
         let Some(index) = self.channel_index(channel) else {
             return;
         };
@@ -1034,7 +1060,7 @@ impl AppState {
         } else {
             self.sessions
                 .iter()
-                .position(|session| session.name == target)
+                .position(|session| session.view.name == target)
                 .filter(|&index| index != from)
                 .into_iter()
                 .collect()
@@ -1056,7 +1082,7 @@ impl AppState {
             return;
         }
 
-        let name = self.sessions[from].name.clone();
+        let name = self.sessions[from].view.name.clone();
         for index in matched {
             self.sessions[index].push_line(RetainedLine::from_session(
                 &name,
@@ -1085,15 +1111,15 @@ impl AppState {
             return Vec::new();
         }
 
-        let name = self.sessions[from].name.clone();
+        let name = self.sessions[from].view.name.clone();
         let mut out = Vec::new();
         let mut notices = Vec::new();
         for index in matched {
             let session = &self.sessions[index];
-            if !session.connected {
+            if !session.view.connected {
                 notices.push(format!(
                     "** {label} `{}`: not connected, dropped {} command(s)",
-                    session.name,
+                    session.view.name,
                     lines.len()
                 ));
                 continue;
@@ -1104,7 +1130,7 @@ impl AppState {
             if hops > session.cross.max_hops {
                 notices.push(format!(
                     "** {label} `{}`: hop limit ({}) reached, dropped",
-                    session.name, session.cross.max_hops
+                    session.view.name, session.cross.max_hops
                 ));
                 continue;
             }
@@ -1153,8 +1179,8 @@ fn apply_session_event(
     {
         let connected_status = state.sessions[index].connected_status.clone();
         let session = &mut state.sessions[index];
-        if session.status != connected_status && !matches!(ev, SessionEvent::Ended(_)) {
-            session.status = connected_status;
+        if session.view.status != connected_status && !matches!(ev, SessionEvent::Ended(_)) {
+            session.view.status = connected_status;
         }
     }
 
@@ -1164,7 +1190,7 @@ fn apply_session_event(
             session.learn_words(&text, &origin);
             session.push_line(RetainedLine::with_origin(text, origin));
             if !focused {
-                session.unread += 1;
+                session.view.unread += 1;
             }
             (false, Vec::new())
         }
@@ -1189,12 +1215,12 @@ fn apply_session_event(
             (false, Vec::new())
         }
         SessionEvent::Prompt(text) => {
-            state.sessions[index].prompt = text;
+            state.sessions[index].view.prompt = text;
             (false, Vec::new())
         }
         SessionEvent::EchoMask(masked) => {
             let session = &mut state.sessions[index];
-            session.masked = masked;
+            session.view.masked = masked;
             // Being asked to hide typing again, with a password still
             // waiting on an answer, means the server re-prompted: the one
             // it was just given was wrong. Withdraw the offer rather than
@@ -1219,9 +1245,9 @@ fn apply_session_event(
             // room to remember, and says so rather than silently recording
             // nothing for a `/corpse` that will later claim no death ever
             // happened.
-            match session.current_room {
+            match session.view.current_room {
                 Some(at) => {
-                    session.corpse = Some(at);
+                    session.view.corpse = Some(at);
                     let name = state
                         .map_of(index)
                         .and_then(|map| map.rooms.get(&at))
@@ -1267,11 +1293,12 @@ fn apply_session_event(
             // were when they went.
             let walked = match surprising {
                 false => session
+                    .view
                     .current_room
                     .zip(arrived_via.as_deref().map(str::to_string)),
                 true => None,
             };
-            session.current_room = Some(info.id);
+            session.view.current_room = Some(info.id);
             // The world learns the room and the edge; the session only
             // learns where it now stands (§16).
             let world = state.world_mut(index);
@@ -1358,7 +1385,7 @@ fn apply_session_event(
             let session = &mut state.sessions[index];
             // Same ordering as `Corpse`: whatever room the character is in
             // as this arrives is the one the line was about.
-            match session.current_room {
+            match session.view.current_room {
                 Some(at) => {
                     // Through the same door as `/mark`, so a trigger's
                     // label reaches this world's other characters too.
@@ -1377,7 +1404,7 @@ fn apply_session_event(
         }
         SessionEvent::Security(security) => {
             let session = &mut state.sessions[index];
-            session.security = security.label;
+            session.view.security = security.label;
             // §13 requires an insecure connection (or a newly pinned
             // certificate) to be visible, not just implied by a label.
             if let Some(warning) = security.warning {
@@ -1386,7 +1413,7 @@ fn apply_session_event(
             (false, Vec::new())
         }
         SessionEvent::Latency(rtt) => {
-            state.sessions[index].latency = format!("{}ms", rtt.as_millis());
+            state.sessions[index].view.latency = format!("{}ms", rtt.as_millis());
             (false, Vec::new())
         }
         SessionEvent::Reconnecting {
@@ -1395,19 +1422,19 @@ fn apply_session_event(
             reason,
         } => {
             let session = &mut state.sessions[index];
-            session.status = format!(
+            session.view.status = format!(
                 "reconnecting in {}s (attempt {attempt}): {reason}",
                 delay.as_secs()
             );
-            session.latency.clear();
+            session.view.latency.clear();
             // Whatever the server had asked us to hide, it is not asking
             // any more.
-            session.masked = false;
+            session.view.masked = false;
             (false, Vec::new())
         }
         SessionEvent::Ended(reason) => {
             let session = &mut state.sessions[index];
-            session.status = format!("disconnected: {reason}");
+            session.view.status = format!("disconnected: {reason}");
             // The status line is one row wide and gets cut off mid-word on
             // anything longer than a short reason (a TLS pin mismatch's
             // full fingerprint comparison, say) — exactly the moment a
@@ -1416,9 +1443,9 @@ fn apply_session_event(
             // always lands there too, the same way §13 already puts a
             // security warning in both places.
             session.push_line(RetainedLine::client(format!("** disconnected: {reason}")));
-            session.latency.clear();
-            session.masked = false;
-            session.connected = false;
+            session.view.latency.clear();
+            session.view.masked = false;
+            session.view.connected = false;
             // Nothing will confirm the outstanding step now — leaving it set
             // would have the next `/goto` compare against a room from a
             // connection that no longer exists.
@@ -1528,10 +1555,11 @@ fn open_new_trigger_from_line(state: &mut AppState, channels: &[Channel], back_o
         return;
     };
     let Some(raw) = session
+        .view
         .scrollback
         .len()
         .checked_sub(1 + back_offset)
-        .and_then(|index| session.scrollback.get(index))
+        .and_then(|index| session.view.scrollback.get(index))
     else {
         return;
     };
@@ -1622,11 +1650,15 @@ async fn service_config_save(state: &mut AppState, channels: &[Channel], mode: c
             let mut lines_for = Vec::new();
             for session in &state.sessions {
                 if session.rules.1.as_deref() == Some(name.as_str()) {
-                    lines_for.push(session.name.clone());
+                    lines_for.push(session.view.name.clone());
                 }
             }
             for target_name in lines_for {
-                if let Some(index) = state.sessions.iter().position(|s| s.name == target_name) {
+                if let Some(index) = state
+                    .sessions
+                    .iter()
+                    .position(|s| s.view.name == target_name)
+                {
                     let session = &state.sessions[index];
                     let (config_dir, profile) = &session.rules;
                     let text =
@@ -2032,22 +2064,29 @@ fn connect(
         tracing::warn!("could not adopt an older map: {err:#}");
     }
     SessionPane {
+        view: SessionView {
+            name: target.name,
+            scrollback: VecDeque::new(),
+            prompt: String::new(),
+            input: Input::default(),
+            status,
+            masked: false,
+            security: String::new(),
+            latency: String::new(),
+            connected: true,
+            inspector_log: VecDeque::new(),
+            unread: 0,
+            distress: None,
+            color: target.color,
+            back_offset: 0,
+            current_room: None,
+            corpse: None,
+            suggestion: None,
+        },
+
         map_key,
-        name: target.name,
-        scrollback: VecDeque::new(),
-        prompt: String::new(),
-        input: Input::default(),
-        status,
-        masked: false,
-        security: String::new(),
-        latency: String::new(),
-        connected: true,
-        inspector_log: VecDeque::new(),
         gmcp_seen: false,
         msdp_seen: false,
-        unread: 0,
-        distress: None,
-        color: target.color,
         history: VecDeque::new(),
         history_pos: None,
         history_draft: String::new(),
@@ -2062,12 +2101,8 @@ fn connect(
         last_size: None,
         scrollback_limit,
         log: target.log_path.as_deref().and_then(open_log),
-        back_offset: 0,
-        current_room: None,
-        corpse: None,
         walk: None,
         vocabulary: crate::complete::Vocabulary::default(),
-        suggestion: None,
         dismissed: None,
         autocomplete,
     }
@@ -2103,7 +2138,7 @@ fn type_into_input(session: &mut SessionPane, key: crossterm::event::KeyEvent) {
         _ => false,
     };
     if !walked {
-        session.input.handle_event(&Event::Key(key));
+        session.view.input.handle_event(&Event::Key(key));
     }
     session.refresh_suggestion();
 }
@@ -2188,11 +2223,11 @@ fn map_debug_snapshot(state: &AppState, has_image: bool, screen_text: &str) -> S
         out.push_str("no session bound\n");
         return out;
     };
-    let _ = writeln!(out, "session: {}", session.name);
+    let _ = writeln!(out, "session: {}", session.view.name);
     let _ = writeln!(out, "sixel image this frame: {has_image}");
     let _ = writeln!(out, "map cursor: {:?}", state.map_cursor);
-    let _ = writeln!(out, "corpse: {:?}", session.corpse);
-    let current = session.current_room;
+    let _ = writeln!(out, "corpse: {:?}", session.view.corpse);
+    let current = session.view.current_room;
     let _ = writeln!(
         out,
         "current room: {}",
@@ -2213,7 +2248,7 @@ fn map_debug_snapshot(state: &AppState, has_image: bool, screen_text: &str) -> S
     let Some(map) = state.map_of(state.input_session) else {
         return out;
     };
-    let scene = map.scene(current, session.corpse, &[]);
+    let scene = map.scene(current, session.view.corpse, &[]);
     out.push_str("\n\nrooms:\n");
     for room in &scene.rooms {
         let _ = writeln!(
@@ -2261,9 +2296,9 @@ impl MapDebugKey {
     fn of(state: &AppState, has_image: bool) -> Option<Self> {
         let session = state.bound()?;
         Some(Self {
-            session: session.name.clone(),
-            current_room: session.current_room,
-            corpse: session.corpse,
+            session: session.view.name.clone(),
+            current_room: session.view.current_room,
+            corpse: session.view.corpse,
             cursor: state.map_cursor,
             has_image,
         })
@@ -3015,7 +3050,10 @@ async fn event_loop(
                     None => state.sessions[index].events = None,
                 }
                 if ring_bell {
-                    notify(&format!("{} has new output", state.sessions[index].name));
+                    notify(&format!(
+                        "{} has new output",
+                        state.sessions[index].view.name
+                    ));
                 }
                 for (target, command) in injections {
                     let _ = state.sessions[target].commands.send(command).await;
@@ -3235,7 +3273,7 @@ fn handle_key(
         // for players who reach for a shortcut rather than counting panes.
         if state
             .bound()
-            .and_then(|session| session.current_room)
+            .and_then(|session| session.view.current_room)
             .is_none()
         {
             if let Some(session) = state.bound_mut() {
@@ -3251,7 +3289,7 @@ fn handle_key(
         return true;
     }
     if let Some(cursor) = state.line_cursor {
-        let len = state.bound().map_or(0, |s| s.scrollback.len());
+        let len = state.bound().map_or(0, |s| s.view.scrollback.len());
         let new_cursor = match code {
             KeyCode::Esc => {
                 state.line_cursor = None;
@@ -3270,7 +3308,7 @@ fn handle_key(
         };
         state.line_cursor = Some(new_cursor);
         if let Some(session) = state.bound_mut() {
-            session.back_offset = new_cursor;
+            session.view.back_offset = new_cursor;
         }
         return true;
     }
@@ -3320,7 +3358,7 @@ fn handle_key(
     }
     if keybinds.line_picker.matches(code, modifiers) {
         if let Some(session) = state.bound()
-            && !session.scrollback.is_empty()
+            && !session.view.scrollback.is_empty()
         {
             // Starts wherever the pane is already scrolled to, rather than
             // always jumping to the newest line — if you scrolled up to
@@ -3328,8 +3366,9 @@ fn handle_key(
             // you meant to pick.
             state.line_cursor = Some(
                 session
+                    .view
                     .back_offset
-                    .min(session.scrollback.len().saturating_sub(1)),
+                    .min(session.view.scrollback.len().saturating_sub(1)),
             );
         }
         return true;
@@ -3438,8 +3477,8 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     // The ghost is part of the line: what is on screen is what gets sent,
     // which is the whole bargain of an inline completion (§11.3).
     let line = session.completed_input();
-    session.input.reset();
-    session.suggestion = None;
+    session.view.input.reset();
+    session.view.suggestion = None;
     session.dismissed = None;
     // Player intervention always wins over an in-flight `/goto` (§16): a
     // gate the walk hasn't discovered yet, or the player simply changing
@@ -3455,14 +3494,14 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
     // server rather than being swallowed as "nothing typed". It is not
     // echoed: a lone `>` in the scrollback would be noise, and the server's
     // own response is the feedback that matters.
-    if !line.is_empty() && !session.masked {
+    if !line.is_empty() && !session.view.masked {
         // Never echo what the server is masking.
         session.push_line(RetainedLine::echo(format!("> {line}")));
     }
     // A masked line at a login the profile wants automated is the password
     // it is missing (§13). Offer to keep it rather than making the player
     // find `--set-password`; it is held in memory only until they answer.
-    if session.offer_password_save && session.masked && !line.is_empty() {
+    if session.offer_password_save && session.view.masked && !line.is_empty() {
         session.offer_password_save = false;
         session.pending_password = Some(line.clone());
         let profile = session.rules.1.clone().unwrap_or_default();
@@ -3600,7 +3639,7 @@ async fn send_as_other_session(state: &mut AppState, args: &str) {
     // a local send would run through this session's aliases when the same
     // command aimed anywhere else would not, which is exactly the "means
     // something different depending on the target" trap above.
-    if state.sessions[from].name == target {
+    if state.sessions[from].view.name == target {
         let notice = format!("** /send: `{target}` is the character you are typing as");
         state.sessions[from].push_line(RetainedLine::client(notice));
         return;
@@ -3647,7 +3686,7 @@ fn toggle_comms(state: &mut AppState) {
 fn describe_current_room(state: &mut AppState) {
     let described = state
         .bound()
-        .and_then(|session| session.current_room)
+        .and_then(|session| session.view.current_room)
         .zip(state.map_of(state.input_session))
         .map(|(at, map)| map.describe(at))
         .filter(|lines| !lines.is_empty());
@@ -3674,7 +3713,7 @@ fn describe_current_room(state: &mut AppState) {
 /// the walk rather than keep firing steps planned for a world that has since
 /// changed.
 async fn start_goto(state: &mut AppState, arg: &str) {
-    let Some(current) = state.bound().and_then(|session| session.current_room) else {
+    let Some(current) = state.bound().and_then(|session| session.view.current_room) else {
         if let Some(session) = state.bound_mut() {
             session.push_line(RetainedLine::client(
                 "** /goto doesn't know where you are yet",
@@ -3756,7 +3795,7 @@ async fn walk_to_room(state: &mut AppState, target: crate::map::RoomId) {
     let Some(session) = state.bound_mut() else {
         return;
     };
-    let Some(current) = session.current_room else {
+    let Some(current) = session.view.current_room else {
         return;
     };
     let index = state.input_session;
@@ -3780,7 +3819,7 @@ fn map_cursor_step(
         .map_of(state.input_session)?
         // No party: stepping the cursor only reads where rooms are, and
         // who is standing in one has no bearing on which room is next.
-        .scene(session.current_room?, session.corpse, &[]);
+        .scene(session.view.current_room?, session.view.corpse, &[]);
     let at = scene.rooms.iter().find(|room| room.id == from)?.at;
     let wanted = (at.0 + step.0, at.1 + step.1);
     scene
@@ -3838,7 +3877,7 @@ fn mark_current_room(state: &mut AppState, label: &str) {
     let Some(session) = state.bound_mut() else {
         return;
     };
-    let Some(at) = session.current_room else {
+    let Some(at) = session.view.current_room else {
         session.push_line(RetainedLine::client(
             "** /mark doesn't know where you are yet",
         ));
@@ -3927,7 +3966,7 @@ async fn start_corpse_run(state: &mut AppState) {
     let Some(session) = state.bound_mut() else {
         return;
     };
-    let Some(corpse) = session.corpse else {
+    let Some(corpse) = session.view.corpse else {
         // Distinguished from "no route" deliberately: a player whose death
         // was never marked needs to be told to write the trigger, not to
         // go explore.
@@ -3936,7 +3975,7 @@ async fn start_corpse_run(state: &mut AppState) {
         ));
         return;
     };
-    let Some(current) = session.current_room else {
+    let Some(current) = session.view.current_room else {
         session.push_line(RetainedLine::client(
             "** /corpse doesn't know where you are yet",
         ));
@@ -4027,7 +4066,7 @@ async fn walk_to(
 /// never applies here: it is a startup flag with no CLI invocation to read
 /// from at this point.
 async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &str) {
-    let mut taken: Vec<String> = state.sessions.iter().map(|s| s.name.clone()).collect();
+    let mut taken: Vec<String> = state.sessions.iter().map(|s| s.view.name.clone()).collect();
     let target = match build_profile_target(
         &state.config_dir,
         name,
@@ -4099,21 +4138,28 @@ pub(crate) mod test_support {
         let (tx, rx) = mpsc::channel(16);
         (
             SessionPane {
-                name: name.to_string(),
-                scrollback: VecDeque::new(),
-                prompt: String::new(),
-                input: Input::default(),
-                status: "connecting".to_string(),
-                masked: false,
-                security: String::new(),
-                latency: String::new(),
-                connected: true,
-                inspector_log: VecDeque::new(),
+                view: SessionView {
+                    name: name.to_string(),
+                    scrollback: VecDeque::new(),
+                    prompt: String::new(),
+                    input: Input::default(),
+                    status: "connecting".to_string(),
+                    masked: false,
+                    security: String::new(),
+                    latency: String::new(),
+                    connected: true,
+                    inspector_log: VecDeque::new(),
+                    unread: 0,
+                    distress: None,
+                    color: None,
+                    back_offset: 0,
+                    current_room: None,
+                    corpse: None,
+                    suggestion: None,
+                },
+
                 gmcp_seen: false,
                 msdp_seen: false,
-                unread: 0,
-                distress: None,
-                color: None,
                 history: VecDeque::new(),
                 history_pos: None,
                 history_draft: String::new(),
@@ -4128,16 +4174,12 @@ pub(crate) mod test_support {
                 last_size: None,
                 scrollback_limit: 10_000,
                 log: None,
-                back_offset: 0,
-                current_room: None,
-                corpse: None,
                 // Empty on purpose: a test pane saves nothing unless it
                 // says which world it belongs to, so tests that never
                 // mention maps do not write files or report failing to.
                 map_key: String::new(),
                 walk: None,
                 vocabulary: crate::complete::Vocabulary::default(),
-                suggestion: None,
                 dismissed: None,
                 // On, so a test that means to exercise completion only has
                 // to teach the pane a word.
@@ -4247,7 +4289,7 @@ mod tests {
         let mut state = test_support::app(&["tank"]);
         put_room(state.map_of_mut(0), 1, Some("Temple"), &[("n", 2)]);
         put_room(state.map_of_mut(0), 2, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         let snapshot = map_debug_snapshot(&state, true, "@ captured screen text @");
 
@@ -4335,7 +4377,7 @@ mod tests {
         let mut writer = MapDebugWriter::new(dir.path().to_path_buf());
         let mut state = test_support::app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         writer
             .record(&state, false, String::new)
@@ -4370,7 +4412,7 @@ mod tests {
         let mut writer = MapDebugWriter::new(dir.path().to_path_buf());
         let mut state = test_support::app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         let calls = std::cell::Cell::new(0);
         let screen_text = || {
@@ -4391,6 +4433,7 @@ mod tests {
 
     fn scrollback(session: &SessionPane) -> String {
         session
+            .view
             .scrollback
             .iter()
             .map(|line| line.text.clone())
@@ -4405,11 +4448,12 @@ mod tests {
     async fn a_pane_records_who_wrote_each_line() {
         let (mut state, _rx) = app(&["tank"]);
         apply_session_event(&mut state, 0, SessionEvent::server("You see a rat."));
-        state.sessions[0].input = Input::default().with_value("kill rat".into());
+        state.sessions[0].view.input = Input::default().with_value("kill rat".into());
         submit_input(&mut state, &[]).await;
         apply_session_event(&mut state, 0, SessionEvent::Ended("host went away".into()));
 
         let origins: Vec<&Origin> = state.sessions[0]
+            .view
             .scrollback
             .iter()
             .map(|line| &line.origin)
@@ -4436,7 +4480,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(state.sessions[0].security, "TLS insecure");
+        assert_eq!(state.sessions[0].view.security, "TLS insecure");
         assert!(
             scrollback(&state.sessions[0]).contains("certificate NOT verified"),
             "warning missing from the pane: {:?}",
@@ -4456,8 +4500,8 @@ mod tests {
             }),
         );
 
-        assert_eq!(state.sessions[0].security, "TLS");
-        assert!(state.sessions[0].scrollback.is_empty());
+        assert_eq!(state.sessions[0].view.security, "TLS");
+        assert!(state.sessions[0].view.scrollback.is_empty());
     }
 
     /// A round trip is only worth showing while one is possible: a pane
@@ -4466,17 +4510,17 @@ mod tests {
     #[test]
     fn latency_shows_once_measured_and_goes_with_the_connection() {
         let (mut state, _rx) = app(&["tank"]);
-        assert!(state.sessions[0].latency.is_empty());
+        assert!(state.sessions[0].view.latency.is_empty());
 
         apply_session_event(
             &mut state,
             0,
             SessionEvent::Latency(std::time::Duration::from_millis(42)),
         );
-        assert_eq!(state.sessions[0].latency, "42ms");
+        assert_eq!(state.sessions[0].view.latency, "42ms");
 
         apply_session_event(&mut state, 0, SessionEvent::Ended("closed".to_string()));
-        assert!(state.sessions[0].latency.is_empty());
+        assert!(state.sessions[0].view.latency.is_empty());
     }
 
     /// The status line is one row and cuts a long reason off mid-word —
@@ -4517,16 +4561,16 @@ mod tests {
     #[test]
     fn masked_input_is_never_echoed_to_scrollback() {
         let (mut state, _rx) = app(&["tank"]);
-        state.sessions[0].masked = true;
+        state.sessions[0].view.masked = true;
         // Mirrors the Enter branch of the event loop.
         let session = &mut state.sessions[0];
         let line = "hunter2".to_string();
-        if !session.masked {
+        if !session.view.masked {
             session.push_line(RetainedLine::echo(format!("> {line}")));
         }
-        assert!(session.scrollback.is_empty());
+        assert!(session.view.scrollback.is_empty());
 
-        session.masked = false;
+        session.view.masked = false;
         session.push_line(RetainedLine::echo("> look"));
         assert_eq!(scrollback(session), "> look");
     }
@@ -4545,15 +4589,15 @@ mod tests {
         session.log = open_log(&path);
         assert!(session.log.is_some(), "log file failed to open");
 
-        session.masked = true;
+        session.view.masked = true;
         let line = "hunter2".to_string();
         // Mirrors the Enter branch of the event loop: a masked line never
         // reaches push_line at all.
-        if !session.masked {
+        if !session.view.masked {
             session.push_line(RetainedLine::echo(format!("> {line}")));
         }
 
-        session.masked = false;
+        session.view.masked = false;
         session.push_line(RetainedLine::echo("> look"));
         drop(session);
 
@@ -4621,13 +4665,13 @@ mod tests {
                 payload: Some(r#"{"hp":100}"#.to_string()),
             },
         );
-        assert_eq!(state.sessions[0].inspector_log.len(), 1);
+        assert_eq!(state.sessions[0].view.inspector_log.len(), 1);
         assert_eq!(
-            state.sessions[0].inspector_log[0],
+            state.sessions[0].view.inspector_log[0],
             r#"[GMCP] Char.Vitals {"hp":100}"#
         );
         assert!(
-            state.sessions[0].scrollback.is_empty(),
+            state.sessions[0].view.scrollback.is_empty(),
             "GMCP must not reach scrollback"
         );
     }
@@ -4645,10 +4689,10 @@ mod tests {
                 pairs: vec![("HP".to_string(), "100".to_string())],
             },
         );
-        assert_eq!(state.sessions[0].inspector_log.len(), 1);
-        assert_eq!(state.sessions[0].inspector_log[0], "[MSDP] HP 100");
+        assert_eq!(state.sessions[0].view.inspector_log.len(), 1);
+        assert_eq!(state.sessions[0].view.inspector_log[0], "[MSDP] HP 100");
         assert!(
-            state.sessions[0].scrollback.is_empty(),
+            state.sessions[0].view.scrollback.is_empty(),
             "MSDP must not reach scrollback"
         );
     }
@@ -4674,7 +4718,7 @@ mod tests {
                 pairs: vec![("HP".to_string(), "100".to_string())],
             },
         );
-        let log = &state.sessions[0].inspector_log;
+        let log = &state.sessions[0].view.inspector_log;
         assert_eq!(log.len(), 2);
         assert_eq!(log[0], r#"[GMCP] Char.Vitals {"hp":100}"#);
         assert_eq!(log[1], "[MSDP] HP 100");
@@ -4687,7 +4731,7 @@ mod tests {
     fn msdp_control_bytes_are_escaped_in_the_inspector_log() {
         let (mut session, _rx) = test_support::pane("tank");
         session.push_msdp(vec![("K\x1b[31mEY".to_string(), "V\x07AL".to_string())]);
-        let line = &session.inspector_log[0];
+        let line = &session.view.inspector_log[0];
         assert!(!line.contains('\x1b'));
         assert!(!line.contains('\x07'));
     }
@@ -4717,7 +4761,7 @@ mod tests {
     #[test]
     fn ending_a_session_clears_masking_and_connected_state() {
         let (mut state, _rx) = app(&["tank"]);
-        state.sessions[0].masked = true;
+        state.sessions[0].view.masked = true;
         let (ended, _) = apply_session_event(
             &mut state,
             0,
@@ -4726,11 +4770,11 @@ mod tests {
 
         assert!(ended);
         assert!(
-            !state.sessions[0].masked,
+            !state.sessions[0].view.masked,
             "a dead session must not leave input hidden"
         );
-        assert!(!state.sessions[0].connected);
-        assert!(state.sessions[0].status.contains("connection closed"));
+        assert!(!state.sessions[0].view.connected);
+        assert!(state.sessions[0].view.status.contains("connection closed"));
     }
 
     // ---- per-session isolation audit (docs/ARCHITECTURE.md §14 M7) ----
@@ -4757,12 +4801,15 @@ mod tests {
 
         assert_eq!(scrollback(&state.sessions[0]), "tank sees this");
         assert_eq!(scrollback(&state.sessions[1]), "cleric sees this");
-        assert_eq!(state.sessions[0].prompt, "HP:100>");
-        assert!(state.sessions[1].prompt.is_empty());
-        assert!(state.sessions[0].masked);
-        assert!(!state.sessions[1].masked, "echo masking must not spread");
-        assert_eq!(state.sessions[0].inspector_log.len(), 1);
-        assert!(state.sessions[1].inspector_log.is_empty());
+        assert_eq!(state.sessions[0].view.prompt, "HP:100>");
+        assert!(state.sessions[1].view.prompt.is_empty());
+        assert!(state.sessions[0].view.masked);
+        assert!(
+            !state.sessions[1].view.masked,
+            "echo masking must not spread"
+        );
+        assert_eq!(state.sessions[0].view.inspector_log.len(), 1);
+        assert!(state.sessions[1].view.inspector_log.is_empty());
     }
 
     /// Input buffers are per-session: switching focus never mixes them
@@ -4770,13 +4817,13 @@ mod tests {
     #[test]
     fn input_buffers_stay_with_their_session() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
-        state.sessions[0].input = Input::default().with_value("kill rat".into());
+        state.sessions[0].view.input = Input::default().with_value("kill rat".into());
 
         state.focus_pane(Focus::Session(1));
-        assert_eq!(state.bound().unwrap().input.value(), "");
+        assert_eq!(state.bound().unwrap().view.input.value(), "");
 
         state.focus_pane(Focus::Session(0));
-        assert_eq!(state.bound().unwrap().input.value(), "kill rat");
+        assert_eq!(state.bound().unwrap().view.input.value(), "kill rat");
     }
 
     /// A session ending must not disturb the others (§12).
@@ -4785,9 +4832,9 @@ mod tests {
         let (mut state, _rx) = app(&["tank", "cleric"]);
         apply_session_event(&mut state, 0, SessionEvent::Ended("socket dropped".into()));
 
-        assert!(!state.sessions[0].connected);
-        assert!(state.sessions[1].connected);
-        assert!(state.sessions[1].scrollback.is_empty());
+        assert!(!state.sessions[0].view.connected);
+        assert!(state.sessions[1].view.connected);
+        assert!(state.sessions[1].view.scrollback.is_empty());
     }
 
     // ---- unread indicators (§11) ----
@@ -4800,11 +4847,11 @@ mod tests {
         apply_session_event(&mut state, 1, SessionEvent::server("and another"));
         apply_session_event(&mut state, 0, SessionEvent::server("focused output"));
 
-        assert_eq!(state.sessions[1].unread, 2);
-        assert_eq!(state.sessions[0].unread, 0, "the focused pane is read");
+        assert_eq!(state.sessions[1].view.unread, 2);
+        assert_eq!(state.sessions[0].view.unread, 0, "the focused pane is read");
 
         state.focus_pane(Focus::Session(1));
-        assert_eq!(state.sessions[1].unread, 0);
+        assert_eq!(state.sessions[1].view.unread, 0);
     }
 
     // ---- focus (§11) ----
@@ -4848,7 +4895,7 @@ mod tests {
 
         assert_eq!(state.focus, Focus::Channel(0));
         assert_eq!(state.input_session, 1, "input stays with the last session");
-        assert_eq!(state.bound().unwrap().name, "cleric");
+        assert_eq!(state.bound().unwrap().view.name, "cleric");
     }
 
     // ---- channel panes (§11.1) ----
@@ -4892,7 +4939,7 @@ mod tests {
         );
         assert_eq!(state.channels[0].unread, 1);
         assert!(
-            state.sessions[1].scrollback.is_empty(),
+            state.sessions[1].view.scrollback.is_empty(),
             "a routed line reaches the pane only via Line, which the gag suppresses"
         );
     }
@@ -5165,11 +5212,17 @@ mod tests {
 
         // Display-only: nothing is asked of the target session.
         assert!(commands.is_empty(), "{commands:?}");
-        let line = state.sessions[1].scrollback.back().expect("the echo");
+        let line = state.sessions[1].view.scrollback.back().expect("the echo");
         assert_eq!(line.text, "[from tank] he is about to fall");
         assert_eq!(line.origin, Origin::Session(vec!["tank".to_string()]));
-        assert!(state.sessions[0].scrollback.is_empty(), "not the sender");
-        assert!(state.sessions[2].scrollback.is_empty(), "not a bystander");
+        assert!(
+            state.sessions[0].view.scrollback.is_empty(),
+            "not the sender"
+        );
+        assert!(
+            state.sessions[2].view.scrollback.is_empty(),
+            "not a bystander"
+        );
     }
 
     #[test]
@@ -5185,7 +5238,7 @@ mod tests {
             },
         );
 
-        let notice = state.sessions[0].scrollback.back().expect("a notice");
+        let notice = state.sessions[0].view.scrollback.back().expect("a notice");
         assert!(notice.text.contains("ghost"), "{}", notice.text);
         assert_eq!(notice.origin, Origin::Client);
     }
@@ -5245,7 +5298,7 @@ mod tests {
     #[test]
     fn a_disconnected_target_warns_in_the_origin_pane() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
-        state.sessions[1].connected = false;
+        state.sessions[1].view.connected = false;
 
         let (_, injections) = apply_session_event(
             &mut state,
@@ -5263,7 +5316,7 @@ mod tests {
             "{:?}",
             scrollback(&state.sessions[0])
         );
-        assert!(state.sessions[1].scrollback.is_empty());
+        assert!(state.sessions[1].view.scrollback.is_empty());
     }
 
     #[test]
@@ -5332,7 +5385,8 @@ mod tests {
 
     /// Helper: type a line and press Enter, as the bound session.
     async fn enter_line(state: &mut AppState, line: &str) {
-        state.sessions[state.input_session].input = Input::default().with_value(line.to_string());
+        state.sessions[state.input_session].view.input =
+            Input::default().with_value(line.to_string());
         submit_input(state, &[]).await;
     }
 
@@ -5420,7 +5474,7 @@ mod tests {
     #[tokio::test]
     async fn send_to_a_disconnected_character_says_so_as_send() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
-        state.sessions[1].connected = false;
+        state.sessions[1].view.connected = false;
 
         enter_line(&mut state, "/send cleric drink well").await;
 
@@ -5465,21 +5519,21 @@ mod tests {
             other => panic!("expected SendLine, got {other:?}"),
         }
         assert!(
-            state.sessions[0].scrollback.is_empty(),
+            state.sessions[0].view.scrollback.is_empty(),
             "a bare Enter must not leave a stray prompt line: {:?}",
-            state.sessions[0].scrollback
+            state.sessions[0].view.scrollback
         );
     }
 
     #[tokio::test]
     async fn a_typed_line_is_still_echoed() {
         let (mut state, _rx) = app(&["tank"]);
-        state.sessions[0].input = Input::default().with_value("look".into());
+        state.sessions[0].view.input = Input::default().with_value("look".into());
 
         submit_input(&mut state, &[]).await;
 
         assert_eq!(scrollback(&state.sessions[0]), "> look");
-        assert_eq!(state.sessions[0].input.value(), "", "input is cleared");
+        assert_eq!(state.sessions[0].view.input.value(), "", "input is cleared");
     }
 
     // ---- help (docs/ARCHITECTURE.md §11.2) ----
@@ -5554,7 +5608,7 @@ mod tests {
     #[tokio::test]
     async fn the_help_command_prints_the_same_listing_into_the_pane() {
         let (mut state, mut receivers) = app(&["tank"]);
-        state.sessions[0].input = Input::default().with_value("/help".into());
+        state.sessions[0].view.input = Input::default().with_value("/help".into());
 
         submit_input(&mut state, &[]).await;
 
@@ -5573,7 +5627,7 @@ mod tests {
     /// Submits `line` as if typed into the bound session.
     async fn submit(state: &mut AppState, line: &str) {
         if let Some(session) = state.bound_mut() {
-            session.input = Input::default().with_value(line.into());
+            session.view.input = Input::default().with_value(line.into());
         }
         submit_input(state, &[]).await;
     }
@@ -5585,21 +5639,21 @@ mod tests {
         submit(&mut state, "look").await;
 
         let session = &mut state.sessions[0];
-        session.input = Input::default().with_value("half typ".into());
+        session.view.input = Input::default().with_value("half typ".into());
 
         assert!(session.walk_history(true));
-        assert_eq!(session.input.value(), "look");
+        assert_eq!(session.view.input.value(), "look");
         assert!(session.walk_history(true));
-        assert_eq!(session.input.value(), "kill rat");
+        assert_eq!(session.view.input.value(), "kill rat");
         // Nothing older to reach; the oldest entry stays put.
         assert!(!session.walk_history(true));
-        assert_eq!(session.input.value(), "kill rat");
+        assert_eq!(session.view.input.value(), "kill rat");
 
         assert!(session.walk_history(false));
-        assert_eq!(session.input.value(), "look");
+        assert_eq!(session.view.input.value(), "look");
         assert!(session.walk_history(false));
         assert_eq!(
-            session.input.value(),
+            session.view.input.value(),
             "half typ",
             "walking back past the newest entry restores what was being typed"
         );
@@ -5612,15 +5666,15 @@ mod tests {
 
         let session = &mut state.sessions[0];
         session.walk_history(true);
-        session.input = Input::default().with_value("kill wolf".into());
+        session.view.input = Input::default().with_value("kill wolf".into());
         submit(&mut state, "kill wolf").await;
 
         let session = &mut state.sessions[0];
         assert!(session.walk_history(true));
-        assert_eq!(session.input.value(), "kill wolf");
+        assert_eq!(session.view.input.value(), "kill wolf");
         assert!(session.walk_history(true));
         assert_eq!(
-            session.input.value(),
+            session.view.input.value(),
             "kill rat",
             "the edited recall was appended, not written over its source"
         );
@@ -5648,7 +5702,7 @@ mod tests {
 
         let session = &mut state.sessions[0];
         assert!(session.walk_history(true));
-        assert_eq!(session.input.value(), "look");
+        assert_eq!(session.view.input.value(), "look");
     }
 
     /// A password typed under server ECHO stays out of history for the same
@@ -5658,7 +5712,7 @@ mod tests {
         let (mut state, _rx) = app(&["tank"]);
         submit(&mut state, "look").await;
 
-        state.sessions[0].masked = true;
+        state.sessions[0].view.masked = true;
         submit(&mut state, "hunter2").await;
 
         let session = &mut state.sessions[0];
@@ -5671,13 +5725,13 @@ mod tests {
             !session.walk_history(true),
             "recall into a masked prompt would send an old command as the password"
         );
-        assert_eq!(session.input.value(), "");
+        assert_eq!(session.view.input.value(), "");
 
         // Unmasking restores ordinary recall, minus the password.
-        state.sessions[0].masked = false;
+        state.sessions[0].view.masked = false;
         let session = &mut state.sessions[0];
         assert!(session.walk_history(true));
-        assert_eq!(session.input.value(), "look");
+        assert_eq!(session.view.input.value(), "look");
     }
 
     // ---- offering to keep a typed password (docs/ARCHITECTURE.md §13) ----
@@ -5689,7 +5743,7 @@ mod tests {
         let session = &mut state.sessions[0];
         session.rules = (dir.to_path_buf(), Some("kestrel".to_string()));
         session.offer_password_save = true;
-        session.masked = true;
+        session.view.masked = true;
         (state, receivers)
     }
 
@@ -5712,7 +5766,7 @@ mod tests {
 
         // Once per session: a second masked line is not another question.
         state.sessions[0].pending_password = None;
-        state.sessions[0].scrollback.clear();
+        state.sessions[0].view.scrollback.clear();
         submit(&mut state, "again").await;
         assert!(state.sessions[0].pending_password.is_none());
     }
@@ -5723,7 +5777,7 @@ mod tests {
     async fn an_unmasked_line_is_never_taken_for_a_password() {
         let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = armed(dir.path());
-        state.sessions[0].masked = false;
+        state.sessions[0].view.masked = false;
 
         submit(&mut state, "look").await;
 
@@ -5784,7 +5838,7 @@ mod tests {
         submit(&mut state, "hunter2").await;
 
         assert!(state.sessions[0].pending_password.is_none());
-        assert!(state.sessions[0].scrollback.is_empty());
+        assert!(state.sessions[0].view.scrollback.is_empty());
     }
 
     /// A stray keystroke must not answer the question, and must not be read
@@ -5820,7 +5874,7 @@ mod tests {
             !cleric.walk_history(true),
             "the tank's commands must not be recallable in the cleric's input"
         );
-        assert_eq!(cleric.input.value(), "");
+        assert_eq!(cleric.view.input.value(), "");
     }
 
     #[tokio::test]
@@ -5845,13 +5899,13 @@ mod tests {
 
         state.sessions[0].walk_history(true);
         state.sessions[0].walk_history(true);
-        assert_eq!(state.sessions[0].input.value(), "one");
+        assert_eq!(state.sessions[0].view.input.value(), "one");
         submit(&mut state, "one").await;
 
         let session = &mut state.sessions[0];
         assert!(session.walk_history(true));
         assert_eq!(
-            session.input.value(),
+            session.view.input.value(),
             "one",
             "a fresh walk starts at the newest entry, not where the last one stopped"
         );
@@ -5890,7 +5944,7 @@ mod tests {
 
         typed(&mut session, "look bull");
 
-        assert_eq!(session.suggestion.as_deref(), Some("ywug"));
+        assert_eq!(session.view.suggestion.as_deref(), Some("ywug"));
         assert_eq!(session.completed_input(), "look bullywug");
     }
 
@@ -5900,11 +5954,11 @@ mod tests {
     fn a_name_that_arrives_while_you_type_completes_what_is_already_there() {
         let (mut session, _rx) = test_support::pane("tank");
         typed(&mut session, "look bull");
-        assert_eq!(session.suggestion, None);
+        assert_eq!(session.view.suggestion, None);
 
         heard(&mut session, "A bullywug is here.");
 
-        assert_eq!(session.suggestion.as_deref(), Some("ywug"));
+        assert_eq!(session.view.suggestion.as_deref(), Some("ywug"));
     }
 
     /// Tab takes the guess and puts it in the line for real, with the cursor
@@ -5918,15 +5972,15 @@ mod tests {
 
         press_tab(&mut session);
 
-        assert_eq!(session.input.value(), "look bullywug");
+        assert_eq!(session.view.input.value(), "look bullywug");
         assert_eq!(
-            session.input.cursor(),
+            session.view.input.cursor(),
             "look bullywug".chars().count(),
             "the cursor belongs after what was just accepted"
         );
         // The ghost has become the line, so there is nothing left to draw
         // dimmed after it.
-        assert_eq!(session.suggestion, None);
+        assert_eq!(session.view.suggestion, None);
         assert_eq!(session.completed_input(), "look bullywug");
     }
 
@@ -5941,7 +5995,7 @@ mod tests {
 
         typed(&mut session, "s");
 
-        assert_eq!(session.input.value(), "look bullywugs");
+        assert_eq!(session.view.input.value(), "look bullywugs");
     }
 
     /// With nothing to accept, Tab does what it did before this existed:
@@ -5950,11 +6004,14 @@ mod tests {
     fn tab_with_no_guess_leaves_the_line_alone() {
         let (mut session, _rx) = test_support::pane("tank");
         typed(&mut session, "look bull");
-        assert_eq!(session.suggestion, None, "nothing heard, nothing to guess");
+        assert_eq!(
+            session.view.suggestion, None,
+            "nothing heard, nothing to guess"
+        );
 
         press_tab(&mut session);
 
-        assert_eq!(session.input.value(), "look bull");
+        assert_eq!(session.view.input.value(), "look bull");
     }
 
     /// A dismissed guess stays dismissed. Escape said "send what I typed",
@@ -5971,7 +6028,7 @@ mod tests {
 
         press_tab(&mut session);
 
-        assert_eq!(session.input.value(), "look bull");
+        assert_eq!(session.view.input.value(), "look bull");
     }
 
     fn press_tab(session: &mut SessionPane) {
@@ -5993,7 +6050,7 @@ mod tests {
             crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         );
 
-        assert_eq!(session.suggestion, None);
+        assert_eq!(session.view.suggestion, None);
         assert_eq!(session.completed_input(), "look bull");
     }
 
@@ -6011,7 +6068,7 @@ mod tests {
 
         typed(&mut session, "y");
 
-        assert_eq!(session.suggestion.as_deref(), Some("wug"));
+        assert_eq!(session.view.suggestion.as_deref(), Some("wug"));
     }
 
     /// Never into a password. The server is hiding this line and the
@@ -6021,11 +6078,11 @@ mod tests {
     fn a_masked_line_is_never_completed() {
         let (mut session, _rx) = test_support::pane("tank");
         heard(&mut session, "A bullywug is here.");
-        session.masked = true;
+        session.view.masked = true;
 
         typed(&mut session, "bull");
 
-        assert_eq!(session.suggestion, None);
+        assert_eq!(session.view.suggestion, None);
     }
 
     /// Only what the MUD said. Our own echo and the client's notices are
@@ -6038,7 +6095,7 @@ mod tests {
 
         typed(&mut session, "bull");
 
-        assert_eq!(session.suggestion, None);
+        assert_eq!(session.view.suggestion, None);
     }
 
     /// Colour is not part of a name: a MUD that tints the mob's name must
@@ -6050,7 +6107,7 @@ mod tests {
 
         typed(&mut session, "bull");
 
-        assert_eq!(session.suggestion.as_deref(), Some("ywug"));
+        assert_eq!(session.view.suggestion.as_deref(), Some("ywug"));
     }
 
     /// Completing a word in the middle of a line would have to decide what
@@ -6067,7 +6124,7 @@ mod tests {
             crossterm::event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
         );
 
-        assert_eq!(session.suggestion, None);
+        assert_eq!(session.view.suggestion, None);
     }
 
     /// `autocomplete: false` makes the whole path inert — nothing learned,
@@ -6080,7 +6137,7 @@ mod tests {
 
         typed(&mut session, "look bull");
 
-        assert_eq!(session.suggestion, None);
+        assert_eq!(session.view.suggestion, None);
         assert_eq!(session.completed_input(), "look bull");
     }
 
@@ -6096,11 +6153,11 @@ mod tests {
 
         submit_input(&mut state, &[]).await;
 
-        let echoed = &state.sessions[0].scrollback[0];
+        let echoed = &state.sessions[0].view.scrollback[0];
         assert_eq!(echoed.text, "> look bullywug");
-        assert_eq!(state.sessions[0].suggestion, None, "and it is spent");
+        assert_eq!(state.sessions[0].view.suggestion, None, "and it is spent");
         state.sessions[0].walk_history(true);
-        assert_eq!(state.sessions[0].input.value(), "look bullywug");
+        assert_eq!(state.sessions[0].view.input.value(), "look bullywug");
     }
 
     // ---- who needs me? (docs/ARCHITECTURE.md §11.7) ----
@@ -6144,7 +6201,7 @@ mod tests {
             &[("HEALTH", "90"), ("HEALTH_MAX", "100")],
         );
         assert_eq!(state.refresh_distress(), Vec::<String>::new());
-        assert_eq!(state.sessions[1].distress, None, "healed, and said so");
+        assert_eq!(state.sessions[1].view.distress, None, "healed, and said so");
 
         publish_vitals(
             &mut state,
@@ -6171,7 +6228,7 @@ mod tests {
         );
 
         assert_eq!(state.refresh_distress(), Vec::<String>::new());
-        assert!(state.sessions[0].distress.is_some());
+        assert!(state.sessions[0].view.distress.is_some());
     }
 
     #[test]
@@ -6211,10 +6268,11 @@ mod tests {
 
         assert_eq!(state.input_session, 0, "nobody to jump to");
         let said = state.sessions[0]
+            .view
             .scrollback
             .iter()
             .any(|line| line.text.contains("nobody is in trouble"));
-        assert!(said, "{:?}", state.sessions[0].scrollback);
+        assert!(said, "{:?}", state.sessions[0].view.scrollback);
     }
 
     #[test]
@@ -6364,6 +6422,7 @@ mod tests {
         let (mut state, _rx) = app_with_rules(dir.path());
         let line = "The kobold\x1bM is DEAD!";
         state.sessions[0]
+            .view
             .scrollback
             .push_back(RetainedLine::server(line));
 
@@ -6503,7 +6562,7 @@ mod tests {
         state.scroll_focused(KeyCode::PageUp);
         state.scroll_focused(KeyCode::PageUp);
 
-        assert_eq!(state.sessions[0].back_offset, SCROLL_PAGE * 2);
+        assert_eq!(state.sessions[0].view.back_offset, SCROLL_PAGE * 2);
     }
 
     /// The channel-pane half of `scrolling_up_then_new_output_does_not_move_the_reader`
@@ -6560,7 +6619,7 @@ mod tests {
             "the focused channel pane must scroll"
         );
         assert_eq!(
-            state.sessions[0].back_offset, 0,
+            state.sessions[0].view.back_offset, 0,
             "the bound-but-unfocused session must not scroll"
         );
     }
@@ -6570,11 +6629,11 @@ mod tests {
     #[test]
     fn pgdn_at_the_tail_stays_put() {
         let (mut state, _rx) = app(&["tank"]);
-        assert_eq!(state.sessions[0].back_offset, 0);
+        assert_eq!(state.sessions[0].view.back_offset, 0);
 
         state.scroll_focused(KeyCode::PageDown);
 
-        assert_eq!(state.sessions[0].back_offset, 0);
+        assert_eq!(state.sessions[0].view.back_offset, 0);
     }
 
     /// `End` resets to the tail from anywhere, including `Home`'s
@@ -6585,10 +6644,10 @@ mod tests {
         let (mut state, _rx) = app(&["tank"]);
 
         state.scroll_focused(KeyCode::Home);
-        assert_eq!(state.sessions[0].back_offset, usize::MAX);
+        assert_eq!(state.sessions[0].view.back_offset, usize::MAX);
 
         state.scroll_focused(KeyCode::End);
-        assert_eq!(state.sessions[0].back_offset, 0);
+        assert_eq!(state.sessions[0].view.back_offset, 0);
     }
 
     /// New output must not yank a reader who has scrolled away from the
@@ -6599,13 +6658,13 @@ mod tests {
     fn scrolling_up_then_new_output_does_not_move_the_reader() {
         let (mut state, _rx) = app(&["tank"]);
         state.scroll_focused(KeyCode::PageUp);
-        let offset_before = state.sessions[0].back_offset;
+        let offset_before = state.sessions[0].view.back_offset;
         assert_ne!(offset_before, 0);
 
         apply_session_event(&mut state, 0, SessionEvent::server("more output"));
 
         assert_eq!(
-            state.sessions[0].back_offset, offset_before,
+            state.sessions[0].view.back_offset, offset_before,
             "a scrolled reader's position must not move on new output"
         );
     }
@@ -6615,11 +6674,11 @@ mod tests {
     #[test]
     fn a_pane_at_the_tail_stays_pinned_on_new_output() {
         let (mut state, _rx) = app(&["tank"]);
-        assert_eq!(state.sessions[0].back_offset, 0);
+        assert_eq!(state.sessions[0].view.back_offset, 0);
 
         apply_session_event(&mut state, 0, SessionEvent::server("more output"));
 
-        assert_eq!(state.sessions[0].back_offset, 0);
+        assert_eq!(state.sessions[0].view.back_offset, 0);
     }
 
     // ---- /newprofile (§15, UX_REVIEW.md B) ----
@@ -6827,7 +6886,7 @@ mod tests {
 
         let session = &state.sessions[0];
         assert_eq!(
-            session.current_room,
+            session.view.current_room,
             Some(crate::map::RoomId(5)),
             "position still tracks, even with nothing learned about the way there"
         );
@@ -6962,7 +7021,7 @@ mod tests {
         put_room(state.map_of_mut(0), 1, None, &[("n", 2)]);
         put_room(state.map_of_mut(0), 2, None, &[("n", 3)]);
         put_room(state.map_of_mut(0), 3, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto 3").await;
 
@@ -6992,7 +7051,7 @@ mod tests {
         let (mut state, mut receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, Some("Town Square"), &[("e", 2)]);
         put_room(state.map_of_mut(0), 2, Some("Temple of the Sun"), &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto temple").await;
 
@@ -7015,7 +7074,7 @@ mod tests {
         let (mut state, _receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, Some("Town Square"), &[("e", 2)]);
         put_room(state.map_of_mut(0), 2, Some("Temple of the Sun"), &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/map").await;
         assert!(state.show_map, "the column comes up");
@@ -7108,7 +7167,7 @@ mod tests {
         put_room(state.map_of_mut(0), 1, Some("Start"), &[]);
         put_room(state.map_of_mut(0), 10, Some("North Gate"), &[]);
         put_room(state.map_of_mut(0), 11, Some("South Gate"), &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto gate").await;
 
@@ -7125,7 +7184,7 @@ mod tests {
     async fn goto_reports_a_name_with_no_match() {
         let (mut state, _receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, Some("Start"), &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto nowhere").await;
 
@@ -7137,7 +7196,7 @@ mod tests {
     async fn goto_reports_an_unknown_vnum() {
         let (mut state, _receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto 999").await;
 
@@ -7150,7 +7209,7 @@ mod tests {
         let (mut state, _receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
         put_room(state.map_of_mut(0), 2, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto 2").await;
 
@@ -7162,7 +7221,7 @@ mod tests {
     async fn goto_reports_already_there() {
         let (mut state, _receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/goto 1").await;
 
@@ -7175,7 +7234,7 @@ mod tests {
     #[test]
     fn a_step_landing_somewhere_unexpected_stops_the_walk() {
         let (mut state, _rx) = app(&["tank"]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         state.sessions[0].walk = Some(Walk {
             remaining: VecDeque::new(),
             expecting: crate::map::RoomId(2),
@@ -7204,7 +7263,7 @@ mod tests {
         // The route believes `n` from room 1 reaches room 99.
         put_room(state.map_of_mut(0), 1, None, &[("n", 99)]);
         let session = &mut state.sessions[0];
-        session.current_room = Some(crate::map::RoomId(1));
+        session.view.current_room = Some(crate::map::RoomId(1));
         session.walk = Some(Walk {
             remaining: VecDeque::new(),
             expecting: crate::map::RoomId(99),
@@ -7230,7 +7289,7 @@ mod tests {
             "and must not overwrite the edge with an arrival it cannot attribute"
         );
         assert_eq!(
-            session.current_room,
+            session.view.current_room,
             Some(crate::map::RoomId(2)),
             "where the character actually is is never in doubt: the server said so"
         );
@@ -7246,7 +7305,7 @@ mod tests {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[("n", 99)]);
         let session = &mut state.sessions[0];
-        session.current_room = Some(crate::map::RoomId(1));
+        session.view.current_room = Some(crate::map::RoomId(1));
         assert!(session.walk.is_none(), "no route running");
 
         apply_session_event(&mut state, 0, room(2, Some("n")));
@@ -7289,7 +7348,7 @@ mod tests {
     #[tokio::test]
     async fn a_typed_step_mid_walk_cancels_it_and_a_late_arrival_does_not_resume_it() {
         let (mut state, mut receivers) = app(&["tank"]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         state.sessions[0].walk = Some(Walk {
             remaining: VecDeque::from(["e".to_string()]),
             expecting: crate::map::RoomId(2),
@@ -7363,7 +7422,7 @@ mod tests {
         state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         mark_current_room(&mut state, "shop");
         save_dirty_maps(&mut state);
@@ -7443,7 +7502,7 @@ mod tests {
         put_room(state.map_of_mut(0), 2, None, &[("e", 3)]);
         put_room(state.map_of_mut(0), 3, None, &[("e", 4)]);
         put_room(state.map_of_mut(0), 4, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/goto 4").await;
         let _ = receivers[0].try_recv();
 
@@ -7503,7 +7562,7 @@ mod tests {
         put_room(state.map_of_mut(0), 1, None, &[("n", 2)]);
         put_room(state.map_of_mut(0), 2, None, &[("e", 3)]);
         put_room(state.map_of_mut(0), 3, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/goto 3").await;
         let _ = receivers[0].try_recv();
 
@@ -7701,7 +7760,7 @@ mod tests {
     async fn typing_a_word_into_the_chooser_writes_that_word() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
 
@@ -7738,7 +7797,7 @@ mod tests {
     async fn a_digit_still_takes_its_row_rather_than_starting_a_label() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
 
@@ -7772,7 +7831,7 @@ mod tests {
         put_room(state.map_of_mut(0), 1, Some("West Gate"), &[("e", 2)]);
         put_room(state.map_of_mut(0), 2, Some("Town Square"), &[("e", 3)]);
         put_room(state.map_of_mut(0), 3, Some("East Road"), &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(2));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(2));
         (state, rx)
     }
 
@@ -7954,7 +8013,7 @@ mod tests {
     async fn a_key_the_cursor_ignores_still_does_its_own_job() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         let keys = crate::config::Keybinds::default();
         handle_key(
             &mut state,
@@ -7985,7 +8044,7 @@ mod tests {
     async fn a_binding_pressed_with_the_cursor_up_still_fires() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         let keys = crate::config::Keybinds::default();
         handle_key(
             &mut state,
@@ -8019,7 +8078,7 @@ mod tests {
     async fn alt_n_reaches_the_map_pane() {
         let (mut state, _rx) = app(&["tank", "cleric"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         state.show_map = true;
         let keys = crate::config::Keybinds::default();
 
@@ -8086,7 +8145,7 @@ mod tests {
     async fn cycling_focus_visits_the_map_when_it_is_shown() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         state.show_map = true;
         state.show_channels = false;
 
@@ -8103,7 +8162,7 @@ mod tests {
     async fn esc_returns_focus_to_the_character() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         state.show_map = true;
         let keys = crate::config::Keybinds::default();
         handle_key(
@@ -8135,7 +8194,7 @@ mod tests {
     async fn mark_labels_the_room_and_shows_on_the_map() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, Some("Bakers Shop"), &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark shop").await;
 
@@ -8171,7 +8230,7 @@ mod tests {
         state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark shop").await;
         assert_eq!(
@@ -8185,7 +8244,7 @@ mod tests {
         let remove_row = state.mark_menu.as_ref().unwrap().entries().len() - 1;
         state.mark_menu.as_mut().unwrap().selected = remove_row;
         apply_mark_menu(&mut state);
-        state.sessions[0].current_room = Some(crate::map::RoomId(2));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(2));
 
         // No `save_dirty_maps`, no quit key — reading straight from disk,
         // as if the process had just been killed.
@@ -8204,7 +8263,7 @@ mod tests {
         let (mut state, _rx) = app(&["mathias", "saihtam", "elsewhere"]);
         for (index, key) in [(0, "hercmud.net"), (1, "hercmud.net"), (2, "other.mud")] {
             state.sessions[index].map_key = key.to_string();
-            state.sessions[index].current_room = Some(crate::map::RoomId(index as i64 + 1));
+            state.sessions[index].view.current_room = Some(crate::map::RoomId(index as i64 + 1));
         }
 
         let party = state.party_of(0);
@@ -8225,7 +8284,7 @@ mod tests {
         for session in &mut state.sessions {
             session.map_key = "hercmud.net".to_string();
         }
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         assert!(state.party_of(0).is_empty());
     }
@@ -8255,7 +8314,7 @@ mod tests {
             "saihtam reads the same map, so the edge is already there"
         );
         assert_eq!(
-            state.sessions[1].current_room, None,
+            state.sessions[1].view.current_room, None,
             "but standing somewhere is still each character's own business"
         );
     }
@@ -8292,7 +8351,7 @@ mod tests {
         for session in &mut state.sessions {
             session.rules = (dir.path().to_path_buf(), None);
             session.map_key = "hercmud.net".to_string();
-            session.current_room = Some(crate::map::RoomId(1));
+            session.view.current_room = Some(crate::map::RoomId(1));
         }
         state.world_mut(0).map = config::load_map(dir.path(), "hercmud.net");
         assert_eq!(
@@ -8340,7 +8399,7 @@ mod tests {
         state.config_dir = dir.path().to_path_buf();
         state.sessions[0].map_key = "tank".to_string();
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark well").await;
 
@@ -8364,7 +8423,7 @@ mod tests {
     async fn marking_and_removing_both_record_the_room_as_explicitly_touched() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark shop").await;
         assert!(
@@ -8410,7 +8469,7 @@ mod tests {
     async fn opening_the_chooser_changes_nothing_by_itself() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark well").await;
 
         submit(&mut state, "/mark").await;
@@ -8449,7 +8508,7 @@ mod tests {
     async fn bare_mark_opens_the_chooser() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/mark").await;
 
@@ -8471,7 +8530,7 @@ mod tests {
     async fn picking_a_row_marks_the_room() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
 
         // `2` is the second suggestion.
@@ -8499,7 +8558,7 @@ mod tests {
     async fn the_chooser_takes_a_label_of_your_own() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
 
@@ -8560,7 +8619,7 @@ mod tests {
     async fn digits_typed_into_a_custom_label_stay_in_it() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
         state.mark_menu.as_mut().unwrap().typing = Some(String::new());
@@ -8586,7 +8645,7 @@ mod tests {
     async fn the_chooser_offers_to_take_an_existing_mark_off() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark well").await;
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
@@ -8621,7 +8680,7 @@ mod tests {
     async fn esc_leaves_the_room_as_it_was() {
         let (mut state, _rx) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         submit(&mut state, "/mark").await;
         let keys = crate::config::Keybinds::default();
 
@@ -8669,9 +8728,9 @@ mod tests {
         // usual — an arrival no movement predicted.
         apply_session_event(&mut state, 0, room(99, None));
 
-        assert_eq!(state.sessions[0].corpse, Some(crate::map::RoomId(1)));
+        assert_eq!(state.sessions[0].view.corpse, Some(crate::map::RoomId(1)));
         assert_eq!(
-            state.sessions[0].current_room,
+            state.sessions[0].view.current_room,
             Some(crate::map::RoomId(99)),
             "the relocation still lands; only the mark is taken from before it"
         );
@@ -8691,7 +8750,7 @@ mod tests {
 
         apply_session_event(&mut state, 0, SessionEvent::Corpse);
 
-        assert!(state.sessions[0].corpse.is_none());
+        assert!(state.sessions[0].view.corpse.is_none());
         assert!(
             scrollback(&state.sessions[0]).contains("doesn't know where you died"),
             "{}",
@@ -8708,9 +8767,9 @@ mod tests {
         put_room(state.map_of_mut(0), 1, Some("Dark Alley"), &[]);
         put_room(state.map_of_mut(0), 99, Some("Temple"), &[("s", 2)]);
         put_room(state.map_of_mut(0), 2, Some("Street"), &[("w", 1)]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         apply_session_event(&mut state, 0, SessionEvent::Corpse);
-        state.sessions[0].current_room = Some(crate::map::RoomId(99));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(99));
 
         submit(&mut state, "/corpse").await;
 
@@ -8734,7 +8793,7 @@ mod tests {
     async fn corpse_without_a_recorded_death_says_no_death_was_recorded() {
         let (mut state, mut receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         submit(&mut state, "/corpse").await;
 
@@ -8754,9 +8813,9 @@ mod tests {
         let (mut state, _receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
         put_room(state.map_of_mut(0), 99, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         apply_session_event(&mut state, 0, SessionEvent::Corpse);
-        state.sessions[0].current_room = Some(crate::map::RoomId(99));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(99));
 
         submit(&mut state, "/corpse").await;
 
@@ -8774,12 +8833,12 @@ mod tests {
     async fn walking_back_to_the_corpse_leaves_the_mark_in_place() {
         let (mut state, _receivers) = app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
         apply_session_event(&mut state, 0, SessionEvent::Corpse);
 
         submit(&mut state, "/corpse").await;
 
-        assert_eq!(state.sessions[0].corpse, Some(crate::map::RoomId(1)));
+        assert_eq!(state.sessions[0].view.corpse, Some(crate::map::RoomId(1)));
         assert!(
             scrollback(&state.sessions[0]).contains("/corpse: already there"),
             "{}",
@@ -8813,7 +8872,7 @@ mod tests {
         submit(&mut state, "/connect cleric").await;
 
         assert_eq!(state.sessions.len(), 2);
-        assert_eq!(state.sessions[1].name, "cleric");
+        assert_eq!(state.sessions[1].view.name, "cleric");
         assert_eq!(
             state.focus,
             Focus::Session(1),
@@ -8841,7 +8900,7 @@ mod tests {
         submit(&mut state, "/connect tank").await;
 
         assert_eq!(state.sessions.len(), 2);
-        assert_eq!(state.sessions[1].name, "tank-2");
+        assert_eq!(state.sessions[1].view.name, "tank-2");
     }
 
     #[tokio::test]
