@@ -1,13 +1,20 @@
-# One member beside the root package: `test-support`, a dev-dependency
-# holding helpers shared by tests in several modules. It is a workspace so
-# that a path dev-dependency has somewhere to live; nothing else about the
-# single-crate layout changes (docs/ARCHITECTURE.md §4).
+# `test-support` is a path dev-dependency, deliberately NOT a workspace
+# member.
 #
-# `release-plz.toml` pins `git_tag_name` precisely because becoming a
-# workspace would otherwise change the tag shape from `v0.7.0` to
-# `mudular-v0.7.0`, which `release.yml` would not fire on.
+# Excluding it is what keeps the release machinery working. release-plz
+# determines a next version for every *member* — `release = false` only
+# skips the release itself, not the version calculation — and because
+# `git_tag_name` is one workspace-wide template, it read the existing
+# `v0.7.0` tag as this package's own last release, checked out that tag to
+# diff against, and failed: at v0.7.0 the package did not exist yet
+# ("Failed to find package test-support"). Two releases broke that way
+# before this line existed.
+#
+# `exclude` gives cargo everything it needs — the path dev-dependency
+# still resolves, and `cargo test` still runs it — while leaving the
+# workspace with the single member release-plz has always seen.
 [workspace]
-members = ["test-support"]
+exclude = ["test-support"]
 
 [package]
 name = "mudular"
