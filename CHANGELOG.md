@@ -8,6 +8,17 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2](https://github.com/millermatt/mudular/compare/v0.6.1...v0.6.2) - 2026-08-17
+
+### Fixed
+
+- *(session)* re-arm auto-login on each connection ([#86](https://github.com/millermatt/mudular/pull/86))
+
+### Other
+
+- wait for release-plz to go quiet before merging its release PR ([#84](https://github.com/millermatt/mudular/pull/84))
+- list #79 under 0.6.1, which shipped it ([#83](https://github.com/millermatt/mudular/pull/83))
+
 ## [0.6.1](https://github.com/millermatt/mudular/compare/v0.6.0...v0.6.1) - 2026-08-17
 
 ### Fixed
