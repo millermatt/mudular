@@ -71,11 +71,7 @@ release_commits = "^(feat|fix|perf)(\\(.*\\))?!?:"
 # trailer moves the minor position on its own.
 features_always_increment_minor = true
 
-# `test-support` is a dev-dependency living in this workspace, not something
-# anyone installs or depends on. Without this, becoming a workspace would
-# have release-plz version it, changelog it and tag it alongside the client.
-[[package]]
-name = "test-support"
-release = false
-changelog_update = false
-git_tag_enable = false
+# No `[[package]]` block for `test-support`: it is excluded from the
+# workspace in Cargo.toml, so release-plz never sees it. A block here was
+# tried first and was not enough — `release = false` skips the release, not
+# the version determination that failed. See the comment in Cargo.toml.
