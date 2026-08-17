@@ -33,6 +33,26 @@ guidance is docs/DEVELOPMENT.md.
 
 ## Git
 
+**Never push to `main`.** Every change goes on a branch and through a pull
+request, however small — a one-line README fix included. Branch protection
+allows a direct push, deliberately, so that a human can make one; that
+permission is not for you. A PR is what gets the change tested on all three
+platforms before it is on `main`, and CI is the only thing that runs macOS and
+Windows at all.
+
+**One concern per branch.** If the change cannot be described in one sentence,
+it is two branches. This is a rule about `main` as much as about branches: PRs
+are squash-merged, so a branch becomes exactly one commit and exactly one
+changelog line. A branch carrying a feature plus four unrelated fixes lands as
+one commit whose subject misdescribes four of them, and their explanations end
+up filed under something they have nothing to do with. PR #72 was that mistake
+— a workflow plus four harness bugs, squashed into `ci: …` — and squashing is
+what made it painless to create, which is why the discipline has to be here.
+
+Corollary: when a fix turns up mid-branch and is not what the branch is about,
+finish the branch, then do the fix in its own. Two small PRs beat one honest
+commit message apologising for a mixed one.
+
 **This checkout is habitually behind `origin/main`.** PRs — including
 release-plz's release PRs — are merged on GitHub, which never touches the local
 repo. So:
