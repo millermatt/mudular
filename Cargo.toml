@@ -1,3 +1,14 @@
+# One member beside the root package: `test-support`, a dev-dependency
+# holding helpers shared by tests in several modules. It is a workspace so
+# that a path dev-dependency has somewhere to live; nothing else about the
+# single-crate layout changes (docs/ARCHITECTURE.md §4).
+#
+# `release-plz.toml` pins `git_tag_name` precisely because becoming a
+# workspace would otherwise change the tag shape from `v0.7.0` to
+# `mudular-v0.7.0`, which `release.yml` would not fire on.
+[workspace]
+members = ["test-support"]
+
 [package]
 name = "mudular"
 version = "0.7.0"
@@ -73,6 +84,7 @@ keyring = { version = "4", default-features = false, features = [
 
 [dev-dependencies]
 libc = "0.2.189"
+test-support = { path = "test-support" }
 rcgen = "0.14"
 
 # Script engines are feature-gated so a build carries only the VMs it wants

@@ -1590,6 +1590,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "test-support",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
@@ -2751,6 +2752,10 @@ dependencies = [
  "wezterm-input-types",
  "winapi",
 ]
+
+[[package]]
+name = "test-support"
+version = "0.0.0"
 
 [[package]]
 name = "thiserror"

@@ -103,8 +103,8 @@ fn write_pins(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub mod tests {
     use super::*;
 
-    fn store() -> (PinStore, crate::test_support::TempDir) {
-        let dir = crate::test_support::TempDir::new();
+    fn store() -> (PinStore, ::test_support::TempDir) {
+        let dir = ::test_support::TempDir::new();
         let store = PinStore::new(dir.path().join("nested").join("known_certs"));
         (store, dir)
     }

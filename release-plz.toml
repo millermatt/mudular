@@ -70,3 +70,12 @@ release_commits = "^(feat|fix|perf)(\\(.*\\))?!?:"
 # Breaking markers still outrank this: `feat!:` or a `BREAKING CHANGE:`
 # trailer moves the minor position on its own.
 features_always_increment_minor = true
+
+# `test-support` is a dev-dependency living in this workspace, not something
+# anyone installs or depends on. Without this, becoming a workspace would
+# have release-plz version it, changelog it and tag it alongside the client.
+[[package]]
+name = "test-support"
+release = false
+changelog_update = false
+git_tag_enable = false
