@@ -8,6 +8,18 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0](https://github.com/millermatt/mudular/compare/v0.6.2...v0.7.0) - 2026-08-17
+
+### Added
+
+- *(engine)* plain patterns as the default, regex as the escape hatch ([#88](https://github.com/millermatt/mudular/pull/88))
+
+### Other
+
+- *(test)* give the shared TempDir helper a home of its own ([#92](https://github.com/millermatt/mudular/pull/92))
+- stop config and ui reaching up the layer stack ([#91](https://github.com/millermatt/mudular/pull/91))
+- keep the line ending when migrating a channel's `match:` ([#90](https://github.com/millermatt/mudular/pull/90))
+
 ## [0.6.2](https://github.com/millermatt/mudular/compare/v0.6.1...v0.6.2) - 2026-08-17
 
 ### Fixed
