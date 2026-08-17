@@ -2614,21 +2614,46 @@ mod tests {
     }
 
     /// A broken plain pattern has to name the rule's own text, not the regex
-    /// it would have become — the author never wrote that regex.
+    /// it would have become — the author never wrote that regex, and being
+    /// shown `(?P<who>.+?)` when you typed `{who}` is being told about a
+    /// language you were promised you would not have to learn.
+    ///
+    /// Both halves are checked, because only the second can fail: an
+    /// unclosed `{` is caught before any regex exists, while a repeated name
+    /// is caught *after* the translator has built most of one, which is
+    /// where a generated fragment could leak into the message.
     #[test]
     fn a_broken_plain_pattern_reports_the_pattern_as_written() {
-        let err = Engine::compile(&[module(
-            r#"
+        let compile = |pattern: &str| {
+            Engine::compile(&[module(&format!(
+                r#"
             name: broken
             triggers:
-              - pattern: '{who has arrived'
+              - pattern: '{pattern}'
                 send: ["wave"]
-            "#,
-        )])
-        .unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("{who has arrived"), "{message}");
-        assert!(message.contains("never closed"), "{message}");
+            "#
+            ))])
+            .unwrap_err()
+            .to_string()
+        };
+
+        let unclosed = compile("{who has arrived");
+        assert!(unclosed.contains("{who has arrived"), "{unclosed}");
+        assert!(unclosed.contains("never closed"), "{unclosed}");
+
+        let repeated = compile("{who} hits {who}");
+        assert!(repeated.contains("{who} hits {who}"), "{repeated}");
+        assert!(repeated.contains("twice"), "{repeated}");
+
+        for message in [&unclosed, &repeated] {
+            for generated in ["(?P<", ".+?", r"\\."] {
+                assert!(
+                    !message.contains(generated),
+                    "the error showed `{generated}`, which is translator \
+                     output rather than anything the author typed: {message}"
+                );
+            }
+        }
     }
 
     /// Shadowing by `id` inherits the base's spelling along with its text —
