@@ -544,11 +544,12 @@ Steering the cursor past the edge of the column brings the map with it, so
 what you are pointing at is always something you can see. Putting the
 cursor away hands the view back to your character.
 
-A bright stretch of the column's border means there is more map that way —
-rooms you have been to that do not fit in the space the column has. No
-mark means nothing known beyond that edge, which is not the same as
-nothing *being* there: an unexplored exit and a wall look identical until
-somebody tries it.
+Arrows along the column's border — `<`, `>`, `^`, `v` — mean there is more
+map that way: rooms you have been to that do not fit in the space the
+column has. Widening the column (`Alt+,`) or walking that way brings them
+into view. No arrows means nothing known beyond that edge, which is not
+the same as nothing *being* there: an unexplored exit and a wall look
+identical until somebody tries it.
 
 Switching between two characters who are near enough to see each other
 leaves the picture where it is. The map is of the world rather than of a
