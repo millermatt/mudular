@@ -755,7 +755,7 @@ cd ~/.config/mudular                     # macOS: ~/Library/Application\ Support
 cp -a . ../mudular.backup
 find . -name '*.yaml' -exec sed -i -E \
   's/^([[:space:]]*)(- )?pattern:/\1\2regex:/
-   s/^([[:space:]]*)match:[[:space:]]*$/\1regex:/' {} +
+   s/^([[:space:]]*)match:([[:space:]]*)$/\1regex:\2/' {} +
 ```
 
 macOS ships BSD `sed`, which wants an argument to `-i`: write `sed -i ''`
@@ -772,7 +772,7 @@ $utf8 = New-Object System.Text.UTF8Encoding $false
 Get-ChildItem $dir -Recurse -Filter *.yaml | ForEach-Object {
   $text = [IO.File]::ReadAllText($_.FullName, $utf8)
   $text = [regex]::Replace($text, '(?m)^([ \t]*)(- )?pattern:', '$1$2regex:')
-  $text = [regex]::Replace($text, '(?m)^([ \t]*)match:[ \t]*\r?$', '$1regex:')
+  $text = [regex]::Replace($text, '(?m)^([ \t]*)match:[ \t]*(\r?)$', '$1regex:$2')
   [IO.File]::WriteAllText($_.FullName, $text, $utf8)
 }
 ```
