@@ -1,0 +1,49 @@
+[package]
+name = "mudular-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace root. The parent is a plain package, not a workspace, so
+# without this cargo refuses to build a package nested inside it. Keeping the
+# two separate is also what stops `cargo build`/`clippy`/CI at the repo root
+# from trying to build libfuzzer on stable.
+[workspace]
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+# No default features: `proto` is sans-IO and needs no script engine, so
+# there is no reason for a fuzz build to compile vendored Lua.
+mudular = { path = "..", default-features = false }
+
+[[bin]]
+name = "telnet_fsm"
+path = "fuzz_targets/telnet_fsm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mccp_switchover"
+path = "fuzz_targets/mccp_switchover.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "charset_decode"
+path = "fuzz_targets/charset_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzzing wants release-grade speed but keeps the assertions that make a
+# panic the thing being hunted.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true

@@ -87,6 +87,20 @@ mod tests {
         assert_eq!(Charset::Latin1.decode_byte(0xFF), 'ÿ');
     }
 
+    /// Exhaustive, and deliberately so: the fuzz target for charset decode
+    /// (`fuzz/fuzz_targets/charset_decode.rs`) can only *search* a 256-value
+    /// input domain that this walks in full, so the guarantee that no byte
+    /// off the wire panics the CP437 table lookup belongs here rather than
+    /// there.
+    #[test]
+    fn every_byte_decodes_in_every_charset() {
+        for charset in [Charset::Utf8, Charset::Latin1, Charset::Cp437] {
+            for byte in 0u8..=0xFF {
+                let _ = charset.decode_byte(byte);
+            }
+        }
+    }
+
     #[test]
     fn cp437_ascii_range_is_unchanged() {
         for byte in 0x20u8..0x7F {

@@ -4,12 +4,16 @@ mod config;
 mod engine;
 mod map;
 mod net;
-mod proto;
 mod scrollback;
 mod session;
 mod ui;
 mod update;
 mod vitals;
+
+// `proto` lives in the library half of this crate (see lib.rs) so the fuzz
+// targets can reach it. Re-exporting it here keeps every `crate::proto::…`
+// path in the binary working unchanged.
+pub(crate) use mudular::proto;
 
 use std::path::PathBuf;
 
