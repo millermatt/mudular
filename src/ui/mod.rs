@@ -177,7 +177,7 @@ pub struct Panes {
 
 /// Splits `area` into the panes `state` asks for.
 pub fn layout(area: Rect, state: &AppState) -> Panes {
-    let reserve_prompt = state.bound().is_some_and(|session| session.connected);
+    let reserve_prompt = state.bound().is_some_and(|session| session.view.connected);
     // Above the prompt rather than below it: the prompt and the input line
     // are one thing to look at while typing, and a strip between them would
     // split the pair the player's eye already treats as joined.
@@ -372,7 +372,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
 
     let bound = state.bound();
     if let (Some(area), Some(session)) = (panes.prompt, bound)
-        && !session.prompt.is_empty()
+        && !session.view.prompt.is_empty()
     {
         // Indent by one column so the prompt lines up with the pane's
         // content rather than its border.
@@ -382,7 +382,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
             ..area
         };
         frame.render_widget(
-            Paragraph::new(Text::from(ansi_lines(&session.prompt))),
+            Paragraph::new(Text::from(ansi_lines(&session.view.prompt))),
             inset,
         );
     }
@@ -613,32 +613,36 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     let picked_line = (!showing_inspector && index == state.input_session)
         .then_some(state.line_cursor)
         .flatten()
-        .and_then(|cursor| session.scrollback.len().checked_sub(1 + cursor));
+        .and_then(|cursor| session.view.scrollback.len().checked_sub(1 + cursor));
 
     let content_width = area.width.saturating_sub(2);
 
     // Security and latency are each absent until they are known, so a pane
     // never shows an empty bracket or a placeholder round trip.
-    let security = match session.security.is_empty() {
+    let security = match session.view.security.is_empty() {
         true => String::new(),
-        false => format!(" [{}]", session.security),
+        false => format!(" [{}]", session.view.security),
     };
-    let latency = match session.latency.is_empty() {
+    let latency = match session.view.latency.is_empty() {
         true => String::new(),
-        false => format!(" {}", session.latency),
+        false => format!(" {}", session.view.latency),
     };
     let title = if showing_inspector {
-        format!(" {} — {} ", session.name, session.inspector_title())
+        format!(" {} — {} ", session.view.name, session.inspector_title())
     } else {
         let picking = if picked_line.is_some() {
             " ↑↓ pick a line, Enter for a trigger, Esc to cancel"
         } else {
-            scroll_indicator(session.back_offset)
+            scroll_indicator(session.view.back_offset)
         };
         format!(
             "{} — {}{security}{latency}{picking} ",
-            pane_title(&session.name, session.unread, session.distress.is_some()),
-            session.status,
+            pane_title(
+                &session.view.name,
+                session.view.unread,
+                session.view.distress.is_some()
+            ),
+            session.view.status,
         )
     };
 
@@ -651,12 +655,12 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     let back_offset = if showing_inspector {
         0
     } else {
-        session.back_offset
+        session.view.back_offset
     };
 
     let (lines, extent) = if showing_inspector {
         visible_window(
-            &session.inspector_log,
+            &session.view.inspector_log,
             area.height,
             content_width,
             back_offset,
@@ -664,7 +668,7 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         )
     } else {
         visible_window(
-            &session.scrollback,
+            &session.view.scrollback,
             area.height,
             content_width,
             back_offset,
@@ -694,7 +698,15 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         )
     };
 
-    render_scrollback(frame, area, lines, title, focused, session.color, extent);
+    render_scrollback(
+        frame,
+        area,
+        lines,
+        title,
+        focused,
+        session.view.color,
+        extent,
+    );
 }
 
 /// Every character's vitals on one row (§11.6).
@@ -713,7 +725,7 @@ fn draw_hud(frame: &mut Frame, area: Rect, state: &AppState) {
         // redrawn every frame.
         let vitals = state
             .peer_registry
-            .get(&session.name)
+            .get(&session.view.name)
             .map(
                 |peer: &tokio::sync::watch::Receiver<crate::engine::PeerSnapshot>| {
                     crate::vitals::from_server_data(&peer.borrow().data)
@@ -724,15 +736,15 @@ fn draw_hud(frame: &mut Frame, area: Rect, state: &AppState) {
         if index > 0 {
             spans.push(Span::raw("  "));
         }
-        let name = Style::default().fg(session.color.unwrap_or(Color::Gray));
+        let name = Style::default().fg(session.view.color.unwrap_or(Color::Gray));
         let focused = state.input_session == index;
         spans.push(Span::styled(
             match focused {
                 // The character the input line is bound to, marked the way
                 // the tab bar marks it — the strip is another place to
                 // answer "who am I typing to".
-                true => format!("▸{}", session.name),
-                false => format!(" {}", session.name),
+                true => format!("▸{}", session.view.name),
+                false => format!(" {}", session.view.name),
             },
             match focused {
                 true => name.add_modifier(Modifier::BOLD),
@@ -820,7 +832,7 @@ fn draw_map(
     map_cache: &mut MapImageCache,
 ) -> (Option<map_render::PendingImage>, bool) {
     let session = state.bound();
-    let title = match session.and_then(|session| session.current_room) {
+    let title = match session.and_then(|session| session.view.current_room) {
         Some(at) => state
             .bound_map()
             .and_then(|map| map.rooms.get(&at))
@@ -861,7 +873,8 @@ fn draw_map(
         legend_area,
     );
 
-    let (Some(session), Some(current)) = (session, session.and_then(|s| s.current_room)) else {
+    let (Some(session), Some(current)) = (session, session.and_then(|s| s.view.current_room))
+    else {
         frame.render_widget(
             Paragraph::new("no room data yet").wrap(Wrap { trim: true }),
             inner,
@@ -875,7 +888,7 @@ fn draw_map(
     // Everyone on this world, not only the character being typed at
     // (§16) — the map is of the world, and they are all on it.
     let party = state.party_of(state.input_session);
-    let scene = map.scene(current, session.corpse, &party);
+    let scene = map.scene(current, session.view.corpse, &party);
     // Pixels where the terminal takes them, cells everywhere else — the
     // same scene either way (§16).
     if let Some(cell) = state.map_cell_px {
@@ -1053,8 +1066,8 @@ fn draw_channel(
         state
             .sessions
             .iter()
-            .find(|session| session.name == name)
-            .and_then(|session| session.color)
+            .find(|session| session.view.name == name)
+            .and_then(|session| session.view.color)
     };
     let (lines, extent) = visible_window(
         &channel.lines,
@@ -1318,25 +1331,25 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     };
 
-    let (value, cursor) = if session.masked {
+    let (value, cursor) = if session.view.masked {
         (
-            "*".repeat(session.input.value().chars().count()),
-            session.input.cursor() as u16,
+            "*".repeat(session.view.input.value().chars().count()),
+            session.view.input.cursor() as u16,
         )
     } else {
         (
-            session.input.value().to_string(),
-            session.input.visual_cursor() as u16,
+            session.view.input.value().to_string(),
+            session.view.input.visual_cursor() as u16,
         )
     };
     // The border names the session commands go to: with several characters
     // open, and focus possibly on a channel pane, that must never be a guess.
-    let title = if session.masked {
-        format!(" input → {} (hidden) ", session.name)
+    let title = if session.view.masked {
+        format!(" input → {} (hidden) ", session.view.name)
     } else {
         format!(
             " input → {} ({} to quit) ",
-            session.name, state.keybinds.quit
+            session.view.name, state.keybinds.quit
         )
     };
     // The completion is drawn past the cursor rather than inserted (§11.3):
@@ -1344,7 +1357,7 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     // typed, and behind the cursor, so the cursor still sits where the next
     // character will land.
     let mut spans = vec![Span::raw(value)];
-    if let Some(rest) = &session.suggestion {
+    if let Some(rest) = &session.view.suggestion {
         spans.push(Span::styled(rest.clone(), Style::new().dim()));
     }
     let input_line = Paragraph::new(Line::from(spans)).block(
@@ -1385,13 +1398,13 @@ fn tab_line(state: &AppState) -> Line<'static> {
         if index > 0 {
             spans.push(Span::raw(" │"));
         }
-        let in_trouble = session.distress.is_some();
+        let in_trouble = session.view.distress.is_some();
         let label = format!(
             "{}:{}",
             index + 1,
-            pane_title(&session.name, session.unread, in_trouble)
+            pane_title(&session.view.name, session.view.unread, in_trouble)
         );
-        let mut style = match session.color {
+        let mut style = match session.view.color {
             Some(color) => Style::new().fg(color),
             None => Style::new(),
         };
@@ -1755,7 +1768,7 @@ mod tests {
         map_room(&mut state, 1, &[("e", 2), ("n", 4)]);
         map_room(&mut state, 2, &[("s", 4)]);
         map_room(&mut state, 4, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         let buffer = render_sized(&state, 60, 14);
         let text = rows(&buffer);
@@ -1775,7 +1788,7 @@ mod tests {
         state.show_map = true;
         map_room(&mut state, 1, &[("e", 2)]);
         map_room(&mut state, 2, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         let buffer = render_sized(&state, 60, 14);
         let text = rows(&buffer);
@@ -1794,7 +1807,7 @@ mod tests {
         state.show_map = true;
         map_room(&mut state, 1, &[("se", 2)]);
         map_room(&mut state, 2, &[]);
-        state.sessions[0].current_room = Some(crate::map::RoomId(1));
+        state.sessions[0].view.current_room = Some(crate::map::RoomId(1));
 
         let buffer = render_sized(&state, 60, 14);
         let text = rows(&buffer);
@@ -1811,9 +1824,10 @@ mod tests {
     fn pins_the_prompt_above_the_input_line() {
         let mut state = state();
         state.sessions[0]
+            .view
             .scrollback
             .push_back(RetainedLine::server("You are in a forest."));
-        state.sessions[0].prompt = "HP:100 MP:50>".to_string();
+        state.sessions[0].view.prompt = "HP:100 MP:50>".to_string();
 
         let buffer = render(&state);
         assert!(
@@ -1834,9 +1848,11 @@ mod tests {
     fn shows_the_inspector_log_instead_of_scrollback_when_toggled() {
         let mut state = state();
         state.sessions[0]
+            .view
             .scrollback
             .push_back(RetainedLine::server("You are in a forest."));
         state.sessions[0]
+            .view
             .inspector_log
             .push_back(r#"[GMCP] Char.Vitals {"hp":100}"#.to_string());
         state.show_inspector = true;
@@ -1907,14 +1923,14 @@ mod tests {
     #[test]
     fn the_pane_title_shows_latency_once_there_is_one() {
         let mut state = state();
-        state.sessions[0].status = "connected".to_string();
-        state.sessions[0].security = "TLS".to_string();
+        state.sessions[0].view.status = "connected".to_string();
+        state.sessions[0].view.security = "TLS".to_string();
 
         let before = row(&render_sized(&state, 60, 12), 0);
         assert!(before.contains("[TLS]"), "title: {before:?}");
         assert!(!before.contains("ms"), "title: {before:?}");
 
-        state.sessions[0].latency = "42ms".to_string();
+        state.sessions[0].view.latency = "42ms".to_string();
         let after = row(&render_sized(&state, 60, 12), 0);
         assert!(after.contains("[TLS] 42ms"), "title: {after:?}");
     }
@@ -1924,7 +1940,7 @@ mod tests {
     #[test]
     fn a_profiles_color_tints_its_border_and_its_tab() {
         let mut state = test_support::app(&["tank", "cleric"]);
-        state.sessions[0].color = Some(Color::Magenta);
+        state.sessions[0].view.color = Some(Color::Magenta);
 
         let buffer = render_sized(&state, 40, 12);
         // Row 0 is the tab bar; row 1 is the focused pane's top border.
@@ -1945,8 +1961,8 @@ mod tests {
     #[test]
     fn the_unread_badge_matches_the_pane_color() {
         let mut state = test_support::app(&["tank", "cleric"]);
-        state.sessions[1].color = Some(Color::Magenta);
-        state.sessions[1].unread = 3;
+        state.sessions[1].view.color = Some(Color::Magenta);
+        state.sessions[1].view.unread = 3;
 
         let buffer = render_sized(&state, 40, 12);
         let badge = buffer
@@ -1964,8 +1980,8 @@ mod tests {
     #[test]
     fn a_character_in_trouble_is_marked_in_the_tab_bar() {
         let mut state = test_support::app(&["tank", "cleric"]);
-        state.sessions[1].color = Some(Color::Magenta);
-        state.sessions[1].distress = Some(0.1);
+        state.sessions[1].view.color = Some(Color::Magenta);
+        state.sessions[1].view.distress = Some(0.1);
 
         let buffer = render_sized(&state, 40, 12);
         let bar = row(&buffer, 0);
@@ -1987,7 +2003,7 @@ mod tests {
     #[test]
     fn the_mark_stays_on_the_pane_being_looked_at() {
         let mut state = test_support::app(&["tank", "cleric"]);
-        state.sessions[0].distress = Some(0.1);
+        state.sessions[0].view.distress = Some(0.1);
 
         let screen = rows(&render_sized(&state, 40, 12));
 
@@ -2002,8 +2018,8 @@ mod tests {
     fn splits_mode_unread_badge_matches_the_pane_color() {
         let mut state = test_support::app(&["tank", "cleric"]);
         state.layout = LayoutMode::Splits;
-        state.sessions[1].color = Some(Color::Magenta);
-        state.sessions[1].unread = 3;
+        state.sessions[1].view.color = Some(Color::Magenta);
+        state.sessions[1].view.unread = 3;
 
         let buffer = render_sized(&state, 60, 12);
         let badge = buffer
@@ -2019,7 +2035,7 @@ mod tests {
     #[test]
     fn an_unfocused_colored_pane_stays_colored() {
         let mut state = test_support::app(&["tank", "cleric"]);
-        state.sessions[1].color = Some(Color::Green);
+        state.sessions[1].view.color = Some(Color::Green);
         state.layout = LayoutMode::Splits;
 
         let buffer = render_sized(&state, 60, 12);
@@ -2079,6 +2095,7 @@ mod tests {
         let mut state = state();
         for _ in 0..40 {
             state.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server("You are in a forest."));
         }
@@ -2154,12 +2171,13 @@ mod tests {
     #[test]
     fn masks_input_when_the_server_is_echoing() {
         let mut state = state();
-        state.sessions[0].input = tui_input::Input::default().with_value("hunter2".to_string());
+        state.sessions[0].view.input =
+            tui_input::Input::default().with_value("hunter2".to_string());
 
         let visible = render(&state);
         assert!(row(&visible, 8).contains("hunter2"));
 
-        state.sessions[0].masked = true;
+        state.sessions[0].view.masked = true;
         let hidden = render(&state);
         assert!(
             !row(&hidden, 8).contains("hunter2"),
@@ -2178,7 +2196,7 @@ mod tests {
         // 30 wide - 2 border columns; 10 tall - 1 prompt - 3 input - 2 border.
         assert_eq!(session_pane_sizes(area, &state), vec![(0, (28, 4))]);
 
-        state.sessions[0].connected = false;
+        state.sessions[0].view.connected = false;
         assert_eq!(session_pane_sizes(area, &state), vec![(0, (28, 5))]);
     }
 
@@ -2211,9 +2229,11 @@ mod tests {
         let mut state = test_support::app(&["tank", "cleric"]);
         state.layout = LayoutMode::Splits;
         state.sessions[0]
+            .view
             .scrollback
             .push_back(RetainedLine::server("tankline"));
         state.sessions[1]
+            .view
             .scrollback
             .push_back(RetainedLine::server("clericline"));
 
@@ -2228,9 +2248,11 @@ mod tests {
     fn tabs_show_only_the_focused_session() {
         let mut state = test_support::app(&["tank", "cleric"]);
         state.sessions[0]
+            .view
             .scrollback
             .push_back(RetainedLine::server("tankline"));
         state.sessions[1]
+            .view
             .scrollback
             .push_back(RetainedLine::server("clericline"));
 
@@ -2254,7 +2276,7 @@ mod tests {
     #[test]
     fn an_unfocused_session_shows_an_unread_badge() {
         let mut state = test_support::app(&["tank", "cleric"]);
-        state.sessions[1].unread = 3;
+        state.sessions[1].view.unread = 3;
 
         let buffer = render_sized(&state, 60, 12);
         assert!(row(&buffer, 0).contains("● 3"), "{:?}", row(&buffer, 0));
@@ -2311,8 +2333,8 @@ mod tests {
     #[test]
     fn the_input_line_shows_the_completion_as_a_dim_ghost() {
         let mut state = state();
-        state.sessions[0].input = Input::default().with_value("look bull".into());
-        state.sessions[0].suggestion = Some("ywug".to_string());
+        state.sessions[0].view.input = Input::default().with_value("look bull".into());
+        state.sessions[0].view.suggestion = Some("ywug".to_string());
 
         let buffer = render_sized(&state, 40, 8);
         let screen: String = (0..8).map(|y| row(&buffer, y)).collect();
@@ -2338,8 +2360,8 @@ mod tests {
     #[test]
     fn the_cursor_sits_before_the_ghost() {
         let mut state = state();
-        state.sessions[0].input = Input::default().with_value("look bull".into());
-        state.sessions[0].suggestion = Some("ywug".to_string());
+        state.sessions[0].view.input = Input::default().with_value("look bull".into());
+        state.sessions[0].view.suggestion = Some("ywug".to_string());
 
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         let mut cache = MapImageCache::default();
@@ -2360,7 +2382,7 @@ mod tests {
     #[test]
     fn a_channel_tags_each_line_in_the_speaker_s_own_colour() {
         let mut state = state();
-        state.sessions[0].color = Some(Color::Magenta);
+        state.sessions[0].view.color = Some(Color::Magenta);
         let mut channel = ChannelPane {
             config: test_support::channel("comms"),
             lines: VecDeque::new(),
@@ -2369,7 +2391,7 @@ mod tests {
             back_offset: 0,
         };
         channel.lines.push_back(RetainedLine::from_session(
-            state.sessions[0].name.clone(),
+            state.sessions[0].view.name.clone(),
             "Bob tells you hi",
         ));
         state.channels.push(channel);
@@ -2400,7 +2422,7 @@ mod tests {
     #[test]
     fn an_uncoloured_profile_keeps_a_plain_tag() {
         let mut state = state();
-        state.sessions[0].color = None;
+        state.sessions[0].view.color = None;
         let mut channel = ChannelPane {
             config: test_support::channel("comms"),
             lines: VecDeque::new(),
@@ -2409,7 +2431,7 @@ mod tests {
             back_offset: 0,
         };
         channel.lines.push_back(RetainedLine::from_session(
-            state.sessions[0].name.clone(),
+            state.sessions[0].view.name.clone(),
             "Bob tells you hi",
         ));
         state.channels.push(channel);
@@ -2426,7 +2448,7 @@ mod tests {
     #[test]
     fn a_line_several_characters_heard_names_them_all_in_one_tag() {
         let mut state = state();
-        state.sessions[0].color = Some(Color::Magenta);
+        state.sessions[0].view.color = Some(Color::Magenta);
         let mut channel = ChannelPane {
             config: test_support::channel("comms"),
             lines: VecDeque::new(),
@@ -2436,7 +2458,10 @@ mod tests {
         };
         channel.lines.push_back(RetainedLine::with_origin(
             "Bob gossips hi",
-            Origin::Session(vec![state.sessions[0].name.clone(), "cleric".to_string()]),
+            Origin::Session(vec![
+                state.sessions[0].view.name.clone(),
+                "cleric".to_string(),
+            ]),
         ));
         state.channels.push(channel);
         state.show_channels = true;
@@ -2464,7 +2489,7 @@ mod tests {
         let mut state = state();
         let line = RetainedLine::server("Bob tells you hi");
         let at = line.at.format("%H:%M:%S").to_string();
-        state.sessions[0].scrollback.push_back(line);
+        state.sessions[0].view.scrollback.push_back(line);
 
         let plain: String = {
             let buffer = render_sized(&state, 60, 10);
@@ -2492,7 +2517,7 @@ mod tests {
         state.show_timestamps = true;
         let line = RetainedLine::server("word ".repeat(20).trim_end());
         let at = line.at.format("%H:%M:%S").to_string();
-        state.sessions[0].scrollback.push_back(line);
+        state.sessions[0].view.scrollback.push_back(line);
 
         let buffer = render_sized(&state, 40, 10);
         let screen: String = (0..10).map(|y| row(&buffer, y)).collect();
@@ -2719,7 +2744,7 @@ mod tests {
         map.connect(RoomId(1), "d", RoomId(9));
 
         state.world_mut(0).map = map;
-        state.sessions[0].current_room = Some(RoomId(1));
+        state.sessions[0].view.current_room = Some(RoomId(1));
         state.show_map = true;
         state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
@@ -2777,7 +2802,7 @@ mod tests {
             exits: BTreeMap::new(),
         });
         state.world_mut(0).map = map;
-        state.sessions[0].current_room = Some(RoomId(1));
+        state.sessions[0].view.current_room = Some(RoomId(1));
         state.show_map = true;
         state.map_width = crate::config::DEFAULT_MAP_WIDTH;
         state.map_cell_px = Some((8, 16));
@@ -2815,7 +2840,7 @@ mod tests {
 
         // Moving invalidates it: the picture drawn afterward has to be a
         // different render, not the stale one from the old room.
-        state.sessions[0].current_room = Some(RoomId(1));
+        state.sessions[0].view.current_room = Some(RoomId(1));
         state.map_cursor = Some(RoomId(1));
         let mut third = DrawnFrame {
             image: None,
@@ -2853,7 +2878,7 @@ mod tests {
             exits: Default::default(),
         });
         state.world_mut(0).map = map;
-        state.sessions[0].current_room = Some(RoomId(1));
+        state.sessions[0].view.current_room = Some(RoomId(1));
         state.show_map = true;
         state.map_width = crate::config::DEFAULT_MAP_WIDTH;
         state.map_cell_px = Some((8, 16));
@@ -2914,7 +2939,7 @@ mod tests {
         map.connect(RoomId(1), "e", RoomId(2));
 
         state.world_mut(0).map = map;
-        state.sessions[0].current_room = Some(RoomId(2));
+        state.sessions[0].view.current_room = Some(RoomId(2));
         state.show_map = true;
         state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
@@ -2952,7 +2977,7 @@ mod tests {
             exits: Default::default(),
         });
         state.world_mut(0).map = map;
-        state.sessions[0].current_room = Some(RoomId(1));
+        state.sessions[0].view.current_room = Some(RoomId(1));
 
         let populated = rows(&render_sized(&state, 80, 20));
         assert!(
@@ -3039,8 +3064,8 @@ mod tests {
             session.map_key = "hercmud.net".to_string();
         }
         state.world_mut(0).map = map;
-        state.sessions[0].current_room = Some(RoomId(1));
-        state.sessions[1].current_room = Some(RoomId(2));
+        state.sessions[0].view.current_room = Some(RoomId(1));
+        state.sessions[1].view.current_room = Some(RoomId(2));
         state.show_map = true;
         state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
@@ -3073,6 +3098,7 @@ mod tests {
     fn scroll_offset_matches_real_wrap_count() {
         let mut state = state();
         state.sessions[0]
+            .view
             .scrollback
             .push_back(RetainedLine::server(format!(
                 "{} {} {}",
@@ -3082,10 +3108,11 @@ mod tests {
             )));
         for i in 0..10 {
             state.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server(format!("line {i}")));
         }
-        state.sessions[0].prompt = "By what name do you wish to be known?".to_string();
+        state.sessions[0].view.prompt = "By what name do you wish to be known?".to_string();
 
         assert_left_border_intact(&render(&state));
     }
@@ -3107,6 +3134,7 @@ mod tests {
         ];
         for line in banner {
             state.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server(line));
             terminal
@@ -3117,7 +3145,7 @@ mod tests {
             assert_left_border_intact(terminal.backend().buffer());
         }
 
-        state.sessions[0].prompt = "By what name do you wish to be known?".to_string();
+        state.sessions[0].view.prompt = "By what name do you wish to be known?".to_string();
         terminal
             .draw(|frame| {
                 draw(frame, &state, &mut cache);
@@ -3125,12 +3153,14 @@ mod tests {
             .unwrap();
         assert_left_border_intact(terminal.backend().buffer());
 
-        state.sessions[0].prompt.clear();
+        state.sessions[0].view.prompt.clear();
         state.sessions[0]
+            .view
             .scrollback
             .push_back(RetainedLine::server("> crazy-foo"));
         for line in ["Password:", "Reconnecting.", "", "i107 >"] {
             state.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server(line));
             terminal
@@ -3152,6 +3182,7 @@ mod tests {
         let mut state = state();
         for i in 0..20 {
             state.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server(format!("line {i}")));
         }
@@ -3162,7 +3193,7 @@ mod tests {
             "a tailed pane must show no indicator: {at_tail}"
         );
 
-        state.sessions[0].back_offset = 5;
+        state.sessions[0].view.back_offset = 5;
         let scrolled = rows(&render_sized(&state, 40, 12));
         assert!(
             scrolled.contains("scrolled"),
@@ -3178,10 +3209,11 @@ mod tests {
         let mut state = state();
         for i in 0..20 {
             state.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server(format!("line {i}")));
         }
-        state.sessions[0].back_offset = usize::MAX;
+        state.sessions[0].view.back_offset = usize::MAX;
 
         let buffer = render_sized(&state, 40, 12);
         assert!(
@@ -3257,12 +3289,14 @@ mod tests {
         let mut big = state();
         for i in 0..5_000 {
             big.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server(format!("line {i}")));
         }
         let mut small = state();
         for i in 4_980..5_000 {
             small.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server(format!("line {i}")));
         }
@@ -3290,10 +3324,11 @@ mod tests {
         let mut state = state();
         for i in 0..5_000 {
             state.sessions[0]
+                .view
                 .scrollback
                 .push_back(RetainedLine::server(format!("line {i}")));
         }
-        state.sessions[0].back_offset = 100;
+        state.sessions[0].view.back_offset = 100;
 
         // `back_offset` is a distance from the tail in rows, so with 5,000
         // single-row lines the newest visible one is 5000 - 100 - 1.
@@ -3321,12 +3356,13 @@ mod tests {
         // the tail rather than just failing to matter.
         for i in 0..8 {
             state.sessions[0]
+                .view
                 .inspector_log
                 .push_back(format!("gmcp-{i}"));
         }
         // A large offset set while looking at the scrollback, carried
         // along when the player then hits F2.
-        state.sessions[0].back_offset = usize::MAX;
+        state.sessions[0].view.back_offset = usize::MAX;
         state.show_inspector = true;
 
         let buffer = render(&state);
