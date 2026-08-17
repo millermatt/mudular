@@ -540,6 +540,10 @@ sitting on, and `Enter` walks you there — the same one-step-at-a-time
 walk `/goto` does. `Esc` closes it, and so does any other key, so a
 keystroke meant for the game is never half-swallowed.
 
+Steering the cursor past the edge of the column brings the map with it, so
+what you are pointing at is always something you can see. Putting the
+cursor away hands the view back to your character.
+
 Switching between two characters who are near enough to see each other
 leaves the picture where it is. The map is of the world rather than of a
 character, so when both are already drawn the two views are the same

@@ -1024,15 +1024,44 @@ impl AppState {
             None => (0, 0),
         };
 
-        // Whatever the arithmetic said, the character being played has to
-        // be on screen with room to see where they can go next. A pane too
-        // small to hold the margin therefore never holds a view still,
-        // which is the old behaviour and the right thing to fall back to.
-        if !self
-            .map_grid
-            .is_some_and(|grid| crate::ui::map_shows_room(grid, self.map_pan))
-        {
-            self.map_pan = (0, 0);
+        // With the cursor up the view belongs to it, not to the character
+        // (#103). Browsing away from where you are standing is the whole
+        // point of the cursor, so the character-centred rule below must not
+        // fight it — and a cursor steered off the pane is a highlight the
+        // player cannot see, on the room `Enter` would walk them to.
+        //
+        // `layout_area` is asked about the character's room, so the
+        // coordinate it returns for the cursor is already relative to the
+        // scene being drawn; the room lands at `pan + at`.
+        let cursor_at = self.map_cursor.and_then(|cursor| {
+            self.bound_map()
+                .map(|map| map.layout_area(current))
+                .and_then(|coords| coords.get(&cursor).copied())
+        });
+        match (cursor_at, self.map_grid) {
+            (Some(at), Some(grid)) => {
+                let drawn =
+                    crate::ui::map_shows_room(grid, (self.map_pan.0 + at.0, self.map_pan.1 + at.1));
+                if !drawn {
+                    // Centred rather than nudged to the edge: the cursor is
+                    // being steered, and the next arrow press should have
+                    // somewhere to go in every direction.
+                    self.map_pan = (-at.0, -at.1);
+                }
+            }
+            // No cursor, or nothing drawn yet to judge against. The
+            // character being played has to be on screen with room to see
+            // where they can go next; a pane too small to hold the margin
+            // therefore never holds a view still, which is the old
+            // behaviour and the right thing to fall back to.
+            _ => {
+                if !self
+                    .map_grid
+                    .is_some_and(|grid| crate::ui::map_shows_room(grid, self.map_pan))
+                {
+                    self.map_pan = (0, 0);
+                }
+            }
         }
         self.map_pan_for = Some((id, current));
     }
@@ -8814,6 +8843,103 @@ mod tests {
             state.map_pan,
             (2, 0),
             "the offset is kept, so the world panned by exactly one room"
+        );
+    }
+
+    /// #103. The cursor steps room to room with no idea what is drawn, so
+    /// arrowing far enough used to take it off the pane — steering a
+    /// highlight you cannot see, with `Enter` still walking you to it.
+    #[tokio::test]
+    async fn the_view_follows_the_map_cursor_off_the_pane() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].map_key = "hercmud.net".to_string();
+        map_grid(&mut state);
+        walk_east_to(&mut state, 0, 9);
+        // Back to the west end, so the corridor runs away east of them.
+        apply_session_event(&mut state, 0, room(1, None));
+        state.update_map_pan();
+        assert_eq!(state.map_pan, (0, 0));
+
+        // Arrow east until the cursor leaves what a 40-column pane shows.
+        state.map_cursor = Some(crate::map::RoomId(1));
+        for _ in 0..8 {
+            handle_key(
+                &mut state,
+                &Keybinds::default(),
+                KeyCode::Right,
+                KeyModifiers::NONE,
+                80,
+                &[],
+            );
+            state.update_map_pan();
+        }
+
+        let cursor = state.map_cursor.expect("the cursor is still up");
+        let at = state
+            .bound_map()
+            .and_then(|map| map.layout_area(crate::map::RoomId(1)).get(&cursor).copied())
+            .expect("the cursor is on this layout");
+        let grid = state.map_grid.expect("a grid");
+        assert!(
+            crate::ui::map_shows_room(grid, (state.map_pan.0 + at.0, state.map_pan.1 + at.1)),
+            "the cursor at {at:?} is off the pane with pan {:?}",
+            state.map_pan
+        );
+    }
+
+    /// The rule that resets the pan when the *character* leaves the pane
+    /// must not fire while the cursor is being steered: browsing away from
+    /// your own character is the whole point of the cursor, and the two
+    /// rules would otherwise fight every frame.
+    #[tokio::test]
+    async fn steering_the_cursor_away_does_not_snap_back_to_the_character() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].map_key = "hercmud.net".to_string();
+        map_grid(&mut state);
+        walk_east_to(&mut state, 0, 9);
+        apply_session_event(&mut state, 0, room(1, None));
+        state.update_map_pan();
+
+        state.map_cursor = Some(crate::map::RoomId(1));
+        for _ in 0..8 {
+            handle_key(
+                &mut state,
+                &Keybinds::default(),
+                KeyCode::Right,
+                KeyModifiers::NONE,
+                80,
+                &[],
+            );
+            state.update_map_pan();
+        }
+        let while_browsing = state.map_pan;
+        assert_ne!(
+            while_browsing,
+            (0, 0),
+            "the view moved to follow the cursor"
+        );
+
+        // Another frame with nothing touched must not undo it.
+        state.update_map_pan();
+        assert_eq!(
+            state.map_pan, while_browsing,
+            "the character being off-pane is expected while browsing"
+        );
+
+        // Putting the cursor away hands the view back to the character.
+        handle_key(
+            &mut state,
+            &Keybinds::default(),
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            80,
+            &[],
+        );
+        state.update_map_pan();
+        assert_eq!(
+            state.map_pan,
+            (0, 0),
+            "with the cursor gone the character is centred again"
         );
     }
 
