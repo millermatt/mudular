@@ -185,6 +185,11 @@ pub(super) mod palette {
     /// them at all.
     pub const PARTY: Color = Color::Rgb(0xA7, 0x8B, 0xFA); // violet
     pub const INK: Color = Color::Rgb(0x0B, 0x0E, 0x11); // near-black
+    /// The status bar's ground. Grey rather than the near-white `PAPER`:
+    /// the bar is on screen all the time, and a full-width white strip at
+    /// the bottom of a dark terminal pulls the eye away from the game it
+    /// is supposed to be reporting on.
+    pub const CHROME: Color = Color::Rgb(0x9C, 0xA3, 0xAF); // slate grey
     pub const PAPER: Color = Color::Rgb(0xF8, 0xFA, 0xFC); // near-white
 
     /// Okabe-Ito, minus its black.

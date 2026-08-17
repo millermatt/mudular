@@ -54,6 +54,10 @@ const SCROLL_PAGE: usize = 10;
 /// one that answers worst.
 const SHELL_NOTICES: usize = 24;
 
+/// How many warnings `/errors` keeps (#18). Enough that a session's worth
+/// of them survives, bounded because nothing else prunes it.
+const ERRORS_KEPT: usize = 200;
+
 /// The client-side commands. Everything else starting with `/` is left
 /// alone, since plenty of MUDs use `/` for their own commands.
 const RELOAD_COMMAND: &str = "/reload";
@@ -80,6 +84,10 @@ const CONNECT_COMMAND: &str = "/connect";
 /// the one you mean, and naming a character invites closing the wrong one
 /// by typo.
 const DISCONNECT_COMMAND: &str = "/disconnect";
+/// Opens the panel of client warnings (#18). Client-generated, so it
+/// never fills with server text: the point is a place where a failed
+/// `/reload` cannot be mistaken for something the MUD said.
+pub(crate) const ERRORS_COMMAND: &str = "/errors";
 /// Walks toward a room already on the map, one step at a time (§16) — a
 /// vnum, or a case-insensitive substring of a room name.
 const GOTO_COMMAND: &str = "/goto";
@@ -785,6 +793,19 @@ pub struct AppState {
     /// character panes rather than out past them (#111). Persisted with
     /// the rest of the layout, so the toggle *is* the preference.
     pub map_first: bool,
+    /// Client-generated warnings, oldest first (#18).
+    ///
+    /// App-level rather than per-session: a rejected keybind at startup or
+    /// a profile that would not load belongs to no character, and the ones
+    /// that do belong to one are still worth reading after that character
+    /// has been disconnected.
+    pub errors: VecDeque<String>,
+    /// How many have arrived since the panel was last looked at. The count
+    /// is the whole point of keeping it — a warning nobody sees is the
+    /// thing #18 is about, and a panel nobody knows to open is the same
+    /// failure wearing a hat.
+    pub errors_unread: usize,
+    pub show_errors: bool,
     /// The input line when no session is bound (#108).
     ///
     /// `SessionView` owns the ordinary one, which is right — it is that
@@ -1100,6 +1121,35 @@ impl AppState {
     /// `push_line` was a silent drop waiting for the day nothing was
     /// bound — which `/connect`'s own "no such profile" reply was, in
     /// exactly the state a player would be typing `/connect` in.
+    /// Says something *and* keeps it (#18).
+    ///
+    /// For failures only. A warning shown as one more scrollback line is
+    /// indistinguishable from server text a minute later and gone entirely
+    /// once it scrolls off, which is how a failed `/reload` or a dropped
+    /// `send_to:` comes to be missed. Successes and running commentary
+    /// stay on `tell_player`: a panel that keeps everything is a scrollback
+    /// with extra steps.
+    pub fn warn_player(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.record_warning(text.clone());
+        self.tell_player(text);
+    }
+
+    /// Keeps a warning without printing it — for the sites that already
+    /// put it in front of the player themselves, usually because they know
+    /// which pane it belongs in.
+    pub fn record_warning(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.errors.push_back(text);
+        while self.errors.len() > ERRORS_KEPT {
+            self.errors.pop_front();
+        }
+        // Already looking at the panel means it is not unread.
+        if !self.show_errors {
+            self.errors_unread += 1;
+        }
+    }
+
     pub fn tell_player(&mut self, text: impl Into<String>) {
         let text = text.into();
         match self.bound_mut() {
@@ -1331,7 +1381,8 @@ impl AppState {
         let matched = self.addressed(from, target);
         if matched.is_empty() {
             let notice = format!("** echo_to: no session named `{target}`");
-            self.sessions[from].push_line(RetainedLine::client(notice));
+            self.sessions[from].push_line(RetainedLine::client(notice.clone()));
+            self.record_warning(notice);
             return;
         }
 
@@ -1360,7 +1411,8 @@ impl AppState {
 
         if matched.is_empty() {
             let notice = format!("** {label}: no session named `{target}`");
-            self.sessions[from].push_line(RetainedLine::client(notice));
+            self.sessions[from].push_line(RetainedLine::client(notice.clone()));
+            self.record_warning(notice);
             return Vec::new();
         }
 
@@ -3114,6 +3166,9 @@ async fn event_loop(
         map_first: false,
         shell_input: Input::default(),
         shell_notices: Vec::new(),
+        errors: VecDeque::new(),
+        errors_unread: 0,
+        show_errors: false,
         map_pan: (0, 0),
         map_pan_for: None,
         map_grid: None,
@@ -3672,6 +3727,20 @@ fn handle_key(
         }
         return true;
     }
+    // The warnings panel closes the way every other overlay here does —
+    // Esc, or any key that is not steering it. A panel that could only be
+    // dismissed by retyping the command that opened it would be one more
+    // thing to learn for no reason.
+    if state.show_errors {
+        state.show_errors = false;
+        // Anything but Esc does its ordinary job as well, so a key meant
+        // for the game is never swallowed by an overlay the player had
+        // already stopped reading — the same rule the map cursor follows.
+        if code == KeyCode::Esc && modifiers.is_empty() {
+            return true;
+        }
+        return handle_key(state, keybinds, code, modifiers, area_width, channels);
+    }
     if keybinds.help.matches(code, modifiers) {
         state.show_help = true;
         // Always from the top: reopening to wherever it was left reads as
@@ -3886,6 +3955,7 @@ enum ClientCommand {
     NewProfile,
     Connect(String),
     Disconnect,
+    Errors,
     Map,
     Comms,
     Goto(String),
@@ -3914,6 +3984,7 @@ impl ClientCommand {
             NEWPROFILE_COMMAND => Self::NewProfile,
             CONNECT_COMMAND => Self::Connect(rest),
             DISCONNECT_COMMAND => Self::Disconnect,
+            ERRORS_COMMAND => Self::Errors,
             MAP_COMMAND => Self::Map,
             COMMS_COMMAND => Self::Comms,
             GOTO_COMMAND => Self::Goto(rest),
@@ -3932,7 +4003,9 @@ impl ClientCommand {
     fn needs_a_character(&self) -> bool {
         match self {
             // Opening or making one, and the listing that names them.
-            Self::Connect(_) | Self::NewProfile | Self::Help => false,
+            // Warnings outlive the character they were about, and the
+            // ones from startup never had one (#18).
+            Self::Connect(_) | Self::NewProfile | Self::Help | Self::Errors => false,
             Self::Reload
             | Self::Update
             | Self::Config
@@ -3959,7 +4032,13 @@ async fn run_client_command(state: &mut AppState, channels: &[Channel], command:
         }
         ClientCommand::Reload => {
             let notice = reload_rules(state, channels).await;
-            state.tell_player(notice);
+            // A reload that failed is the example #18 opens with: it reads
+            // like any other line, and the rules the player thought they
+            // had loaded are not the ones running.
+            match notice.contains("failed") || notice.contains("could not") {
+                true => state.warn_player(notice),
+                false => state.tell_player(notice),
+            }
         }
         ClientCommand::Update => {
             // Runs off the loop thread, but awaited here, so the pane stops
@@ -3988,6 +4067,14 @@ async fn run_client_command(state: &mut AppState, channels: &[Channel], command:
             connect_new_session(state, channels, &name).await;
         }
         ClientCommand::Disconnect => disconnect_bound_session(state).await,
+        ClientCommand::Errors => {
+            state.show_errors = !state.show_errors;
+            // Opening is what marks them read: the badge means "since you
+            // last looked", so looking has to be what resets it.
+            if state.show_errors {
+                state.errors_unread = 0;
+            }
+        }
         ClientCommand::Map => {
             state.show_map = !state.show_map;
             describe_current_room(state);
@@ -4531,7 +4618,7 @@ async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &
             // where `/connect` gets typed and mistyped (#108) — and a
             // reply that goes to the bound session goes nowhere at all
             // when there is none.
-            state.tell_player(format!("** could not connect `{name}`: {err:#}"));
+            state.warn_player(format!("** could not connect `{name}`: {err:#}"));
             return;
         }
     };
@@ -4682,6 +4769,9 @@ pub(crate) mod test_support {
                 map_first: false,
                 shell_input: Input::default(),
                 shell_notices: Vec::new(),
+                errors: VecDeque::new(),
+                errors_unread: 0,
+                show_errors: false,
                 map_pan: (0, 0),
                 map_pan_for: None,
                 map_grid: None,
@@ -8781,6 +8871,63 @@ mod tests {
     /// per-session copies this replaced only reconciled through the file,
     /// so until the next launch two panes could show different amounts of
     /// the same world — quieter than the mark bug, and the same cause.
+    /// #18. A warning shown as one more scrollback line is
+    /// indistinguishable from server text a minute later, and gone once it
+    /// scrolls off. The panel keeps it; the badge is what makes anyone
+    /// look.
+    #[tokio::test]
+    async fn a_warning_is_kept_and_counted_until_it_is_read() {
+        let (mut state, _rx) = app(&["tank"]);
+        assert_eq!(state.errors_unread, 0);
+
+        state.warn_player("** could not connect `nobody`: no such profile");
+        state.warn_player("** /goto: no room matches `nowhere`");
+
+        assert_eq!(state.errors.len(), 2, "both are kept");
+        assert_eq!(state.errors_unread, 2, "and both are news");
+        assert!(
+            scrollback(&state.sessions[0]).contains("no such profile"),
+            "a warning is still shown where it happened, not only filed"
+        );
+
+        submit(&mut state, "/errors").await;
+        assert!(state.show_errors, "the panel is open");
+        assert_eq!(state.errors_unread, 0, "looking is what marks them read");
+        assert_eq!(state.errors.len(), 2, "but the warnings themselves stay");
+    }
+
+    /// Warnings outlive the character they were about — including the
+    /// character being disconnected, which is when a player is most likely
+    /// to want to know what went wrong.
+    #[tokio::test]
+    async fn the_warnings_panel_opens_with_no_character_at_all() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.warn_player("** could not connect `nobody`");
+        submit(&mut state, "/disconnect").await;
+
+        state.shell_input = Input::default().with_value("/errors".to_string());
+        submit_input(&mut state, &[]).await;
+
+        assert!(
+            state.show_errors,
+            "the panel is reachable from the empty client"
+        );
+        assert_eq!(state.errors.len(), 1, "and still holds what happened");
+    }
+
+    /// A warning arriving while the panel is open is already being looked
+    /// at, so it must not raise a badge for something on screen.
+    #[tokio::test]
+    async fn a_warning_arriving_while_the_panel_is_open_is_not_unread() {
+        let (mut state, _rx) = app(&["tank"]);
+        submit(&mut state, "/errors").await;
+
+        state.warn_player("** something went wrong");
+
+        assert_eq!(state.errors_unread, 0);
+        assert_eq!(state.errors.len(), 1);
+    }
+
     /// #7. An unknown `/word` is not a client command and must reach the
     /// MUD — plenty of them use `/` themselves, and a client that refused
     /// every slash would be unusable on those.
