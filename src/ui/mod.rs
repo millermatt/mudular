@@ -610,7 +610,7 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
     // The scrollback line-cursor (docs/ARCHITECTURE.md §10.2/§11.5) only
     // ever picks from the input-bound session, regardless of which pane is
     // visually focused — same scoping as `Alt+V` itself in `app.rs`.
-    let picked_line = (!showing_inspector && index == state.input_session)
+    let picked_line = (!showing_inspector && state.is_bound(index))
         .then_some(state.line_cursor)
         .flatten()
         .and_then(|cursor| session.view.scrollback.len().checked_sub(1 + cursor));
@@ -737,7 +737,7 @@ fn draw_hud(frame: &mut Frame, area: Rect, state: &AppState) {
             spans.push(Span::raw("  "));
         }
         let name = Style::default().fg(session.view.color.unwrap_or(Color::Gray));
-        let focused = state.input_session == index;
+        let focused = state.is_bound(index);
         spans.push(Span::styled(
             match focused {
                 // The character the input line is bound to, marked the way
@@ -887,7 +887,10 @@ fn draw_map(
     };
     // Everyone on this world, not only the character being typed at
     // (§16) — the map is of the world, and they are all on it.
-    let party = state.party_of(state.input_session);
+    let party = state
+        .bound_index()
+        .map(|i| state.party_of(i))
+        .unwrap_or_default();
     let scene = map.scene(current, session.view.corpse, &party);
     // Pixels where the terminal takes them, cells everywhere else — the
     // same scene either way (§16).
@@ -2295,7 +2298,7 @@ mod tests {
             back_offset: 0,
         });
         state.show_channels = true;
-        state.focus_pane(Focus::Session(1));
+        state.focus_pane(Focus::Session(state.id_at(1).unwrap()));
         state.focus_pane(Focus::Channel(0));
 
         let buffer = render_sized(&state, 70, 12);
