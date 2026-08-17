@@ -1651,12 +1651,19 @@ it speaks for.
   - Integration: an in-process fake MUD server (tokio `TcpListener`)
     scripted to exercise negotiation, compression switchover, and TLS.
   - UI: ratatui `TestBackend` snapshot tests for layout/indicators.
-  - Fuzzing: `cargo-fuzz` targets for the Telnet FSM, MCCP switchover, and
-    charset decode — server bytes are attacker-controlled input. Not yet
-    written (tracked as
-    [#1](https://github.com/millermatt/mudular/issues/1)); the hand-written
-    byte fixtures and the MCCP inflate cap (§6.4, §13) currently stand in
-    for it.
+  - Fuzzing: `cargo-fuzz` targets in `fuzz/` for the Telnet FSM, MCCP
+    switchover, and charset decode — server bytes are attacker-controlled
+    input. `fuzz/` is its own workspace and needs nightly, so it is not part
+    of the per-commit gate below; it is run against a change that touches
+    `proto`, and left running longer when one lands. See `fuzz/README.md`
+    for how, and for why the three are not equally load-bearing (the
+    switchover is the one no fixture stands in for; charset decode is
+    largely proven exhaustively in a unit test instead).
+  - Fuzzing needs a library target: `src/lib.rs` publishes `proto` and
+    nothing else, because a fuzz target is a separate crate and cannot see
+    into a binary. `proto` depends on nothing above it (§4), so this is a
+    seam, not a restructuring — and it is explicitly not a stability
+    promise.
   - Fixtures: `--record` (M1) captures raw inbound bytes with timing, so
     any real-MUD quirk becomes a replayable regression test.
 - **Gate per milestone:** `cargo fmt --check`, `clippy -D warnings`,
