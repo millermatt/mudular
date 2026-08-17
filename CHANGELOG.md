@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- put ACTORS.md in the working loop, not just in UX_REVIEW.md ([#79](https://github.com/millermatt/mudular/pull/79))
 - *(proto)* cargo-fuzz targets for Telnet, MCCP switchover and charset ([#76](https://github.com/millermatt/mudular/pull/76))
 - never push to main, one concern per branch ([#75](https://github.com/millermatt/mudular/pull/75))
 
