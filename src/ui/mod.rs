@@ -433,16 +433,6 @@ struct MapImageCacheKey {
     /// is a different picture, and leaving this out of the key is how the
     /// map would appear frozen after a character switch (#58).
     pan: (i32, i32),
-    /// Whether an overlay was covering the pane.
-    ///
-    /// Not part of the picture, but part of what is on those cells. A
-    /// reused picture marks its cells `Skip` so ratatui will not paint
-    /// over the pixels — which also stops it repainting them when an
-    /// overlay drawn on top goes away, leaving a rectangle of dead overlay
-    /// across the map. Keying on it forces one fresh write when an overlay
-    /// opens and another when it closes, which is exactly when those cells
-    /// need rewriting.
-    overlaid: bool,
 }
 
 pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) -> DrawnFrame {
@@ -1086,7 +1076,15 @@ fn draw_map(
 
     // Pixels where the terminal takes them, cells everywhere else — the
     // same scene either way (§16).
-    if let Some(cell) = state.map_cell_px {
+    //
+    // And cells, whatever the terminal can do, while an overlay is open.
+    // A sixel picture is written to the terminal *after* the frame, so it
+    // lands on top of whatever ratatui drew — including a panel the player
+    // is reading. Drawing the map as glyphs for those frames puts it back
+    // in the buffer, where the overlay's `Clear` covers it like any other
+    // pane, and the cell path clears the image cache on its way through so
+    // the picture returns freshly rasterised once the overlay closes.
+    if let Some(cell) = state.map_cell_px.filter(|_| !overlay_covers_map(state)) {
         let described_rows = described_height(state, inner);
         let (grid, caption) = split_caption(inner, described_rows);
         let key = MapImageCacheKey {
@@ -1098,7 +1096,6 @@ fn draw_map(
             // different picture, and reusing the cached one would leave
             // the map visibly stuck (#58).
             pan,
-            overlaid: overlay_covers_map(state),
         };
         // Rasterising and RLE-encoding a real map costs tens of
         // milliseconds — fine once, on the frame that moved the player,
@@ -2397,26 +2394,57 @@ mod tests {
     /// was covering this" as part of what is on those cells, so opening
     /// and closing each force one fresh write.
     #[test]
-    fn an_overlay_opening_or_closing_redraws_the_map_picture() {
-        let mut state = crate::app::test_support::app(&["tank"]);
-        state.show_map = true;
+    fn an_open_overlay_draws_the_map_as_cells_not_pixels() {
+        use crate::map::{RoomId, RoomInfo};
+        use std::collections::BTreeMap;
 
-        assert!(!overlay_covers_map(&state), "nothing is open to begin with");
+        let mut state = state();
+        let mut map = crate::map::Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: Some("Town Square".to_string()),
+            area: Some("Midgaard".to_string()),
+            exits: BTreeMap::new(),
+        });
+        state.world_mut(0).map = map;
+        state.sessions[0].view.current_room = Some(RoomId(1));
+        state.show_map = true;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
+        // A terminal that reports a cell size is one that can draw pixels.
+        state.map_cell_px = Some((8, 16));
+        let mut cache = MapImageCache::default();
+
+        let drew_a_picture = |state: &AppState, cache: &mut MapImageCache| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut had_image = false;
+            terminal
+                .draw(|frame| had_image = draw(frame, state, cache).image.is_some())
+                .unwrap();
+            had_image
+        };
+
+        assert!(
+            drew_a_picture(&state, &mut cache),
+            "with nothing in the way the map is a picture"
+        );
+
         state.show_errors = true;
         assert!(
-            overlay_covers_map(&state),
-            "the warnings panel covers the map, so the picture is rewritten"
-        );
-        state.show_errors = false;
-        assert!(
-            !overlay_covers_map(&state),
-            "and closing it rewrites them again, or the overlay stays behind"
+            !drew_a_picture(&state, &mut cache),
+            "a picture is written after the frame, so it would land on top \
+             of the panel — the map has to be glyphs while one is open"
         );
 
-        // Every overlay, because they are all centred on the whole
-        // terminal and any of them leaves the same debris.
+        state.show_errors = false;
+        assert!(
+            drew_a_picture(&state, &mut cache),
+            "and the picture comes back once the panel is gone"
+        );
+
+        // Every overlay, because each is centred on the whole terminal and
+        // each would be painted over the same way.
         state.show_help = true;
-        assert!(overlay_covers_map(&state));
+        assert!(!drew_a_picture(&state, &mut cache));
     }
 
     /// The picture is cached against the rect it was drawn into, so
