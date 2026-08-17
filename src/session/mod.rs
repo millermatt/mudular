@@ -414,6 +414,12 @@ struct FirstUseHints {
 /// reconnect starts from a clean machine (§6.5); the engine is not, so
 /// aliases, variables and the rule set survive a reconnect the way they
 /// survive a `/reload`.
+///
+/// Auto-login is in neither group and is the reason to read this carefully.
+/// The machine is owned by `run` so the keyring is read once, outside the
+/// session task — but a login exchange belongs to one connection, so it is
+/// re-armed below rather than rebuilt. It used to be neither, which left a
+/// reconnected session sitting at the name prompt forever (#85).
 #[allow(clippy::too_many_arguments)]
 async fn run_connection(
     connection: net::Connection,
@@ -435,6 +441,12 @@ async fn run_connection(
     } = connection;
     if events.send(SessionEvent::Security(security)).await.is_err() {
         return Outcome::Gone;
+    }
+
+    // A new socket is a new login exchange, whatever happened on the last
+    // one — completed, or disarmed because the player typed.
+    if let Some(login) = login.as_mut() {
+        login.rearm();
     }
 
     let (mut reader, mut writer) = tokio::io::split(transport);
@@ -3119,6 +3131,69 @@ mod tests {
             );
         }
         assert_eq!(received, vec!["Kestrel", "hunter2"]);
+    }
+
+    /// A server restart is the case reconnect exists for, and reconnecting
+    /// is not the same as being back in the world: the second connection has
+    /// to answer the login prompts exactly like the first (#85). Before the
+    /// fix the session reattached cleanly and then sat at the name prompt,
+    /// because the `Autologin` outlives the connection it was built for and
+    /// nothing re-armed it.
+    #[tokio::test]
+    async fn auto_login_answers_again_after_a_reconnect() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let login = Autologin::new("Kestrel".into(), Some("hunter2".into()), None, None).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            // Two connections from one listener: the first is dropped under
+            // the client the way a restarting MUD drops it, and the second is
+            // the one the test is about.
+            for _ in 0..2 {
+                let (sock, _) = listener.accept().await.unwrap();
+                let (mut sock, spare) = two_handles(sock);
+                let mut reader = CommandReader::default();
+                sock.write_all(b"By what name are you known?\r\n")
+                    .await
+                    .unwrap();
+                tx.send(reader.next(&mut sock).await).await.unwrap();
+                sock.write_all(b"Password:\r\n").await.unwrap();
+                tx.send(reader.next(&mut sock).await).await.unwrap();
+                close_gracefully(spare).await;
+            }
+        });
+
+        let (_events, _commands) = spawn(
+            "127.0.0.1".to_string(),
+            port,
+            None,
+            None,
+            Charset::Utf8,
+            Engine::default(),
+            false,
+            Some(login),
+            PeerLinks::default(),
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            received.push(
+                // Generous: the second connection waits out the 1s backoff.
+                timeout(Duration::from_secs(10), sent.recv())
+                    .await
+                    .expect("timed out waiting for a login reply")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            received,
+            vec!["Kestrel", "hunter2", "Kestrel", "hunter2"],
+            "the reconnected session must log in without the player typing"
+        );
     }
 
     /// Auto-login's own progress notices are the client talking, not the
