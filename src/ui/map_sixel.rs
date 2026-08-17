@@ -41,6 +41,7 @@ pub(crate) fn render(
     scene: &Scene,
     cursor: Option<RoomId>,
     cell: (u16, u16),
+    pan: (i32, i32),
 ) -> Option<PendingImage> {
     let (cw, ch) = (cell.0 as i32, cell.1 as i32);
     if cw == 0 || ch == 0 {
@@ -77,8 +78,10 @@ pub(crate) fn render(
         }
     };
 
-    let origin_col = area.width as i32 / 2 - 1;
-    let origin_row = area.height as i32 / 2;
+    // Same pan as the cell renderer, in the same units: the two draw the
+    // same scene and must agree about where it sits (#58).
+    let origin_col = area.width as i32 / 2 - 1 + pan.0 * STEP_X;
+    let origin_row = area.height as i32 / 2 + pan.1 * STEP_Y;
     // Centre of a room in pixels, which is what corridors are drawn between.
     let centre = |at: (i32, i32)| {
         let col = origin_col + at.0 * STEP_X;
@@ -308,13 +311,13 @@ mod tests {
     #[test]
     fn no_cell_size_means_no_image() {
         let area = Rect::new(0, 0, 20, 10);
-        assert!(render(area, &scene_of(&[]), None, (0, 0)).is_none());
+        assert!(render(area, &scene_of(&[]), None, (0, 0), (0, 0)).is_none());
     }
 
     #[test]
     fn the_image_covers_exactly_the_pane() {
         let area = Rect::new(3, 4, 20, 10);
-        let image = render(area, &scene_of(&[]), None, (8, 16)).expect("an image");
+        let image = render(area, &scene_of(&[]), None, (8, 16), (0, 0)).expect("an image");
 
         assert_eq!(image.area, area);
         assert!(
@@ -331,8 +334,14 @@ mod tests {
     /// transmitted black, not a gap.
     #[test]
     fn the_void_behind_the_map_is_an_explicit_black_not_left_to_the_terminal() {
-        let image =
-            render(Rect::new(0, 0, 20, 10), &scene_of(&[]), None, (8, 16)).expect("an image");
+        let image = render(
+            Rect::new(0, 0, 20, 10),
+            &scene_of(&[]),
+            None,
+            (8, 16),
+            (0, 0),
+        )
+        .expect("an image");
 
         assert!(
             image.sixel.contains("#0;2;0;0;0"),
@@ -350,8 +359,14 @@ mod tests {
     /// how big the pane is.
     #[test]
     fn the_payload_stays_small_on_a_pane_much_bigger_than_the_map() {
-        let image =
-            render(Rect::new(0, 0, 200, 150), &scene_of(&[]), None, (8, 16)).expect("an image");
+        let image = render(
+            Rect::new(0, 0, 200, 150),
+            &scene_of(&[]),
+            None,
+            (8, 16),
+            (0, 0),
+        )
+        .expect("an image");
 
         assert!(
             image.sixel.len() < 4_000,
@@ -370,6 +385,7 @@ mod tests {
             &scene_of(&[(1, "e", 2)]),
             None,
             (8, 16),
+            (0, 0),
         )
         .expect("an image");
         let diagonal = render(
@@ -377,6 +393,7 @@ mod tests {
             &scene_of(&[(1, "se", 2)]),
             None,
             (8, 16),
+            (0, 0),
         )
         .expect("an image");
 
@@ -386,8 +403,14 @@ mod tests {
     /// Letters are the terminal's job, on the cells the image covers.
     #[test]
     fn the_character_is_written_as_a_glyph_not_drawn_as_pixels() {
-        let image =
-            render(Rect::new(0, 0, 20, 10), &scene_of(&[]), None, (8, 16)).expect("an image");
+        let image = render(
+            Rect::new(0, 0, 20, 10),
+            &scene_of(&[]),
+            None,
+            (8, 16),
+            (0, 0),
+        )
+        .expect("an image");
 
         assert!(
             image.glyphs.iter().any(|(_, _, ch, _)| *ch == '@'),
@@ -402,8 +425,14 @@ mod tests {
     /// hole in the room it is naming.
     #[test]
     fn a_glyph_repaints_the_room_colour_it_covers() {
-        let image =
-            render(Rect::new(0, 0, 20, 10), &scene_of(&[]), None, (8, 16)).expect("an image");
+        let image = render(
+            Rect::new(0, 0, 20, 10),
+            &scene_of(&[]),
+            None,
+            (8, 16),
+            (0, 0),
+        )
+        .expect("an image");
 
         let (_, _, _, style) = image
             .glyphs
@@ -418,8 +447,14 @@ mod tests {
     #[test]
     fn glyphs_stay_inside_the_pane() {
         let area = Rect::new(5, 2, 20, 10);
-        let image =
-            render(area, &scene_of(&[(1, "e", 2), (2, "e", 3)]), None, (8, 16)).expect("an image");
+        let image = render(
+            area,
+            &scene_of(&[(1, "e", 2), (2, "e", 3)]),
+            None,
+            (8, 16),
+            (0, 0),
+        )
+        .expect("an image");
 
         for (x, y, ch, _) in &image.glyphs {
             assert!(

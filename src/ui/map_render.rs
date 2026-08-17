@@ -43,6 +43,7 @@ pub(crate) trait MapRenderer {
         area: Rect,
         scene: &Scene,
         cursor: Option<RoomId>,
+        pan: (i32, i32),
     ) -> Option<PendingImage>;
 }
 
@@ -52,6 +53,28 @@ pub(crate) trait MapRenderer {
 /// looking like a diagonal.
 pub(super) const STEP_X: i32 = 4;
 pub(super) const STEP_Y: i32 = 2;
+
+/// Whether a room at scene coordinate `at` is drawn in `grid` with enough
+/// around it to be worth not re-centring for (#58).
+///
+/// The arithmetic mirrors `draw` exactly — same origin, same `STEP_*`, and
+/// the room's own cell is `col + 1`, the middle of its three slots — so
+/// this cannot drift from what the renderer actually puts on screen
+/// without a test noticing.
+///
+/// The margin is one room step on every side, and it is the point rather
+/// than a safety fudge: centring exists so a player can see where they can
+/// go next, and a character pinned against the pane edge has lost that
+/// even though their letter is technically visible. A pane too small to
+/// hold the margin never reports anything as visible, so it re-centres on
+/// every switch — the old behaviour, which is the right degradation.
+pub(super) fn room_is_visible(grid: Rect, at: (i32, i32)) -> bool {
+    let width = grid.width as i32;
+    let height = grid.height as i32;
+    let col = width / 2 - 1 + at.0 * STEP_X + 1;
+    let row = height / 2 + at.1 * STEP_Y;
+    col - STEP_X >= 0 && col + STEP_X < width && row - STEP_Y >= 0 && row + STEP_Y < height
+}
 
 /// What each role paints. Colour carries the meaning here because a room is
 /// three cells of solid ground with one slot on it — shape alone cannot say
@@ -353,14 +376,18 @@ impl MapRenderer for CharRenderer {
         area: Rect,
         scene: &Scene,
         cursor: Option<RoomId>,
+        pan: (i32, i32),
     ) -> Option<PendingImage> {
         let width = area.width as i32;
         let height = area.height as i32;
         // The current room sits in the middle, so walking scrolls the world
         // past a fixed marker rather than sliding a dot at an edge it then
         // falls off (§16).
-        let origin_col = width / 2 - 1;
-        let origin_row = height / 2;
+        // `pan` moves the whole picture, character included, in room
+        // steps — the character is the scene's (0,0), so panning is the
+        // only way anything other than them can sit at the middle (#58).
+        let origin_col = width / 2 - 1 + pan.0 * STEP_X;
+        let origin_row = height / 2 + pan.1 * STEP_Y;
 
         let mut cells: Vec<Vec<(char, Style)>> =
             vec![vec![(' ', Style::default()); area.width as usize]; area.height as usize];
@@ -720,10 +747,14 @@ mod tests {
     }
 
     fn render(scene: &Scene) -> String {
+        render_panned(scene, (0, 0))
+    }
+
+    fn render_panned(scene: &Scene, pan: (i32, i32)) -> String {
         let mut terminal = Terminal::new(TestBackend::new(11, 5)).unwrap();
         terminal
             .draw(|frame| {
-                CharRenderer.draw(frame, frame.area(), scene, None);
+                CharRenderer.draw(frame, frame.area(), scene, None, pan);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -735,6 +766,40 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The pan is only real if it moves the picture (#58). Everything else
+    /// about #58 is arithmetic on `AppState`; this is the one test that
+    /// says the arithmetic reaches the screen.
+    #[test]
+    fn panning_moves_the_whole_picture_by_whole_room_steps() {
+        let scene = scene_of(&[(1, "e", 2)]);
+        let centred = render_panned(&scene, (0, 0));
+        let panned = render_panned(&scene, (1, 0));
+
+        assert_ne!(centred, panned, "a pan has to change what is drawn");
+        // One room step east is `STEP_X` columns, and every row moves
+        // together — the picture is shifted, not re-laid-out.
+        for (before, after) in centred.lines().zip(panned.lines()) {
+            let shifted: String = " ".repeat(STEP_X as usize) + before;
+            assert!(
+                shifted.starts_with(after.trim_end()) || after.trim().is_empty(),
+                "row moved by something other than one whole room step:\n\
+                 before: {before:?}\nafter:  {after:?}"
+            );
+        }
+    }
+
+    /// Panning far enough takes the character off the pane entirely. The
+    /// renderer simply clips — deciding that this must not happen is
+    /// `AppState::update_map_pan`'s job, and it has its own tests.
+    #[test]
+    fn a_pan_beyond_the_pane_draws_nothing_rather_than_wrapping() {
+        let drawn = render_panned(&scene_of(&[(1, "e", 2)]), (99, 0));
+        assert!(
+            drawn.trim().is_empty(),
+            "expected an empty pane, got:\n{drawn}"
+        );
     }
 
     /// The picture, not just the scene, has to distinguish "known but not
