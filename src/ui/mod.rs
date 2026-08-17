@@ -296,6 +296,58 @@ pub struct DrawnFrame {
     pub map_grid: Option<Rect>,
 }
 
+/// Brightens the middle of each border side that has undrawn rooms beyond
+/// it (#55).
+///
+/// The border rather than the grid, for two reasons. The cells are already
+/// spoken for by chrome, so nothing has to give way for the mark — and
+/// both renderers get it for free, since the sixel path draws a picture
+/// inside a border ratatui still owns.
+///
+/// Restyled rather than re-glyphed: #50 left the map's marks confined to
+/// glyphs present in every monospace font measured, and "brighter and
+/// bold" needs no glyph at all. The run is the middle third of the side so
+/// that it reads as deliberate; a single cell looks like a rendering
+/// artifact, and a fully lit side looks like a focus highlight.
+fn mark_edges(frame: &mut Frame, area: Rect, beyond: &map_render::Beyond) {
+    if area.width < 3 || area.height < 3 || !beyond.any() {
+        return;
+    }
+    let lit = Style::new()
+        .fg(map_render::palette::PAPER)
+        .add_modifier(Modifier::BOLD);
+    let run = |span: u16| {
+        let length = (span / 3).max(1);
+        let start = span.saturating_sub(length) / 2;
+        (start, length)
+    };
+
+    if beyond.up || beyond.down {
+        let (start, length) = run(area.width.saturating_sub(2));
+        for offset in 0..length {
+            let x = area.left() + 1 + start + offset;
+            if beyond.up {
+                frame.buffer_mut()[(x, area.top())].set_style(lit);
+            }
+            if beyond.down {
+                frame.buffer_mut()[(x, area.bottom() - 1)].set_style(lit);
+            }
+        }
+    }
+    if beyond.left || beyond.right {
+        let (start, length) = run(area.height.saturating_sub(2));
+        for offset in 0..length {
+            let y = area.top() + 1 + start + offset;
+            if beyond.left {
+                frame.buffer_mut()[(area.left(), y)].set_style(lit);
+            }
+            if beyond.right {
+                frame.buffer_mut()[(area.right() - 1, y)].set_style(lit);
+            }
+        }
+    }
+}
+
 /// Whether the map pane would draw the room at scene coordinate `at`, with
 /// enough context around it to be worth keeping the view still (#58).
 ///
@@ -976,6 +1028,7 @@ fn draw_map(
                 }
             }
             draw_caption(frame, caption, state);
+            mark_edges(frame, area, &map_render::rooms_beyond(grid, &scene, pan));
             return (Some(image), fresh, Some(grid));
         }
     }
@@ -1020,6 +1073,7 @@ fn draw_map(
     }
     // No picture occupies the pane this frame, so nothing in the cache is
     // still on screen to reuse.
+    mark_edges(frame, area, &map_render::rooms_beyond(grid, &scene, pan));
     map_cache.key = None;
     map_cache.image = None;
     (None, true, Some(grid))
@@ -2080,6 +2134,50 @@ mod tests {
         let border = buffer.cell((59, 1)).unwrap();
         assert_eq!(border.fg, Color::Green);
         assert!(border.modifier.contains(ratatui::style::Modifier::DIM));
+    }
+
+    /// #55's mark has to reach the screen, not just the arithmetic. The
+    /// border is chrome the map does not own, so this is the one test that
+    /// says the two meet.
+    #[test]
+    fn a_side_with_more_map_beyond_it_is_lit_on_the_border() {
+        use map_render::Beyond;
+        let area = Rect::new(0, 0, 20, 9);
+        let lit = |beyond: Beyond| {
+            let mut terminal = Terminal::new(TestBackend::new(20, 9)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(Block::bordered(), area);
+                    mark_edges(frame, area, &beyond);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            // The middle of the right-hand border, which is where a run
+            // lands on a nine-row pane.
+            buffer[(area.right() - 1, area.top() + 4)]
+                .style()
+                .add_modifier
+                .contains(Modifier::BOLD)
+        };
+
+        assert!(
+            lit(Beyond {
+                right: true,
+                ..Beyond::default()
+            }),
+            "rooms beyond the east edge should light it"
+        );
+        assert!(
+            !lit(Beyond::default()),
+            "a map with nothing beyond it must leave the border alone"
+        );
+        assert!(
+            !lit(Beyond {
+                left: true,
+                ..Beyond::default()
+            }),
+            "the west edge lighting the east border would be a transposition"
+        );
     }
 
     /// `help_lines`'s own doc comment promises "every binding" — a
