@@ -637,13 +637,13 @@ impl ConfigEditorState {
         match field {
             ConnField::TlsEnabled => self.draft.tls.enabled = !self.draft.tls.enabled,
             ConnField::TlsVerify => {
-                use crate::net::VerifyMode;
+                use crate::config::VerifyMode;
                 self.draft.tls.verify = match self.draft.tls.verify {
                     VerifyMode::Full => VerifyMode::Pinned,
                     VerifyMode::Pinned => VerifyMode::Insecure,
                     VerifyMode::Insecure => VerifyMode::Full,
                 };
-                if self.draft.tls.verify == crate::net::VerifyMode::Insecure {
+                if self.draft.tls.verify == crate::config::VerifyMode::Insecure {
                     self.set_notice_error(
                         "tls.verify: insecure — the connection will not be validated \
                          at all (docs/ARCHITECTURE.md §13)"

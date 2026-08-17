@@ -29,11 +29,11 @@ mod sixel;
 
 use map_render::MapRenderer as _;
 
-/// Default width of the docked channel column, and the smallest main area
-/// worth keeping beside it — below that the channels are simply not drawn.
-/// The live width is `AppState::channel_width`; this is only where it starts
-/// (docs/ARCHITECTURE.md §11.4).
-pub(crate) const CHANNEL_WIDTH: u16 = 28;
+/// The smallest main area worth keeping beside the docked column — below
+/// that the channels are simply not drawn. Where the column *starts* is
+/// `config::DEFAULT_CHANNEL_WIDTH`: a starting value is a setting's
+/// default, and `config` cannot read it from here without depending on
+/// the layer that draws (docs/ARCHITECTURE.md §4, §11.4).
 const MIN_MAIN_WIDTH: u16 = 30;
 /// The narrowest the column may be resized to: enough for a channel name and
 /// a couple of words inside the border. Shrinking a pane to nothing is a way
@@ -53,11 +53,11 @@ pub(crate) fn clamp_channel_width(width: u16, area_width: u16) -> u16 {
 }
 
 /// Default width of the docked map column, and the narrowest it may be
-/// resized to. The live width is `AppState::map_width` (§11.4, §16).
+/// resized to. The live width is `AppState::map_width` (§11.4, §16), and
+/// where it starts is `config::DEFAULT_MAP_WIDTH`.
 /// Narrower than the comms floor because a map row is glyphs and
 /// connectors, not words — but not so narrow that the current room can
 /// never be centred with a neighbour either side.
-pub(crate) const MAP_WIDTH: u16 = 24;
 pub(crate) const MIN_MAP_WIDTH: u16 = 12;
 
 /// As `clamp_channel_width`, for the map column.
@@ -2721,7 +2721,7 @@ mod tests {
         state.world_mut(0).map = map;
         state.sessions[0].current_room = Some(RoomId(1));
         state.show_map = true;
-        state.map_width = MAP_WIDTH;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
         let drawn = render_sized(&state, 80, 32);
         let screen = rows(&drawn);
@@ -2779,7 +2779,7 @@ mod tests {
         state.world_mut(0).map = map;
         state.sessions[0].current_room = Some(RoomId(1));
         state.show_map = true;
-        state.map_width = MAP_WIDTH;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
         state.map_cell_px = Some((8, 16));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -2855,7 +2855,7 @@ mod tests {
         state.world_mut(0).map = map;
         state.sessions[0].current_room = Some(RoomId(1));
         state.show_map = true;
-        state.map_width = MAP_WIDTH;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
         state.map_cell_px = Some((8, 16));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -2916,7 +2916,7 @@ mod tests {
         state.world_mut(0).map = map;
         state.sessions[0].current_room = Some(RoomId(2));
         state.show_map = true;
-        state.map_width = MAP_WIDTH;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
         let drawn = render_sized(&state, 80, 32);
         let screen = rows(&drawn);
@@ -2935,7 +2935,7 @@ mod tests {
     fn the_map_pane_always_shows_the_legend() {
         let mut state = state();
         state.show_map = true;
-        state.map_width = MAP_WIDTH;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
         let empty = rows(&render_sized(&state, 80, 20));
         assert!(
@@ -2968,7 +2968,7 @@ mod tests {
     fn the_legend_explains_the_exit_glyphs_too() {
         let mut state = state();
         state.show_map = true;
-        state.map_width = MAP_WIDTH;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
         let screen = rows(&render_sized(&state, 80, 24));
 
@@ -3042,7 +3042,7 @@ mod tests {
         state.sessions[0].current_room = Some(RoomId(1));
         state.sessions[1].current_room = Some(RoomId(2));
         state.show_map = true;
-        state.map_width = MAP_WIDTH;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
         let screen = rows(&render_sized(&state, 80, 20));
 
@@ -3059,7 +3059,7 @@ mod tests {
     fn the_map_pane_says_when_it_has_no_room_data() {
         let mut state = state();
         state.show_map = true;
-        state.map_width = MAP_WIDTH;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
         let screen = rows(&render_sized(&state, 80, 20));
         assert!(screen.contains("no room data yet"), "{screen}");
