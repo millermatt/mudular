@@ -540,6 +540,16 @@ sitting on, and `Enter` walks you there — the same one-step-at-a-time
 walk `/goto` does. `Esc` closes it, and so does any other key, so a
 keystroke meant for the game is never half-swallowed.
 
+Switching between two characters who are near enough to see each other
+leaves the picture where it is. The map is of the world rather than of a
+character, so when both are already drawn the two views are the same
+picture — sliding it across so the newly bound character sits dead centre
+would move every room on screen to say something the moving highlight
+already says. Walking is unchanged: the world still pans a room at a time
+under whoever you are playing, keeping whatever offset the switch left. A
+character the current view cannot show is a different matter — the map
+follows them, because nothing else would bring them into view.
+
 ```
  Ofcol Village — ↑↓←→ Enter Esc
      ▓  ▓

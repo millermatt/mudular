@@ -288,6 +288,22 @@ pub struct DrawnFrame {
     /// to the terminal again — the one already on screen is still correct.
     pub image_is_fresh: bool,
     pub map_area: Option<Rect>,
+    /// The grid the map was actually drawn into — the pane minus border,
+    /// legend and caption. Reported rather than recomputed because those
+    /// subtractions depend on the cursor's description and the legend's
+    /// wrapped height, and a second copy of that arithmetic would drift
+    /// (#58).
+    pub map_grid: Option<Rect>,
+}
+
+/// Whether the map pane would draw the room at scene coordinate `at`, with
+/// enough context around it to be worth keeping the view still (#58).
+///
+/// `app` owns the policy — when to re-centre — and this is the geometry
+/// question it cannot answer without knowing how the renderer lays a scene
+/// out. Takes the grid `draw` reported, not the pane rect.
+pub fn map_shows_room(grid: Rect, at: (i32, i32)) -> bool {
+    map_render::room_is_visible(grid, at)
 }
 
 /// What the map pane drew last frame, so a frame where nothing about the
@@ -321,12 +337,17 @@ struct MapImageCacheKey {
     cursor: Option<crate::map::RoomId>,
     area: Rect,
     cell: (u16, u16),
+    /// Where the picture is panned to. The same scene at a different pan
+    /// is a different picture, and leaving this out of the key is how the
+    /// map would appear frozen after a character switch (#58).
+    pan: (i32, i32),
 }
 
 pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) -> DrawnFrame {
     let mut pending = None;
     let mut image_is_fresh = true;
     let mut map_area = None;
+    let mut map_grid = None;
     let panes = layout(frame.area(), state);
 
     if state.sessions.is_empty() {
@@ -367,8 +388,10 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
     }
 
     if let Some(rect) = panes.map {
-        (pending, image_is_fresh) = draw_map(frame, rect, state, map_cache);
+        let drawn;
+        (pending, image_is_fresh, drawn) = draw_map(frame, rect, state, map_cache);
         map_area = Some(rect);
+        map_grid = drawn;
     }
 
     let bound = state.bound();
@@ -421,6 +444,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
         image: pending,
         image_is_fresh,
         map_area,
+        map_grid,
     }
 }
 
@@ -831,7 +855,7 @@ fn draw_map(
     area: Rect,
     state: &AppState,
     map_cache: &mut MapImageCache,
-) -> (Option<map_render::PendingImage>, bool) {
+) -> (Option<map_render::PendingImage>, bool, Option<Rect>) {
     let session = state.bound();
     let title = match session.and_then(|session| session.view.current_room) {
         Some(at) => state
@@ -860,7 +884,7 @@ fn draw_map(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
-        return (None, true);
+        return (None, true, None);
     }
 
     // Reserved before anything else claims the bottom of the pane, so it
@@ -880,11 +904,11 @@ fn draw_map(
             Paragraph::new("no room data yet").wrap(Wrap { trim: true }),
             inner,
         );
-        return (None, true);
+        return (None, true, None);
     };
 
     let Some(map) = state.bound_map() else {
-        return (None, true);
+        return (None, true, None);
     };
     // Everyone on this world, not only the character being typed at
     // (§16) — the map is of the world, and they are all on it.
@@ -893,6 +917,12 @@ fn draw_map(
         .map(|i| state.party_of(i))
         .unwrap_or_default();
     let scene = map.scene(current, session.view.corpse, &party);
+    // Where the picture sits relative to the character, in room steps
+    // (#58). Zero is the historical behaviour — character at the middle,
+    // world sliding under them as they walk — and it stays zero unless a
+    // switch between characters has deliberately held the view still.
+    let pan = state.map_pan;
+
     // Pixels where the terminal takes them, cells everywhere else — the
     // same scene either way (§16).
     if let Some(cell) = state.map_cell_px {
@@ -903,6 +933,10 @@ fn draw_map(
             cursor: state.map_cursor,
             area: grid,
             cell,
+            // Part of the key: the same scene panned elsewhere is a
+            // different picture, and reusing the cached one would leave
+            // the map visibly stuck (#58).
+            pan,
         };
         // Rasterising and RLE-encoding a real map costs tens of
         // milliseconds — fine once, on the frame that moved the player,
@@ -915,7 +949,7 @@ fn draw_map(
         let (image, fresh) = match cached {
             Some(image) => (Some(image), false),
             None => {
-                let image = map_sixel::render(grid, &scene, state.map_cursor, cell);
+                let image = map_sixel::render(grid, &scene, state.map_cursor, cell, pan);
                 map_cache.key = Some(key);
                 map_cache.image = image.clone();
                 (image, true)
@@ -942,7 +976,7 @@ fn draw_map(
                 }
             }
             draw_caption(frame, caption, state);
-            return (Some(image), fresh);
+            return (Some(image), fresh, Some(grid));
         }
     }
 
@@ -974,7 +1008,7 @@ fn draw_map(
         }
     };
 
-    map_render::CharRenderer.draw(frame, grid, &scene, state.map_cursor);
+    map_render::CharRenderer.draw(frame, grid, &scene, state.map_cursor, pan);
 
     if let Some(rect) = caption {
         frame.render_widget(
@@ -988,7 +1022,7 @@ fn draw_map(
     // still on screen to reuse.
     map_cache.key = None;
     map_cache.image = None;
-    (None, true)
+    (None, true, Some(grid))
 }
 
 /// How many rows the cursor's description wants, so both renderers leave
@@ -2818,6 +2852,7 @@ mod tests {
             image: None,
             image_is_fresh: true,
             map_area: None,
+            map_grid: None,
         };
         terminal
             .draw(|frame| first = draw(frame, &state, &mut cache))
@@ -2829,6 +2864,7 @@ mod tests {
             image: None,
             image_is_fresh: true,
             map_area: None,
+            map_grid: None,
         };
         terminal
             .draw(|frame| second = draw(frame, &state, &mut cache))
@@ -2850,6 +2886,7 @@ mod tests {
             image: None,
             image_is_fresh: true,
             map_area: None,
+            map_grid: None,
         };
         terminal
             .draw(|frame| third = draw(frame, &state, &mut cache))
@@ -2894,6 +2931,7 @@ mod tests {
                 image: None,
                 image_is_fresh: true,
                 map_area: None,
+                map_grid: None,
             };
             terminal
                 .draw(|frame| drawn = draw(frame, &state, cache))

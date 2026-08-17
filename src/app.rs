@@ -772,6 +772,23 @@ pub struct AppState {
     /// coordinate would quietly come to mean a different room the moment
     /// anything moved.
     pub map_cursor: Option<crate::map::RoomId>,
+    /// Where the map picture sits relative to the bound character, in room
+    /// steps (#58). `(0, 0)` is the historical behaviour: the character in
+    /// the middle, the world sliding under them as they walk.
+    ///
+    /// A pan rather than a centre room, so that walking keeps whatever
+    /// offset a character switch established instead of paging: the scene
+    /// is rebuilt around wherever the character now stands, and holding
+    /// the offset constant is exactly a one-room pan per step.
+    pub map_pan: (i32, i32),
+    /// The character and room `map_pan` was last computed against, so a
+    /// switch can be told from a step by the same character.
+    map_pan_for: Option<(SessionId, crate::map::RoomId)>,
+    /// The grid the map pane drew into last frame, as `ui` reported it.
+    /// One frame stale by construction: a pane that changed size since is
+    /// re-judged on the next frame, and the cost of being wrong for one
+    /// frame is a view that held still when it should have moved.
+    pub map_grid: Option<ratatui::layout::Rect>,
     /// A room `Enter` on the map cursor asked to walk to. Serviced by the
     /// event loop rather than acted on in `handle_key`, which is not async
     /// — the same hand-off `reload_requested` uses.
@@ -959,6 +976,65 @@ impl AppState {
         if self.focus == Focus::Session(id) {
             self.focus_pane(Focus::Session(self.input_session));
         }
+    }
+
+    /// Chooses what the map is centred on, before a frame is drawn (#58).
+    ///
+    /// Re-centring on every frame is what made `Alt+<n>` between two
+    /// characters standing near each other slide the whole world, even
+    /// though both were already on screen and the picture either way is
+    /// the same one shifted. So the rule is: keep the current centre while
+    /// the bound character is comfortably drawn in it, and move only when
+    /// they are not.
+    ///
+    /// "Not" covers three cases and they all want the same answer —
+    /// nothing has been drawn yet, the character walked out of view, or
+    /// they are somewhere this centre cannot show at all (another area, or
+    /// a group it cannot reach, where `layout_area` gives them no
+    /// coordinate). In each, centring on them is the only thing that puts
+    /// them in front of the player.
+    pub fn update_map_pan(&mut self) {
+        let (Some(id), Some(current)) = (
+            self.bound_index().and_then(|i| self.id_at(i)),
+            self.bound().and_then(|session| session.view.current_room),
+        ) else {
+            return;
+        };
+
+        self.map_pan = match self.map_pan_for {
+            // The same character, a step later. Holding the offset is what
+            // makes walking a pan rather than a page: the scene moved, the
+            // picture moves with it, and where they sit on screen does not
+            // change.
+            Some((was, _)) if was == id => self.map_pan,
+            // A different character. The picture should not move at all,
+            // so the new pan is the old one plus however far apart the two
+            // of them are — which `layout_area` gives directly, since it
+            // puts the room it is asked about at the origin.
+            Some((_, from)) => match self
+                .bound_map()
+                .map(|map| map.layout_area(from))
+                .and_then(|coords| coords.get(&current).copied())
+            {
+                Some((dx, dy)) => (self.map_pan.0 + dx, self.map_pan.1 + dy),
+                // Nowhere this layout can show: another area, or a group
+                // the old room cannot reach. Nothing to preserve.
+                None => (0, 0),
+            },
+            None => (0, 0),
+        };
+
+        // Whatever the arithmetic said, the character being played has to
+        // be on screen with room to see where they can go next. A pane too
+        // small to hold the margin therefore never holds a view still,
+        // which is the old behaviour and the right thing to fall back to.
+        if !self
+            .map_grid
+            .is_some_and(|grid| crate::ui::map_shows_room(grid, self.map_pan))
+        {
+            self.map_pan = (0, 0);
+        }
+        self.map_pan_for = Some((id, current));
     }
 
     pub fn focus_pane(&mut self, focus: Focus) {
@@ -2939,6 +3015,9 @@ async fn event_loop(
         reload_requested: false,
         line_cursor: None,
         map_cursor: None,
+        map_pan: (0, 0),
+        map_pan_for: None,
+        map_grid: None,
         walk_requested: None,
         config_dir,
         mark_menu: None,
@@ -3013,10 +3092,15 @@ async fn event_loop(
         for name in state.refresh_distress() {
             notify(&format!("{name} needs help"));
         }
+        // Decided once per frame, from the grid the last frame reported,
+        // rather than hooked onto every event that could move a character
+        // or change who is bound (#58).
+        state.update_map_pan();
         let mut drawn = ui::DrawnFrame {
             image: None,
             image_is_fresh: true,
             map_area: None,
+            map_grid: None,
         };
         let mut completed =
             terminal.draw(|frame| drawn = ui::draw(frame, &state, &mut map_image_cache))?;
@@ -3061,6 +3145,8 @@ async fn event_loop(
                 capture_map_area(completed.buffer, drawn.map_area, drawn.image.as_ref())
             })?;
         }
+        // What the next frame's re-centring decision is judged against.
+        state.map_grid = drawn.map_grid;
         had_image = drawn.image.is_some();
 
         let wake = tokio::select! {
@@ -4402,6 +4488,9 @@ pub(crate) mod test_support {
                 reload_requested: false,
                 line_cursor: None,
                 map_cursor: None,
+                map_pan: (0, 0),
+                map_pan_for: None,
+                map_grid: None,
                 walk_requested: None,
                 config_dir: PathBuf::from("/cfg"),
                 mark_menu: None,
@@ -8588,6 +8677,143 @@ mod tests {
         assert!(
             state.bound().is_none(),
             "nothing is bound, and nothing panics"
+        );
+    }
+
+    /// Walks `session` east from room 1 to room `to`, building a straight
+    /// corridor on the shared map. Room *n* lands one step east of *n-1*.
+    fn walk_east_to(state: &mut AppState, session: usize, to: i64) {
+        apply_session_event(state, session, room(1, None));
+        for id in 2..=to {
+            apply_session_event(state, session, room(id, Some("e")));
+        }
+    }
+
+    /// A grid wide enough to show three rooms either side of the middle,
+    /// which is what the visibility margin allows at this width.
+    fn map_grid(state: &mut AppState) {
+        state.map_grid = Some(ratatui::layout::Rect::new(0, 0, 40, 20));
+    }
+
+    /// #58. `Alt+<n>` between two characters who can see each other used to
+    /// slide the whole world, because the picture was always re-centred on
+    /// whoever was bound. Both views are the same picture — `layout_area`
+    /// anchors the shape rather than deriving it from the character — so
+    /// the switch should move the highlight and nothing else.
+    ///
+    /// "Nothing else" is what the pan measures: it ends up exactly as far
+    /// from centre as the new character is from the old one, which is the
+    /// offset that leaves every room where it already was.
+    #[tokio::test]
+    async fn switching_to_a_character_already_on_screen_leaves_the_map_still() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        for session in &mut state.sessions {
+            session.map_key = "hercmud.net".to_string();
+        }
+        map_grid(&mut state);
+        walk_east_to(&mut state, 0, 3); // tank ends at room 3
+        apply_session_event(&mut state, 1, room(1, None)); // cleric at room 1
+
+        let cleric = state.sessions[1].id;
+        state.focus_pane(Focus::Session(cleric));
+        state.update_map_pan();
+        assert_eq!(state.map_pan, (0, 0), "the first character centres");
+
+        let tank = state.sessions[0].id;
+        state.focus_pane(Focus::Session(tank));
+        state.update_map_pan();
+
+        assert_eq!(
+            state.map_pan,
+            (2, 0),
+            "tank is two rooms east of cleric, so the picture holds still \
+             by sitting two steps off centre"
+        );
+    }
+
+    /// The other half of the rule: a character this view cannot show has to
+    /// be put in front of the player, because nothing else would bring
+    /// them into view.
+    #[tokio::test]
+    async fn switching_to_a_character_off_screen_recentres_on_them() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        for session in &mut state.sessions {
+            session.map_key = "hercmud.net".to_string();
+        }
+        map_grid(&mut state);
+        walk_east_to(&mut state, 0, 8); // tank ends seven rooms east
+        apply_session_event(&mut state, 1, room(1, None));
+
+        let cleric = state.sessions[1].id;
+        state.focus_pane(Focus::Session(cleric));
+        state.update_map_pan();
+
+        let tank = state.sessions[0].id;
+        state.focus_pane(Focus::Session(tank));
+        state.update_map_pan();
+
+        assert_eq!(
+            state.map_pan,
+            (0, 0),
+            "seven rooms east cannot be shown from here, so the map follows"
+        );
+    }
+
+    /// Walking must still pan one room per step, which is the whole reason
+    /// the offset is stored rather than a centre room: rebuilding the
+    /// scene around the new room while holding the offset *is* a one-room
+    /// pan. Keeping a centre room instead would have made a walk hold
+    /// still for several rooms and then jump — a change to how walking
+    /// looks, which #58 never asked for.
+    #[tokio::test]
+    async fn walking_still_pans_one_room_at_a_time() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].map_key = "hercmud.net".to_string();
+        map_grid(&mut state);
+
+        walk_east_to(&mut state, 0, 2);
+        state.update_map_pan();
+        assert_eq!(state.map_pan, (0, 0));
+
+        for id in 3..=8 {
+            apply_session_event(&mut state, 0, room(id, Some("e")));
+            state.update_map_pan();
+            assert_eq!(
+                state.map_pan,
+                (0, 0),
+                "a lone character stays centred however far they walk"
+            );
+        }
+    }
+
+    /// An offset established by a switch survives the walking that follows
+    /// — until it would take the character off the pane, when it resets and
+    /// they are centred again.
+    #[tokio::test]
+    async fn a_held_view_survives_walking_until_it_cannot() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        for session in &mut state.sessions {
+            session.map_key = "hercmud.net".to_string();
+        }
+        map_grid(&mut state);
+        walk_east_to(&mut state, 0, 3);
+        apply_session_event(&mut state, 1, room(1, None));
+
+        let cleric = state.sessions[1].id;
+        state.focus_pane(Focus::Session(cleric));
+        state.update_map_pan();
+        let tank = state.sessions[0].id;
+        state.focus_pane(Focus::Session(tank));
+        state.update_map_pan();
+        assert_eq!(state.map_pan, (2, 0), "held still on the switch");
+
+        // Tank walks back west, towards where cleric is standing.
+        apply_session_event(&mut state, 0, room(2, Some("w")));
+        state.update_map_pan();
+        assert_eq!(
+            state.map_pan,
+            (2, 0),
+            "the offset is kept, so the world panned by exactly one room"
         );
     }
 
