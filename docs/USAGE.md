@@ -325,6 +325,16 @@ already see it — `${@cleric.hp}` and `send_to: {cleric: [...]}` work from
 the moment it connects, in both directions. Nothing else's scrollback is
 touched.
 
+Done with a character for the evening? `/disconnect` closes the one you're
+typing at — no name, so there's nothing to mistype and no way to close the
+wrong pane. The character's map is written before the pane goes, whatever
+it explored since the last save; the session is told the close was
+deliberate, so it doesn't reconnect the character you just dismissed; and
+typing lands on whoever is left. Closing your last character leaves the
+client running and empty rather than quitting: `/disconnect` means
+disconnect, and losing your other panes' scrollback because you closed one
+is not what it should mean.
+
 Need one of the others to do something *right now*, without deciding in
 advance that you'd want to? `/send` takes a character and a command:
 

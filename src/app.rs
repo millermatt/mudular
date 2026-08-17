@@ -64,6 +64,13 @@ const NEWPROFILE_COMMAND: &str = "/newprofile";
 /// `ARCH_REVIEW.md` "Features that would break the architecture") — a
 /// name follows, not a fixed string like the commands above.
 const CONNECT_COMMAND: &str = "/connect";
+/// Closes the character being typed at (#98). The other half of
+/// `/connect`: a client that can add a pane but never remove one teaches
+/// its user to relaunch, which is what multi-session support exists to
+/// avoid. Takes no argument deliberately — the pane you are typing at is
+/// the one you mean, and naming a character invites closing the wrong one
+/// by typo.
+const DISCONNECT_COMMAND: &str = "/disconnect";
 /// Walks toward a room already on the map, one step at a time (§16) — a
 /// vnum, or a case-insensitive substring of a room name.
 const GOTO_COMMAND: &str = "/goto";
@@ -2644,6 +2651,45 @@ fn save_comms_panes(state: &AppState) {
     }
 }
 
+/// Closes the session the input line is bound to (#98).
+///
+/// Order matters here, and it is the order a player would expect if they
+/// thought about it: tell the session task first, write the map, then take
+/// the pane away. Telling the task first is what distinguishes a deliberate
+/// close from a connection that dropped — `SessionCommand::Disconnect`
+/// exists so the retry loop stops rather than reconnecting the character
+/// that was just closed.
+///
+/// The map is written before the pane goes because the quit path saves
+/// every world unconditionally and this path saves one: a character
+/// disconnected mid-evening would otherwise lose whatever it explored since
+/// the last save, and the loss would only show up next launch.
+async fn disconnect_bound_session(state: &mut AppState) {
+    let Some(index) = state.bound_index() else {
+        return;
+    };
+    let id = state.sessions[index].id;
+    let name = state.sessions[index].view.name.clone();
+    let key = state.sessions[index].map_key.clone();
+
+    let _ = state.sessions[index]
+        .commands
+        .send(crate::session::SessionCommand::Disconnect)
+        .await;
+    // Harmless when a sibling is still on this world — the entry stays in
+    // `AppState::maps` for them and for the quit path, and writing it twice
+    // writes the same bytes.
+    save_world_map(state, &key);
+    state.remove_session(id);
+
+    // Into whichever pane the player is now typing at. With none left there
+    // is nowhere to say it, and nothing to say it about: the screen they are
+    // looking at is the empty client, which is its own answer.
+    if let Some(session) = state.bound_mut() {
+        session.push_line(RetainedLine::client(format!("** {name} disconnected")));
+    }
+}
+
 fn save_world_map(state: &mut AppState, key: &str) -> bool {
     // A `--host` session saves too: it has no profile, but the world it is
     // in has a name all the same (§16). An empty key is a session with no
@@ -3672,6 +3718,10 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
             return;
         }
         connect_new_session(state, channels, name).await;
+        return;
+    }
+    if trimmed == DISCONNECT_COMMAND {
+        disconnect_bound_session(state).await;
         return;
     }
     if trimmed == MAP_COMMAND {
@@ -8448,6 +8498,99 @@ mod tests {
     /// per-session copies this replaced only reconciled through the file,
     /// so until the next launch two panes could show different amounts of
     /// the same world — quieter than the mark bug, and the same cause.
+    /// `/connect` could add a character and nothing could remove one (#98),
+    /// so a pane opened by mistake stayed for the evening. The pane goes,
+    /// and typing lands on whoever is left — which is #94's guarantee, used
+    /// here for the first time by something a player can actually reach.
+    #[tokio::test]
+    async fn disconnect_closes_the_bound_pane_and_rebinds() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        let tank = state.sessions[0].id;
+        state.focus_pane(Focus::Session(tank));
+
+        submit(&mut state, "/disconnect").await;
+
+        assert_eq!(state.sessions.len(), 1, "the pane is gone");
+        assert_eq!(
+            state.bound().map(|s| s.view.name.as_str()),
+            Some("cleric"),
+            "typing goes to whoever is left"
+        );
+        assert!(
+            state.bound().is_some_and(|s| s
+                .view
+                .scrollback
+                .iter()
+                .any(|l| l.plain().contains("tank"))),
+            "and the survivor is told which character left"
+        );
+    }
+
+    /// The distinction `SessionCommand::Disconnect` was added for and never
+    /// had a caller: a deliberate close, as against a connection that merely
+    /// dropped. Without it the session task would treat the closed pane as a
+    /// failure and reconnect the character the player just dismissed.
+    #[tokio::test]
+    async fn disconnect_tells_the_session_task_it_was_deliberate() {
+        let (mut state, mut receivers) = app(&["tank", "cleric"]);
+        let tank = state.sessions[0].id;
+        state.focus_pane(Focus::Session(tank));
+
+        submit(&mut state, "/disconnect").await;
+
+        let sent = receivers[0].try_recv();
+        assert!(
+            matches!(sent, Ok(SessionCommand::Disconnect)),
+            "the task should have been told to stop retrying, got {sent:?}"
+        );
+    }
+
+    /// The asymmetry #98 called out as where a bug would live: the quit path
+    /// writes every world unconditionally, this path writes one. A character
+    /// disconnected mid-evening must not lose what it explored since the last
+    /// save — and the loss would only show up at the next launch, which is
+    /// exactly the kind of bug that never gets reported as this one.
+    #[tokio::test]
+    async fn disconnect_writes_the_departing_characters_map_first() {
+        let dir = ::test_support::TempDir::new();
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        state.config_dir = dir.path().to_path_buf();
+        for session in &mut state.sessions {
+            session.map_key = "hercmud.net".to_string();
+        }
+        // Something worth losing: a room this character walked into.
+        apply_session_event(&mut state, 0, room(1, None));
+        apply_session_event(&mut state, 0, room(2, Some("n")));
+
+        let tank = state.sessions[0].id;
+        state.focus_pane(Focus::Session(tank));
+        submit(&mut state, "/disconnect").await;
+
+        let reloaded = config::load_map(dir.path(), "hercmud.net");
+        assert!(
+            reloaded
+                .path(crate::map::RoomId(1), crate::map::RoomId(2))
+                .is_some(),
+            "the walk reached disk before the pane was taken away"
+        );
+    }
+
+    /// `/disconnect` says disconnect. A client that exits on it is a client
+    /// that lost your scrollback because you closed one pane — and an empty
+    /// client is a state it already has, from a launch with no profile.
+    #[tokio::test]
+    async fn disconnecting_the_last_session_leaves_an_empty_client_not_an_exit() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        submit(&mut state, "/disconnect").await;
+
+        assert!(state.sessions.is_empty());
+        assert!(
+            state.bound().is_none(),
+            "nothing is bound, and nothing panics"
+        );
+    }
+
     /// Identity, not position (#94). `/connect` can add a character to a
     /// running instance, so a client that cannot also remove one leaves a
     /// dead pane on screen for the rest of the evening — and removing from
