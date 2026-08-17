@@ -15,7 +15,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{
+    Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 use crate::app::{AppState, ChannelPane, Focus, LayoutMode};
 use crate::config::Keybinds;
@@ -175,6 +177,8 @@ pub struct Panes {
     /// in it (§11.6).
     pub hud: Option<Rect>,
     pub input: Rect,
+    /// The status bar: the last row of the terminal, always present.
+    pub status: Rect,
 }
 
 /// Splits `area` into the panes `state` asks for.
@@ -184,11 +188,17 @@ pub fn layout(area: Rect, state: &AppState) -> Panes {
     // are one thing to look at while typing, and a strip between them would
     // split the pair the player's eye already treats as joined.
     let hud_rows = u16::from(state.show_hud && !state.sessions.is_empty());
-    let [body, hud_area, prompt_area, input] = Layout::vertical([
+    // The status bar is the very last row, below the input box — where a
+    // terminal application's status line belongs, and where the eye can
+    // find it without hunting. One row, always present: a bar that comes
+    // and goes moves everything above it, and the client would appear to
+    // jump whenever a warning arrived.
+    let [body, hud_area, prompt_area, input, status] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(hud_rows),
         Constraint::Length(if reserve_prompt { 1 } else { 0 }),
         Constraint::Length(3),
+        Constraint::Length(1),
     ])
     .areas(area);
 
@@ -261,6 +271,7 @@ pub fn layout(area: Rect, state: &AppState) -> Panes {
         prompt: reserve_prompt.then_some(prompt_area),
         hud: (hud_rows > 0).then_some(hud_area),
         input,
+        status,
     }
 }
 
@@ -509,9 +520,14 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
     if state.config_editor.is_none() {
         draw_input(frame, panes.input, state);
     }
+    draw_status(frame, panes.status, state);
 
     if state.show_help {
         draw_help(frame, frame.area(), state);
+    }
+
+    if state.show_errors {
+        draw_errors(frame, frame.area(), state);
     }
 
     if let Some(menu) = &state.mark_menu {
@@ -545,6 +561,46 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
 
 /// The help overlay: a box centred over the layout, sized to its content and
 /// clipped to the terminal (docs/ARCHITECTURE.md §11.2).
+/// The warnings panel (#18).
+///
+/// Newest last, like scrollback, because that is the order the player read
+/// them in the first place. Only the tail is shown when there are more
+/// than fit: the recent ones are what a player who just saw the badge is
+/// looking for, and an old warning nobody chased is not worth pushing a
+/// new one off the screen for.
+fn draw_errors(frame: &mut Frame, area: Rect, state: &AppState) {
+    let width = (area.width * 3 / 4).max(20).min(area.width);
+    let height = (area.height * 3 / 4).max(3).min(area.height);
+    let overlay = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let rows = overlay.height.saturating_sub(2) as usize;
+    let lines: Vec<Line<'static>> = match state.errors.is_empty() {
+        true => vec![Line::from("nothing has gone wrong yet".dim())],
+        false => state
+            .errors
+            .iter()
+            .rev()
+            .take(rows)
+            .rev()
+            .map(|text| Line::from(text.clone()))
+            .collect(),
+    };
+
+    let title = format!(" warnings ({}) ", state.errors.len());
+    frame.render_widget(Clear, overlay);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::bordered().title(title.bold())),
+        overlay,
+    );
+}
+
 fn draw_help(frame: &mut Frame, area: Rect, state: &AppState) {
     let keybinds = &state.keybinds;
     let lines = help_lines(keybinds);
@@ -737,16 +793,13 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
 
     let content_width = area.width.saturating_sub(2);
 
-    // Security and latency are each absent until they are known, so a pane
-    // never shows an empty bracket or a placeholder round trip.
-    let security = match session.view.security.is_empty() {
-        true => String::new(),
-        false => format!(" [{}]", session.view.security),
-    };
-    let latency = match session.view.latency.is_empty() {
-        true => String::new(),
-        false => format!(" {}", session.view.latency),
-    };
+    // Where the connection stands lives in the status bar now, not in
+    // every pane title — it was in both, which is one place too many.
+    //
+    // What stays here is a session that is *not* connected. The bar can
+    // only speak for the character being typed at, so a second character
+    // dropping while you play the first would otherwise say so nowhere.
+    // Trouble is per-pane; routine is global.
     let title = if showing_inspector {
         format!(" {} — {} ", session.view.name, session.inspector_title())
     } else {
@@ -755,14 +808,17 @@ fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, index: usize) {
         } else {
             scroll_indicator(session.view.back_offset)
         };
+        let state_note = match session.view.connected {
+            true => String::new(),
+            false => format!(" — {}", session.view.status),
+        };
         format!(
-            "{} — {}{security}{latency}{picking} ",
+            "{}{state_note}{picking} ",
             pane_title(
                 &session.view.name,
                 session.view.unread,
                 session.view.distress.is_some()
             ),
-            session.view.status,
         )
     };
 
@@ -1020,7 +1076,15 @@ fn draw_map(
 
     // Pixels where the terminal takes them, cells everywhere else — the
     // same scene either way (§16).
-    if let Some(cell) = state.map_cell_px {
+    //
+    // And cells, whatever the terminal can do, while an overlay is open.
+    // A sixel picture is written to the terminal *after* the frame, so it
+    // lands on top of whatever ratatui drew — including a panel the player
+    // is reading. Drawing the map as glyphs for those frames puts it back
+    // in the buffer, where the overlay's `Clear` covers it like any other
+    // pane, and the cell path clears the image cache on its way through so
+    // the picture returns freshly rasterised once the overlay closes.
+    if let Some(cell) = state.map_cell_px.filter(|_| !overlay_covers_map(state)) {
         let described_rows = described_height(state, inner);
         let (grid, caption) = split_caption(inner, described_rows);
         let key = MapImageCacheKey {
@@ -1455,6 +1519,79 @@ fn render_scrollback(
     }
 }
 
+/// The status bar (#18, and the home #23 and #40 will want).
+///
+/// Dark on light, which is what makes it read as chrome rather than as
+/// one more line of the game: everything else in the client is light text
+/// on the terminal's own background, so the inversion says "this row is
+/// the client talking about itself".
+///
+/// Left is what the client is doing — the character commands go to, and
+/// how its connection is holding up. Right is what wants attention, which
+/// today is the unread warning count and nothing else. Right-aligned
+/// because a badge that moves as the left side changes length is a badge
+/// the eye has to search for.
+/// Whether anything is drawn on top of the map pane this frame.
+///
+/// Every overlay here is centred on the whole terminal, so any of them
+/// being open is enough — none can be open and *not* cover a docked map
+/// column of any useful width.
+fn overlay_covers_map(state: &AppState) -> bool {
+    state.show_help
+        || state.show_errors
+        || state.mark_menu.is_some()
+        || state.config_editor.is_some()
+        || state.new_profile_wizard.is_some()
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
+    if area.width == 0 {
+        return;
+    }
+    let bar = Style::new()
+        .bg(map_render::palette::CHROME)
+        .fg(map_render::palette::INK);
+
+    let left = match state.bound() {
+        Some(session) => {
+            // The whole connection, in one place: who you are typing at,
+            // where they are connected, whether it is encrypted, and how
+            // the round trip is holding up. Each part is absent until it
+            // is known, so the bar never shows an empty bracket or a
+            // placeholder latency.
+            let mut text = format!(" {}", session.view.name);
+            if !session.view.status.is_empty() {
+                text.push_str(&format!("  {}", session.view.status));
+            }
+            if !session.view.security.is_empty() {
+                text.push_str(&format!("  [{}]", session.view.security));
+            }
+            if !session.view.latency.is_empty() {
+                text.push_str(&format!("  {}", session.view.latency));
+            }
+            text
+        }
+        None => " no character".to_string(),
+    };
+    // Never "0 errors": a count of nothing is not news, and a bar that
+    // always says something teaches the eye to stop reading it.
+    let right = match state.errors_unread {
+        0 => String::new(),
+        1 => format!("!1 error ({}) ", crate::app::ERRORS_COMMAND),
+        n => format!("!{n} errors ({}) ", crate::app::ERRORS_COMMAND),
+    };
+
+    let gap = (area.width as usize)
+        .saturating_sub(left.chars().count() + right.chars().count())
+        .max(1);
+    let line = Line::from(vec![
+        Span::styled(left, bar),
+        Span::styled(" ".repeat(gap), bar),
+        Span::styled(right, bar.add_modifier(Modifier::BOLD)),
+    ]);
+    frame.render_widget(Paragraph::new(line).style(bar), area);
+}
+
 fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     let Some(session) = state.bound() else {
         // No character, but still a line: `/connect` has to be typeable in
@@ -1591,10 +1728,49 @@ mod tests {
     /// inside its border), a 1-row prompt, and a 3-tall input box. Content
     /// rows are 1..=4; row 0 and row 5 are the pane's own borders, so
     /// asserting `│` there would test the border, not corruption.
-    const CONTENT_ROWS: std::ops::RangeInclusive<u16> = 1..=4;
+    /// The rows inside the session pane's border, derived from the layout
+    /// rather than counted: this was `1..=4` until the status bar took a
+    /// row, at which point row 4 became the bottom border and the failure
+    /// read as "left border corrupted".
+    fn content_rows(state: &AppState) -> std::ops::RangeInclusive<u16> {
+        let pane = panes_of(state).sessions[0];
+        (pane.y + 1)..=(pane.y + pane.height.saturating_sub(2))
+    }
 
     fn state() -> AppState {
         test_support::app(&["kestrel"])
+    }
+
+    /// A terminal tall enough to leave the session pane `rows` of content.
+    ///
+    /// Derived rather than counted, because chrome has now changed height
+    /// twice — the prompt row, then the status bar — and each time a
+    /// hand-counted terminal height in a test silently started meaning
+    /// something else. `overlay_fits` records the same lesson for width.
+    fn terminal_height_for(state: &AppState, width: u16, rows: u16) -> u16 {
+        (rows + 2..rows + 12)
+            .find(|height| {
+                session_pane_sizes(Rect::new(0, 0, width, *height), state)
+                    .first()
+                    .is_some_and(|(_, (_, tall))| *tall >= rows)
+            })
+            .expect("some terminal height gives the pane that many rows")
+    }
+
+    /// Where a pane actually lands, for tests that used to count rows from
+    /// the bottom of a 30x10 buffer. Adding the status bar moved every one
+    /// of them by a row, which is the same lesson `overlay_fits` records:
+    /// a hand-counted offset is a number that silently stops being true.
+    fn panes_of(state: &AppState) -> Panes {
+        layout(Rect::new(0, 0, 30, 10), state)
+    }
+
+    fn prompt_row(state: &AppState) -> u16 {
+        panes_of(state).prompt.expect("a prompt row").y
+    }
+
+    fn input_top(state: &AppState) -> u16 {
+        panes_of(state).input.y
     }
 
     fn render(state: &AppState) -> ratatui::buffer::Buffer {
@@ -1623,8 +1799,14 @@ mod tests {
     /// How many cells the map painted as room ground. Rooms are a
     /// background fill rather than a glyph, so counting ink means counting
     /// backgrounds, not characters.
+    /// Cells with a background of their own — room tiles, legend swatches
+    /// — which is how the map tests count what was drawn.
+    ///
+    /// The status bar is excluded: it paints its whole row, so counting it
+    /// would swamp the thing being measured. It is always the last row,
+    /// which is the one property of it these tests need to know.
     fn filled_cells(buffer: &ratatui::buffer::Buffer) -> usize {
-        (0..buffer.area.height)
+        (0..buffer.area.height.saturating_sub(1))
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
             .filter(|(x, y)| buffer.cell((*x, *y)).unwrap().bg != ratatui::style::Color::Reset)
             .count()
@@ -1649,8 +1831,8 @@ mod tests {
             .collect()
     }
 
-    fn assert_left_border_intact(buffer: &ratatui::buffer::Buffer) {
-        for y in CONTENT_ROWS {
+    fn assert_left_border_intact(state: &AppState, buffer: &ratatui::buffer::Buffer) {
+        for y in content_rows(state) {
             assert_eq!(
                 buffer.cell((0, y)).unwrap().symbol(),
                 "│",
@@ -1975,9 +2157,9 @@ mod tests {
 
         let buffer = render(&state);
         assert!(
-            row(&buffer, 6).contains("HP:100 MP:50>"),
+            row(&buffer, prompt_row(&state)).contains("HP:100 MP:50>"),
             "prompt row: {:?}",
-            row(&buffer, 6)
+            row(&buffer, prompt_row(&state))
         );
         assert!(
             row(&buffer, 1).contains("You are in a forest."),
@@ -2062,21 +2244,36 @@ mod tests {
         assert!(rows(&buffer).contains("x1b"), "{}", rows(&buffer));
     }
 
-    /// §11: the pane title carries the latency, and carries nothing where
-    /// it would be before the first round trip has been measured.
+    /// The status bar carries the connection — where you are, whether it
+    /// is encrypted, and the round trip — and carries nothing where a
+    /// number is not known yet, so it never shows a placeholder.
+    ///
+    /// It used to be the pane title's job, and for a while it was both,
+    /// which is one place too many for the same fact.
     #[test]
-    fn the_pane_title_shows_latency_once_there_is_one() {
+    fn the_status_bar_shows_the_connection_once_there_is_one() {
         let mut state = state();
         state.sessions[0].view.status = "connected".to_string();
         state.sessions[0].view.security = "TLS".to_string();
 
-        let before = row(&render_sized(&state, 60, 12), 0);
-        assert!(before.contains("[TLS]"), "title: {before:?}");
-        assert!(!before.contains("ms"), "title: {before:?}");
+        let status_row = |state: &AppState| {
+            let area = Rect::new(0, 0, 60, 12);
+            row(&render_sized(state, 60, 12), layout(area, state).status.y)
+        };
+
+        let before = status_row(&state);
+        assert!(before.contains("[TLS]"), "status bar: {before:?}");
+        assert!(before.contains("connected"), "status bar: {before:?}");
+        assert!(!before.contains("ms"), "status bar: {before:?}");
 
         state.sessions[0].view.latency = "42ms".to_string();
-        let after = row(&render_sized(&state, 60, 12), 0);
-        assert!(after.contains("[TLS] 42ms"), "title: {after:?}");
+        let after = status_row(&state);
+        assert!(after.contains("42ms"), "status bar: {after:?}");
+
+        // And no longer in two places at once.
+        let title = row(&render_sized(&state, 60, 12), 0);
+        assert!(!title.contains("42ms"), "still in the title: {title:?}");
+        assert!(!title.contains("[TLS]"), "still in the title: {title:?}");
     }
 
     /// A profile's colour has to reach both places a character is named,
@@ -2186,6 +2383,68 @@ mod tests {
         let border = buffer.cell((59, 1)).unwrap();
         assert_eq!(border.fg, Color::Green);
         assert!(border.modifier.contains(ratatui::style::Modifier::DIM));
+    }
+
+    /// Reported live with map graphics on: closing the warnings panel left
+    /// the part of it that had been over the map still on screen.
+    ///
+    /// A reused sixel picture marks its cells `Skip` so ratatui will not
+    /// paint over the pixels — which also stops it repainting them after
+    /// an overlay drawn on top goes away. The cache key treats "an overlay
+    /// was covering this" as part of what is on those cells, so opening
+    /// and closing each force one fresh write.
+    #[test]
+    fn an_open_overlay_draws_the_map_as_cells_not_pixels() {
+        use crate::map::{RoomId, RoomInfo};
+        use std::collections::BTreeMap;
+
+        let mut state = state();
+        let mut map = crate::map::Map::default();
+        map.observe(&RoomInfo {
+            id: RoomId(1),
+            name: Some("Town Square".to_string()),
+            area: Some("Midgaard".to_string()),
+            exits: BTreeMap::new(),
+        });
+        state.world_mut(0).map = map;
+        state.sessions[0].view.current_room = Some(RoomId(1));
+        state.show_map = true;
+        state.map_width = crate::config::DEFAULT_MAP_WIDTH;
+        // A terminal that reports a cell size is one that can draw pixels.
+        state.map_cell_px = Some((8, 16));
+        let mut cache = MapImageCache::default();
+
+        let drew_a_picture = |state: &AppState, cache: &mut MapImageCache| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut had_image = false;
+            terminal
+                .draw(|frame| had_image = draw(frame, state, cache).image.is_some())
+                .unwrap();
+            had_image
+        };
+
+        assert!(
+            drew_a_picture(&state, &mut cache),
+            "with nothing in the way the map is a picture"
+        );
+
+        state.show_errors = true;
+        assert!(
+            !drew_a_picture(&state, &mut cache),
+            "a picture is written after the frame, so it would land on top \
+             of the panel — the map has to be glyphs while one is open"
+        );
+
+        state.show_errors = false;
+        assert!(
+            drew_a_picture(&state, &mut cache),
+            "and the picture comes back once the panel is gone"
+        );
+
+        // Every overlay, because each is centred on the whole terminal and
+        // each would be painted over the same way.
+        state.show_help = true;
+        assert!(!drew_a_picture(&state, &mut cache));
     }
 
     /// The picture is cached against the rect it was drawn into, so
@@ -2455,16 +2714,17 @@ mod tests {
             tui_input::Input::default().with_value("hunter2".to_string());
 
         let visible = render(&state);
-        assert!(row(&visible, 8).contains("hunter2"));
+        let value_row = input_top(&state) + 1;
+        assert!(row(&visible, value_row).contains("hunter2"));
 
         state.sessions[0].view.masked = true;
         let hidden = render(&state);
         assert!(
-            !row(&hidden, 8).contains("hunter2"),
+            !row(&hidden, value_row).contains("hunter2"),
             "password leaked: {:?}",
-            row(&hidden, 8)
+            row(&hidden, value_row)
         );
-        assert!(row(&hidden, 8).contains("*******"));
+        assert!(row(&hidden, value_row).contains("*******"));
     }
 
     /// NAWS must describe the output pane inside its border, not the whole
@@ -2473,11 +2733,13 @@ mod tests {
     fn reports_pane_size_excluding_chrome() {
         let mut state = state();
         let area = Rect::new(0, 0, 30, 10);
-        // 30 wide - 2 border columns; 10 tall - 1 prompt - 3 input - 2 border.
-        assert_eq!(session_pane_sizes(area, &state), vec![(0, (28, 4))]);
+        // 30 wide - 2 border columns; 10 tall - 1 prompt - 3 input - 1
+        // status bar - 2 border. The status bar's row comes out of the
+        // scrollback, which is the price of it being always present.
+        assert_eq!(session_pane_sizes(area, &state), vec![(0, (28, 3))]);
 
         state.sessions[0].view.connected = false;
-        assert_eq!(session_pane_sizes(area, &state), vec![(0, (28, 5))]);
+        assert_eq!(session_pane_sizes(area, &state), vec![(0, (28, 4))]);
     }
 
     /// Split panes each report their own width, not the terminal's — two
@@ -2579,7 +2841,7 @@ mod tests {
         state.focus_pane(Focus::Channel(0));
 
         let buffer = render_sized(&state, 70, 12);
-        let input_row = row(&buffer, 9);
+        let input_row = row(&buffer, layout(Rect::new(0, 0, 70, 12), &state).input.y);
         assert!(input_row.contains("input → cleric"), "{input_row:?}");
     }
 
@@ -3028,7 +3290,8 @@ mod tests {
         state.show_map = true;
         state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
-        let drawn = render_sized(&state, 80, 32);
+        let tall = terminal_height_for(&state, 80, 26);
+        let drawn = render_sized(&state, 80, tall);
         let screen = rows(&drawn);
         assert!(
             screen.contains("Midgaard"),
@@ -3227,7 +3490,8 @@ mod tests {
         state.show_map = true;
         state.map_width = crate::config::DEFAULT_MAP_WIDTH;
 
-        let drawn = render_sized(&state, 80, 32);
+        let tall = terminal_height_for(&state, 80, 26);
+        let drawn = render_sized(&state, 80, tall);
         let screen = rows(&drawn);
         assert!(screen.contains('@'), "the current room is drawn: {screen}");
         assert_eq!(
@@ -3398,7 +3662,7 @@ mod tests {
         }
         state.sessions[0].view.prompt = "By what name do you wish to be known?".to_string();
 
-        assert_left_border_intact(&render(&state));
+        assert_left_border_intact(&state, &render(&state));
     }
 
     /// Redraws on every event, exactly like the real event loop: a banner
@@ -3406,8 +3670,9 @@ mod tests {
     /// one `Terminal` (and its diff buffer) across draws.
     #[test]
     fn repeated_draws_never_corrupt_the_left_border() {
-        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
         let mut state = state();
+        let tall = terminal_height_for(&state, 30, 4);
+        let mut terminal = Terminal::new(TestBackend::new(30, tall)).unwrap();
         let mut cache = MapImageCache::default();
 
         let banner = [
@@ -3426,7 +3691,7 @@ mod tests {
                     draw(frame, &state, &mut cache);
                 })
                 .unwrap();
-            assert_left_border_intact(terminal.backend().buffer());
+            assert_left_border_intact(&state, terminal.backend().buffer());
         }
 
         state.sessions[0].view.prompt = "By what name do you wish to be known?".to_string();
@@ -3435,7 +3700,7 @@ mod tests {
                 draw(frame, &state, &mut cache);
             })
             .unwrap();
-        assert_left_border_intact(terminal.backend().buffer());
+        assert_left_border_intact(&state, terminal.backend().buffer());
 
         state.sessions[0].view.prompt.clear();
         state.sessions[0]
@@ -3452,7 +3717,7 @@ mod tests {
                     draw(frame, &state, &mut cache);
                 })
                 .unwrap();
-            assert_left_border_intact(terminal.backend().buffer());
+            assert_left_border_intact(&state, terminal.backend().buffer());
         }
     }
 

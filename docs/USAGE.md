@@ -1311,6 +1311,7 @@ fallback.
 | `F7` | Show or hide the map column, and print where you are — the same thing `/map` does | `toggle_map` |
 | `Alt+,` / `Alt+.` | Widen / narrow the map column | `map_wider` / `map_narrower` |
 | `Alt+S` | Swap the map and comms columns | `swap_columns` |
+| `/errors` | Show the client's own warnings, and clear the badge | — |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 | `Alt+T` | Show or hide the clock down the character panes | `toggle_timestamps` |
 | `/comms` | Show or hide the comms column — the same thing `F4` does | — (a command) |
