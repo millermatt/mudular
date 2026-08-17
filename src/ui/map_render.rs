@@ -54,6 +54,55 @@ pub(crate) trait MapRenderer {
 pub(super) const STEP_X: i32 = 4;
 pub(super) const STEP_Y: i32 = 2;
 
+/// Which sides of the pane have rooms beyond them that are not drawn
+/// (#55).
+///
+/// A column showing four rooms looks the same whether the area has four
+/// rooms or forty, which is the same dishonesty #47 fixed for a room whose
+/// exits could not be drawn: the map should not look complete when it is
+/// showing part of something.
+///
+/// A room counts as beyond only when *no* part of it is on the pane. One
+/// clipped to a single column is still visible, and marking its side would
+/// point at something the player can already see.
+///
+/// Deliberately says nothing about "the area ends here". Absence of a mark
+/// means no known rooms that way — whether because the area stops or
+/// because nobody has walked there yet is a distinction the map cannot
+/// honestly draw, since an unexplored exit and a wall look identical until
+/// someone tries.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Beyond {
+    pub left: bool,
+    pub right: bool,
+    pub up: bool,
+    pub down: bool,
+}
+
+impl Beyond {
+    pub fn any(&self) -> bool {
+        self.left || self.right || self.up || self.down
+    }
+}
+
+pub(super) fn rooms_beyond(grid: Rect, scene: &Scene, pan: (i32, i32)) -> Beyond {
+    let width = grid.width as i32;
+    let height = grid.height as i32;
+    let mut beyond = Beyond::default();
+    for room in &scene.rooms {
+        // The same arithmetic the renderer uses, including the three
+        // columns a room occupies — a room is off to the left only when
+        // its rightmost column is.
+        let col = width / 2 - 1 + (pan.0 + room.at.0) * STEP_X;
+        let row = height / 2 + (pan.1 + room.at.1) * STEP_Y;
+        beyond.left |= col + 2 < 0;
+        beyond.right |= col >= width;
+        beyond.up |= row < 0;
+        beyond.down |= row >= height;
+    }
+    beyond
+}
+
 /// Whether a room at scene coordinate `at` is drawn in `grid` with enough
 /// around it to be worth not re-centring for (#58).
 ///
@@ -316,6 +365,17 @@ pub(super) fn legend(width: u16) -> Vec<Line<'static>> {
         Some('?'),
         "other",
         2,
+    ));
+
+    // The edge mark (#55). Its own group, because it answers neither "who
+    // is on the map" nor "what is this room" but "is there more of it" —
+    // and it is drawn the way the border is drawn, since that is where the
+    // player will see it rather than on any room.
+    entries.push((
+        Style::new().fg(palette::PAPER).add_modifier(Modifier::BOLD),
+        Some('│'),
+        "more this way",
+        3,
     ));
 
     // Broken at entry boundaries rather than left to `Paragraph`'s word
@@ -766,6 +826,84 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// #55. A column showing four rooms looked the same whether the area
+    /// had four rooms or forty. The sides with something beyond them are
+    /// exactly the ones the renderer was already discarding.
+    #[test]
+    fn a_room_off_the_pane_marks_the_side_it_is_off() {
+        let scene = scene_of(&[(1, "e", 2)]);
+        // Wide enough for both rooms: room 2 sits one step east of centre.
+        let roomy = rooms_beyond(Rect::new(0, 0, 40, 20), &scene, (0, 0));
+        assert_eq!(roomy, Beyond::default(), "both rooms fit, so no marks");
+
+        // Eleven columns puts room 1 at columns 4-6 and room 2 at 8-10,
+        // both on. Panning one step east slides room 1 to 8-10 and room 2
+        // past the right-hand edge.
+        let panned = rooms_beyond(Rect::new(0, 0, 11, 5), &scene, (1, 0));
+        assert!(panned.right, "room 2 is off to the east");
+        assert!(!panned.left && !panned.up && !panned.down);
+    }
+
+    /// A room clipped to part of its width is still something the player
+    /// can see, so marking its side would point at what is already on
+    /// screen. Only a room with no cell at all on the pane counts.
+    #[test]
+    fn a_partly_drawn_room_is_not_beyond_the_edge() {
+        let scene = scene_of(&[(1, "e", 2)]);
+        // 9 columns: centre at 3, room 2 at columns 7, 8, 9 — the last of
+        // those is off, the first two are not.
+        let clipped = rooms_beyond(Rect::new(0, 0, 9, 5), &scene, (0, 0));
+        assert_eq!(
+            clipped,
+            Beyond::default(),
+            "part of the room is drawn, so nothing is hidden beyond the edge"
+        );
+    }
+
+    /// Every side, so the marks cannot be wired up transposed — the bug
+    /// this test exists to catch is `up` lighting the bottom border.
+    #[test]
+    fn each_direction_marks_its_own_side() {
+        for (dir, expected) in [
+            (
+                "e",
+                Beyond {
+                    right: true,
+                    ..Beyond::default()
+                },
+            ),
+            (
+                "w",
+                Beyond {
+                    left: true,
+                    ..Beyond::default()
+                },
+            ),
+            (
+                "s",
+                Beyond {
+                    down: true,
+                    ..Beyond::default()
+                },
+            ),
+            (
+                "n",
+                Beyond {
+                    up: true,
+                    ..Beyond::default()
+                },
+            ),
+        ] {
+            let scene = scene_of(&[(1, dir, 2)]);
+            // Small enough that one step in any direction is off the pane.
+            assert_eq!(
+                rooms_beyond(Rect::new(0, 0, 5, 3), &scene, (0, 0)),
+                expected,
+                "going {dir} marked the wrong side"
+            );
+        }
     }
 
     /// The pan is only real if it moves the picture (#58). Everything else
