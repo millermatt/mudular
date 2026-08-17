@@ -1035,13 +1035,29 @@ is shaped by what must never happen rather than by convenience.
   that changes; the negative signal covers the case that matters.
 - **A small forward-only state machine** (name → password → done) drives
   it, sans-IO in `session::login` and fed the lines, prompts, and ECHO
-  events the pipeline already produces. Each step fires at most once, and
-  anything the player types disarms it permanently.
+  events the pipeline already produces. Within a connection each step
+  fires at most once, and anything the player types disarms it for the
+  rest of that connection.
 - That last property is the security argument. Matching `Password:`
   against arbitrary server text is otherwise an injection hole: another
   player says `Password:` in chat, and a naive client sends the secret as
   a public command. With one-shot steps that disarm on first input, there
   is no armed step left by the time anyone can talk to you.
+- **The connection is the boundary, and it is the whole guarantee.** One
+  machine is built per session, so the keyring is read once and outside
+  the session task; a reconnect re-arms it rather than rebuilding it, and
+  `session::run_connection` is the only caller. Nothing moves a step
+  backwards on its own — re-arming on a *prompt* would reintroduce exactly
+  the injection hole above, whereas a new socket is a protocol fact, not a
+  guess about what the server meant. Without this a session reconnected
+  after a server restart reattaches and then sits at the name prompt, which
+  is what shipped until #85.
+- **The cost is that the password stays in memory** for the session, where
+  it used to be dropped after first use. Re-reading the keyring per attempt
+  is the alternative and is worse: that read can prompt, so doing it from
+  the session task would block the pipeline mid-connection — potentially
+  during an unattended overnight reconnect. Logging back in without the
+  player present is the point; this is what it costs.
 - **A masked prompt is a password prompt**, whatever it says: the server
   negotiating ECHO is a protocol fact rather than a guess about wording,
   so it fires the password step alongside the regex.

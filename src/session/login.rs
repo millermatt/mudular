@@ -7,9 +7,17 @@
 //!
 //! The password never comes from YAML — it is read from the OS keyring by
 //! the caller and handed in here (§13). What keeps it from leaking is the
-//! state machine: each step fires at most once, the steps only run forward,
-//! and anything the player types disarms the machine for the rest of the
-//! connection. A later `Password:` in chat therefore has nothing to fire.
+//! state machine: within a connection each step fires at most once, the
+//! steps only run forward, and anything the player types disarms the machine
+//! for the rest of that connection. A later `Password:` in chat therefore
+//! has nothing to fire.
+//!
+//! **Per connection** is the whole of that guarantee, and the boundary is
+//! load-bearing. The machine outlives the connection it was built for — one
+//! is made per session, and a reconnect reuses it — so `rearm` is what starts
+//! the next login, and only the session calls it, only on a new connection.
+//! Nothing in here ever moves a step backwards on its own. Re-arming on a
+//! prompt instead would be the hazard this design exists to remove.
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -90,6 +98,19 @@ impl Autologin {
         }
     }
 
+    /// Arms the machine for a new connection, undoing both a completed login
+    /// and a `disarm`.
+    ///
+    /// The only way a step ever moves backwards, and it is the session's call
+    /// alone: a new socket is the one event that means "this is a fresh login
+    /// exchange" without having to guess it from what the server said. A
+    /// player who took over a login during one connection has not asked to
+    /// hand-type their password after every server restart for the rest of
+    /// the session.
+    pub fn rearm(&mut self) {
+        self.step = Step::Name;
+    }
+
     /// Stops the machine for the rest of the connection. Called the moment
     /// the player types anything: past that point the login either worked
     /// or they are handling it, and either way an automated password send
@@ -100,8 +121,15 @@ impl Autologin {
 
     fn send_password(&mut self) -> Option<LoginAction> {
         self.step = Step::Done;
-        match self.password.take() {
-            Some(password) => Some(LoginAction::Send(password)),
+        // Borrowed, not taken. Consuming it used to double as hygiene — the
+        // password left memory once it had been used — but it also meant a
+        // reconnect had nothing to send (#85), and re-reading the keyring per
+        // attempt is not available: that read can prompt, and doing it from
+        // inside the session task would block the pipeline mid-connection
+        // (see `app.rs`). So it is held for the session's life deliberately,
+        // which is the cost of logging back in unattended.
+        match self.password.as_ref() {
+            Some(password) => Some(LoginAction::Send(password.clone())),
             None => Some(LoginAction::Notice(
                 "auto-login: no password in the keyring for this profile \
                  (type it below and you'll be offered to save it)"
@@ -164,10 +192,57 @@ mod tests {
         assert_eq!(login.on_echo_mask(true), None);
     }
 
-    /// The whole safety argument: nothing fires twice, so a `Password:` in
-    /// chat an hour later has no armed step to trigger.
+    /// A reconnect is a new login. The machine outlives the connection it
+    /// was built for, so unless the session re-arms it the second connection
+    /// has no armed step and sits at the name prompt forever (#85).
     #[test]
-    fn each_step_fires_once_and_the_machine_never_rearms() {
+    fn rearming_answers_the_prompts_again_on_the_next_connection() {
+        let mut login = login();
+        assert_eq!(
+            sends(login.on_line("What is your name?")).as_deref(),
+            Some("Kestrel")
+        );
+        assert_eq!(
+            sends(login.on_line("Password: ")).as_deref(),
+            Some("hunter2")
+        );
+
+        login.rearm();
+
+        assert_eq!(
+            sends(login.on_line("What is your name?")).as_deref(),
+            Some("Kestrel"),
+            "the password must survive the first login, not be consumed by it"
+        );
+        assert_eq!(
+            sends(login.on_line("Password: ")).as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    /// Typing disarms *that* login, not every future one. The player who
+    /// took over during a server wobble has not asked to hand-type their
+    /// password after every restart for the rest of the session.
+    #[test]
+    fn rearming_undoes_a_disarm_from_the_previous_connection() {
+        let mut login = login();
+        login.on_line("What is your name?");
+        login.disarm();
+        assert_eq!(login.on_line("Password: "), None);
+
+        login.rearm();
+        assert_eq!(
+            sends(login.on_line("What is your name?")).as_deref(),
+            Some("Kestrel")
+        );
+    }
+
+    /// The whole safety argument, and it is per-connection: nothing fires
+    /// twice within one, so a `Password:` in chat an hour later has no armed
+    /// step to trigger. Only the session re-arms it, and only on a new
+    /// connection.
+    #[test]
+    fn each_step_fires_once_within_a_connection() {
         let mut login = login();
         login.on_line("What is your name?");
         login.on_line("Password: ");
