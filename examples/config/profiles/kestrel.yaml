@@ -26,7 +26,7 @@ variables:
 
 triggers:
   # A rule of this character's own.
-  - pattern: '^You are hungry\.$'
+  - pattern: 'You are hungry.'
     send: ["eat bread"]
 
   # Override rules the shared module defined, by id. Only the fields
@@ -39,7 +39,7 @@ triggers:
 # Cross-session automation: this character's rules can drive another open
 # session by name (`*` addresses every other session).
   - id: call-for-heals
-    pattern: '^You are badly wounded'
+    pattern: 'You are badly wounded'
     send_to:
       cleric: ["cast 'major heal' Kestrel"]
 

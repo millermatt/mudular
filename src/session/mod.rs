@@ -1756,7 +1756,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: '^You are now fighting (?P<foe>\w+)'
+                  - regex: '^You are now fighting (?P<foe>\w+)'
                     set: {target: "${foe}"}
                 "#,
             ),
@@ -1796,7 +1796,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^check$'
+                  - regex: '^check$'
                     send: ["say ${@cleric.hp}"]
                 "#,
             ),
@@ -1841,7 +1841,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^check$'
+                  - regex: '^check$'
                     send: ["say ${@cleric.hp}"]
                 "#,
             ),
@@ -2002,7 +2002,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'is DEAD!'
+                  - regex: 'is DEAD!'
                     send: ["get all corpse"]
                 "#,
             ),
@@ -2033,7 +2033,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: '^The kobold is DEAD!$'
+                  - regex: '^The kobold is DEAD!$'
                     send: ["cheer"]
                 "#,
             ),
@@ -2062,7 +2062,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'spam'
+                  - regex: 'spam'
                     gag: true
                 "#,
             ),
@@ -2096,7 +2096,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'spam'
+                  - regex: 'spam'
                     gag: true
                 "#,
             ),
@@ -2124,7 +2124,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'slain'
+                  - regex: 'slain'
                     bell: true
                 "#,
             ),
@@ -2149,7 +2149,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'You have been KILLED'
+                  - regex: 'You have been KILLED'
                     corpse: true
                 "#,
             ),
@@ -2219,7 +2219,7 @@ mod tests {
                 variables:
                   target: rat
                 aliases:
-                  - pattern: '^k$'
+                  - regex: '^k$'
                     send: ["kill ${target}"]
                 "#,
             ),
@@ -2256,7 +2256,7 @@ mod tests {
                 r#"
                 name: before
                 aliases:
-                  - pattern: '^x$'
+                  - regex: '^x$'
                     send: ["old"]
                 "#,
             ),
@@ -2273,7 +2273,7 @@ mod tests {
                 r#"
                 name: after
                 aliases:
-                  - pattern: '^x$'
+                  - regex: '^x$'
                     send: ["new"]
                 "#,
             ))))
@@ -2339,7 +2339,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^hp$'
+                  - regex: '^hp$'
                     send: ["tell hp ${Char.Vitals.hp}"]
                 "#,
             ),
@@ -2425,7 +2425,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^aff$'
+                  - regex: '^aff$'
                     send: ["tell 0=${Char.Affects.0} 1=${Char.Affects.1}"]
                 "#,
             ),
@@ -2480,7 +2480,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^look$'
+                  - regex: '^look$'
                     send: ["you see ${ROOM_NAME}"]
                 "#,
             ),
@@ -2597,7 +2597,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^exits$'
+                  - regex: '^exits$'
                     send: ["tell 0=${ROOM_EXITS.0} 1=${ROOM_EXITS.1}"]
                 "#,
             ),
@@ -3243,7 +3243,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^k$'
+                  - regex: '^k$'
                     send: ["kill rat"]
                 "#,
             ),
@@ -3278,7 +3278,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: '^HP: (?P<hp>\d+)%'
+                  - regex: '^HP: (?P<hp>\d+)%'
                     send_to:
                       cleric: ["cast 'major heal' Grunk", "say healing ${hp}"]
                 "#,
@@ -3309,7 +3309,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^heal (?P<who>\w+)$'
+                  - regex: '^heal (?P<who>\w+)$'
                     send_to:
                       cleric: ["cast heal ${who}"]
                 "#,
@@ -3344,7 +3344,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^hh$'
+                  - regex: '^hh$'
                     send: ["cast 'major heal' me"]
                 "#,
             ),
@@ -3393,7 +3393,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^hh$'
+                  - regex: '^hh$'
                     send: ["cast 'major heal' me"]
                 "#,
             ),
@@ -3428,7 +3428,7 @@ mod tests {
                 r#"
                 name: test
                 aliases:
-                  - pattern: '^relay$'
+                  - regex: '^relay$'
                     send_to:
                       mage: ["shield tank"]
                 "#,
@@ -3471,7 +3471,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'tells you'
+                  - regex: 'tells you'
                     route: comms
                     gag: true
                 "#,
@@ -3508,7 +3508,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: 'tells you'
+                  - regex: 'tells you'
                     route: comms
                     gag: false
                 "#,
@@ -3540,7 +3540,7 @@ mod tests {
                 r#"
                 name: test
                 triggers:
-                  - pattern: '\bBob\b'
+                  - regex: '\bBob\b'
                     highlight: {fg: bright_yellow, bold: true}
                     route: comms
                 "#,

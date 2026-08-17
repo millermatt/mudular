@@ -335,7 +335,7 @@ pinned by integration tests with synthetic compressed captures.
 
 ### 7.1 Concepts
 
-- **Alias:** rewrites *outbound* input. Regex match on the typed line,
+- **Alias:** rewrites *outbound* input. Matches the typed line whole,
   expansion with capture substitution, may emit multiple commands
   (`send:` list) and set variables.
 - **Trigger:** fires on *inbound* completed lines (or prompt lines —
@@ -348,6 +348,27 @@ pinned by integration tests with synthetic compressed captures.
 - **Condition:** an optional `when:` guard on an alias or trigger. The
   pattern decides what matched; the condition decides whether to act on it,
   reading captures, variables, and live server data (§7.6).
+- **Pattern:** what a rule matches, in one of two spellings. `pattern:` is
+  *plain*: literal text, with `{name}` capturing the part that varies (and
+  binding `${name}`), `*` capturing one positionally (`${1}`, `${2}`), and
+  `\` making the next character literal. Everything else means itself — a
+  `.` is a full stop. `regex:` is raw regex, unchanged, for what a plain
+  pattern cannot say; a rule setting both is refused at load, since
+  silently preferring one would make edits to the other do nothing.
+
+  Plain is the default because a shared module's patterns are read and
+  adjusted by whoever copies it in (ACTORS.md actor 2), and regex made the
+  recipient's job the author's job: a dropped backslash produces a pattern
+  that still compiles, still matches most of the time, and is quietly
+  wrong. Anchoring differs by rule kind, because the two are asking
+  different questions — an alias is the whole command the player typed, a
+  trigger is something inside a line the server sent. Captures are
+  non-greedy so a capture stops at the literal that follows it, except a
+  trailing one, which has nothing to stop at and takes the rest.
+
+  Plain patterns compile *to* a regex at load (`engine::pattern`), so
+  everything downstream — captures, `${...}` expansion, `highlight:`,
+  `when:` guards — sees one matching engine, not two.
 - **Variable:** string values in a per-session store; substituted into
   send/echo actions as `${name}`; captures bind `${1}`, `${name}` from
   named groups. All matching uses the `regex` crate: Unicode-aware classes,
@@ -376,12 +397,12 @@ gmcp_packages: ["Group 1"]        # extra GMCP packages to ask for, §6.3
 variables:
   heal_at: "40"
 aliases:
-  - pattern: '^hh$'
+  - pattern: 'hh'                   # the whole command, matched literally
     send: ["cast heal ${target}"]
 triggers:
-  - pattern: '^(?P<who>\p{L}+) has arrived\.$'
+  - pattern: '{who} has arrived.'   # `{who}` binds `${who}`; `.` is a `.`
     send: ["look ${who}"]
-  - pattern: '^Your health: (?P<hp>\d+)%'
+  - regex: '^Your health: (?P<hp>\d+)%'   # raw regex, for what plain can't say
     when: '${hp} < ${heal_at}'      # optional guard, §7.6 (M8)
     send: ["quaff heal"]
     gag: false
@@ -517,7 +538,7 @@ action alongside `send`:
 ```yaml
 # tank profile — heal me when I drop below 40%
 triggers:
-  - pattern: '^HP: (?P<hp>\d+)%'
+  - regex: '^HP: (?P<hp>\d+)%'
     when: '${hp} < 40'              # optional guard, §7.6 (M8)
     send_to:
       cleric: ["cast 'major heal' Grunk"]
@@ -644,7 +665,7 @@ if its pattern matches **and** the condition evaluates true:
 
 ```yaml
 triggers:
-  - pattern: '^Your health: (?P<hp>\d+)%'
+  - regex: '^Your health: (?P<hp>\d+)%'
     when: '${hp} < ${heal_at}'
     send: ["quaff heal"]
 ```
@@ -729,10 +750,10 @@ pane it moves nothing and hides nothing, so it is safe to apply liberally.
 
 ```yaml
 triggers:
-  - pattern: '\bKestrel\b'
+  - regex: '\bKestrel\b'
     highlight: {fg: bright_yellow, bold: true}
   - id: low-hp
-    pattern: '^You are bleeding'
+    pattern: 'You are bleeding'
     highlight: {fg: white, bg: red, whole_line: true}
 ```
 
@@ -1115,10 +1136,14 @@ keyring-only (§10.1) and never grows a field here.
 - **A keyboard line-cursor over the scrollback** (`Alt+V`, building on the
   scroll state in §11.5) turns something a player just saw into a trigger:
   `↑`/`↓` move a highlighted line, `Enter` opens the editor straight into a
-  new trigger with that line's text — regex-escaped verbatim, not
-  auto-detected into capture groups, since a wrong guess there produces a
-  pattern that looks plausible but doesn't reliably match — as its starting
-  `pattern:`, ready to hand-edit into a real one.
+  new trigger with that line's text — verbatim, not auto-detected into
+  capture groups, since a wrong guess there produces a pattern that looks
+  plausible but doesn't reliably match — as its starting `pattern:`, ready
+  to hand-edit into a real one. Plain patterns (§7.1) are what make that
+  prefill readable: only `*`, `{`, `}` and `\` need escaping, so what the
+  player is handed is the line they picked rather than a regex-escaped
+  rendering of it, and generalising it means replacing a word with
+  `{name}` rather than learning capture-group syntax.
 - **Deferred**, deliberately: editing `global.yaml` or a shared module from
   here, git-backed history (a plain backup directory covers "I broke it
   earlier" without a repository's worth of machinery), renaming a profile
@@ -1172,14 +1197,17 @@ spam — and conversely, so slow conversations stay visible.
   ```yaml
   channels:
     - name: comms
-      match: ['^\[gossip\]', '^\w+ tells you']
+      pattern: ['[gossip]', '{who} tells you']
+      regex: ['^\[(gossip|auction)\]']   # for what plain can't say
       keep_in_main: false     # move (default) or copy
       timestamps: true
       persist: true           # survives a restart (default)
   ```
 
-  `match` is sugar that compiles to ordinary route triggers, so channel
-  classification gets the engine's full regex/Unicode machinery; lines that
+  `pattern` takes plain patterns and `regex` regexes — a rule's two keys,
+  named the same here because that is what they compile to (§7.1). Both
+  are sugar for ordinary route triggers, so channel classification gets
+  the engine's full machinery; lines that
   need context to classify can be routed explicitly with a trigger's
   `route: comms` action (§7.1) from any scope layer.
 - **Aggregation:** channels are app-level and aggregate across sessions —

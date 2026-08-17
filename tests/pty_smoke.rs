@@ -172,7 +172,7 @@ fn adds_a_trigger_through_the_config_editor_and_saves_it_live() {
     app.send(b"a"); // add a new trigger, opening its form on `id`
     app.send(DOWN); // -> pattern
     app.send(b"\r"); // begin editing it
-    app.send(b"^zap$");
+    app.send(b"zap");
     app.send(b"\r"); // commit the pattern
     app.send(DOWN); // -> when
     app.send(DOWN); // -> send
@@ -208,7 +208,8 @@ fn adds_a_trigger_through_the_config_editor_and_saves_it_live() {
 
 /// The scrollback line-cursor (§10.2/§11.5): `Alt+V` picks a line, `Enter`
 /// opens the profile editor straight into a new trigger with that line's
-/// text, regex-escaped, as its starting pattern.
+/// text as its starting pattern — plain, so what is prefilled is the line
+/// the player picked rather than an escaped rendering of it.
 #[test]
 fn picks_a_scrollback_line_into_a_new_trigger_pattern() {
     let mud = FakeMud::start();
@@ -465,7 +466,7 @@ fn write_config(dir: &Path, port: u16, quit: Option<&str>) {
     }
     std::fs::write(
         dir.join("modules/combat.yaml"),
-        "name: combat\nvariables:\n  target: kobold\naliases:\n  - id: kill\n    pattern: '^k$'\n    send: [\"kill ${target}\"]\n",
+        "name: combat\nvariables:\n  target: kobold\naliases:\n  - id: kill\n    pattern: 'k'\n    send: [\"kill ${target}\"]\n",
     )
     .unwrap();
     std::fs::write(

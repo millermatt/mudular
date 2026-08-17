@@ -495,10 +495,17 @@ impl CrossSession {
 #[serde(deny_unknown_fields)]
 pub struct Channel {
     pub name: String,
-    /// Sugar: each pattern compiles to an ordinary route trigger, so
-    /// classification gets the engine's full regex machinery.
-    #[serde(default, rename = "match")]
-    pub matches: Vec<String>,
+    /// Sugar: each plain pattern (§7.1) compiles to an ordinary route
+    /// trigger, so classification gets the engine's full machinery. Named
+    /// as a rule's keys are, because that is what these become — a channel
+    /// is a place to put lines, not a second pattern language.
+    #[serde(default, rename = "pattern")]
+    pub patterns: Vec<String>,
+    /// The same, for classification a plain pattern cannot express — a
+    /// channel tag that varies, say. Unlike a rule, a channel may use both:
+    /// these are two lists, not two answers to one question.
+    #[serde(default, rename = "regex")]
+    pub regexes: Vec<String>,
     /// `false` (the default) moves matching lines out of the main
     /// scrollback; `true` mirrors them to both.
     #[serde(default)]
@@ -1679,12 +1686,14 @@ fn check_trigger_hygiene(triggers: &[Trigger]) -> Result<()> {
         // pattern-less rule is an override by the engine's own definition —
         // `merge_layer` already rejects one that patches nothing. Demanding
         // an action from either made the documented shape unsaveable.
-        let is_override = trigger.enabled == Some(false) || trigger.pattern.is_none();
+        let matches_something = trigger.pattern.is_some() || trigger.regex.is_some();
+        let is_override = trigger.enabled == Some(false) || !matches_something;
         if no_action && !is_override {
             let label = trigger
                 .id
                 .as_deref()
                 .or(trigger.pattern.as_deref())
+                .or(trigger.regex.as_deref())
                 .unwrap_or("(unnamed)");
             bail!(
                 "trigger `{label}` matches but has no action — nothing to \
@@ -1707,10 +1716,24 @@ fn channel_module(channels: &[Channel], profile: Option<&str>) -> RuleModule {
         {
             continue;
         }
-        for (index, pattern) in channel.matches.iter().enumerate() {
+        for (index, pattern) in channel.patterns.iter().enumerate() {
             triggers.push(Trigger {
                 id: Some(format!("channel:{}:{index}", channel.name)),
                 pattern: Some(pattern.clone()),
+                route: Some(channel.name.clone()),
+                ..Trigger::default()
+            });
+        }
+        // Numbered on from the plain ones, so a channel using both lists
+        // cannot give two of its triggers the same id.
+        for (index, regex) in channel.regexes.iter().enumerate() {
+            triggers.push(Trigger {
+                id: Some(format!(
+                    "channel:{}:{}",
+                    channel.name,
+                    channel.patterns.len() + index
+                )),
+                regex: Some(regex.clone()),
                 route: Some(channel.name.clone()),
                 ..Trigger::default()
             });
@@ -2420,11 +2443,11 @@ variables:
   target: rat
 aliases:
   - id: quicklook
-    pattern: '^ll$'
+    regex: '^ll$'
     send: ["look"]
 triggers:
   - id: greet
-    pattern: '^(?P<who>\w+) has arrived\.$'
+    regex: '^(?P<who>\w+) has arrived\.$'
     send: ["say welcome ${who}"]
 "#,
         )
@@ -2438,11 +2461,11 @@ variables:
   target: kobold
 aliases:
   - id: kill
-    pattern: '^k$'
+    regex: '^k$'
     send: ["kill ${target}"]
 triggers:
   - id: autoloot
-    pattern: 'is DEAD'
+    regex: 'is DEAD'
     send: ["get all corpse"]
 "#,
         )
@@ -2668,7 +2691,7 @@ triggers:
 
     fn trigger(pattern: &str) -> Trigger {
         Trigger {
-            pattern: Some(pattern.to_string()),
+            regex: Some(pattern.to_string()),
             ..Trigger::default()
         }
     }
@@ -2975,7 +2998,8 @@ triggers:
     fn channel(name: &str, patterns: &[&str], keep_in_main: bool) -> Channel {
         Channel {
             name: name.to_string(),
-            matches: patterns.iter().map(|s| s.to_string()).collect(),
+            patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            regexes: Vec::new(),
             keep_in_main,
             timestamps: false,
             session: None,
@@ -3081,12 +3105,12 @@ triggers:
     }
 
     /// `match:` is sugar for route triggers, so classification gets the
-    /// engine's full regex machinery — and `keep_in_main: false` (the
-    /// default) becomes the gag that moves the line out of main.
+    /// engine's full machinery — and `keep_in_main: false` (the default)
+    /// becomes the gag that moves the line out of main.
     #[test]
     fn a_channel_match_compiles_to_a_gagging_route_trigger() {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
-        let channels = [channel("comms", &[r"^\w+ tells you"], false)];
+        let channels = [channel("comms", &["{who} tells you"], false)];
 
         let layers = load_rules(dir.path(), None, &channels).unwrap();
         let mut engine = crate::engine::Engine::compile(&layers).unwrap();
@@ -3099,7 +3123,7 @@ triggers:
     #[test]
     fn keep_in_main_copies_the_line_instead_of_moving_it() {
         let dir = crate::net::pins::tests::tempdir::TempDir::new();
-        let channels = [channel("comms", &[r"^\w+ tells you"], true)];
+        let channels = [channel("comms", &["{who} tells you"], true)];
 
         let layers = load_rules(dir.path(), None, &channels).unwrap();
         let mut engine = crate::engine::Engine::compile(&layers).unwrap();
@@ -3107,6 +3131,28 @@ triggers:
         let outcome = engine.process_line("Bob tells you hi");
         assert_eq!(outcome.route.as_deref(), Some("comms"));
         assert!(!outcome.gag);
+    }
+
+    /// A channel's `pattern:` is plain and its `regex:` is not, and it may
+    /// use both — they are two lists, not two answers to one question, so the
+    /// ids they generate must not collide either.
+    #[test]
+    fn a_channel_can_classify_by_plain_pattern_and_by_regex_at_once() {
+        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let mut channels = [channel("comms", &["{who} tells you"], false)];
+        channels[0].regexes = vec![r"^\[(gossip|auction)\]".to_string()];
+
+        let layers = load_rules(dir.path(), None, &channels).unwrap();
+        let mut engine = crate::engine::Engine::compile(&layers).unwrap();
+
+        assert_eq!(
+            engine.process_line("Bob tells you hi").route.as_deref(),
+            Some("comms")
+        );
+        assert_eq!(
+            engine.process_line("[gossip] Bob: hi").route.as_deref(),
+            Some("comms")
+        );
     }
 
     /// A trigger that routes explicitly inherits the channel's move-vs-copy
@@ -3143,7 +3189,7 @@ triggers:
             .unwrap();
         }
 
-        let mut channels = [channel("tankchat", &["^chat:"], false)];
+        let mut channels = [channel("tankchat", &["chat:"], false)];
         channels[0].session = Some("tank".to_string());
 
         let engine = |profile: &str| {
@@ -3183,7 +3229,7 @@ triggers:
             r#"
             channels:
               - name: comms
-                match: ['^\[gossip\]']
+                regex: ['^\[gossip\]']
                 keep_in_main: true
                 timestamps: true
                 session: tank
@@ -3192,7 +3238,7 @@ triggers:
         .unwrap();
         let channel = &config.channels[0];
         assert_eq!(channel.name, "comms");
-        assert_eq!(channel.matches, vec![r"^\[gossip\]"]);
+        assert_eq!(channel.regexes, vec![r"^\[gossip\]"]);
         assert!(channel.keep_in_main);
         assert!(channel.timestamps);
         assert_eq!(channel.session.as_deref(), Some("tank"));
@@ -3517,7 +3563,7 @@ triggers:
 
         let mut alias = Alias {
             id: Some("quicklook".to_string()),
-            pattern: Some("^ll$".to_string()),
+            regex: Some("^ll$".to_string()),
             send: Some(vec!["look".to_string()]),
             ..Default::default()
         };
@@ -3536,7 +3582,7 @@ triggers:
 
         let trigger = Trigger {
             id: Some("greet".to_string()),
-            pattern: Some(r"^(?P<who>\w+) has arrived\.$".to_string()),
+            regex: Some(r"^(?P<who>\w+) has arrived\.$".to_string()),
             send: Some(vec!["say welcome ${who}".to_string()]),
             gag: Some(false),
             route: Some("chat".to_string()),
@@ -3582,7 +3628,7 @@ triggers:
 
         let trigger = Trigger {
             id: Some("x".to_string()),
-            pattern: Some("x".to_string()),
+            regex: Some("x".to_string()),
             enabled: Some(false),
             ..Default::default()
         };

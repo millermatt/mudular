@@ -23,7 +23,7 @@ use tui_input::backend::crossterm::EventHandler;
 use ratatui::style::Color;
 
 use crate::config::{self, Channel, CrossSession, Keybinds};
-use crate::engine::{Engine, PeerSnapshot};
+use crate::engine::{self, Engine, PeerSnapshot};
 use crate::proto::charset::Charset;
 use crate::scrollback::{Origin, RetainedLine};
 use crate::session::{self, PeerLinks, SessionCommand, SessionEvent};
@@ -1535,7 +1535,7 @@ fn open_new_trigger_from_line(state: &mut AppState, channels: &[Channel], back_o
     else {
         return;
     };
-    let pattern = regex::escape(raw.plain());
+    let pattern = engine::pattern_escape(raw.plain());
     let (dir, profile) = session.rules.clone();
     let Some(name) = profile else {
         if let Some(session) = state.bound_mut() {
@@ -4204,7 +4204,8 @@ pub(crate) mod test_support {
     pub(crate) fn channel(name: &str) -> Channel {
         Channel {
             name: name.to_string(),
-            matches: Vec::new(),
+            patterns: Vec::new(),
+            regexes: Vec::new(),
             keep_in_main: false,
             timestamps: false,
             session: None,
@@ -6339,7 +6340,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("modules/combat.yaml"),
-            format!("name: combat\naliases:\n  - pattern: '^x$'\n    send: [\"{send}\"]\n"),
+            format!("name: combat\naliases:\n  - regex: '^x$'\n    send: [\"{send}\"]\n"),
         )
         .unwrap();
         dir
@@ -6377,10 +6378,13 @@ mod tests {
             .expect("a new trigger was added, with a pattern");
         assert_eq!(
             pattern,
-            regex::escape(&crate::scrollback::strip_ansi(line)),
+            engine::pattern_escape(&crate::scrollback::strip_ansi(line)),
             "the pattern must be built from the projection triggers match"
         );
-        assert_eq!(pattern, regex::escape("The kobold is DEAD!"));
+        // A plain pattern only escapes its own syntax, so what the player is
+        // handed to edit is the line they picked, not a thicket of
+        // backslashes.
+        assert_eq!(pattern, "The kobold is DEAD!");
     }
 
     #[tokio::test]
@@ -6391,7 +6395,7 @@ mod tests {
         // Edit the module on disk, exactly as a player would.
         std::fs::write(
             dir.path().join("modules/combat.yaml"),
-            "name: combat\naliases:\n  - pattern: '^x$'\n    send: [\"new\"]\n",
+            "name: combat\naliases:\n  - regex: '^x$'\n    send: [\"new\"]\n",
         )
         .unwrap();
 
@@ -6415,7 +6419,7 @@ mod tests {
 
         std::fs::write(
             dir.path().join("modules/combat.yaml"),
-            "name: combat\naliases:\n  - pattern: '('\n",
+            "name: combat\naliases:\n  - regex: '('\n",
         )
         .unwrap();
 
