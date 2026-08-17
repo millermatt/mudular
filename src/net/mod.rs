@@ -386,8 +386,8 @@ mod tests {
     use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-    use super::pins::tests::tempdir::TempDir;
     use super::*;
+    use crate::test_support::TempDir;
 
     /// A self-signed TLS server, like the ones MUDs commonly run. Returns
     /// its port and the SHA-256 of the certificate it presents.

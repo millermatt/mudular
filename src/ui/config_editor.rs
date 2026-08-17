@@ -1520,7 +1520,7 @@ fn tabs_line(current: Section) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::pins::tests::tempdir::TempDir;
+    use crate::test_support::TempDir;
 
     fn minimal(name: &str) -> Profile {
         Profile {

@@ -2064,7 +2064,7 @@ mod tests {
     /// rooms — nor their `/mark` labels — are the one that loses.
     #[test]
     fn old_per_character_maps_are_folded_into_the_world() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut hers = crate::map::Map::default();
         hers.observe(&sample_room(1, "Temple Square"));
         hers.set_mark(crate::map::RoomId(1), Some("shop".to_string()));
@@ -2093,7 +2093,7 @@ mod tests {
     /// it happen once, rather than resurrecting rooms deleted later.
     #[test]
     fn adopting_sets_the_old_file_aside_rather_than_removing_it() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut old = crate::map::Map::default();
         old.observe(&sample_room(1, "Temple Square"));
         save_map(dir.path(), "mathias", &old, &HashSet::new()).unwrap();
@@ -2117,7 +2117,7 @@ mod tests {
 
     #[test]
     fn a_missing_map_file_loads_as_empty() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         assert_eq!(load_map(dir.path(), "kestrel"), crate::map::Map::default());
     }
 
@@ -2126,7 +2126,7 @@ mod tests {
     /// file that can also be *present and broken*, not just missing.
     #[test]
     fn a_corrupt_map_file_loads_as_empty_rather_than_panicking() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = map_path(dir.path(), "kestrel");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ not json at all").unwrap();
@@ -2145,7 +2145,7 @@ mod tests {
 
     #[test]
     fn a_saved_map_round_trips_through_load_map() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut map = crate::map::Map::default();
         map.observe(&sample_room(1, "Temple Square"));
         map.connect(crate::map::RoomId(1), "n", crate::map::RoomId(2));
@@ -2168,7 +2168,7 @@ mod tests {
 
     #[test]
     fn the_layout_round_trips() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let saved = UiState {
             show_channels: false,
             show_hud: Some(false),
@@ -2188,7 +2188,7 @@ mod tests {
     /// played, so a layout that never mentions it must not answer for it.
     #[test]
     fn a_layout_from_before_the_strip_leaves_it_unanswered() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         std::fs::write(
             dir.path().join("ui_state.json"),
             br#"{"show_channels":true,"show_map":false,"show_inspector":false,
@@ -2206,7 +2206,7 @@ mod tests {
     /// defaults are what a first run is for.
     #[test]
     fn no_remembered_layout_is_not_an_error() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         assert_eq!(load_ui_state(dir.path()), None);
     }
 
@@ -2215,7 +2215,7 @@ mod tests {
     /// would have been data loss.
     #[test]
     fn an_unreadable_layout_falls_back_to_the_configured_one() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         std::fs::write(dir.path().join("ui_state.json"), b"{ not json").unwrap();
 
         assert_eq!(load_ui_state(dir.path()), None);
@@ -2225,7 +2225,7 @@ mod tests {
     /// hand-edited, with comments, and must be left exactly as written.
     #[test]
     fn remembering_the_layout_does_not_touch_the_config_file() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let config = "# my notes\nchannel_width: 40\n";
         std::fs::write(dir.path().join("mudular.yaml"), config).unwrap();
 
@@ -2252,7 +2252,7 @@ mod tests {
 
     #[test]
     fn save_map_refuses_to_overwrite_a_map_it_could_not_read() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("maps").join("kestrel.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{ this is not json").unwrap();
@@ -2275,7 +2275,7 @@ mod tests {
     /// The other half — a missing file is not a failure, it is a first run.
     #[test]
     fn save_map_still_writes_when_there_is_nothing_on_disk_yet() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut session = crate::map::Map::default();
         session.observe(&sample_room(1, "Temple Square"));
 
@@ -2290,7 +2290,7 @@ mod tests {
 
     #[test]
     fn save_map_merges_with_what_is_already_on_disk() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
 
         let mut first = crate::map::Map::default();
         first.observe(&sample_room(1, "Temple Square"));
@@ -2330,7 +2330,7 @@ mod tests {
     /// merge that protects against a stale session blanking it out.
     #[test]
     fn removing_a_mark_survives_a_save_even_though_disk_still_has_it() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
 
         let mut marked = crate::map::Map::default();
         marked.observe(&sample_room(1, "Temple Square"));
@@ -2359,7 +2359,7 @@ mod tests {
     /// for every room.
     #[test]
     fn a_room_outside_explicit_marks_still_keeps_its_disk_mark() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
 
         let mut marked = crate::map::Map::default();
         marked.observe(&sample_room(1, "Temple Square"));
@@ -2383,7 +2383,7 @@ mod tests {
 
     #[test]
     fn has_profiles_is_false_until_the_profiles_dir_has_one() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         assert!(!has_profiles(dir), "neither the dir nor a profile exists");
 
@@ -2399,7 +2399,7 @@ mod tests {
     /// the moment a saved profile fails to load back.
     #[test]
     fn a_wizard_profile_round_trips_through_load_profile() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         let new_profile = NewProfile {
             name: "kestrel".to_string(),
@@ -2421,7 +2421,7 @@ mod tests {
     /// reason this is serialized rather than hand-formatted.
     #[test]
     fn a_host_with_yaml_special_characters_survives_the_round_trip() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         let new_profile = NewProfile {
             name: "weird".to_string(),
@@ -2443,7 +2443,7 @@ mod tests {
     /// own layer actually reaching the merge in the right order.
     #[test]
     fn two_profiles_share_a_module_and_layer_it_differently() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
         std::fs::create_dir_all(dir.join("modules")).unwrap();
@@ -2549,7 +2549,7 @@ triggers:
     /// module that declared them (§7.4).
     #[test]
     fn a_module_loads_the_scripts_it_declares_from_beside_itself() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("modules")).unwrap();
         std::fs::write(
@@ -2573,7 +2573,7 @@ triggers:
     /// is a name — not a way to reach the rest of the filesystem.
     #[test]
     fn a_script_name_that_is_a_path_is_refused() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("modules")).unwrap();
         std::fs::write(
@@ -2592,7 +2592,7 @@ triggers:
     /// only one character loads adds the packages that character needs.
     #[test]
     fn global_and_module_layers_both_declare_gmcp_packages() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
         std::fs::create_dir_all(dir.join("modules")).unwrap();
@@ -2622,7 +2622,7 @@ triggers:
     /// worse than one that refused to.
     #[test]
     fn a_missing_script_names_the_file() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("modules")).unwrap();
         std::fs::write(
@@ -2640,7 +2640,7 @@ triggers:
     /// which profile, not just "file not found".
     #[test]
     fn a_missing_module_names_the_profile_that_wanted_it() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
         std::fs::write(
@@ -2660,7 +2660,7 @@ triggers:
     /// victim's disk and fold its contents into the rule engine.
     #[test]
     fn a_module_name_that_is_a_path_is_refused() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
         // The escape route: `modules/` must actually exist for `..` to
@@ -2686,7 +2686,7 @@ triggers:
     /// construction against a draft that isn't on disk yet.
     #[test]
     fn validate_profile_rules_also_refuses_a_module_path() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
         std::fs::create_dir_all(dir.join("modules")).unwrap();
@@ -2872,7 +2872,7 @@ triggers:
     /// including one the user has deliberately emptied.
     #[test]
     fn write_starter_app_config_does_not_overwrite() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
 
         assert!(write_starter_app_config(dir).expect("first write"));
@@ -2895,7 +2895,7 @@ triggers:
     /// not just the standalone function.
     #[test]
     fn validate_profile_rules_refuses_a_no_op_trigger() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
 
@@ -2913,7 +2913,7 @@ triggers:
     /// findings, Low #5).
     #[test]
     fn validate_profile_rules_does_not_double_the_backticks_around_a_profile_name() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
 
@@ -3026,7 +3026,7 @@ triggers:
 
     #[test]
     fn a_channel_pane_round_trips_through_its_file() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut lines = std::collections::VecDeque::new();
         lines.push_back(RetainedLine::server("\x1b[36mBob gossips hi\x1b[0m"));
         lines.push_back(RetainedLine::with_origin(
@@ -3054,7 +3054,7 @@ triggers:
     /// with the time it was *read* would say a week-old tell just came in.
     #[test]
     fn a_restored_line_keeps_the_time_it_arrived() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut line = RetainedLine::server("Bob tells you hi");
         line.at -= chrono::TimeDelta::days(7);
         let lines = std::collections::VecDeque::from(vec![line.clone()]);
@@ -3068,7 +3068,7 @@ triggers:
     /// keep a long evening in view has not asked for a file to match.
     #[test]
     fn only_the_newest_lines_are_persisted() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let lines: std::collections::VecDeque<RetainedLine> = (0..PERSISTED_LINES + 100)
             .map(|n| RetainedLine::server(format!("line {n}")))
             .collect();
@@ -3084,7 +3084,7 @@ triggers:
     /// it would stack a fresh one under the last one at every launch.
     #[test]
     fn the_clients_own_notices_are_not_persisted() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut lines = std::collections::VecDeque::new();
         lines.push_back(RetainedLine::server("Bob gossips hi"));
         lines.push_back(RetainedLine::client("** end of saved comms"));
@@ -3101,7 +3101,7 @@ triggers:
     /// reason the client will not start.
     #[test]
     fn an_unparsable_file_is_an_empty_pane() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = comms_path(dir.path(), "comms");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ not json").unwrap();
@@ -3122,7 +3122,7 @@ triggers:
     /// becomes the gag that moves the line out of main.
     #[test]
     fn a_channel_match_compiles_to_a_gagging_route_trigger() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let channels = [channel("comms", &["{who} tells you"], false)];
 
         let layers = load_rules(dir.path(), None, &channels).unwrap();
@@ -3135,7 +3135,7 @@ triggers:
 
     #[test]
     fn keep_in_main_copies_the_line_instead_of_moving_it() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let channels = [channel("comms", &["{who} tells you"], true)];
 
         let layers = load_rules(dir.path(), None, &channels).unwrap();
@@ -3151,7 +3151,7 @@ triggers:
     /// ids they generate must not collide either.
     #[test]
     fn a_channel_can_classify_by_plain_pattern_and_by_regex_at_once() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut channels = [channel("comms", &["{who} tells you"], false)];
         channels[0].regexes = vec![r"^\[(gossip|auction)\]".to_string()];
 
@@ -3172,7 +3172,7 @@ triggers:
     /// setting: that is a property of the channel, not of each rule.
     #[test]
     fn an_explicit_route_inherits_the_channels_move_setting() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         std::fs::write(
             dir.path().join("global.yaml"),
             "name: global\ntriggers:\n  - pattern: 'the guild announces'\n    route: comms\n",
@@ -3192,7 +3192,7 @@ triggers:
     /// anything in the other sessions.
     #[test]
     fn a_pinned_channel_only_compiles_into_its_own_session() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
         for name in ["tank", "cleric"] {
             std::fs::write(
@@ -3223,7 +3223,7 @@ triggers:
     /// drawn — they must fail loudly, like any other config typo.
     #[test]
     fn a_route_to_an_undeclared_channel_is_rejected() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         std::fs::write(
             dir.path().join("global.yaml"),
             "name: global\ntriggers:\n  - pattern: 'x'\n    route: coms\n",
@@ -3288,7 +3288,7 @@ triggers:
     /// file into a growing list of the same name.
     #[test]
     fn a_refusal_is_recorded_per_profile_and_only_once() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let dir = dir.path();
 
         assert!(!password_save_declined(dir, "kestrel"));
@@ -3345,7 +3345,7 @@ triggers:
 
     #[test]
     fn atomic_write_leaves_no_partial_file() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         atomic_write(&path, b"host: h\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "host: h\n");
@@ -3364,7 +3364,7 @@ triggers:
     fn atomic_write_creates_the_file_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         atomic_write(&path, b"host: h\n").unwrap();
 
@@ -3374,7 +3374,7 @@ triggers:
 
     #[test]
     fn atomic_write_cleans_up_its_temp_file_on_a_write_failure() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         // A directory where the target file should be turns "create the temp
         // file" into an error, exercising the cleanup path.
         let profiles_dir = dir.path().join("profiles");
@@ -3396,7 +3396,7 @@ triggers:
 
     #[test]
     fn save_creates_a_timestamped_backup_of_the_previous_version() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         let first = minimal_profile("kestrel", "first.example.org");
         atomic_write(&path, serde_yaml::to_string(&first).unwrap().as_bytes()).unwrap();
@@ -3422,7 +3422,7 @@ triggers:
 
     #[test]
     fn prune_keeps_only_the_newest_backups() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         let backup_dir = backup_dir_for(&path).unwrap();
         std::fs::create_dir_all(&backup_dir).unwrap();
@@ -3452,7 +3452,7 @@ triggers:
 
     #[test]
     fn conflict_is_detected_when_the_file_changed_on_disk() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         let original = minimal_profile("kestrel", "original.example.org");
         atomic_write(&path, serde_yaml::to_string(&original).unwrap().as_bytes()).unwrap();
@@ -3475,7 +3475,7 @@ triggers:
 
     #[test]
     fn overwrite_mode_ignores_the_conflict_but_still_backs_up_the_interloper() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         let original = minimal_profile("kestrel", "original.example.org");
         atomic_write(&path, serde_yaml::to_string(&original).unwrap().as_bytes()).unwrap();
@@ -3501,7 +3501,7 @@ triggers:
 
     #[test]
     fn two_saves_in_one_editor_session_do_not_self_conflict() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         let original = minimal_profile("kestrel", "one.example.org");
         atomic_write(&path, serde_yaml::to_string(&original).unwrap().as_bytes()).unwrap();
@@ -3515,7 +3515,7 @@ triggers:
 
     #[test]
     fn missing_file_reports_vanished() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         let original = minimal_profile("kestrel", "one.example.org");
         atomic_write(&path, serde_yaml::to_string(&original).unwrap().as_bytes()).unwrap();
@@ -3529,7 +3529,7 @@ triggers:
 
     #[test]
     fn unchanged_profile_saves_are_byte_identical() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         let mut profile = minimal_profile("kestrel", "h.example.org");
         profile
@@ -3550,7 +3550,7 @@ triggers:
 
     #[test]
     fn round_trips_a_profile_with_every_field_type() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.path().join("profiles").join("kestrel.yaml");
         let mut profile = minimal_profile("kestrel", "underworld.example.org");
         profile.tls = TlsSettings {

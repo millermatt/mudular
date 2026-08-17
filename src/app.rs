@@ -4331,7 +4331,7 @@ mod tests {
     /// would otherwise write one file per frame, most of them identical.
     #[test]
     fn a_map_debug_writer_only_writes_when_the_snapshot_changes() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut writer = MapDebugWriter::new(dir.path().to_path_buf());
         let mut state = test_support::app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
@@ -4366,7 +4366,7 @@ mod tests {
     /// called at all.
     #[test]
     fn an_unchanged_frame_never_pays_for_the_screen_text() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut writer = MapDebugWriter::new(dir.path().to_path_buf());
         let mut state = test_support::app(&["tank"]);
         put_room(state.map_of_mut(0), 1, None, &[]);
@@ -5046,7 +5046,7 @@ mod tests {
     /// tell sits above tonight's first line and reads as new.
     #[test]
     fn a_restored_pane_says_where_the_saved_lines_end() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut saved = VecDeque::new();
         saved.push_back(RetainedLine::server("Bob tells you hi"));
         config::save_comms(dir.path(), "comms", &saved).unwrap();
@@ -5068,7 +5068,7 @@ mod tests {
     /// history that isn't there.
     #[test]
     fn a_pane_with_nothing_saved_opens_empty() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         assert!(restored_comms(dir.path(), &persisting("comms"), 10_000).is_empty());
     }
 
@@ -5077,7 +5077,7 @@ mod tests {
     /// file written before the setting changed must not be read anyway.
     #[test]
     fn a_channel_that_does_not_persist_starts_empty() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut saved = VecDeque::new();
         saved.push_back(RetainedLine::server("Bob tells you hi"));
         config::save_comms(dir.path(), "comms", &saved).unwrap();
@@ -5089,7 +5089,7 @@ mod tests {
     /// must not hand a pane more lines than it is willing to hold.
     #[test]
     fn restoring_respects_the_panes_own_scrollback_bound() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let saved: VecDeque<RetainedLine> = (0..50)
             .map(|n| RetainedLine::server(format!("line {n}")))
             .collect();
@@ -5106,7 +5106,7 @@ mod tests {
     /// at all.
     #[test]
     fn quitting_writes_the_persisting_panes_and_only_those() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank", "cleric"]);
         state.config_dir = dir.path().to_path_buf();
         with_channel(&mut state, "comms", false);
@@ -5695,7 +5695,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_masked_login_password_is_offered_to_the_keyring() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, mut receivers) = armed(dir.path());
 
         submit(&mut state, "hunter2").await;
@@ -5721,7 +5721,7 @@ mod tests {
     /// offered to the keyring.
     #[tokio::test]
     async fn an_unmasked_line_is_never_taken_for_a_password() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = armed(dir.path());
         state.sessions[0].masked = false;
 
@@ -5735,7 +5735,7 @@ mod tests {
     /// rather than one per login.
     #[tokio::test]
     async fn refusing_is_recorded_against_the_profile() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = armed(dir.path());
         submit(&mut state, "hunter2").await;
 
@@ -5750,7 +5750,7 @@ mod tests {
     /// next login rather than automate it.
     #[tokio::test]
     async fn a_rejected_password_is_never_offered_to_the_keyring() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = armed(dir.path());
         submit(&mut state, "wrong").await;
 
@@ -5776,7 +5776,7 @@ mod tests {
     /// so nothing asks about the password it types at a masked prompt.
     #[tokio::test]
     async fn a_profile_with_a_stored_password_is_never_asked() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = armed(dir.path());
         // What `autologin` produces when the keyring already has one.
         state.sessions[0].offer_password_save = false;
@@ -5791,7 +5791,7 @@ mod tests {
     /// as a refusal either — it just drops the held password.
     #[tokio::test]
     async fn a_stray_key_drops_the_offer_without_recording_a_refusal() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = armed(dir.path());
         submit(&mut state, "hunter2").await;
 
@@ -6329,8 +6329,8 @@ mod tests {
     // ---- /reload (docs/ARCHITECTURE.md §7.3) ----
 
     /// Writes a config dir with one module the profile pulls in.
-    fn config_with_alias(send: &str) -> crate::net::pins::tests::tempdir::TempDir {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+    fn config_with_alias(send: &str) -> crate::test_support::TempDir {
+        let dir = crate::test_support::TempDir::new();
         std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
         std::fs::create_dir_all(dir.path().join("modules")).unwrap();
         std::fs::write(
@@ -6636,7 +6636,7 @@ mod tests {
 
     #[test]
     fn the_wizard_collects_all_four_fields_then_reports_done() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut wizard = NewProfileWizard::new(dir.path().to_path_buf());
 
         assert!(matches!(
@@ -6668,7 +6668,7 @@ mod tests {
     /// silently overwrite the existing file.
     #[test]
     fn the_wizard_rejects_a_name_that_already_exists() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         config::save_new_profile(
             dir.path(),
             &config::NewProfile {
@@ -6701,7 +6701,7 @@ mod tests {
     /// terminal's full width (UX_REVIEW.md, Adversarial findings, Low #6).
     #[test]
     fn the_wizard_rejects_a_name_longer_than_the_cap() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let mut wizard = NewProfileWizard::new(dir.path().to_path_buf());
 
         let too_long = "x".repeat(MAX_PROFILE_NAME_LEN + 1);
@@ -6725,7 +6725,7 @@ mod tests {
 
     #[tokio::test]
     async fn newprofile_command_opens_the_form_and_saving_writes_the_file() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.config_dir = dir.path().to_path_buf();
 
@@ -6755,7 +6755,7 @@ mod tests {
 
     #[tokio::test]
     async fn escape_cancels_the_newprofile_form_without_saving() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.config_dir = dir.path().to_path_buf();
 
@@ -6774,7 +6774,7 @@ mod tests {
     /// sessions keep receiving and rendering while the form is up (§15).
     #[tokio::test]
     async fn other_sessions_keep_running_while_the_form_is_open() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank", "cleric"]);
         state.config_dir = dir.path().to_path_buf();
 
@@ -6856,7 +6856,7 @@ mod tests {
     /// longer exploring into nothing.
     #[test]
     fn an_ad_hoc_session_now_keeps_its_map() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["adhoc"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), None);
         state.config_dir = dir.path().to_path_buf();
@@ -6874,7 +6874,7 @@ mod tests {
     /// is the whole point of keeping the graph on disk.
     #[test]
     fn a_profile_session_saves_its_map_where_it_can_be_loaded_again() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
         state.config_dir = dir.path().to_path_buf();
@@ -7330,7 +7330,7 @@ mod tests {
 
     #[test]
     fn a_periodic_save_writes_the_map_and_marks_it_clean() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
         state.config_dir = dir.path().to_path_buf();
@@ -7357,7 +7357,7 @@ mod tests {
     /// survive a restart rather than quietly reviving on the next launch.
     #[test]
     fn unmarking_a_room_survives_a_reload_after_it_was_already_saved_once() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
         state.config_dir = dir.path().to_path_buf();
@@ -7393,7 +7393,7 @@ mod tests {
     /// every interval, forever.
     #[test]
     fn a_periodic_save_with_nothing_new_writes_nothing() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
         state.config_dir = dir.path().to_path_buf();
@@ -7419,7 +7419,7 @@ mod tests {
     /// invent one just because the timer fired.
     #[test]
     fn a_periodic_save_skips_a_session_with_no_world() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["adhoc"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), None);
         state.config_dir = dir.path().to_path_buf();
@@ -7543,7 +7543,7 @@ mod tests {
     /// with every save failing and find out at quit.
     #[test]
     fn a_map_save_that_fails_tells_the_player() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let maps = dir.path().join("maps");
         std::fs::create_dir_all(&maps).unwrap();
         std::fs::write(maps.join("tank.json"), b"{ not json").unwrap();
@@ -7566,7 +7566,7 @@ mod tests {
     /// fill the scrollback with the same line and bury the first one.
     #[test]
     fn a_failing_map_save_says_so_once_not_every_tick() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let maps = dir.path().join("maps");
         std::fs::create_dir_all(&maps).unwrap();
         std::fs::write(maps.join("tank.json"), b"{ not json").unwrap();
@@ -7589,7 +7589,7 @@ mod tests {
     /// And if it starts working again, a later failure is news once more.
     #[test]
     fn a_save_that_recovers_can_complain_again_later() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let maps = dir.path().join("maps");
         std::fs::create_dir_all(&maps).unwrap();
         let path = maps.join("tank.json");
@@ -7620,7 +7620,7 @@ mod tests {
 
     #[test]
     fn a_pane_key_that_changes_nothing_writes_nothing() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.config_dir = dir.path().to_path_buf();
         state.map_width = crate::ui::MIN_MAP_WIDTH;
@@ -7646,7 +7646,7 @@ mod tests {
 
     #[test]
     fn toggling_a_pane_is_remembered_at_once() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.config_dir = dir.path().to_path_buf();
 
@@ -7673,7 +7673,7 @@ mod tests {
     /// `ui_state.json` exists to spare them (§11.4).
     #[test]
     fn the_character_pane_clock_toggles_and_is_remembered() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.config_dir = dir.path().to_path_buf();
         assert!(!state.show_timestamps, "off until asked for");
@@ -8165,7 +8165,7 @@ mod tests {
     /// the moment it happened, not queued for later.
     #[tokio::test]
     async fn a_removed_mark_is_on_disk_even_if_the_process_dies_right_after() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
         state.config_dir = dir.path().to_path_buf();
@@ -8271,7 +8271,7 @@ mod tests {
     /// so it was back at the next launch.
     #[tokio::test]
     async fn unmarking_is_not_undone_by_another_character_on_the_same_world() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
 
         // A room labelled in some earlier run, already on disk — so both
         // characters load it at connect time, which is how they really
@@ -8334,7 +8334,7 @@ mod tests {
     /// rather than merely flagged for later.
     #[tokio::test]
     async fn marking_a_room_saves_immediately_rather_than_waiting() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         let (mut state, _rx) = app(&["tank"]);
         state.sessions[0].rules = (dir.path().to_path_buf(), Some("tank".to_string()));
         state.config_dir = dir.path().to_path_buf();
@@ -8804,7 +8804,7 @@ mod tests {
     /// already running is told about it.
     #[tokio::test]
     async fn connect_adds_a_session_and_notifies_existing_ones() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         write_profile(dir.path(), "cleric");
 
         let (mut state, mut receivers) = app(&["tank"]);
@@ -8832,7 +8832,7 @@ mod tests {
     /// `mudular tank tank` on the command line would (§7.5).
     #[tokio::test]
     async fn connect_to_a_taken_name_gets_a_suffix() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         write_profile(dir.path(), "tank");
 
         let (mut state, _rx) = app(&["tank"]);
@@ -8846,7 +8846,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_to_an_unknown_profile_shows_an_error_and_adds_nothing() {
-        let dir = crate::net::pins::tests::tempdir::TempDir::new();
+        let dir = crate::test_support::TempDir::new();
         std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
 
         let (mut state, _rx) = app(&["tank"]);
