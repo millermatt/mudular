@@ -8,6 +8,18 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1](https://github.com/millermatt/mudular/compare/v0.6.0...v0.6.1) - 2026-08-17
+
+### Fixed
+
+- *(session)* decode the whole read after an invalid UTF-8 byte ([#78](https://github.com/millermatt/mudular/pull/78))
+
+### Other
+
+- put ACTORS.md in the working loop, not just in UX_REVIEW.md ([#79](https://github.com/millermatt/mudular/pull/79))
+- *(proto)* cargo-fuzz targets for Telnet, MCCP switchover and charset ([#76](https://github.com/millermatt/mudular/pull/76))
+- never push to main, one concern per branch ([#75](https://github.com/millermatt/mudular/pull/75))
+
 ## [0.6.0](https://github.com/millermatt/mudular/compare/v0.5.0...v0.6.0) - 2026-08-16
 
 ### Added
