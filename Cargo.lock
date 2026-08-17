@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "mudular"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
