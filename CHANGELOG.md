@@ -8,6 +8,20 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0](https://github.com/millermatt/mudular/compare/v0.9.1...v0.10.0) - 2026-08-17
+
+### Added
+
+- *(ui)* let the map and comms columns swap places ([#112](https://github.com/millermatt/mudular/pull/112))
+
+### Fixed
+
+- *(ui)* make the map's edge marks legible ([#114](https://github.com/millermatt/mudular/pull/114))
+
+### Other
+
+- *(app)* one registry for client commands, not two if-chains ([#115](https://github.com/millermatt/mudular/pull/115))
+
 ## [0.9.1](https://github.com/millermatt/mudular/compare/v0.9.0...v0.9.1) - 2026-08-17
 
 ### Fixed
