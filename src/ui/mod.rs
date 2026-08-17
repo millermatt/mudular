@@ -403,10 +403,24 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
     let panes = layout(frame.area(), state);
 
     if state.sessions.is_empty() {
-        let help = Paragraph::new(
-            "no target — run with a profile name, or --host <mud> [--port N] [--tls]",
-        )
-        .block(Block::bordered().title(" Mudular ".bold()));
+        // The hint, then whatever the client has been told since — a
+        // `/connect` that named a profile nobody has heard of has nowhere
+        // else to say so (#108).
+        let mut lines = vec![Line::from(
+            "no target — /connect <profile> opens a character, /newprofile makes one",
+        )];
+        if !state.shell_notices.is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(
+                state
+                    .shell_notices
+                    .iter()
+                    .map(|notice| Line::from(notice.as_str().dim())),
+            );
+        }
+        let help = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::bordered().title(" Mudular ".bold()));
         frame.render_widget(
             help,
             panes.sessions.first().copied().unwrap_or(frame.area()),
@@ -1414,12 +1428,21 @@ fn render_scrollback(
 
 fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     let Some(session) = state.bound() else {
-        let empty = Paragraph::new("").block(
+        // No character, but still a line: `/connect` has to be typeable in
+        // the one state a player most needs it (#108). Drawn with a real
+        // cursor for the same reason — an input box without one reads as
+        // decoration, which is exactly how this looked when it swallowed
+        // every keystroke.
+        let shell = Paragraph::new(state.shell_input.value()).block(
             Block::bordered()
                 .title(format!(" input ({} to quit) ", state.keybinds.quit))
                 .border_style(Style::new().dim()),
         );
-        frame.render_widget(empty, area);
+        frame.render_widget(shell, area);
+        frame.set_cursor_position((
+            area.x + 1 + state.shell_input.visual_cursor() as u16,
+            area.y + 1,
+        ));
         return;
     };
 
