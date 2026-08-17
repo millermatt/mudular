@@ -1337,27 +1337,47 @@ struct Utf8Decoder {
 impl Utf8Decoder {
     fn decode(&mut self, bytes: &[u8]) -> String {
         self.pending.extend_from_slice(bytes);
-        match std::str::from_utf8(&self.pending) {
-            Ok(text) => {
-                let text = text.to_string();
-                self.pending.clear();
-                text
-            }
-            Err(err) => {
-                let valid_up_to = err.valid_up_to();
-                let text = String::from_utf8_lossy(&self.pending[..valid_up_to]).into_owned();
-                match err.error_len() {
-                    // Invalid (not just incomplete) sequence: drop it and
-                    // mark with the replacement character.
-                    Some(bad_len) => {
-                        let rest = self.pending.split_off(valid_up_to + bad_len);
-                        self.pending = rest;
-                        format!("{text}\u{FFFD}")
-                    }
-                    // Incomplete trailing sequence: hold it for next read.
-                    None => {
-                        self.pending.drain(..valid_up_to);
-                        text
+
+        // Loop rather than return after the first bad sequence. Returning
+        // early leaves the rest of the read in `pending`, and only a *later*
+        // read flushes it — so the decoder runs permanently one bad sequence
+        // behind, and a prompt the server sends before blocking on input
+        // loses its tail for good (#77).
+        //
+        // `start` advances instead of draining per sequence: `drain(..n)`
+        // shifts everything after it, which would make a read of all-invalid
+        // bytes quadratic. That read is the one an untrusted server is most
+        // able to send (§13), so the buffer is compacted once, at the end.
+        let mut text = String::new();
+        let mut start = 0;
+        loop {
+            match std::str::from_utf8(&self.pending[start..]) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    self.pending.clear();
+                    return text;
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+                    text.push_str(&String::from_utf8_lossy(
+                        &self.pending[start..start + valid_up_to],
+                    ));
+                    match err.error_len() {
+                        // Invalid (not just incomplete) sequence: mark it with
+                        // the replacement character and carry on through the
+                        // rest of the buffer.
+                        Some(bad_len) => {
+                            text.push('\u{FFFD}');
+                            start += valid_up_to + bad_len;
+                        }
+                        // Incomplete trailing sequence: hold it for the next
+                        // read. It is a UTF-8 prefix, so at most three bytes —
+                        // `pending` cannot grow on a stream that never
+                        // completes one.
+                        None => {
+                            self.pending.drain(..start + valid_up_to);
+                            return text;
+                        }
                     }
                 }
             }
@@ -4110,5 +4130,123 @@ mod tests {
         let (second, arrived_via) = next_room(&mut events).await;
         assert_eq!(second, crate::map::RoomId(2));
         assert_eq!(arrived_via, None);
+    }
+
+    /// One invalid byte must not defer the rest of the read. A prompt is the
+    /// case that bites: the server sends it and then blocks on input, so
+    /// anything the decoder holds back is never flushed by a later read and
+    /// the player simply never sees it (#77).
+    #[test]
+    fn an_invalid_byte_does_not_strand_the_rest_of_the_read() {
+        let mut decoder = Utf8Decoder::default();
+        assert_eq!(
+            decoder.decode(b"HP:100 \xFF MP:50> "),
+            "HP:100 \u{FFFD} MP:50> "
+        );
+        assert!(decoder.pending.is_empty());
+    }
+
+    /// Several bad sequences in one read all resolve within it, rather than
+    /// the decoder emitting one per subsequent read and running permanently
+    /// behind the stream.
+    #[test]
+    fn every_invalid_sequence_in_a_read_is_replaced_in_that_read() {
+        let mut decoder = Utf8Decoder::default();
+        assert_eq!(decoder.decode(b"a\xFFb\xFFc"), "a\u{FFFD}b\u{FFFD}c");
+        assert!(decoder.pending.is_empty());
+    }
+
+    /// The reason the incomplete-tail branch exists: a multi-byte character
+    /// split across two reads must survive, not become two replacements.
+    #[test]
+    fn a_multi_byte_character_split_across_reads_is_held_not_replaced() {
+        let mut decoder = Utf8Decoder::default();
+        assert_eq!(decoder.decode(b"cost: \xE2\x82"), "cost: ");
+        assert_eq!(decoder.decode(b"\xAC5\r\n"), "\u{20AC}5\r\n");
+    }
+
+    /// An incomplete tail is held, but a UTF-8 prefix is at most three bytes,
+    /// so a server that sends nothing else can not grow the buffer.
+    #[test]
+    fn a_hostile_stream_of_incomplete_prefixes_does_not_grow_pending() {
+        let mut decoder = Utf8Decoder::default();
+        for _ in 0..1000 {
+            decoder.decode(b"\xE2\x82");
+        }
+        assert!(decoder.pending.len() < 4, "{}", decoder.pending.len());
+    }
+
+    /// Two properties over random streams and random read boundaries, which
+    /// between them cover what the worked examples above only sample.
+    ///
+    /// The equality half guards the *fix*: the loop must emit one U+FFFD per
+    /// invalid sequence and no text twice, matching `from_utf8_lossy` over the
+    /// whole stream. Note it does not by itself catch #77 — stranded bytes
+    /// resurface on a later read, so a concatenation of every read still
+    /// matches.
+    ///
+    /// The `pending` bound is what catches #77, and is the sharper of the
+    /// two. Only an incomplete trailing sequence may be held, so the buffer
+    /// can never exceed three bytes; the stranding bug held 27 on this same
+    /// input. A decoder that defers anything else trips it immediately.
+    ///
+    /// Deterministic (fixed seed), so a failure is reproducible rather than
+    /// a flake. Bytes are biased toward continuation and lead bytes so that
+    /// invalid and truncated sequences actually turn up.
+    #[test]
+    fn chunked_decoding_matches_lossy_decoding_of_the_whole_stream() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for _ in 0..20_000 {
+            let len = (rand() % 40) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| match rand() % 4 {
+                    0 => (rand() % 128) as u8,       // ASCII
+                    1 => 0x80 | (rand() % 64) as u8, // continuation
+                    2 => 0xC0 | (rand() % 32) as u8, // lead
+                    _ => (rand() % 256) as u8,
+                })
+                .collect();
+
+            let mut decoder = Utf8Decoder::default();
+            let mut decoded = String::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                let end = (at + 1 + (rand() % 5) as usize).min(bytes.len());
+                decoded.push_str(&decoder.decode(&bytes[at..end]));
+                at = end;
+            }
+
+            // A UTF-8 prefix is at most three bytes, so a stream that never
+            // completes one still cannot grow the buffer.
+            assert!(decoder.pending.len() < 4, "{:?}", decoder.pending);
+
+            // What is still held is an incomplete trailing sequence, which
+            // `from_utf8_lossy` has already replaced in `expected`.
+            decoded.push_str(&String::from_utf8_lossy(&decoder.pending));
+
+            assert_eq!(
+                decoded,
+                String::from_utf8_lossy(&bytes),
+                "bytes: {bytes:02X?}"
+            );
+        }
+    }
+
+    /// Valid input is untouched, and the buffer is left clean.
+    #[test]
+    fn valid_text_decodes_unchanged() {
+        let mut decoder = Utf8Decoder::default();
+        assert_eq!(
+            decoder.decode("a\u{20AC}\u{1F600}z".as_bytes()),
+            "a\u{20AC}\u{1F600}z"
+        );
+        assert!(decoder.pending.is_empty());
     }
 }
