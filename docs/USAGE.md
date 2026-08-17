@@ -1309,6 +1309,7 @@ fallback.
 | `F6` | Recompile rules and scripts from disk — the same thing `/reload` does | `reload` |
 | `F7` | Show or hide the map column, and print where you are — the same thing `/map` does | `toggle_map` |
 | `Alt+,` / `Alt+.` | Widen / narrow the map column | `map_wider` / `map_narrower` |
+| `Alt+S` | Swap the map and comms columns | `swap_columns` |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 | `Alt+T` | Show or hide the clock down the character panes | `toggle_timestamps` |
 | `/comms` | Show or hide the comms column — the same thing `F4` does | — (a command) |
@@ -1401,6 +1402,13 @@ starting point:
 ```yaml
 channel_width: 28
 ```
+
+`Alt+S` swaps the two side columns, so the map can sit next to your
+characters rather than out past the comms column. Which you want depends
+on what you look at while playing: the map is glanced at constantly when
+you are moving, comms only when something arrives in it. Like the widths
+and the show/hide toggles, the choice is remembered — there is no separate
+setting to keep in step with the key.
 
 `map_width:` (default 24) does the same for the map column, resized live
 with `Alt+,`/`Alt+.`. On a terminal too narrow for both columns the comms
