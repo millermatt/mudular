@@ -776,6 +776,10 @@ pub struct AppState {
     /// coordinate would quietly come to mean a different room the moment
     /// anything moved.
     pub map_cursor: Option<crate::map::RoomId>,
+    /// Whether the map column sits inboard of comms — next to the
+    /// character panes rather than out past them (#111). Persisted with
+    /// the rest of the layout, so the toggle *is* the preference.
+    pub map_first: bool,
     /// The input line when no session is bound (#108).
     ///
     /// `SessionView` owns the ordinary one, which is right — it is that
@@ -2681,6 +2685,7 @@ fn current_layout(state: &AppState) -> config::UiState {
         show_timestamps: state.show_timestamps,
         channel_width: state.channel_width,
         map_width: state.map_width,
+        map_first: state.map_first,
     }
 }
 
@@ -3101,6 +3106,7 @@ async fn event_loop(
         reload_requested: false,
         line_cursor: None,
         map_cursor: None,
+        map_first: false,
         shell_input: Input::default(),
         shell_notices: Vec::new(),
         map_pan: (0, 0),
@@ -3145,6 +3151,7 @@ async fn event_loop(
         }
         state.channel_width = ui::clamp_channel_width(saved.channel_width, width);
         state.map_width = ui::clamp_map_width(saved.map_width, width);
+        state.map_first = saved.map_first;
     }
 
     if !has_sessions {
@@ -3669,6 +3676,10 @@ fn handle_key(
     }
     if keybinds.config_editor.matches(code, modifiers) {
         open_config_editor(state, channels);
+        return true;
+    }
+    if keybinds.swap_columns.matches(code, modifiers) {
+        state.map_first = !state.map_first;
         return true;
     }
     if keybinds.toggle_map.matches(code, modifiers) {
@@ -4614,6 +4625,7 @@ pub(crate) mod test_support {
                 reload_requested: false,
                 line_cursor: None,
                 map_cursor: None,
+                map_first: false,
                 shell_input: Input::default(),
                 shell_notices: Vec::new(),
                 map_pan: (0, 0),

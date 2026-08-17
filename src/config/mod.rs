@@ -618,6 +618,14 @@ pub struct UiState {
     pub show_timestamps: bool,
     pub channel_width: u16,
     pub map_width: u16,
+    /// Whether the map column sits between the character panes and the
+    /// comms column rather than outboard of it (#111).
+    ///
+    /// `default` rather than required, like `show_timestamps`: a layout
+    /// file written before this existed is still a layout somebody chose,
+    /// and refusing to parse it would throw the rest of their choices away.
+    #[serde(default)]
+    pub map_first: bool,
 }
 
 /// Reads the remembered layout, or `None` if there is not a usable one.
@@ -776,6 +784,11 @@ pub struct Keybinds {
     /// Shows or hides the channel panes (§11.1).
     #[serde(default = "default_toggle_channels")]
     pub toggle_channels: KeyBinding,
+    /// Swaps the map and comms columns (#111). Which of the two sits
+    /// next to the character panes is a matter of what a player looks at
+    /// while playing, so it is theirs to choose rather than ours.
+    #[serde(default = "default_swap_columns")]
+    pub swap_columns: KeyBinding,
     /// Widens the channel column (§11.4).
     #[serde(default = "default_channel_wider")]
     pub channel_wider: KeyBinding,
@@ -831,6 +844,7 @@ impl Default for Keybinds {
             quit: default_quit(),
             server_data_inspector: default_server_data_inspector(),
             focus_next: default_focus_next(),
+            swap_columns: default_swap_columns(),
             cycle_layout: default_cycle_layout(),
             toggle_channels: default_toggle_channels(),
             channel_wider: default_channel_wider(),
@@ -871,6 +885,12 @@ fn default_toggle_channels() -> KeyBinding {
 /// send for arrow keys and friends, so terminals resolve the ambiguity
 /// inconsistently — some report it as Alt+`[`, others hand back a bare
 /// `[` once the escape times out with nothing CSI-shaped following it.
+fn default_swap_columns() -> KeyBinding {
+    // `s` for swap, and the last unbound letter in the Alt row that means
+    // anything mnemonic.
+    "alt+s".parse().expect("built-in default keybinding")
+}
+
 fn default_channel_wider() -> KeyBinding {
     "alt+-".parse().expect("built-in default keybinding")
 }
@@ -2177,11 +2197,28 @@ mod tests {
             show_timestamps: true,
             channel_width: 34,
             map_width: 30,
+            map_first: false,
         };
 
         save_ui_state(dir.path(), &saved).unwrap();
 
         assert_eq!(load_ui_state(dir.path()), Some(saved));
+    }
+
+    /// A layout file written before the columns could swap is still a
+    /// layout somebody chose (#111). Parsing has to keep their widths and
+    /// toggles rather than refusing the file over a key it has never
+    /// heard of — the same rule `show_timestamps` set.
+    #[test]
+    fn a_layout_saved_before_the_columns_could_swap_still_loads() {
+        let older = r#"{"show_channels":true,"show_map":true,"show_inspector":false,
+                        "show_timestamps":false,"channel_width":31,"map_width":29}"#;
+        let parsed: UiState = serde_json::from_str(older).expect("an older layout still parses");
+        assert_eq!(parsed.channel_width, 31, "their width survived");
+        assert!(
+            !parsed.map_first,
+            "and the order they never chose is the old one"
+        );
     }
 
     /// The strip's default depends on how many characters are being
@@ -2239,6 +2276,7 @@ mod tests {
                 show_timestamps: false,
                 channel_width: 22,
                 map_width: 18,
+                map_first: false,
             },
         )
         .unwrap();

@@ -103,6 +103,7 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
             "widen / narrow the comms column",
         ),
         row(keybinds.toggle_map, "show or hide the map column"),
+        row(keybinds.swap_columns, "swap the map and comms columns"),
         row(
             format!("{} / {}", keybinds.map_wider, keybinds.map_narrower),
             "widen / narrow the map column",
@@ -204,17 +205,35 @@ pub fn layout(area: Rect, state: &AppState) -> Panes {
     };
     let show_map = state.show_map && body.width >= MIN_MAIN_WIDTH + channel_cost + state.map_width;
 
+    // Which side column sits next to the character panes is the player's
+    // to choose (#111): the map is read *while* playing, so a multi-boxer
+    // glancing between a pane and the map would rather not cross a column
+    // of chatter to do it.
+    //
+    // Built as a list so the order is stated once. Pushing constraints and
+    // then indexing `columns` separately is how the two could disagree,
+    // and a map drawn in the comms column is not a subtle bug to find.
+    let mut side: Vec<(bool, u16)> = Vec::new();
+    if state.map_first {
+        side.push((true, state.map_width));
+        side.push((false, state.channel_width));
+    } else {
+        side.push((false, state.channel_width));
+        side.push((true, state.map_width));
+    }
+    side.retain(|(is_map, _)| if *is_map { show_map } else { show_channels });
+
     let mut constraints = vec![Constraint::Min(MIN_MAIN_WIDTH)];
-    if show_channels {
-        constraints.push(Constraint::Length(state.channel_width));
-    }
-    if show_map {
-        constraints.push(Constraint::Length(state.map_width));
-    }
+    constraints.extend(side.iter().map(|(_, width)| Constraint::Length(*width)));
     let columns = Layout::horizontal(constraints).split(body);
     let main = columns[0];
-    let channel_column = show_channels.then(|| columns[1]);
-    let map = show_map.then(|| columns[columns.len() - 1]);
+    let column_of = |wanted_map: bool| {
+        side.iter()
+            .position(|(is_map, _)| *is_map == wanted_map)
+            .map(|at| columns[at + 1])
+    };
+    let channel_column = column_of(false);
+    let map = column_of(true);
 
     let (tab_bar, session_area) = match state.layout {
         LayoutMode::Tabs if state.sessions.len() > 1 => {
@@ -2157,6 +2176,101 @@ mod tests {
         let border = buffer.cell((59, 1)).unwrap();
         assert_eq!(border.fg, Color::Green);
         assert!(border.modifier.contains(ratatui::style::Modifier::DIM));
+    }
+
+    /// The picture is cached against the rect it was drawn into, so
+    /// moving the column has to invalidate it (#111). If it did not, the
+    /// map would be redrawn from a cache keyed to where it used to be —
+    /// which is the failure most likely to look like a rendering bug
+    /// rather than a layout one.
+    #[test]
+    fn moving_the_map_column_does_not_reuse_the_old_picture() {
+        let mut state = crate::app::test_support::app(&["tank"]);
+        state.channels.push(ChannelPane {
+            config: test_support::channel("chat"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        });
+        state.show_channels = true;
+        state.show_map = true;
+        let area = Rect::new(0, 0, 120, 30);
+
+        let before = layout(area, &state).map.expect("a map column");
+        state.map_first = true;
+        let after = layout(area, &state).map.expect("a map column");
+
+        assert_ne!(
+            before, after,
+            "the map moved, so anything keyed on its rect is a different key"
+        );
+    }
+
+    /// #111. Which side column sits next to the character panes is the
+    /// player's to choose, so both orders have to actually come out of
+    /// `layout` — and the two columns must not land on the same rect,
+    /// which is what a disagreement between the constraint order and the
+    /// index lookups would produce.
+    #[test]
+    fn the_map_and_comms_columns_swap_on_request() {
+        let mut state = crate::app::test_support::app(&["tank"]);
+        state.channels.push(ChannelPane {
+            config: test_support::channel("chat"),
+            lines: VecDeque::new(),
+            unread: 0,
+            scrollback_limit: 10_000,
+            back_offset: 0,
+        });
+        state.show_channels = true;
+        state.show_map = true;
+        let area = Rect::new(0, 0, 120, 30);
+
+        let comms_first = layout(area, &state);
+        state.map_first = true;
+        let map_first = layout(area, &state);
+
+        let (comms_a, map_a) = (
+            comms_first
+                .channels
+                .first()
+                .copied()
+                .expect("a comms column"),
+            comms_first.map.expect("a map column"),
+        );
+        let (comms_b, map_b) = (
+            map_first.channels.first().copied().expect("a comms column"),
+            map_first.map.expect("a map column"),
+        );
+
+        assert!(comms_a.x < map_a.x, "comms is inboard by default");
+        assert!(map_b.x < comms_b.x, "and outboard once swapped");
+        assert_ne!(comms_b, map_b, "the two columns are never the same rect");
+        assert_eq!(
+            comms_a.width, comms_b.width,
+            "swapping moves the columns, it does not resize them"
+        );
+        assert_eq!(map_a.width, map_b.width);
+    }
+
+    /// With only one side column shown there is nothing to swap with, and
+    /// the order must not leave a hole where the missing one would be.
+    #[test]
+    fn swapping_with_only_one_column_shown_still_fills_the_space() {
+        let mut state = crate::app::test_support::app(&["tank"]);
+        state.show_channels = false;
+        state.show_map = true;
+        state.map_first = true;
+        let area = Rect::new(0, 0, 120, 30);
+
+        let panes = layout(area, &state);
+        let map = panes.map.expect("a map column");
+        assert!(panes.channels.is_empty(), "no comms column was asked for");
+        assert_eq!(
+            map.right(),
+            area.right(),
+            "the map takes the edge rather than leaving a gap where comms would have been"
+        );
     }
 
     /// #55's mark has to reach the screen, not just the arithmetic. The
