@@ -588,11 +588,17 @@ fn draw_palette(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let selected = palette.selected.min(entries.len().saturating_sub(1));
+    // The window follows the selection instead of being pinned to the top
+    // of the list: with more matches than rows, arrowing down moved a
+    // highlight nobody could see, because the same first ten entries were
+    // drawn every frame.
+    let first = selected.saturating_sub(rows.saturating_sub(1) as usize);
     let mut lines = vec![Line::from(vec![
         Span::styled("> ", Style::new().dim()),
         Span::raw(palette.input.value().to_string()),
     ])];
-    for (index, entry) in entries.iter().take(rows as usize).enumerate() {
+    for (offset, entry) in entries.iter().skip(first).take(rows as usize).enumerate() {
+        let index = first + offset;
         // The selected row is reversed rather than recoloured: the labels
         // are already the client's own commands in the client's own
         // colours, and a second hue here would be one more thing to learn.
@@ -610,9 +616,14 @@ fn draw_palette(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     frame.render_widget(Clear, overlay);
+    // The count says there is more below than fits, which a window that
+    // scrolled silently would otherwise hide.
+    let title = match entries.len() {
+        0 => " run a command (Esc to close) ".to_string(),
+        total => format!(" run a command — {} of {total} (Esc) ", selected + 1),
+    };
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title(" run a command (Esc to close) ".bold())),
+        Paragraph::new(lines).block(Block::bordered().title(title.bold())),
         overlay,
     );
     // The cursor belongs in the query, which is the only thing being typed

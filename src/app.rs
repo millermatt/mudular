@@ -3791,14 +3791,34 @@ fn handle_key(
     // The palette owns the keyboard while it is open: it is a text field,
     // so a key that means something elsewhere in the client means a
     // character here (#43).
-    if let Some(palette) = &mut state.palette {
+    if state.palette.is_some() {
+        // How many rows there are to move through, before touching the
+        // palette itself: `palette_entries` reads the whole of `state`, so
+        // holding a mutable borrow of the palette across it would not
+        // compile — and a selection that moved without knowing the count
+        // is how it used to walk off the end of the list.
+        let query = state
+            .palette
+            .as_ref()
+            .map(|palette| palette.input.value().to_string())
+            .unwrap_or_default();
+        let matches = state.palette_entries(&query).len();
+        let Some(palette) = state.palette.as_mut() else {
+            return true;
+        };
         match code {
             KeyCode::Esc => state.palette = None,
             KeyCode::Up => {
                 palette.selected = palette.selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                palette.selected = palette.selected.saturating_add(1);
+                // Stops at the last match rather than running past it: the
+                // list scrolls to follow the selection, so a selection
+                // beyond the end would scroll to nothing.
+                palette.selected = palette
+                    .selected
+                    .saturating_add(1)
+                    .min(matches.saturating_sub(1));
             }
             KeyCode::Enter => {
                 let query = palette.input.value().to_string();
@@ -9168,6 +9188,52 @@ mod tests {
     /// per-session copies this replaced only reconciled through the file,
     /// so until the next launch two panes could show different amounts of
     /// the same world — quieter than the mark bug, and the same cause.
+    /// Reported live: the palette would not scroll. The list drew its
+    /// first ten matches every frame, so arrowing past the tenth moved a
+    /// highlight nobody could see, and the entries below it were
+    /// unreachable however long you held the key.
+    #[tokio::test]
+    async fn the_palette_selection_stops_at_the_last_match() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.palette = Some(Palette {
+            input: Input::default(),
+            selected: 0,
+        });
+        let total = state.palette_entries("").len();
+        assert!(total > 10, "the unfiltered list is longer than the window");
+
+        // Far more presses than there are rows.
+        for _ in 0..(total + 20) {
+            handle_key(
+                &mut state,
+                &Keybinds::default(),
+                KeyCode::Down,
+                KeyModifiers::NONE,
+                80,
+                &[],
+            );
+        }
+
+        let selected = state.palette.as_ref().expect("still open").selected;
+        assert_eq!(
+            selected,
+            total - 1,
+            "the selection stops on the last match rather than running past \
+             it into a window that scrolls to nothing"
+        );
+
+        // And Up walks back, one row per press, from wherever it stopped.
+        handle_key(
+            &mut state,
+            &Keybinds::default(),
+            KeyCode::Up,
+            KeyModifiers::NONE,
+            80,
+            &[],
+        );
+        assert_eq!(state.palette.as_ref().unwrap().selected, total - 2);
+    }
+
     /// #43. `ClientCommand::all()` is written out by hand, because a
     /// variant carrying an argument has no single value to enumerate — so
     /// this is the guard that it stays complete. Every name the parser
