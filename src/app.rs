@@ -204,7 +204,31 @@ pub struct SessionView {
     pub corpse: Option<crate::map::RoomId>,
 }
 
+/// A session's identity, fixed for as long as the session exists and
+/// never reused (#94).
+///
+/// The panes live in a `Vec` and are drawn in that order, so an index is
+/// the right way to say *where* a pane is. It is the wrong way to say
+/// *which character* — removing one renumbers every pane above it, and
+/// `Focus`/`input_session` would then quietly name a different person.
+/// Position is a property of the list; identity is a property of the
+/// session, and the two stopped agreeing the moment `/connect` shipped
+/// without a way to disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    /// Handed out in order, never reused within a run: a removed session's
+    /// id must not come back and make a stale `Focus` valid again.
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 pub struct SessionPane {
+    /// Who this pane is, as against where it is (#94).
+    pub id: SessionId,
     /// Everything `ui` draws from (#11).
     pub view: SessionView,
     /// Words this MUD has printed, ranked by recency (§11.3). Per session,
@@ -660,7 +684,7 @@ impl ChannelPane {
 /// change which character your commands go to (§11.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    Session(usize),
+    Session(SessionId),
     Channel(usize),
     /// The map column. Unlike the others it holds no buffer, so focusing
     /// it moves neither the input line nor the scroll keys — what it takes
@@ -684,7 +708,7 @@ pub struct AppState {
     pub channels: Vec<ChannelPane>,
     pub focus: Focus,
     /// The session the input line is bound to — the last focused session.
-    pub input_session: usize,
+    pub input_session: SessionId,
     pub layout: LayoutMode,
     pub show_channels: bool,
     /// Live width of the channel column, in columns. State, not layout:
@@ -801,7 +825,8 @@ impl AppState {
     /// The session the input line types into. Sessions are never removed
     /// from the list, so this index always resolves.
     pub fn bound(&self) -> Option<&SessionPane> {
-        self.sessions.get(self.input_session)
+        self.index_of(self.input_session)
+            .and_then(|i| self.sessions.get(i))
     }
 
     /// The world this session belongs to, opened if this is the first
@@ -846,7 +871,8 @@ impl AppState {
 
     /// The bound session's map — what the map pane draws.
     pub fn bound_map(&self) -> Option<&crate::map::Map> {
-        self.map_of(self.input_session)
+        self.index_of(self.input_session)
+            .and_then(|i| self.map_of(i))
     }
 
     /// Shorthand for the map itself, which is what most callers want.
@@ -862,7 +888,8 @@ impl AppState {
     }
 
     fn bound_mut(&mut self) -> Option<&mut SessionPane> {
-        self.sessions.get_mut(self.input_session)
+        self.index_of(self.input_session)
+            .and_then(|i| self.sessions.get_mut(i))
     }
 
     /// Origin tags only appear once more than one character is in play, so
@@ -871,14 +898,73 @@ impl AppState {
         self.sessions.len() > 1
     }
 
+    /// Where a session currently sits in the list, or `None` if it has
+    /// been removed. The one place identity is translated into position;
+    /// everything that draws or cycles panes goes on using indices, which
+    /// is what they are good for.
+    pub fn index_of(&self, id: SessionId) -> Option<usize> {
+        self.sessions.iter().position(|session| session.id == id)
+    }
+
+    /// The id of the pane at `index` — for the call sites that legitimately
+    /// start from a position, such as a numbered jump key.
+    pub fn id_at(&self, index: usize) -> Option<SessionId> {
+        self.sessions.get(index).map(|session| session.id)
+    }
+
+    /// Where the character being typed at currently sits in the list.
+    pub fn bound_index(&self) -> Option<usize> {
+        self.index_of(self.input_session)
+    }
+
+    /// Whether the pane at `index` is the one the input line is bound to —
+    /// the question `ui` actually has, asked positionally so that drawing a
+    /// list of panes never has to know what a `SessionId` is.
+    pub fn is_bound(&self, index: usize) -> bool {
+        self.id_at(index) == Some(self.input_session)
+    }
+
+    /// Closes a session and leaves the survivors addressable (#94).
+    ///
+    /// The removal itself is one line; everything else is the reason this
+    /// could not be done while identity was an index. Focus and the input
+    /// binding are carried by id, so they need no fixing up — but if the
+    /// session they named is the one that just went, they have to land on a
+    /// survivor rather than on a position that now holds a stranger.
+    #[allow(dead_code)] // `/disconnect` is its own change; this is the seam.
+    pub fn remove_session(&mut self, id: SessionId) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let departing = self.sessions.remove(index);
+        // A peer snapshot outliving its session would leave `${@tank.hp}`
+        // resolving against a character who is no longer connected (§7.5).
+        self.peer_registry.remove(&departing.view.name);
+
+        let Some(fallback) = self.sessions.first().map(|session| session.id) else {
+            // Nothing left to bind to. Leaving the stale id is better than
+            // inventing one; `bound()` answers `None` either way.
+            return;
+        };
+        if self.input_session == id {
+            self.input_session = fallback;
+        }
+        if self.focus == Focus::Session(id) {
+            self.focus_pane(Focus::Session(self.input_session));
+        }
+    }
+
     pub fn focus_pane(&mut self, focus: Focus) {
         self.focus = focus;
         match focus {
-            Focus::Session(index) => {
-                if let Some(session) = self.sessions.get_mut(index) {
+            Focus::Session(id) => {
+                if let Some(session) = self
+                    .index_of(id)
+                    .and_then(|index| self.sessions.get_mut(index))
+                {
                     session.view.unread = 0;
                 }
-                self.input_session = index;
+                self.input_session = id;
             }
             Focus::Channel(index) => {
                 if let Some(channel) = self.channels.get_mut(index) {
@@ -908,7 +994,9 @@ impl AppState {
             return;
         }
         let current = match self.focus {
-            Focus::Session(index) => index,
+            // Cycling is a walk along the list, so identity becomes a
+            // position here and turns back into one below.
+            Focus::Session(id) => self.index_of(id).unwrap_or(0),
             Focus::Channel(index) => sessions + index,
             Focus::Map => sessions + channels,
         };
@@ -918,7 +1006,10 @@ impl AppState {
             return;
         }
         self.focus_pane(if next < sessions {
-            Focus::Session(next)
+            match self.id_at(next) {
+                Some(id) => Focus::Session(id),
+                None => return,
+            }
         } else {
             Focus::Channel(next - sessions)
         });
@@ -965,7 +1056,8 @@ impl AppState {
 
     /// Strictly focused: what unread counting keys off.
     fn is_focused(&self, index: usize) -> bool {
-        self.focus == Focus::Session(index)
+        self.id_at(index)
+            .is_some_and(|id| self.focus == Focus::Session(id))
     }
 
     /// Which session pane the UI draws as active. With focus on a channel
@@ -973,10 +1065,10 @@ impl AppState {
     /// being played (§11.1).
     pub fn is_focused_session(&self, index: usize) -> bool {
         match self.focus {
-            Focus::Session(focused) => focused == index,
+            Focus::Session(focused) => self.id_at(index) == Some(focused),
             // With focus elsewhere the bound session stays highlighted — it
             // is still the character being played (§11.1).
-            Focus::Channel(_) | Focus::Map => self.input_session == index,
+            Focus::Channel(_) | Focus::Map => self.id_at(index) == Some(self.input_session),
         }
     }
 
@@ -988,9 +1080,9 @@ impl AppState {
     /// adjusts the stored distance from the tail.
     fn scroll_focused(&mut self, code: KeyCode) {
         let back_offset = match self.focus {
-            Focus::Session(index) => self
-                .sessions
-                .get_mut(index)
+            Focus::Session(id) => self
+                .index_of(id)
+                .and_then(|index| self.sessions.get_mut(index))
                 .map(|s| &mut s.view.back_offset),
             Focus::Channel(index) => self.channels.get_mut(index).map(|c| &mut c.back_offset),
             // The map holds no buffer: it is a view on the world recomputed
@@ -2064,6 +2156,7 @@ fn connect(
         tracing::warn!("could not adopt an older map: {err:#}");
     }
     SessionPane {
+        id: SessionId::next(),
         view: SessionView {
             name: target.name,
             scrollback: VecDeque::new(),
@@ -2232,7 +2325,7 @@ fn map_debug_snapshot(state: &AppState, has_image: bool, screen_text: &str) -> S
         out,
         "current room: {}",
         match current
-            .zip(state.map_of(state.input_session))
+            .zip(state.bound_index().and_then(|i| state.map_of(i)))
             .and_then(|(id, map)| map.rooms.get(&id).map(|room| (id, room)))
         {
             Some((id, room)) => format!("{} {:?} area {:?}", id.0, room.name, room.area),
@@ -2245,7 +2338,7 @@ fn map_debug_snapshot(state: &AppState, has_image: bool, screen_text: &str) -> S
     let Some(current) = current else {
         return out;
     };
-    let Some(map) = state.map_of(state.input_session) else {
+    let Some(map) = state.bound_index().and_then(|i| state.map_of(i)) else {
         return out;
     };
     let scene = map.scene(current, session.view.corpse, &[]);
@@ -2751,6 +2844,13 @@ async fn event_loop(
         })
         .collect();
     let has_sessions = !sessions.is_empty();
+    // Something has to be bound before the first frame. A launch with no
+    // sessions still needs a value here; it is replaced the moment one is
+    // connected, and `bound()` answers `None` until then.
+    let first_id = sessions
+        .first()
+        .map(|session: &SessionPane| session.id)
+        .unwrap_or_else(SessionId::next);
 
     let mut state = AppState {
         sessions,
@@ -2765,8 +2865,8 @@ async fn event_loop(
                 back_offset: 0,
             })
             .collect(),
-        focus: Focus::Session(0),
-        input_session: 0,
+        focus: Focus::Session(first_id),
+        input_session: first_id,
         layout: LayoutMode::Tabs,
         show_channels: !channels.is_empty(),
         channel_width,
@@ -3256,7 +3356,11 @@ fn handle_key(
     }
     if keybinds.who_needs_me.matches(code, modifiers) {
         match state.neediest() {
-            Some(index) => state.focus_pane(Focus::Session(index)),
+            Some(index) => {
+                if let Some(id) = state.id_at(index) {
+                    state.focus_pane(Focus::Session(id));
+                }
+            }
             // Said rather than ignored, the same way the map cursor says
             // why it did nothing: a key that silently does nothing is a
             // key the player assumes is broken.
@@ -3432,7 +3536,9 @@ fn handle_key(
     {
         let index = n as usize - 1;
         if index < state.sessions.len() {
-            state.focus_pane(Focus::Session(index));
+            if let Some(id) = state.id_at(index) {
+                state.focus_pane(Focus::Session(id));
+            }
             return true;
         }
         if index == state.sessions.len() && state.show_map {
@@ -3631,7 +3737,9 @@ async fn send_as_other_session(state: &mut AppState, args: &str) {
         return;
     }
 
-    let from = state.input_session;
+    let Some(from) = state.bound_index() else {
+        return;
+    };
     // Aiming it at the pane you are already typing in is not a delivery
     // failure, and must not be reported as one — `addressed` excludes the
     // sender, so without this it would come back "no session named `tank`"
@@ -3687,7 +3795,7 @@ fn describe_current_room(state: &mut AppState) {
     let described = state
         .bound()
         .and_then(|session| session.view.current_room)
-        .zip(state.map_of(state.input_session))
+        .zip(state.bound_index().and_then(|i| state.map_of(i)))
         .map(|(at, map)| map.describe(at))
         .filter(|lines| !lines.is_empty());
     let Some(session) = state.bound_mut() else {
@@ -3728,7 +3836,10 @@ async fn start_goto(state: &mut AppState, arg: &str) {
             .bound_map()
             .is_some_and(|map| map.rooms.contains_key(&id))
         {
-            let session = &mut state.sessions[state.input_session];
+            let Some(index) = state.bound_index() else {
+                return;
+            };
+            let session = &mut state.sessions[index];
             session.push_line(RetainedLine::client(format!(
                 "** /goto: no room #{vnum} on the map"
             )));
@@ -3784,7 +3895,9 @@ async fn start_goto(state: &mut AppState, arg: &str) {
         }
     };
 
-    let index = state.input_session;
+    let Some(index) = state.bound_index() else {
+        return;
+    };
     walk_to(state, index, current, target, GOTO_COMMAND).await;
 }
 
@@ -3798,7 +3911,9 @@ async fn walk_to_room(state: &mut AppState, target: crate::map::RoomId) {
     let Some(current) = session.view.current_room else {
         return;
     };
-    let index = state.input_session;
+    let Some(index) = state.bound_index() else {
+        return;
+    };
     walk_to(state, index, current, target, GOTO_COMMAND).await;
 }
 
@@ -3816,7 +3931,8 @@ fn map_cursor_step(
 ) -> Option<crate::map::RoomId> {
     let session = state.bound()?;
     let scene = state
-        .map_of(state.input_session)?
+        .bound_index()
+        .and_then(|i| state.map_of(i))?
         // No party: stepping the cursor only reads where rooms are, and
         // who is standing in one has no bearing on which room is next.
         .scene(session.view.current_room?, session.view.corpse, &[]);
@@ -3885,7 +4001,8 @@ fn mark_current_room(state: &mut AppState, label: &str) {
     };
 
     let previous = state
-        .map_of(state.input_session)
+        .bound_index()
+        .and_then(|i| state.map_of(i))
         .and_then(|map| map.rooms.get(&at))
         .and_then(|room| room.mark.clone());
 
@@ -3909,7 +4026,9 @@ fn mark_current_room(state: &mut AppState, label: &str) {
     };
     // Every character on this world, not only the one who typed it — see
     // `set_mark_across_world`.
-    let from = state.input_session;
+    let Some(from) = state.bound_index() else {
+        return;
+    };
     set_mark(state, from, at, Some(label.to_string()));
     if let Some(session) = state.bound_mut() {
         session.push_line(RetainedLine::client(notice));
@@ -3951,7 +4070,9 @@ fn apply_mark_menu(state: &mut AppState) {
     };
     // Removing is exactly the case `set_mark_across_world` exists for: a
     // sibling still holding the old label would otherwise write it back.
-    let from = state.input_session;
+    let Some(from) = state.bound_index() else {
+        return;
+    };
     set_mark(state, from, menu.at, chosen);
     if let Some(session) = state.bound_mut() {
         session.push_line(RetainedLine::client(notice));
@@ -3981,7 +4102,9 @@ async fn start_corpse_run(state: &mut AppState) {
         ));
         return;
     };
-    let index = state.input_session;
+    let Some(index) = state.bound_index() else {
+        return;
+    };
     walk_to(state, index, current, corpse, CORPSE_COMMAND).await;
 }
 
@@ -4117,9 +4240,10 @@ async fn connect_new_session(state: &mut AppState, channels: &[Channel], name: &
 
     // Focused immediately, the same as a freshly launched character would
     // be — the confirmation below lands in the pane it describes.
-    let index = state.sessions.len() - 1;
-    state.focus = Focus::Session(index);
-    state.input_session = index;
+    if let Some(id) = state.sessions.last().map(|session| session.id) {
+        state.focus = Focus::Session(id);
+        state.input_session = id;
+    }
 
     if let Some(session) = state.bound_mut() {
         session.push_line(RetainedLine::client(format!(
@@ -4138,6 +4262,7 @@ pub(crate) mod test_support {
         let (tx, rx) = mpsc::channel(16);
         (
             SessionPane {
+                id: SessionId::next(),
                 view: SessionView {
                     name: name.to_string(),
                     scrollback: VecDeque::new(),
@@ -4199,13 +4324,17 @@ pub(crate) mod test_support {
             sessions.push(session);
             receivers.push(rx);
         }
+        let first_id = sessions
+            .first()
+            .map(|session: &SessionPane| session.id)
+            .unwrap_or_else(SessionId::next);
         (
             AppState {
                 sessions,
                 maps: HashMap::new(),
                 channels: Vec::new(),
-                focus: Focus::Session(0),
-                input_session: 0,
+                focus: Focus::Session(first_id),
+                input_session: first_id,
                 layout: LayoutMode::Tabs,
                 show_channels: false,
                 channel_width: crate::config::DEFAULT_CHANNEL_WIDTH,
@@ -4819,10 +4948,10 @@ mod tests {
         let (mut state, _rx) = app(&["tank", "cleric"]);
         state.sessions[0].view.input = Input::default().with_value("kill rat".into());
 
-        state.focus_pane(Focus::Session(1));
+        state.focus_pane(Focus::Session(state.id_at(1).unwrap()));
         assert_eq!(state.bound().unwrap().view.input.value(), "");
 
-        state.focus_pane(Focus::Session(0));
+        state.focus_pane(Focus::Session(state.id_at(0).unwrap()));
         assert_eq!(state.bound().unwrap().view.input.value(), "kill rat");
     }
 
@@ -4850,7 +4979,7 @@ mod tests {
         assert_eq!(state.sessions[1].view.unread, 2);
         assert_eq!(state.sessions[0].view.unread, 0, "the focused pane is read");
 
-        state.focus_pane(Focus::Session(1));
+        state.focus_pane(Focus::Session(state.id_at(1).unwrap()));
         assert_eq!(state.sessions[1].view.unread, 0);
     }
 
@@ -4869,11 +4998,11 @@ mod tests {
         state.show_channels = true;
 
         state.focus_next();
-        assert_eq!(state.focus, Focus::Session(1));
+        assert_eq!(state.focus, Focus::Session(state.id_at(1).unwrap()));
         state.focus_next();
         assert_eq!(state.focus, Focus::Channel(0));
         state.focus_next();
-        assert_eq!(state.focus, Focus::Session(0));
+        assert_eq!(state.focus, Focus::Session(state.id_at(0).unwrap()));
     }
 
     /// Focusing a channel pane must leave the input bound to the last
@@ -4890,11 +5019,15 @@ mod tests {
         });
         state.show_channels = true;
 
-        state.focus_pane(Focus::Session(1));
+        state.focus_pane(Focus::Session(state.id_at(1).unwrap()));
         state.focus_pane(Focus::Channel(0));
 
         assert_eq!(state.focus, Focus::Channel(0));
-        assert_eq!(state.input_session, 1, "input stays with the last session");
+        assert_eq!(
+            state.input_session,
+            state.id_at(1).unwrap(),
+            "input stays with the last session"
+        );
         assert_eq!(state.bound().unwrap().view.name, "cleric");
     }
 
@@ -5385,8 +5518,8 @@ mod tests {
 
     /// Helper: type a line and press Enter, as the bound session.
     async fn enter_line(state: &mut AppState, line: &str) {
-        state.sessions[state.input_session].view.input =
-            Input::default().with_value(line.to_string());
+        let bound = state.bound_index().unwrap();
+        state.sessions[bound].view.input = Input::default().with_value(line.to_string());
         submit_input(state, &[]).await;
     }
 
@@ -5866,8 +5999,8 @@ mod tests {
         let (mut state, _rx) = app(&["tank", "cleric"]);
         submit(&mut state, "kill rat").await;
 
-        state.input_session = 1;
-        state.focus_pane(Focus::Session(1));
+        state.input_session = state.id_at(1).unwrap();
+        state.focus_pane(Focus::Session(state.id_at(1).unwrap()));
         let cleric = &mut state.sessions[1];
 
         assert!(
@@ -6248,8 +6381,12 @@ mod tests {
 
         assert!(press(&mut state, KeyCode::F(10), KeyModifiers::NONE));
 
-        assert_eq!(state.input_session, 2, "the mage is closer to dying");
-        assert_eq!(state.focus, Focus::Session(2));
+        assert_eq!(
+            state.input_session,
+            state.id_at(2).unwrap(),
+            "the mage is closer to dying"
+        );
+        assert_eq!(state.focus, Focus::Session(state.id_at(2).unwrap()));
     }
 
     /// A key that silently does nothing is a key the player assumes is
@@ -6266,7 +6403,11 @@ mod tests {
 
         assert!(press(&mut state, KeyCode::F(10), KeyModifiers::NONE));
 
-        assert_eq!(state.input_session, 0, "nobody to jump to");
+        assert_eq!(
+            state.input_session,
+            state.id_at(0).unwrap(),
+            "nobody to jump to"
+        );
         let said = state.sessions[0]
             .view
             .scrollback
@@ -6280,10 +6421,10 @@ mod tests {
         let (mut state, _rx) = app(&["tank", "cleric", "mage"]);
 
         assert!(press(&mut state, KeyCode::Char('3'), KeyModifiers::ALT));
-        assert_eq!(state.focus, Focus::Session(2));
+        assert_eq!(state.focus, Focus::Session(state.id_at(2).unwrap()));
 
         assert!(press(&mut state, KeyCode::Char('1'), KeyModifiers::ALT));
-        assert_eq!(state.focus, Focus::Session(0));
+        assert_eq!(state.focus, Focus::Session(state.id_at(0).unwrap()));
     }
 
     /// Alt+N past the last session must do nothing rather than focus a pane
@@ -6292,7 +6433,7 @@ mod tests {
     fn alt_n_beyond_the_open_sessions_is_ignored() {
         let (mut state, _rx) = app(&["tank"]);
         assert!(!press(&mut state, KeyCode::Char('9'), KeyModifiers::ALT));
-        assert_eq!(state.focus, Focus::Session(0));
+        assert_eq!(state.focus, Focus::Session(state.id_at(0).unwrap()));
     }
 
     #[test]
@@ -6369,7 +6510,7 @@ mod tests {
 
         assert!(press(&mut state, KeyCode::F(4), KeyModifiers::NONE));
         assert!(!state.show_channels);
-        assert_eq!(state.focus, Focus::Session(0));
+        assert_eq!(state.focus, Focus::Session(state.id_at(0).unwrap()));
     }
 
     /// The default binding (F6, UX_REVIEW.md F) sets the deferred flag
@@ -6608,9 +6749,13 @@ mod tests {
         });
         state.show_channels = true;
         // Bind input to "tank" (index 0), then focus the channel pane.
-        state.focus_pane(Focus::Session(0));
+        state.focus_pane(Focus::Session(state.id_at(0).unwrap()));
         state.focus_pane(Focus::Channel(0));
-        assert_eq!(state.input_session, 0, "input stays bound to tank");
+        assert_eq!(
+            state.input_session,
+            state.id_at(0).unwrap(),
+            "input stays bound to tank"
+        );
 
         state.scroll_focused(KeyCode::PageUp);
 
@@ -7121,7 +7266,7 @@ mod tests {
         submit(&mut state, "/comms").await;
 
         assert!(!state.show_channels);
-        assert_eq!(state.focus, Focus::Session(0));
+        assert_eq!(state.focus, Focus::Session(state.id_at(0).unwrap()));
     }
 
     /// An install with no `channels:` block has no column to reveal.
@@ -8035,7 +8180,11 @@ mod tests {
         );
 
         assert!(state.map_cursor.is_none(), "the cursor is put away");
-        assert_eq!(state.input_session, 1, "and the jump still happened");
+        assert_eq!(
+            state.input_session,
+            state.id_at(1).unwrap(),
+            "and the jump still happened"
+        );
     }
 
     /// The same for a binding rather than a jump, so this is not a special
@@ -8098,7 +8247,8 @@ mod tests {
             "and the cursor starts on the character"
         );
         assert_eq!(
-            state.input_session, 0,
+            state.input_session,
+            state.id_at(0).unwrap(),
             "typing stays with the character, as it does for a comms pane"
         );
     }
@@ -8118,7 +8268,7 @@ mod tests {
             &[],
         );
 
-        assert_eq!(state.focus, Focus::Session(1));
+        assert_eq!(state.focus, Focus::Session(state.id_at(1).unwrap()));
     }
 
     /// With the column hidden there is no pane to reach, so the number
@@ -8138,7 +8288,7 @@ mod tests {
             &[],
         );
 
-        assert_eq!(state.focus, Focus::Session(0));
+        assert_eq!(state.focus, Focus::Session(state.id_at(0).unwrap()));
     }
 
     #[tokio::test]
@@ -8153,7 +8303,11 @@ mod tests {
 
         assert_eq!(state.focus, Focus::Map);
         state.focus_next();
-        assert_eq!(state.focus, Focus::Session(0), "and comes back round");
+        assert_eq!(
+            state.focus,
+            Focus::Session(state.id_at(0).unwrap()),
+            "and comes back round"
+        );
     }
 
     /// Leaving the map hands the keyboard back rather than stranding focus
@@ -8184,7 +8338,7 @@ mod tests {
             &[],
         );
 
-        assert_eq!(state.focus, Focus::Session(0));
+        assert_eq!(state.focus, Focus::Session(state.id_at(0).unwrap()));
         assert!(state.map_cursor.is_none());
     }
 
@@ -8294,6 +8448,59 @@ mod tests {
     /// per-session copies this replaced only reconciled through the file,
     /// so until the next launch two panes could show different amounts of
     /// the same world — quieter than the mark bug, and the same cause.
+    /// Identity, not position (#94). `/connect` can add a character to a
+    /// running instance, so a client that cannot also remove one leaves a
+    /// dead pane on screen for the rest of the evening — and removing from
+    /// a `Vec` renumbers everything above it, which is how the input line
+    /// silently ends up bound to somebody else. Nothing about this fails
+    /// loudly, which is why it is a test rather than a comment: for the
+    /// multi-boxer (ACTORS.md actor 1) the symptom is a heal cast into the
+    /// wrong session.
+    #[test]
+    fn removing_a_session_leaves_focus_and_input_on_the_same_character() {
+        let (mut state, _rx) = app(&["tank", "cleric", "mage"]);
+        let mage = state.sessions[2].id;
+        let tank = state.sessions[0].id;
+        state.focus_pane(Focus::Session(mage));
+        assert_eq!(state.bound().map(|s| s.view.name.as_str()), Some("mage"));
+
+        state.remove_session(tank);
+
+        assert_eq!(state.sessions.len(), 2, "tank is gone");
+        assert_eq!(
+            state.bound().map(|s| s.view.name.as_str()),
+            Some("mage"),
+            "the input line stays with the character it was bound to, even \
+             though that character's index just changed"
+        );
+        assert_eq!(
+            state.focus,
+            Focus::Session(mage),
+            "and so does what is drawn as focused"
+        );
+    }
+
+    /// Removing the character being typed at has to land somewhere real,
+    /// rather than on an id nothing answers to any more.
+    #[test]
+    fn removing_the_bound_session_rebinds_to_a_survivor() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        let tank = state.sessions[0].id;
+        state.focus_pane(Focus::Session(tank));
+
+        state.remove_session(tank);
+
+        assert_eq!(
+            state.bound().map(|s| s.view.name.as_str()),
+            Some("cleric"),
+            "typing goes to whoever is left"
+        );
+        assert!(
+            state.sessions.iter().all(|s| s.id != tank),
+            "and the removed session is not reachable by its old id"
+        );
+    }
+
     #[test]
     fn what_one_character_explores_the_other_sees_immediately() {
         let (mut state, _rx) = app(&["mathias", "saihtam"]);
@@ -8875,10 +9082,10 @@ mod tests {
         assert_eq!(state.sessions[1].view.name, "cleric");
         assert_eq!(
             state.focus,
-            Focus::Session(1),
+            Focus::Session(state.id_at(1).unwrap()),
             "a connected character is focused immediately, like a launched one"
         );
-        assert_eq!(state.input_session, 1);
+        assert_eq!(state.input_session, state.id_at(1).unwrap());
         assert!(state.peer_registry.contains_key("cleric"));
 
         match receivers[0].try_recv() {
