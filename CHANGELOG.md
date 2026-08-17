@@ -8,6 +8,12 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1](https://github.com/millermatt/mudular/compare/v0.9.0...v0.9.1) - 2026-08-17
+
+### Fixed
+
+- *(app)* let the empty client be typed into ([#109](https://github.com/millermatt/mudular/pull/109))
+
 ## [0.9.0](https://github.com/millermatt/mudular/compare/v0.8.0...v0.9.0) - 2026-08-17
 
 ### Added
