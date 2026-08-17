@@ -1,8 +1,8 @@
 # Mudular — project instructions
 
 Terminal MUD client in Rust (ratatui + tokio). Design authority is
-docs/ARCHITECTURE.md; build order is its §14 roadmap; per-milestone model
-guidance is docs/DEVELOPMENT.md.
+docs/ARCHITECTURE.md; build order is its §14 roadmap; who a decision is for is
+docs/ACTORS.md; per-milestone model guidance is docs/DEVELOPMENT.md.
 
 ## Working on a milestone
 
@@ -23,6 +23,26 @@ guidance is docs/DEVELOPMENT.md.
   seams, not speculative features.
 - No new dependencies, abstractions, or config options beyond what the
   milestone needs.
+
+## Who the change is for
+
+ARCHITECTURE.md answers *how*. docs/ACTORS.md answers *who for*, and it ranks
+them — multi-boxer, module author, newcomer, security-conscious player,
+power-user scripter — so that when two actors' convenience conflicts there is
+already an answer. Read it alongside §14, not only when reading UX_REVIEW.md.
+
+- **Name the actor in an issue or PR that proposes new surface area.** This is
+  not ceremony; the ranking changes what gets built and how it is argued.
+  "Regexes are unfriendly to newcomers" pitches a feature at actor 3, whom
+  ACTORS.md explicitly treats as *don't break this for them* rather than
+  *optimize for them* — so framed that way the proposal argues against itself.
+  "A shared module has to stay legible to whoever copies it in" is the same
+  feature serving actor 2, and it leads to a different design.
+- **A change that serves nobody on the list is one to question before
+  building, not after.** ACTORS.md says this itself, and it is the same rule
+  as scope discipline above.
+- Bug fixes, refactors and test work don't need this. It is for new surface
+  area: features, config keys, client commands, panes.
 
 ## Commands
 
