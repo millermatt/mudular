@@ -1,0 +1,10 @@
+[package]
+name = "test-support"
+version = "0.0.0"
+edition = "2024"
+description = "Test helpers shared across mudular's modules. Not published, not shipped."
+license = "GPL-3.0-or-later"
+# Never goes to a registry: it exists only as a dev-dependency of the binary
+# in the same repository, and `release-plz.toml` tells the release machinery
+# the same thing in its own vocabulary.
+publish = false
