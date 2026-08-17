@@ -530,6 +530,10 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
         draw_errors(frame, frame.area(), state);
     }
 
+    if state.palette.is_some() {
+        draw_palette(frame, frame.area(), state);
+    }
+
     if let Some(menu) = &state.mark_menu {
         draw_mark_menu(frame, frame.area(), menu);
     }
@@ -561,6 +565,76 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
 
 /// The help overlay: a box centred over the layout, sized to its content and
 /// clipped to the terminal (docs/ARCHITECTURE.md §11.2).
+/// The command palette (#43).
+///
+/// A query line and the matches under it, best first. Near the top of the
+/// terminal rather than centred: the list grows downward as you type, and
+/// a box that grows from the middle of the screen moves its own first row
+/// out from under the eye already reading it.
+fn draw_palette(frame: &mut Frame, area: Rect, state: &AppState) {
+    let Some(palette) = &state.palette else {
+        return;
+    };
+    let entries = state.palette_entries(palette.input.value());
+
+    let width = (area.width * 2 / 3).max(24).min(area.width);
+    let rows = (entries.len() as u16).min(10);
+    let height = (rows + 3).min(area.height);
+    let overlay = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + area.height / 8,
+        width,
+        height,
+    };
+
+    let selected = palette.selected.min(entries.len().saturating_sub(1));
+    // The window follows the selection instead of being pinned to the top
+    // of the list: with more matches than rows, arrowing down moved a
+    // highlight nobody could see, because the same first ten entries were
+    // drawn every frame.
+    let first = selected.saturating_sub(rows.saturating_sub(1) as usize);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("> ", Style::new().dim()),
+        Span::raw(palette.input.value().to_string()),
+    ])];
+    for (offset, entry) in entries.iter().skip(first).take(rows as usize).enumerate() {
+        let index = first + offset;
+        // The selected row is reversed rather than recoloured: the labels
+        // are already the client's own commands in the client's own
+        // colours, and a second hue here would be one more thing to learn.
+        let style = match index == selected {
+            true => Style::new().add_modifier(Modifier::REVERSED),
+            false => Style::new(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<14}", entry.label()), style),
+            Span::styled(format!(" {}", entry.describes()), style.dim()),
+        ]));
+    }
+    if entries.is_empty() {
+        lines.push(Line::from("nothing matches".dim()));
+    }
+
+    frame.render_widget(Clear, overlay);
+    // The count says there is more below than fits, which a window that
+    // scrolled silently would otherwise hide.
+    let title = match entries.len() {
+        0 => " run a command (Esc to close) ".to_string(),
+        total => format!(" run a command — {} of {total} (Esc) ", selected + 1),
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(title.bold())),
+        overlay,
+    );
+    // The cursor belongs in the query, which is the only thing being typed
+    // into — without it the palette reads as a list that happens to have a
+    // line of text above it.
+    frame.set_cursor_position((
+        overlay.x + 3 + palette.input.visual_cursor() as u16,
+        overlay.y + 1,
+    ));
+}
+
 /// The warnings panel (#18).
 ///
 /// Newest last, like scrollback, because that is the order the player read
@@ -1539,6 +1613,7 @@ fn render_scrollback(
 fn overlay_covers_map(state: &AppState) -> bool {
     state.show_help
         || state.show_errors
+        || state.palette.is_some()
         || state.mark_menu.is_some()
         || state.config_editor.is_some()
         || state.new_profile_wizard.is_some()

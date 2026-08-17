@@ -784,6 +784,10 @@ pub struct Keybinds {
     /// Shows or hides the channel panes (§11.1).
     #[serde(default = "default_toggle_channels")]
     pub toggle_channels: KeyBinding,
+    /// Opens the command palette (#43): type a few letters, find any
+    /// command or profile, press Enter.
+    #[serde(default = "default_palette")]
+    pub palette: KeyBinding,
     /// Swaps the map and comms columns (#111). Which of the two sits
     /// next to the character panes is a matter of what a player looks at
     /// while playing, so it is theirs to choose rather than ours.
@@ -845,6 +849,7 @@ impl Default for Keybinds {
             server_data_inspector: default_server_data_inspector(),
             focus_next: default_focus_next(),
             swap_columns: default_swap_columns(),
+            palette: default_palette(),
             cycle_layout: default_cycle_layout(),
             toggle_channels: default_toggle_channels(),
             channel_wider: default_channel_wider(),
@@ -885,6 +890,13 @@ fn default_toggle_channels() -> KeyBinding {
 /// send for arrow keys and friends, so terminals resolve the ambiguity
 /// inconsistently — some report it as Alt+`[`, others hand back a bare
 /// `[` once the escape times out with nothing CSI-shaped following it.
+fn default_palette() -> KeyBinding {
+    // `p` for palette, and Ctrl rather than Alt because this is the one
+    // key a player reaches for *before* knowing any of the others — the
+    // same finger habit every editor has trained.
+    "ctrl+p".parse().expect("built-in default keybinding")
+}
+
 fn default_swap_columns() -> KeyBinding {
     // `s` for swap, and the last unbound letter in the Alt row that means
     // anything mnemonic.
@@ -1176,6 +1188,28 @@ pub fn profile_path(dir: &Path, name: &str) -> PathBuf {
 /// first-run wizard (docs/ARCHITECTURE.md §15): a missing `profiles/` dir
 /// reads the same as an empty one, since neither has anything to connect
 /// with.
+/// Every profile on disk, by name, sorted (#43).
+///
+/// Read each time rather than cached: a profile made a minute ago through
+/// `/newprofile` has to be findable now, and reading a directory of a
+/// dozen files costs nothing next to being wrong about what exists.
+pub fn profile_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.join("profiles"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "yaml"))
+        .filter_map(|entry| {
+            entry
+                .path()
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 pub fn has_profiles(dir: &Path) -> bool {
     std::fs::read_dir(dir.join("profiles"))
         .into_iter()
