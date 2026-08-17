@@ -806,6 +806,12 @@ pub struct AppState {
     /// failure wearing a hat.
     pub errors_unread: usize,
     pub show_errors: bool,
+    /// The command palette, when it is open (#43).
+    pub palette: Option<Palette>,
+    /// Set when the palette filled the input line with something complete,
+    /// so the event loop submits it on the next turn. The palette runs
+    /// inside `handle_key`, which is not async and so cannot submit.
+    pub palette_submit: bool,
     /// The input line when no session is bound (#108).
     ///
     /// `SessionView` owns the ordinary one, which is right — it is that
@@ -1121,6 +1127,53 @@ impl AppState {
     /// `push_line` was a silent drop waiting for the day nothing was
     /// bound — which `/connect`'s own "no such profile" reply was, in
     /// exactly the state a player would be typing `/connect` in.
+    /// Everything the palette can act on, best match first (#43).
+    ///
+    /// Commands whose meaning needs a character are dropped when there is
+    /// none, rather than offered and then refused — the palette is a list
+    /// of what you can do, and a list that lies about that is worse than
+    /// no list. Profiles come from disk each time it opens, because a
+    /// `/newprofile` a minute ago should be findable now.
+    pub fn palette_entries(&self, query: &str) -> Vec<PaletteEntry> {
+        let bound = self.bound().is_some();
+        let mut entries: Vec<PaletteEntry> = ClientCommand::all()
+            .into_iter()
+            .filter(|command| bound || !command.needs_a_character())
+            .map(PaletteEntry::Command)
+            .collect();
+        entries.extend(
+            config::profile_names(&self.config_dir)
+                .into_iter()
+                .map(PaletteEntry::Profile),
+        );
+
+        let mut scored: Vec<(i32, PaletteEntry)> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                // The name and what it does are both searchable: someone
+                // hunting for the map types "map", and someone after a
+                // newer version types "release" — a word that appears
+                // nowhere in `/update`.
+                //
+                // Scored apart, though, and a name always wins. Run
+                // together, "dc" found `/map` — through "hi(d)e the map
+                // (c)olumn" — while `/disconnect` sat below it, which is
+                // the opposite of what typing initials means.
+                let by_name = fuzzy_score(&entry.label(), query);
+                let by_meaning = fuzzy_score(&entry.describes(), query);
+                match (by_name, by_meaning) {
+                    (Some(score), _) => Some((score + NAME_MATCH, entry)),
+                    (None, Some(score)) => Some((score, entry)),
+                    (None, None) => None,
+                }
+            })
+            .collect();
+        scored.sort_by(|(a, left), (b, right)| {
+            b.cmp(a).then_with(|| left.label().cmp(&right.label()))
+        });
+        scored.into_iter().map(|(_, entry)| entry).collect()
+    }
+
     /// Says something *and* keeps it (#18).
     ///
     /// For failures only. A warning shown as one more scrollback line is
@@ -3169,6 +3222,8 @@ async fn event_loop(
         errors: VecDeque::new(),
         errors_unread: 0,
         show_errors: false,
+        palette: None,
+        palette_submit: false,
         map_pan: (0, 0),
         map_pan_for: None,
         map_grid: None,
@@ -3251,6 +3306,12 @@ async fn event_loop(
         // rather than hooked onto every event that could move a character
         // or change who is bound (#58).
         state.update_map_pan();
+        // A palette choice that was complete is sent as if the player had
+        // pressed Enter on it (#43) — `handle_key` filled the line but is
+        // not async, so it cannot submit.
+        if std::mem::take(&mut state.palette_submit) {
+            submit_input(&mut state, &channels).await;
+        }
         let mut drawn = ui::DrawnFrame {
             image: None,
             image_is_fresh: true,
@@ -3727,6 +3788,44 @@ fn handle_key(
         }
         return true;
     }
+    // The palette owns the keyboard while it is open: it is a text field,
+    // so a key that means something elsewhere in the client means a
+    // character here (#43).
+    if let Some(palette) = &mut state.palette {
+        match code {
+            KeyCode::Esc => state.palette = None,
+            KeyCode::Up => {
+                palette.selected = palette.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                palette.selected = palette.selected.saturating_add(1);
+            }
+            KeyCode::Enter => {
+                let query = palette.input.value().to_string();
+                let chosen = palette.selected;
+                state.palette = None;
+                if let Some(entry) = state.palette_entries(&query).into_iter().nth(chosen) {
+                    return run_palette_entry(state, entry);
+                }
+            }
+            _ => {
+                palette.input.handle_event(&crossterm::event::Event::Key(
+                    crossterm::event::KeyEvent::new(code, modifiers),
+                ));
+                // A new query means a new list, and the old row number
+                // pointed into the old one.
+                palette.selected = 0;
+            }
+        }
+        return true;
+    }
+    if keybinds.palette.matches(code, modifiers) {
+        state.palette = Some(Palette {
+            input: Input::default(),
+            selected: 0,
+        });
+        return true;
+    }
     // The warnings panel closes the way every other overlay here does —
     // Esc, or any key that is not steering it. A panel that could only be
     // dismissed by retyping the command that opened it would be one more
@@ -3947,7 +4046,7 @@ async fn submit_input(state: &mut AppState, channels: &[Channel]) {
 /// await — boxing a future per command to fit them into one signature
 /// would cost more than the if-chain ever did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ClientCommand {
+pub(crate) enum ClientCommand {
     Help,
     Reload,
     Update,
@@ -3995,6 +4094,85 @@ impl ClientCommand {
         })
     }
 
+    /// Every command, for anything that needs to show them all (#43).
+    ///
+    /// Spelled out rather than derived, because a variant with an argument
+    /// has no single value to enumerate — and because a list the compiler
+    /// cannot check is exactly what this type exists to replace, the test
+    /// `every_command_is_in_the_palette` walks `parse` over the command
+    /// names to prove nothing is missing from it.
+    fn all() -> Vec<Self> {
+        vec![
+            Self::Help,
+            Self::Errors,
+            Self::Connect(String::new()),
+            Self::Disconnect,
+            Self::NewProfile,
+            Self::Map,
+            Self::Comms,
+            Self::Goto(String::new()),
+            Self::Corpse,
+            Self::Mark(String::new()),
+            Self::Send(String::new()),
+            Self::Config,
+            Self::Reload,
+            Self::Update,
+        ]
+    }
+
+    /// The name as typed, without any argument.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Help => HELP_COMMAND,
+            Self::Reload => RELOAD_COMMAND,
+            Self::Update => UPDATE_COMMAND,
+            Self::Config => CONFIG_COMMAND,
+            Self::NewProfile => NEWPROFILE_COMMAND,
+            Self::Connect(_) => CONNECT_COMMAND,
+            Self::Disconnect => DISCONNECT_COMMAND,
+            Self::Errors => ERRORS_COMMAND,
+            Self::Map => MAP_COMMAND,
+            Self::Comms => COMMS_COMMAND,
+            Self::Goto(_) => GOTO_COMMAND,
+            Self::Corpse => CORPSE_COMMAND,
+            Self::Mark(_) => MARK_COMMAND,
+            Self::Send(_) => SEND_COMMAND,
+        }
+    }
+
+    /// What it does, in the words a player would search for rather than
+    /// the ones the code uses — someone hunting for the map types "map",
+    /// but someone who wants to stop seeing chatter types "hide", and
+    /// neither knows the pane is called a channel.
+    fn describes(&self) -> &'static str {
+        match self {
+            Self::Help => "show every keybinding",
+            Self::Reload => "reload rules and modules from disk",
+            Self::Update => "install a newer release",
+            Self::Config => "edit this profile",
+            Self::NewProfile => "make a new character profile",
+            Self::Connect(_) => "open another character",
+            Self::Disconnect => "close the character you are typing at",
+            Self::Errors => "show warnings the client kept",
+            Self::Map => "show or hide the map column",
+            Self::Comms => "show or hide the comms column",
+            Self::Goto(_) => "walk to a room you have been to",
+            Self::Corpse => "walk back to your corpse",
+            Self::Mark(_) => "label this room on the map",
+            Self::Send(_) => "run a command as another character",
+        }
+    }
+
+    /// Whether the player has to type something after the name, so the
+    /// palette can hand them a half-written line instead of running
+    /// something incomplete.
+    fn takes_an_argument(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect(_) | Self::Goto(_) | Self::Send(_) | Self::Mark(_)
+        )
+    }
+
     /// Whether this means anything with no character connected (#108).
     ///
     /// Exhaustive on purpose: the empty client used to have its own list
@@ -4018,6 +4196,123 @@ impl ClientCommand {
             | Self::Send(_) => true,
         }
     }
+}
+
+/// Acts on a palette choice (#43).
+///
+/// A command that needs no argument runs. One that does — `/connect`,
+/// `/goto`, `/send`, `/mark` — is written into the input line with a
+/// trailing space instead, because the palette knows which command was
+/// wanted and cannot know what to point it at. Handing over a half-typed
+/// line is the honest version of "did you mean this?".
+fn run_palette_entry(state: &mut AppState, entry: PaletteEntry) -> bool {
+    let line = match &entry {
+        PaletteEntry::Command(command) if command.takes_an_argument() => {
+            format!("{} ", command.name())
+        }
+        // A profile is already the argument, so this one is complete.
+        PaletteEntry::Profile(name) => format!("{CONNECT_COMMAND} {name}"),
+        PaletteEntry::Command(command) => command.name().to_string(),
+    };
+    let ready = !matches!(&entry, PaletteEntry::Command(command) if command.takes_an_argument());
+
+    match state.bound_mut() {
+        Some(session) => session.view.input = Input::default().with_value(line.clone()),
+        None => state.shell_input = Input::default().with_value(line.clone()),
+    }
+    // Submitting is the caller's job — `submit_input` is async and this is
+    // not — so a complete line asks the loop to send it, exactly as if the
+    // player had pressed Enter on it themselves.
+    state.palette_submit = ready;
+    true
+}
+
+/// What the palette can act on (#43).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteEntry {
+    Command(ClientCommand),
+    /// A profile on disk, offered as "connect this character" — the
+    /// commonest thing a multi-boxer wants that is not a command at all.
+    Profile(String),
+}
+
+impl PaletteEntry {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Command(command) => command.name().to_string(),
+            Self::Profile(name) => format!("{CONNECT_COMMAND} {name}"),
+        }
+    }
+
+    pub fn describes(&self) -> String {
+        match self {
+            Self::Command(command) => command.describes().to_string(),
+            Self::Profile(name) => format!("open {name}"),
+        }
+    }
+}
+
+/// The command palette (#43).
+pub struct Palette {
+    pub input: Input,
+    /// Which row is selected, as an index into the *filtered* list — the
+    /// list is rebuilt on every keystroke, so an index into the full one
+    /// would point somewhere else the moment a letter is typed.
+    pub selected: usize,
+}
+
+/// Scores `text` against a query typed a few letters at a time.
+///
+/// Subsequence matching rather than substring: "dc" should find
+/// `/disconnect`, which is the whole point of typing three letters instead
+/// of eleven. Consecutive matches and matches at a word boundary score
+/// higher, so `/map` beats `/mark` for "map" even though both contain
+/// those letters in order.
+///
+/// Hand-rolled rather than a dependency: this is thirty lines against a
+/// list of twenty entries, and a fuzzy-matching crate would be a build
+/// dependency for the rest of the client's life (TAD §2.1 asks for
+/// established crates where the work is real; here it is not).
+/// How much a name match outranks a description match. Larger than any
+/// score `fuzzy_score` can return, so the two never interleave.
+const NAME_MATCH: i32 = 1_000_000;
+
+fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let text_lower = text.to_lowercase();
+    let mut score = 0;
+    let mut last_match: Option<usize> = None;
+    let mut from = 0;
+    for needle in query.to_lowercase().chars() {
+        if needle.is_whitespace() {
+            continue;
+        }
+        let at = text_lower[from..].find(needle)? + from;
+        // A letter that follows the previous one is worth more than one
+        // found halfway across the string: "conn" naming `/connect` should
+        // outrank the same letters scattered through a description.
+        score += match last_match {
+            Some(previous) if at == previous + 1 => 8,
+            _ => 1,
+        };
+        // And a letter starting a word is what someone typing initials
+        // means — "np" for `/newprofile`.
+        let starts_word = at == 0
+            || text_lower[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|before| before == ' ' || before == '/' || before == '-');
+        if starts_word {
+            score += 6;
+        }
+        last_match = Some(at);
+        from = at + needle.len_utf8();
+    }
+    // Shorter names win ties: with "map" matching both, `/map` is what was
+    // meant and `/mark` is not.
+    Some(score * 100 - text.chars().count() as i32)
 }
 
 /// Runs a parsed command. One match, so every command's body has exactly
@@ -4772,6 +5067,8 @@ pub(crate) mod test_support {
                 errors: VecDeque::new(),
                 errors_unread: 0,
                 show_errors: false,
+                palette: None,
+                palette_submit: false,
                 map_pan: (0, 0),
                 map_pan_for: None,
                 map_grid: None,
@@ -8871,6 +9168,121 @@ mod tests {
     /// per-session copies this replaced only reconciled through the file,
     /// so until the next launch two panes could show different amounts of
     /// the same world — quieter than the mark bug, and the same cause.
+    /// #43. `ClientCommand::all()` is written out by hand, because a
+    /// variant carrying an argument has no single value to enumerate — so
+    /// this is the guard that it stays complete. Every name the parser
+    /// knows has to appear in the palette, or a command exists that the
+    /// palette cannot find.
+    #[test]
+    fn every_command_is_in_the_palette() {
+        let listed: Vec<&str> = ClientCommand::all().iter().map(|c| c.name()).collect();
+        for name in [
+            HELP_COMMAND,
+            RELOAD_COMMAND,
+            UPDATE_COMMAND,
+            CONFIG_COMMAND,
+            NEWPROFILE_COMMAND,
+            CONNECT_COMMAND,
+            DISCONNECT_COMMAND,
+            ERRORS_COMMAND,
+            MAP_COMMAND,
+            COMMS_COMMAND,
+            GOTO_COMMAND,
+            CORPSE_COMMAND,
+            MARK_COMMAND,
+            SEND_COMMAND,
+        ] {
+            assert!(
+                ClientCommand::parse(name).is_some(),
+                "{name} is not a command the parser knows"
+            );
+            assert!(listed.contains(&name), "{name} is missing from the palette");
+        }
+        assert_eq!(listed.len(), 14, "and nothing is listed twice");
+    }
+
+    /// Typing a few letters has to find the thing meant, not merely
+    /// something containing those letters somewhere.
+    #[tokio::test]
+    async fn the_palette_finds_a_command_from_a_few_letters() {
+        let (state, _rx) = app(&["tank"]);
+        let first = |query: &str| {
+            state
+                .palette_entries(query)
+                .first()
+                .map(|entry| entry.label())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(first("map"), "/map", "an exact name beats a longer match");
+        assert_eq!(first("dc"), "/disconnect", "initials find it");
+        assert_eq!(first("conn"), "/connect");
+        assert_eq!(
+            first("release"),
+            "/update",
+            "the description is searchable too: the word a player has in \
+             mind is often nowhere in the command's own name"
+        );
+        assert!(
+            state.palette_entries("zzzz").is_empty(),
+            "and a query matching nothing matches nothing"
+        );
+    }
+
+    /// The palette lists what you can do. With no character connected the
+    /// commands that need one are not on that list, rather than being
+    /// offered and then refused.
+    #[tokio::test]
+    async fn the_palette_hides_what_cannot_be_done_yet() {
+        let (mut state, _rx) = app(&["tank"]);
+        assert!(
+            state
+                .palette_entries("goto")
+                .iter()
+                .any(|e| e.label() == "/goto"),
+            "with a character, walking is on offer"
+        );
+
+        submit(&mut state, "/disconnect").await;
+        assert!(
+            !state
+                .palette_entries("goto")
+                .iter()
+                .any(|e| e.label() == "/goto"),
+            "with none, it is not"
+        );
+        assert!(
+            state
+                .palette_entries("connect")
+                .iter()
+                .any(|e| e.label() == "/connect"),
+            "but the command that gets you one still is"
+        );
+    }
+
+    /// A command that needs an argument hands over a half-typed line
+    /// rather than running something incomplete; one that does not runs.
+    #[test]
+    fn choosing_an_entry_either_runs_it_or_starts_the_line() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        run_palette_entry(&mut state, PaletteEntry::Command(ClientCommand::Map));
+        assert_eq!(state.bound().unwrap().view.input.value(), "/map");
+        assert!(state.palette_submit, "nothing more to type, so it is sent");
+
+        state.palette_submit = false;
+        run_palette_entry(
+            &mut state,
+            PaletteEntry::Command(ClientCommand::Goto(String::new())),
+        );
+        assert_eq!(
+            state.bound().unwrap().view.input.value(),
+            "/goto ",
+            "the player is left to say where"
+        );
+        assert!(!state.palette_submit, "and it is not sent for them");
+    }
+
     /// #18. A warning shown as one more scrollback line is
     /// indistinguishable from server text a minute later, and gone once it
     /// scrolls off. The panel keeps it; the badge is what makes anyone
