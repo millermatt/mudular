@@ -338,6 +338,7 @@ fn sends_one_command_as_another_character() {
         "the focused session's banner should reach the screen",
     );
     app.wait_for("cleric", "the second session should appear in the tab bar");
+    cleric_mud.wait_for_connection("the second character should reach its server");
 
     app.type_line("/send cleric drink well");
 
@@ -482,6 +483,11 @@ fn write_config(dir: &Path, port: u16, quit: Option<&str>) {
 struct FakeMud {
     port: u16,
     received: Arc<Mutex<Vec<u8>>>,
+    /// Clients accepted so far. A test that types at one character while
+    /// another is still opening its socket has to wait for this, not for
+    /// the name in the tab bar: the pane is drawn from the profile, before
+    /// anything has been connected to.
+    accepted: Arc<AtomicU32>,
     /// Lines to push at the client once it has connected.
     outbound: std::sync::mpsc::Sender<String>,
 }
@@ -493,11 +499,14 @@ impl FakeMud {
         let received = Arc::new(Mutex::new(Vec::new()));
 
         let sink = Arc::clone(&received);
+        let accepted = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&accepted);
         let (outbound, pending) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
             };
+            count.fetch_add(1, Ordering::SeqCst);
             let _ = sock.write_all(format!("{BANNER}\r\n").as_bytes());
             if let Ok(mut writer) = sock.try_clone() {
                 std::thread::spawn(move || {
@@ -520,6 +529,7 @@ impl FakeMud {
         FakeMud {
             port,
             received,
+            accepted,
             outbound,
         }
     }
@@ -529,8 +539,33 @@ impl FakeMud {
         self.outbound.send(line.to_string()).unwrap();
     }
 
+    /// Blocks until the client has opened a socket to this server.
+    ///
+    /// The sync point for anything aimed at a character whose pane is not
+    /// the focused one. `/send` is delivered to a live session task, so a
+    /// test that types it while that task is still inside `connect` is
+    /// racing — and the only on-screen evidence of that character, its tab,
+    /// is drawn from the profile long before the connection exists. It has
+    /// only ever lost the race on macOS, where the pty tests run in
+    /// parallel on a slower runner.
+    fn wait_for_connection(&self, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.accepted.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("{why}: the client never connected to port {}", self.port);
+    }
+
     fn wait_for_command(&self, expected: &str, why: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Generous on purpose, and matched to `App::wait_for`. These tests
+        // run in parallel against a three-core macOS runner, where several
+        // clients are rendering and connecting at once; a deadline that
+        // only just fits an idle machine reports a scheduling delay as a
+        // routing bug. Waiting longer costs nothing unless it really fails.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             let seen = String::from_utf8_lossy(&self.received.lock().unwrap()).into_owned();
             if seen.lines().any(|line| line.trim() == expected) {
@@ -539,7 +574,13 @@ impl FakeMud {
             std::thread::sleep(Duration::from_millis(50));
         }
         let seen = String::from_utf8_lossy(&self.received.lock().unwrap()).into_owned();
-        panic!("{why}: never received {expected:?}; got {seen:?}");
+        // The connection count is in the message because without it an
+        // empty `got` reads the same whether the client sent nothing or
+        // was never there at all — two different bugs.
+        panic!(
+            "{why}: never received {expected:?}; got {seen:?} over {} connection(s)",
+            self.accepted.load(Ordering::SeqCst)
+        );
     }
 }
 
