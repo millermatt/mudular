@@ -8,6 +8,17 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0](https://github.com/millermatt/mudular/compare/v0.10.0...v0.11.0) - 2026-08-18
+
+### Added
+
+- *(ui)* a command palette ([#118](https://github.com/millermatt/mudular/pull/118))
+- *(ui)* a status bar, and a panel that keeps the client's warnings ([#116](https://github.com/millermatt/mudular/pull/116))
+
+### Other
+
+- sync the cross-session send on the connection, not the tab bar ([#119](https://github.com/millermatt/mudular/pull/119))
+
 ## [0.10.0](https://github.com/millermatt/mudular/compare/v0.9.1...v0.10.0) - 2026-08-17
 
 ### Added
