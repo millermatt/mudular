@@ -8,6 +8,17 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1](https://github.com/millermatt/mudular/compare/v0.11.0...v0.11.1) - 2026-08-19
+
+### Fixed
+
+- *(ui)* stop the completion putting back what backspace just deleted ([#125](https://github.com/millermatt/mudular/pull/125))
+
+### Other
+
+- wait for the input to be bound before typing at it ([#126](https://github.com/millermatt/mudular/pull/126))
+- say who decisions are for without ranking people against each other ([#124](https://github.com/millermatt/mudular/pull/124))
+
 ## [0.11.0](https://github.com/millermatt/mudular/compare/v0.10.0...v0.11.0) - 2026-08-18
 
 ### Added
