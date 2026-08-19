@@ -2513,8 +2513,28 @@ fn type_into_input(session: &mut SessionPane, key: crossterm::event::KeyEvent) {
         KeyCode::Down if key.modifiers.is_empty() => session.walk_history(false),
         _ => false,
     };
-    if !walked {
-        session.view.input.handle_event(&Event::Key(key));
+    if walked {
+        session.refresh_suggestion();
+        return;
+    }
+
+    let before = session.view.input.value().chars().count();
+    session.view.input.handle_event(&Event::Key(key));
+
+    // A deletion is not an invitation to guess. The guess is recomputed
+    // after every keystroke, so completing here puts back the character
+    // that was just removed — and because Enter sends the ghost too
+    // (`completed_input`), that is the deletion *undone*, not merely
+    // redrawn: the line reads the same, the cursor sits one to the left,
+    // and the word you were correcting is what gets sent.
+    //
+    // Dismissing rather than clearing is what makes it stick. A bare
+    // `suggestion = None` is undone by the next server line, since
+    // `learn_words` refreshes the guess for a line the player has not
+    // touched since.
+    if session.view.input.value().chars().count() < before {
+        session.dismiss_suggestion();
+        return;
     }
     session.refresh_suggestion();
 }
@@ -6816,6 +6836,51 @@ mod tests {
         heard(&mut session, "A bullywug is here.");
 
         typed(&mut session, "look bull");
+
+        assert_eq!(session.view.suggestion.as_deref(), Some("ywug"));
+        assert_eq!(session.completed_input(), "look bullywug");
+    }
+
+    /// Backspace has to delete. The guess is recomputed after every
+    /// keystroke, so without this the completion puts back the character
+    /// that was just removed: the line reads the same, the cursor has
+    /// moved one left, and Enter sends the word you were trying to
+    /// correct. That is the deletion being undone, not merely redrawn —
+    /// `completed_input` is what Enter sends.
+    #[test]
+    fn backspace_deletes_rather_than_being_completed_back() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        typed(&mut session, "look bullywug");
+        assert_eq!(session.completed_input(), "look bullywug");
+
+        type_into_input(
+            &mut session,
+            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+
+        assert_eq!(
+            session.view.suggestion, None,
+            "a deletion must not be completed back"
+        );
+        assert_eq!(session.completed_input(), "look bullywu");
+    }
+
+    /// ...and the guess comes back as soon as you type again, so the
+    /// suppression is about the deletion rather than a mode the line gets
+    /// stuck in.
+    #[test]
+    fn typing_after_a_backspace_suggests_again() {
+        let (mut session, _rx) = test_support::pane("tank");
+        heard(&mut session, "A bullywug is here.");
+        typed(&mut session, "look bull");
+        type_into_input(
+            &mut session,
+            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(session.view.suggestion, None);
+
+        typed(&mut session, "l");
 
         assert_eq!(session.view.suggestion.as_deref(), Some("ywug"));
         assert_eq!(session.completed_input(), "look bullywug");
