@@ -339,13 +339,29 @@ fn sends_one_command_as_another_character() {
     );
     app.wait_for("cleric", "the second session should appear in the tab bar");
     cleric_mud.wait_for_connection("the second character should reach its server");
+    // The precondition `/send` actually has, and the one the tab bar does
+    // not give: a character bound to the input. Typed before that, the line
+    // goes to the shell input, where `/send` is answered with "needs a
+    // character" and dropped — leaving the far server silent, which reads
+    // from here exactly like a routing failure. The input pane names the
+    // bound character and nothing else does.
+    app.wait_for(
+        "input → tank",
+        "the input line should be bound to tank before typing at it",
+    );
 
     app.type_line("/send cleric drink well");
 
-    cleric_mud.wait_for_command(
-        "drink well",
-        "the typed command should run in the other character's session",
-    );
+    if !cleric_mud.saw("drink well") {
+        let seen = String::from_utf8_lossy(&cleric_mud.received.lock().unwrap()).into_owned();
+        panic!(
+            "the typed command should run in the other character's session: \
+             never received \"drink well\"; got {seen:?} over {} connection(s).\n\
+             What the client drew:\n{}",
+            cleric_mud.accepted.load(Ordering::SeqCst),
+            app.tail(1500)
+        );
+    }
     // Deliberately not checking the `[from tank]` tag in the cleric's pane
     // from here. It is the right behaviour and it is covered — `session::tests`
     // for the echo, `app::tests` for the routing — but reaching that pane
@@ -559,6 +575,21 @@ impl FakeMud {
         panic!("{why}: the client never connected to port {}", self.port);
     }
 
+    /// Whether `expected` arrived as a line of its own, within the deadline.
+    /// Split out of `wait_for_command` so a caller with more context — the
+    /// rendered screen, say — can write its own failure message.
+    fn saw(&self, expected: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let seen = String::from_utf8_lossy(&self.received.lock().unwrap()).into_owned();
+            if seen.lines().any(|line| line.trim() == expected) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     fn wait_for_command(&self, expected: &str, why: &str) {
         // Generous on purpose, and matched to `App::wait_for`. These tests
         // run in parallel against a three-core macOS runner, where several
@@ -718,6 +749,16 @@ impl App {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!("{why}: never saw {needle:?} in the terminal output");
+    }
+
+    /// The end of everything the client has drawn, escape codes and all.
+    /// Ugly, and the point: when a command goes missing the client usually
+    /// said why on screen, and a test watching only the socket cannot see
+    /// it. Two guesses at this failure were spent for want of this.
+    fn tail(&mut self, bytes: usize) -> String {
+        self.pump();
+        let from = self.output.len().saturating_sub(bytes);
+        self.output[from..].to_string()
     }
 
     fn still_running(&mut self) -> bool {
