@@ -357,7 +357,8 @@ pinned by integration tests with synthetic compressed captures.
   silently preferring one would make edits to the other do nothing.
 
   Plain is the default because a shared module's patterns are read and
-  adjusted by whoever copies it in (ACTORS.md actor 2), and regex made the
+  adjusted by whoever copies it in (the module author, ACTORS.md), and
+  regex made the
   recipient's job the author's job: a dropped backslash produces a pattern
   that still compiles, still matches most of the time, and is quietly
   wrong. Anchoring differs by rule kind, because the two are asking

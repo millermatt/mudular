@@ -1,65 +1,126 @@
-# Mudular — Actors
+# Mudular — who decisions are for
 
-Who a design or implementation decision should serve, ranked by how much of
-the architecture already exists to serve them. When a decision has to trade
-one actor's convenience against another's, the actor listed first wins.
+Two questions, and they take different answers:
 
-## 1. The multi-boxer
+- **What has to stay true regardless of who benefits?** — the invariants.
+- **Who is this change for?** — the people.
 
-Runs two or more characters at once in split panes and relies on one
-session driving another — the tank's session healing the cleric's at a
-health threshold (ARCHITECTURE.md §7.5). This is the primary design driver:
-the module map's per-session isolation (§4), zero-latency hotkey focus
-switching, unread indicators, and the cross-session peer-hook protocol all
-exist because of this actor. When a tradeoff pits multi-character
-correctness (buffer isolation, peer message ordering) against convenience
-elsewhere, this actor wins.
+Only one kind of decision here has a winner, and it is a narrow one: see
+"Defaults".
 
-## 2. The module author / community sharer
+## Invariants
 
-Writes YAML triggers or Lua/JS scripts and distributes them as a directory
-others copy in (§7.4). This actor is either the trusted author (their own
-modules) or the attacker vector (an imported module from someone else) —
-the sandboxing, bare-name path checks (`load_scripts`, `module_path`), and
-`deny_unknown_fields` schema all exist for this actor in both roles at
-once. Any feature that lets a module or script reach further than its own
-directory or exceed its time/resource budget is a regression for this
-actor, not a convenience.
+Not anyone's convenience, and not traded. A feature that needs one
+relaxed is a feature that needs redesigning. They are stated apart from
+the people below because they are never the side that loses.
 
-## 3. The newcomer
+**A module or script reaches no further than its own directory and its own
+budget.** The sandbox, the bare-name path checks (`load_scripts`,
+`module_path`), the `deny_unknown_fields` schema and the 100ms per-hook
+ceiling all serve this (§7.4). It holds whether the code was imported
+from a stranger or written by the person running it: trusting the author
+is not something the loader can verify, so it is not something the design
+may assume. Text a script or a module produces is untrusted for the same
+reason, wherever it reaches a screen or a path (§13).
 
-Has never edited YAML and hits the first-run wizard before anything else.
-The in-TUI new-profile form and profile editor (§10.2, §15) exist
-specifically so this actor never has to hand-edit a config file. Error
-messages, defaults, and the wizard's question order should be judged by
-whether they make sense to someone who has never seen `docs/USAGE.md`.
+**Local data belongs to whoever ran the client.** Transcripts, capture
+logs, maps and stored profiles are written owner-only by default, and
+server-controlled strings are untrusted wherever they can reach a
+filesystem path (§5, §13). A missing permission check here fails silently
+until it is exploited, which is what makes it an invariant rather than a
+preference.
 
-## 4. The security-conscious player on a shared machine
+## Who plays
 
-Cares about TLS certificate pinning against MUDs running self-signed certs
-(§5, §13), and about who else on the machine can read transcripts,
-capture logs, and stored profiles. Mostly invisible until something goes
-wrong — a missing permission check or a path-traversal bug is a silent
-failure for this actor until it's exploited. Design for them by keeping
-newly-written files owner-only by default and treating server-controlled
-strings as untrusted wherever they reach a filesystem path.
+Unranked. Appearing here does not win an argument; it means a change
+aimed at this person has an audience, and a change aimed at nobody has a
+question to answer.
 
-## 5. The power-user scripter
+### The multi-boxer
 
-Writes their own Lua/JS triggers rather than importing someone else's.
-Overlaps with actor 2, but trusts their own code, so their friction point
-is the sandbox's limits (no `coroutine`, a 100ms per-hook budget) rather
-than the sandbox's existence. Don't loosen the sandbox to make this
-actor's life easier — actor 2's threat model doesn't change just because
-this particular script came from a trusted source.
+Runs two or more characters at once and relies on one session driving
+another — the tank's session healing the cleric's at a health threshold
+(§7.5). Most of the architecture exists for this player: per-session
+isolation (§4), hotkey focus switching, unread indicators, the
+cross-session peer-hook protocol. Multi-character *correctness* — buffer
+isolation, peer message ordering — is nearer an invariant than a
+preference, since getting it wrong puts one character's output in
+another's pane, which is a bug under any framing.
 
-## Using this list
+### The solo player
 
-Actors 1 and 2 should win when a design decision creates a genuine
-conflict — the architecture doc's own goals (§1) point there. Actors 3–5
-are "don't break this for them," not "optimize for them": their needs are
-served by not regressing, not by adding new surface area on their behalf.
+One character, one pane. The most common way to play a MUD, and the
+player this client's defaults do **not** favour — see "Defaults". A bet
+that is never written down cannot be revisited when it turns out to be
+wrong, so it is written down.
 
-If a proposed feature doesn't clearly serve one of these actors, that's a
-reason to ask why it's being built before building it (see the top-level
-`CLAUDE.md`'s scope-discipline note: no speculative features).
+### The player using a screen reader
+
+MUDs are among the most-played game genres by blind players, because they
+are pure text, and the genre has clients built for them specifically.
+
+What this person needs is a line lifecycle rather than a rendered screen:
+new lines announced as they arrive, reading interrupted the moment a
+command is sent, and one channel speakable on its own. The first two are
+properties of the §6.5 pipeline, which already knows both when a line
+completes and when a command is sent; the third reuses channel routing
+(§11.1).
+
+A full-screen TUI is not that surface — a screen reader re-reads a
+redrawn pane instead of announcing what changed — so serving this player
+means a line-oriented output path beside the panes rather than options
+bolted onto them. That path is not built (#39); what is settled is that
+it is allowed to exist, which is why this entry describes what the person
+needs rather than what the client currently does.
+
+### The module author / community sharer
+
+Writes YAML triggers or Lua/JS scripts and distributes them as a
+directory others copy in (§7.4). What this person needs from a design is
+legibility at the far end: a shared module is read and adjusted by
+someone who did not write it and cannot ask its author. Plain patterns
+over regex (§7.1) come from that.
+
+Their security properties are not here. They are invariants, where no
+one's convenience can trade them away.
+
+### The newcomer
+
+Has never edited YAML and meets the first-run wizard before anything
+else. The in-TUI profile form and config editor (§10.2, §15) exist so
+this person never has to hand-edit a file. Judge error messages,
+defaults, and the wizard's question order by whether they make sense to
+someone who has not read `docs/USAGE.md`.
+
+### The power-user scripter
+
+Writes their own Lua/JS rather than importing someone else's, so their
+friction is the sandbox's limits rather than its existence. The limits
+hold anyway: "I trust this script" is not a thing the loader can check.
+
+## Defaults
+
+There is one default layout, one thing a given key does, one answer for
+`map_first`. A default cannot be split between two people, which makes it
+the one place precedence is needed:
+
+> **When a default has to favour someone, it favours the multi-boxer.**
+
+That is the product bet: this client is for running several characters at
+once, and its defaults should suit that with nothing configured.
+
+It says nothing about anywhere else, because everywhere else the question
+does not arise — a preference, a mode or a command can serve one player
+without being taken from another. Reach for this rule only when the thing
+being decided is genuinely singular.
+
+## "Who is this for?"
+
+Ask it of new surface: features, config keys, client commands, panes. Not
+of bug fixes, refactors or tests.
+
+A change that serves nobody above is one to question before building
+rather than after (`CLAUDE.md`'s scope-discipline note: no speculative
+features). But "serves nobody listed" is a prompt, not a veto. This list
+describes; finding a real player it fails to describe is a reason to fix
+the list.
