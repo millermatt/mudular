@@ -26,21 +26,28 @@ docs/ACTORS.md; per-milestone model guidance is docs/DEVELOPMENT.md.
 
 ## Who the change is for
 
-ARCHITECTURE.md answers *how*. docs/ACTORS.md answers *who for*, and it ranks
-them — multi-boxer, module author, newcomer, security-conscious player,
-power-user scripter — so that when two actors' convenience conflicts there is
-already an answer. Read it alongside §14, not only when reading UX_REVIEW.md.
+ARCHITECTURE.md answers *how*. docs/ACTORS.md answers *who for*: two
+invariants that hold for every change, and the people who play — multi-boxer,
+solo player, screen-reader user, module author, newcomer, power-user
+scripter. Read it alongside §14, not only when reading UX_REVIEW.md.
 
-- **Name the actor in an issue or PR that proposes new surface area.** This is
-  not ceremony; the ranking changes what gets built and how it is argued.
-  "Regexes are unfriendly to newcomers" pitches a feature at actor 3, whom
-  ACTORS.md explicitly treats as *don't break this for them* rather than
-  *optimize for them* — so framed that way the proposal argues against itself.
-  "A shared module has to stay legible to whoever copies it in" is the same
-  feature serving actor 2, and it leads to a different design.
+- **Name the player in an issue or PR that proposes new surface area.** Not
+  ceremony: saying who a change is for is what makes it arguable at all, and
+  it is how a feature nobody needs gets caught before it is built rather than
+  after.
+- **The list is not a ranking, and there is nothing to win.** Precedence
+  applies in exactly one place — a default, which cannot be split between two
+  people, goes to the multi-boxer. Everywhere else a preference, a mode or a
+  command can serve one player without being taken from another, so "which
+  player outranks which" is the wrong question. Don't invent a contest to
+  justify a change; say who it helps and what it costs.
+- **An invariant is never the side that loses.** Module and script isolation,
+  and local data being owner-only, are not traded for anyone's convenience —
+  a design that needs one relaxed needs redesigning instead.
 - **A change that serves nobody on the list is one to question before
   building, not after.** ACTORS.md says this itself, and it is the same rule
-  as scope discipline above.
+  as scope discipline above. It is a prompt rather than a veto: a real player
+  the list fails to describe is a reason to fix the list.
 - Bug fixes, refactors and test work don't need this. It is for new surface
   area: features, config keys, client commands, panes.
 

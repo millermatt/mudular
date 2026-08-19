@@ -113,7 +113,7 @@ impl RetainedLine {
         // way in (its triggers match the result), but a client notice, a
         // script's `mud.echo`, and a peer's relayed line never passed
         // through that — and a community module's script is untrusted
-        // (docs/ACTORS.md §2).
+        // (docs/ACTORS.md, "Invariants").
         let text = strip_unsafe_controls(&text.into());
         // `strip_ansi` walks the line either way; keeping the result only
         // when it differs is what makes the cache free for the uncoloured
@@ -257,8 +257,9 @@ mod plain_tests {
     /// §13 again, on the other side of the funnel. `strip_unsafe_controls`
     /// only ever ran on decoded *server* text, so a line the client or a
     /// script wrote reached the screen with whatever control bytes it
-    /// carried — and a community module's script (docs/ACTORS.md §2) is
-    /// untrusted by the same reasoning the §7.4 sandbox exists for.
+    /// carried — and a community module's script is untrusted
+    /// (docs/ACTORS.md, "Invariants") by the same reasoning the §7.4
+    /// sandbox exists for.
     /// A retained line is safe by construction instead.
     #[test]
     fn a_retained_line_never_carries_a_raw_control_byte() {

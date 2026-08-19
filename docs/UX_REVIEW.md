@@ -87,7 +87,8 @@ previous working rules when a script fails to load.
 
 Not bugs — places where the documented design already works, but a small
 change would make it noticeably easier to live in day to day. Ranked by
-which actor (`docs/ACTORS.md`) it serves and how much friction it removes.
+which player (`docs/ACTORS.md`) it serves and how much friction it
+removes.
 
 **A. No way to add a character to a running instance.** The multi-boxer has
 to quit and relaunch with all profile names to duo, losing every pane's
@@ -145,8 +146,9 @@ Filed as #23.
 If picking a small set to act on: **1** and **2** from the adversarial
 findings are "actor loses trust or gets stuck," the worst outcomes the
 severity rubric defines — fix those first. Of the workflow suggestions,
-**A** and **B** are the two that serve the top-ranked actor
-(`docs/ACTORS.md` §1, the multi-boxer) and remove the most friction from
+**A** and **B** are the two that serve the multi-boxer
+(`docs/ACTORS.md`), whom the defaults favour, and remove the most
+friction from
 sessions that already happen constantly, rather than edge cases. Of the
 joy suggestions, **G** costs the least and pays back the most: it's a
 one-time, opt-out-by-nature echo (fires once, then gets out of the way)

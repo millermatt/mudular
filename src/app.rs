@@ -9880,7 +9880,7 @@ mod tests {
     /// a `Vec` renumbers everything above it, which is how the input line
     /// silently ends up bound to somebody else. Nothing about this fails
     /// loudly, which is why it is a test rather than a comment: for the
-    /// multi-boxer (ACTORS.md actor 1) the symptom is a heal cast into the
+    /// multi-boxer (docs/ACTORS.md) the symptom is a heal cast into the
     /// wrong session.
     #[test]
     fn removing_a_session_leaves_focus_and_input_on_the_same_character() {
