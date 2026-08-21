@@ -727,7 +727,22 @@ pub enum LayoutMode {
 }
 
 /// Everything the UI needs to render a frame.
+/// Whether the environment asked for no colour (no-color.org).
+///
+/// The variable's *presence* is the signal, not its value: `NO_COLOR=0`
+/// still means no colour, which is the part of the convention that is easy
+/// to get wrong by reaching for a bool parser. Empty is the one documented
+/// exception, and means nothing was asked.
+pub fn no_color_requested(value: Option<&str>) -> bool {
+    matches!(value, Some(value) if !value.is_empty())
+}
+
 pub struct AppState {
+    /// The environment asked for no colour (#120, no-color.org). Read once
+    /// at startup and carried, rather than consulted where colour is drawn:
+    /// an env lookup per cell would be absurd, and a test that had to set a
+    /// process-wide variable could not run beside its neighbours.
+    pub no_color: bool,
     pub sessions: Vec<SessionPane>,
     pub channels: Vec<ChannelPane>,
     pub focus: Focus,
@@ -3256,6 +3271,7 @@ async fn event_loop(
         scrollback_size,
         autocomplete,
         cross_session_default,
+        no_color: no_color_requested(std::env::var("NO_COLOR").ok().as_deref()),
     };
     // Each world read off disk once, by whichever character reaches it
     // first — the rest join the entry that is already there (§16).
@@ -5079,6 +5095,9 @@ pub(crate) mod test_support {
             .unwrap_or_else(SessionId::next);
         (
             AppState {
+                // Off in tests: a fixture that stripped colour would make
+                // every colour assertion in this module vacuous.
+                no_color: false,
                 sessions,
                 maps: HashMap::new(),
                 channels: Vec::new(),
@@ -5160,6 +5179,21 @@ mod tests {
     /// skipped until the terminal already has it — so clearing the whole
     /// screen for that, and blanking every pane for a frame, bought
     /// nothing.
+    /// no-color.org: presence is the signal, not truthiness. `NO_COLOR=0`
+    /// asks for no colour just as `NO_COLOR=1` does — the trap being that
+    /// the obvious implementation parses the value and gets that backwards.
+    #[test]
+    fn no_color_is_asked_for_by_presence_not_by_value() {
+        assert!(!no_color_requested(None), "unset asks for nothing");
+        assert!(
+            !no_color_requested(Some("")),
+            "empty is the documented exception"
+        );
+        assert!(no_color_requested(Some("1")));
+        assert!(no_color_requested(Some("0")), "a falsy value still asks");
+        assert!(no_color_requested(Some("false")), "so does this one");
+    }
+
     #[test]
     fn only_a_vanished_picture_needs_the_screen_cleared() {
         assert!(image_vanished(true, false), "gone: its pixels are stranded");

@@ -1463,3 +1463,18 @@ mudular [PROFILE]... [OPTIONS]
   --record <PATH>         Record raw inbound bytes to a file
   --log <PATH>            Write diagnostic logs to a file (filtered via RUST_LOG)
 ```
+
+## Environment
+
+`NO_COLOR`
+: Set to anything non-empty and the client draws without colour, per
+  [no-color.org](https://no-color.org/). Its *presence* is what counts —
+  `NO_COLOR=0` still means no colour — and an empty value means nothing was
+  asked for. Bold, dim and reverse remain, as do the glyphs that carry
+  meaning on their own: `!` beside a character in trouble, `●` with the
+  unread count, `@` and `X` on the map. Colour the MUD itself sends is
+  suppressed too.
+
+`RUST_LOG`
+: Filters what `--log` writes.
+

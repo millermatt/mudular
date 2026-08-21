@@ -553,6 +553,12 @@ pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) 
         );
     }
 
+    // Last, so it catches every overlay above as well as the panes below:
+    // an overlay drawn after the strip would keep its colour (#120).
+    if state.no_color {
+        strip_colour(frame.buffer_mut());
+    }
+
     // The picture is written by the caller once the frame has been
     // flushed: an image is not made of cells, so ratatui cannot carry it.
     DrawnFrame {
@@ -1619,6 +1625,24 @@ fn overlay_covers_map(state: &AppState) -> bool {
         || state.new_profile_wizard.is_some()
 }
 
+/// Removes colour from a finished frame, leaving bold, dim and reverse to
+/// carry the hierarchy (#120, no-color.org).
+///
+/// Done to the whole buffer at the end of the frame rather than at each of
+/// the places a style is built, because colour is not centralised: the
+/// chrome, a profile's tint, the alarm hue, rule highlights and the MUD's
+/// own ANSI (through `ansi_to_tui`) reach the screen by five different
+/// routes. This is the one point they have all arrived at, so it is the
+/// only place a single change can be complete — and the server's colour is
+/// the half a per-call-site fix would silently miss.
+fn strip_colour(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        cell.fg = Color::Reset;
+        cell.bg = Color::Reset;
+        cell.underline_color = Color::Reset;
+    }
+}
+
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     if area.width == 0 {
         return;
@@ -2391,6 +2415,54 @@ mod tests {
     /// where the palette gets advertised too — and by rendering the binding
     /// rather than the string `Ctrl+P`, so a player who remapped it is told
     /// their own key rather than ours.
+    /// #120, no-color.org: an environment that says "no colour" gets none.
+    ///
+    /// Asserted over every cell of a screen deliberately full of it, because
+    /// colour is not centralised here — chrome, a profile's tint, the alarm
+    /// hue and the MUD's own ANSI all arrive by different routes, and a test
+    /// that checked one route would pass while the others still painted.
+    #[test]
+    fn nothing_is_coloured_when_the_environment_asked_for_none() {
+        let mut state = state();
+        state.sessions[0].view.color = Some(Color::Red);
+        state.sessions[0].view.distress = Some(0.09);
+        state.sessions[0].view.security = "TLS".to_string();
+
+        // The control: without it, this screen is colourful. Without this
+        // half the test would pass just as well against a blank frame.
+        let colourful = render_sized(&state, 80, 24);
+        assert!(
+            colourful
+                .content
+                .iter()
+                .any(|c| c.fg != Color::Reset || c.bg != Color::Reset),
+            "the fixture should be colourful, or the assertion below proves nothing"
+        );
+
+        state.no_color = true;
+        let plain = render_sized(&state, 80, 24);
+        let coloured: Vec<_> = plain
+            .content
+            .iter()
+            .filter(|c| c.fg != Color::Reset || c.bg != Color::Reset)
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            coloured.is_empty(),
+            "these cells kept their colour: {coloured:?}"
+        );
+
+        // Colour goes; hierarchy stays. Bold, dim and reverse are not colour
+        // and are what the interface still reads by.
+        assert!(
+            plain
+                .content
+                .iter()
+                .any(|c| c.modifier != ratatui::style::Modifier::empty()),
+            "stripping colour must not flatten the emphasis with it"
+        );
+    }
+
     #[test]
     fn the_input_title_names_the_key_that_opens_the_palette() {
         let mut state = state();
