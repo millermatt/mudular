@@ -1667,6 +1667,42 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(line).style(bar), area);
 }
 
+/// The input pane's title: who the line goes to, and the only key hints the
+/// client shows without being asked.
+///
+/// The palette (#121) is advertised here rather than in the status bar
+/// because this is where a key hint already lived, and because the last row
+/// is spent (#116). One hint, not the five a full hint row would carry: the
+/// palette is the key that opens every other command, so it is the one worth
+/// a permanent column.
+///
+/// Both keys are rendered from the binding, so a player who remapped either
+/// is told their own key rather than the default.
+fn input_title(name: Option<&str>, masked: bool, keybinds: &Keybinds, width: u16) -> String {
+    let who = match name {
+        Some(name) => format!(" input → {name}"),
+        None => " input".to_string(),
+    };
+    if masked {
+        // A password prompt is the wrong moment for chrome, which is why
+        // this form never carried the quit hint either.
+        return format!("{who} (hidden) ");
+    }
+    let full = format!(
+        "{who} ({} cmds · {} quit) ",
+        keybinds.palette, keybinds.quit
+    );
+    // ratatui truncates a title wider than its block without saying so, so
+    // the choice on a narrow pane is not "cramped" but "the quit key silently
+    // cut in half". The new hint yields; the one players already rely on
+    // stays.
+    if full.chars().count() <= width.saturating_sub(2) as usize {
+        full
+    } else {
+        format!("{who} ({} to quit) ", keybinds.quit)
+    }
+}
+
 fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     let Some(session) = state.bound() else {
         // No character, but still a line: `/connect` has to be typeable in
@@ -1676,7 +1712,7 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
         // every keystroke.
         let shell = Paragraph::new(state.shell_input.value()).block(
             Block::bordered()
-                .title(format!(" input ({} to quit) ", state.keybinds.quit))
+                .title(input_title(None, false, &state.keybinds, area.width))
                 .border_style(Style::new().dim()),
         );
         frame.render_widget(shell, area);
@@ -1700,14 +1736,12 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     // The border names the session commands go to: with several characters
     // open, and focus possibly on a channel pane, that must never be a guess.
-    let title = if session.view.masked {
-        format!(" input → {} (hidden) ", session.view.name)
-    } else {
-        format!(
-            " input → {} ({} to quit) ",
-            session.view.name, state.keybinds.quit
-        )
-    };
+    let title = input_title(
+        Some(&session.view.name),
+        session.view.masked,
+        &state.keybinds,
+        area.width,
+    );
     // The completion is drawn past the cursor rather than inserted (§11.3):
     // dim, so it reads as the client's guess rather than as something you
     // typed, and behind the cursor, so the cursor still sits where the next
@@ -2349,6 +2383,92 @@ mod tests {
         let title = row(&render_sized(&state, 60, 12), 0);
         assert!(!title.contains("42ms"), "still in the title: {title:?}");
         assert!(!title.contains("[TLS]"), "still in the title: {title:?}");
+    }
+
+    /// #121: the palette shipped in #118 with nothing on screen naming its
+    /// key, and the first question after it merged was how to open it. The
+    /// input title is where the client already advertises a key, so it is
+    /// where the palette gets advertised too — and by rendering the binding
+    /// rather than the string `Ctrl+P`, so a player who remapped it is told
+    /// their own key rather than ours.
+    #[test]
+    fn the_input_title_names_the_key_that_opens_the_palette() {
+        let mut state = state();
+        let title = row(
+            &render_sized(&state, 80, 12),
+            layout(Rect::new(0, 0, 80, 12), &state).input.y,
+        );
+        assert!(
+            title.contains(&state.keybinds.palette.to_string()),
+            "the input title should name the palette key: {title:?}"
+        );
+        assert!(
+            title.contains(&state.keybinds.quit.to_string()),
+            "and must not have lost the quit key it already had: {title:?}"
+        );
+
+        // Remapped, the hint follows: the point is the player's binding, not
+        // a hard-coded one.
+        state.keybinds.palette = "alt+k".parse().unwrap();
+        let title = row(
+            &render_sized(&state, 80, 12),
+            layout(Rect::new(0, 0, 80, 12), &state).input.y,
+        );
+        assert!(
+            title.contains("Alt+K"),
+            "a remapped palette key should advertise itself: {title:?}"
+        );
+        assert!(
+            !title.contains("Ctrl+P"),
+            "and the old default should be gone: {title:?}"
+        );
+    }
+
+    /// Too narrow for both hints, the palette one goes and the quit one
+    /// stays. ratatui truncates an over-wide block title silently, so the
+    /// alternative is not a cramped title but a `Ctrl+Q` that players
+    /// already rely on being quietly cut in half.
+    ///
+    /// The width is derived from the title itself, per `overlay_fits`: a
+    /// hand-picked number stops meaning "one column too narrow" the moment
+    /// a hint is reworded, and the test would still pass while testing
+    /// nothing.
+    #[test]
+    fn a_title_too_narrow_for_both_hints_keeps_the_one_that_was_already_there() {
+        let state = state();
+        let full = input_title(Some("kestrel"), false, &state.keybinds, u16::MAX);
+        let too_narrow = full.chars().count() as u16 - 1;
+
+        let title = input_title(Some("kestrel"), false, &state.keybinds, too_narrow);
+        assert!(
+            title.contains(&state.keybinds.quit.to_string()),
+            "the quit key must survive a narrow pane: {title:?}"
+        );
+        assert!(
+            !title.contains(&state.keybinds.palette.to_string()),
+            "the palette hint is the one that yields: {title:?}"
+        );
+        assert!(
+            title.chars().count() <= too_narrow as usize,
+            "the fallback must itself fit {too_narrow} columns: {title:?}"
+        );
+    }
+
+    /// A password prompt is the wrong moment for chrome. The masked title
+    /// already dropped the quit hint deliberately; it does not gain one.
+    #[test]
+    fn a_masked_input_advertises_nothing() {
+        let mut state = state();
+        state.sessions[0].view.masked = true;
+        let title = row(
+            &render_sized(&state, 80, 12),
+            layout(Rect::new(0, 0, 80, 12), &state).input.y,
+        );
+        assert!(
+            !title.contains(&state.keybinds.palette.to_string()),
+            "no palette hint while typing a password: {title:?}"
+        );
+        assert!(title.contains("hidden"), "still says hidden: {title:?}");
     }
 
     /// A profile's colour has to reach both places a character is named,
