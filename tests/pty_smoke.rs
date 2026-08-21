@@ -757,8 +757,7 @@ impl App {
     /// it. Two guesses at this failure were spent for want of this.
     fn tail(&mut self, bytes: usize) -> String {
         self.pump();
-        let from = self.output.len().saturating_sub(bytes);
-        self.output[from..].to_string()
+        last_bytes(&self.output, bytes).to_string()
     }
 
     fn still_running(&mut self) -> bool {
@@ -873,5 +872,37 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// The last `bytes` bytes of `s`, starting from the nearest char boundary at
+/// or after that offset. A fixed offset into a screen the client drew lands
+/// inside a box-drawing character often enough to be a certainty, not a risk,
+/// and slicing there panics — which is how the diagnostic added to explain a
+/// macOS failure took the place of the explanation.
+fn last_bytes(s: &str, bytes: usize) -> &str {
+    let mut from = s.len().saturating_sub(bytes);
+    while from < s.len() && !s.is_char_boundary(from) {
+        from += 1;
+    }
+    &s[from..]
+}
+
+#[test]
+fn a_tail_that_lands_mid_character_starts_at_the_next_one() {
+    // Every byte offset into a run of box-drawing characters, which is what a
+    // drawn frame is mostly made of. Slicing at a raw offset panics on two out
+    // of every three.
+    let drawn = "─".repeat(8);
+    for bytes in 0..=drawn.len() {
+        let tail = last_bytes(&drawn, bytes);
+        assert!(
+            drawn.ends_with(tail),
+            "the tail should be a suffix of the whole"
+        );
+        assert!(
+            tail.len() <= bytes,
+            "the tail should not exceed {bytes} bytes"
+        );
     }
 }
