@@ -354,12 +354,21 @@ fn sends_one_command_as_another_character() {
 
     if !cleric_mud.saw("drink well") {
         let seen = String::from_utf8_lossy(&cleric_mud.received.lock().unwrap()).into_owned();
+        // What the sender's own server got is the datum that splits this
+        // three ways, and the assertion below already reads it — on the path
+        // that only runs when the test passes. Here it says whether the line
+        // was submitted at all: `/send ...` reaching tank means Enter worked
+        // and the client did not claim the word; nothing reaching tank means
+        // the line never left the input. The screen cannot tell these apart,
+        // because clearing the input draws erases and those strip to nothing.
+        let tank_seen = String::from_utf8_lossy(&tank_mud.received.lock().unwrap()).into_owned();
         panic!(
             "the typed command should run in the other character's session: \
              never received \"drink well\"; got {seen:?} over {} connection(s).\n\
+             The sender's own server got {tank_seen:?}.\n\
              What the client drew:\n{}",
             cleric_mud.accepted.load(Ordering::SeqCst),
-            app.tail(1500)
+            app.tail(4000)
         );
     }
     // Deliberately not checking the `[from tank]` tag in the cleric's pane
@@ -751,14 +760,20 @@ impl App {
         panic!("{why}: never saw {needle:?} in the terminal output");
     }
 
-    /// The end of everything the client has drawn, escape codes and all.
-    /// Ugly, and the point: when a command goes missing the client usually
-    /// said why on screen, and a test watching only the socket cannot see
-    /// it. Two guesses at this failure were spent for want of this.
+    /// The end of what the client has drawn, as text rather than as bytes:
+    /// when a command goes missing the client usually said why on screen,
+    /// and a test watching only the socket cannot see it.
+    ///
+    /// Stripped of escape codes, because raw is what made the first attempt
+    /// useless. A redraw spends about forty bytes of cursor positioning and
+    /// colour on every single character, so 1500 raw bytes reached back over
+    /// roughly twenty keystrokes — the window ended mid-word, before the line
+    /// the client answered with. Stripping is what makes a byte budget mean
+    /// approximately what it says.
     fn tail(&mut self, bytes: usize) -> String {
         self.pump();
-        let from = self.output.len().saturating_sub(bytes);
-        self.output[from..].to_string()
+        let drawn = visible_text(&self.output);
+        last_bytes(&drawn, bytes).to_string()
     }
 
     fn still_running(&mut self) -> bool {
@@ -874,4 +889,106 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).ok();
     }
+}
+
+/// The last `bytes` bytes of `s`, starting from the nearest char boundary at
+/// or after that offset. A fixed offset into a screen the client drew lands
+/// inside a box-drawing character often enough to be a certainty, not a risk,
+/// and slicing there panics — which is how the diagnostic added to explain a
+/// macOS failure took the place of the explanation.
+fn last_bytes(s: &str, bytes: usize) -> &str {
+    let mut from = s.len().saturating_sub(bytes);
+    while from < s.len() && !s.is_char_boundary(from) {
+        from += 1;
+    }
+    &s[from..]
+}
+
+#[test]
+fn a_tail_that_lands_mid_character_starts_at_the_next_one() {
+    // Every byte offset into a run of box-drawing characters, which is what a
+    // drawn frame is mostly made of. Slicing at a raw offset panics on two out
+    // of every three.
+    let drawn = "─".repeat(8);
+    for bytes in 0..=drawn.len() {
+        let tail = last_bytes(&drawn, bytes);
+        assert!(
+            drawn.ends_with(tail),
+            "the tail should be a suffix of the whole"
+        );
+        assert!(
+            tail.len() <= bytes,
+            "the tail should not exceed {bytes} bytes"
+        );
+    }
+}
+
+/// `s` with its terminal escape sequences removed, leaving the characters
+/// that were actually put on screen.
+///
+/// Not an emulator: nothing here replays cursor movement, so text drawn out
+/// of order arrives out of order. That is enough for the job, which is to
+/// find a sentence the client printed inside a wall of SGR noise, and the
+/// alternative — a real vt100 parse — is a dependency this suite does not
+/// otherwise need.
+fn visible_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if c != '\r' {
+                out.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            // A CSI sequence runs until a byte in @-~ — the colours, the
+            // cursor jumps, and the erases, which is nearly all of it.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // An OSC string runs until BEL or ESC \ — the window title, and
+            // the OSC 9 notifications this client sends.
+            Some(']') => {
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if c == '\x07' || (prev == '\x1b' && c == '\\') {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            // Anything else two-byte: swallow the pair.
+            Some(_) | None => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn the_drawn_text_survives_stripping_and_the_escape_codes_do_not() {
+    // Shaped like a real redraw: SGR colour, a cursor jump, the character,
+    // a reset, a cursor-show. This is what forty bytes per keystroke looks
+    // like, and why a raw tail reached back over so little.
+    let redraw = "\x1b[38;2;11;14;17m\x1b[28;2Hd\x1b[39m\x1b[0m\x1b[?25h";
+    assert_eq!(visible_text(redraw), "d");
+
+    // The sentence we have spent five CI runs trying to read, buried.
+    let answered = "\x1b[2m\x1b[30;1Hneeds a character\x1b[0m\x1b[?25h";
+    assert!(
+        visible_text(answered).contains("needs a character"),
+        "the client's own explanation should survive"
+    );
+
+    // An OSC 9 notification is a string, not a CSI, and terminates on BEL.
+    assert_eq!(visible_text("a\x1b]9;tell from saihtam\x07b"), "ab");
+    // ...or on ESC \.
+    assert_eq!(visible_text("a\x1b]0;title\x1b\\b"), "ab");
+
+    // Box drawing is text and stays; it is also what broke the raw slice.
+    assert_eq!(visible_text("\x1b[0m──\x1b[0m"), "──");
 }
