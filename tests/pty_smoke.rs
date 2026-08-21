@@ -354,9 +354,18 @@ fn sends_one_command_as_another_character() {
 
     if !cleric_mud.saw("drink well") {
         let seen = String::from_utf8_lossy(&cleric_mud.received.lock().unwrap()).into_owned();
+        // What the sender's own server got is the datum that splits this
+        // three ways, and the assertion below already reads it — on the path
+        // that only runs when the test passes. Here it says whether the line
+        // was submitted at all: `/send ...` reaching tank means Enter worked
+        // and the client did not claim the word; nothing reaching tank means
+        // the line never left the input. The screen cannot tell these apart,
+        // because clearing the input draws erases and those strip to nothing.
+        let tank_seen = String::from_utf8_lossy(&tank_mud.received.lock().unwrap()).into_owned();
         panic!(
             "the typed command should run in the other character's session: \
              never received \"drink well\"; got {seen:?} over {} connection(s).\n\
+             The sender's own server got {tank_seen:?}.\n\
              What the client drew:\n{}",
             cleric_mud.accepted.load(Ordering::SeqCst),
             app.tail(4000)
