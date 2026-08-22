@@ -31,10 +31,8 @@ on:
     branches:
       - main
 
-# Never two of these at once: both jobs write to the same branch and tags.
-concurrency:
-  group: release-plz-${{ github.ref }}
-  cancel-in-progress: false
+# Concurrency is per job below, not here. The two jobs want opposite things,
+# and one workflow-level group can only give them the same thing.
 
 jobs:
   # Tags when the merged commit carries a version this repo has not released.
@@ -42,6 +40,11 @@ jobs:
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
+    # Never cancel: this one pushes tags, and dist builds from the tag.
+    # An interrupted run can leave a version tagged with nothing built for it.
+    concurrency:
+      group: release-plz-release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -61,6 +64,15 @@ jobs:
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
+    # Cancel: a newer main supersedes an older one. This job only force-pushes
+    # the release branch to describe current main, so the run for the older
+    # commit has nothing to contribute -- and letting it finish last is the
+    # bug, because it republishes a changelog computed from a stale tree.
+    # v0.6.1 shipped that way. Each run checks out clean and rewrites the
+    # branch wholesale, so a cancelled one cannot leave a partial state behind.
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
