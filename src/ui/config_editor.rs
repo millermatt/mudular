@@ -1166,12 +1166,21 @@ impl ConfigEditorState {
 
         if let Some(notice) = &self.notice {
             lines.push(Line::raw(""));
-            let style = match notice.level {
-                NoticeLevel::Info => Style::default().fg(Color::Green),
-                NoticeLevel::Warn => Style::default().fg(Color::Yellow),
-                NoticeLevel::Error => Style::default().fg(Color::Red),
+            // The word, not just the hue (#120): green, amber and red were
+            // the only thing separating a failed save from a successful one,
+            // so without colour they read identically. Info stays unmarked —
+            // it is the "nothing is wrong" case, and labelling that is what
+            // teaches the eye to stop reading the label, the same reason the
+            // status bar never says "0 errors".
+            let (style, prefix) = match notice.level {
+                NoticeLevel::Info => (Style::default().fg(Color::Green), ""),
+                NoticeLevel::Warn => (Style::default().fg(Color::Yellow), "Warning — "),
+                NoticeLevel::Error => (Style::default().fg(Color::Red), "Error — "),
             };
-            lines.push(Line::from(Span::styled(notice.text.clone(), style)));
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{}", notice.text),
+                style,
+            )));
         }
 
         lines.push(Line::raw(""));
@@ -1633,6 +1642,61 @@ mod tests {
         assert_eq!(
             state.notice.as_ref().map(|n| n.level),
             Some(NoticeLevel::Error)
+        );
+    }
+
+    /// #120: the three notice levels were green, amber and red and nothing
+    /// else, so without colour a failure to save and a confirmation that it
+    /// saved read identically. The level is the one signal here that colour
+    /// carried alone.
+    ///
+    /// Info stays unmarked on purpose: it is the "nothing is wrong" case,
+    /// and the status bar already declines to say "0 errors" for the same
+    /// reason — labelling the absence of a problem teaches the eye to skip
+    /// the label.
+    #[test]
+    fn a_notice_says_which_kind_it_is_without_relying_on_colour() {
+        let render = |state: &ConfigEditorState| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| state.draw(frame, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let area = buffer.area;
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let (_dir, mut state) = open_state(&minimal("kestrel"));
+
+        state.set_notice_error("could not save".to_string());
+        let screen = render(&state);
+        assert!(screen.contains("Error"), "an error should say so: {screen}");
+        assert!(screen.contains("could not save"), "{screen}");
+
+        state.notice = Some(Notice {
+            level: NoticeLevel::Warn,
+            text: "this file has comments".to_string(),
+        });
+        let screen = render(&state);
+        assert!(
+            screen.contains("Warning"),
+            "a warning should say so: {screen}"
+        );
+
+        state.set_notice_info("saved".to_string());
+        let screen = render(&state);
+        assert!(screen.contains("saved"), "{screen}");
+        assert!(
+            !screen.contains("Error") && !screen.contains("Warning"),
+            "an info notice should not wear another level's word: {screen}"
         );
     }
 
