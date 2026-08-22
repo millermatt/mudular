@@ -4,6 +4,12 @@ This covers day-to-day use: connecting, profiles, config files, and
 command-line flags. For how it's built, see
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
+Mudular needs a terminal of at least **80x24**. Below that it says so and
+waits, rather than drawing a layout into a space that cannot hold it —
+resize the window and it picks up where it left off. 80x24 is what a
+default terminal still opens at, so you are only likely to meet this
+notice after deliberately shrinking one.
+
 ## Quick connect
 
 The first time you run `mudular` with no profile name and no `--host`, and

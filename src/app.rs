@@ -3355,7 +3355,7 @@ async fn event_loop(
             map_grid: None,
         };
         let mut completed =
-            terminal.draw(|frame| drawn = ui::draw(frame, &state, &mut map_image_cache))?;
+            terminal.draw(|frame| drawn = ui::draw_screen(frame, &state, &mut map_image_cache))?;
         if image_vanished(had_image, drawn.image.is_some()) {
             // The cells under a picture are marked skipped while it is up,
             // and a skipped cell is excluded from ratatui's diff no matter
@@ -3384,8 +3384,8 @@ async fn event_loop(
             // map stayed blank until something moved and forced a fresh
             // one, which read as "the map needs two moves to appear".
             map_image_cache.forget();
-            completed =
-                terminal.draw(|frame| drawn = ui::draw(frame, &state, &mut map_image_cache))?;
+            completed = terminal
+                .draw(|frame| drawn = ui::draw_screen(frame, &state, &mut map_image_cache))?;
         }
         if drawn.image_is_fresh
             && let Some(image) = &drawn.image
