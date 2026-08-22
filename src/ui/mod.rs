@@ -19,9 +19,9 @@ use ratatui::widgets::{
     Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
-use crate::app::{AppState, ChannelPane, Focus, LayoutMode};
 use crate::config::Keybinds;
 use crate::scrollback::{Origin, RetainedLine};
+use crate::state::{AppState, ChannelPane, Focus, LayoutMode};
 
 pub mod config_editor;
 mod map_render;
@@ -821,7 +821,7 @@ fn draw_help(frame: &mut Frame, area: Rect, state: &AppState) {
 /// player's, and the least a client can do is not make them remember what
 /// they called the last one. Numbered, because nine rows is short enough
 /// that counting beats arrowing.
-fn draw_mark_menu(frame: &mut Frame, area: Rect, menu: &crate::app::MarkMenu) {
+fn draw_mark_menu(frame: &mut Frame, area: Rect, menu: &crate::state::MarkMenu) {
     // Typing a label of your own replaces the list: the choice has been
     // made, and what is left is one field, so the list would only be
     // something to read past.
@@ -1177,7 +1177,7 @@ fn draw_map(
     };
     // The same three keys the scrollback line picker advertises, for the
     // same reason: a selection nobody can see how to leave is a trap.
-    let focused = state.focus == crate::app::Focus::Map;
+    let focused = state.focus == crate::state::Focus::Map;
     let title = match focused {
         true => format!(" {}:{title} — ↑↓←→ Enter Esc ", state.sessions.len() + 1),
         // The number it answers to, so the way in is discoverable from the
@@ -1755,8 +1755,8 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     // always says something teaches the eye to stop reading it.
     let right = match state.errors_unread {
         0 => String::new(),
-        1 => format!("!1 error ({}) ", crate::app::ERRORS_COMMAND),
-        n => format!("!{n} errors ({}) ", crate::app::ERRORS_COMMAND),
+        1 => format!("!1 error ({}) ", crate::state::ERRORS_COMMAND),
+        n => format!("!{n} errors ({}) ", crate::state::ERRORS_COMMAND),
     };
 
     let gap = (area.width as usize)
@@ -1926,14 +1926,39 @@ fn ansi_lines(raw: &str) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
+    /// `ui` draws the model; it must not reach into the module that owns
+    /// the terminal and the event loop (#6, docs/ARCHITECTURE.md §4). Left
+    /// to review this drifted back twice — `AppState` and `Focus` were
+    /// imported straight from `app` for three milestones before a review
+    /// caught it — so the boundary is checked by reading the source rather
+    /// than by remembering. The needle is assembled rather than written
+    /// out, so the check does not trip over its own source.
+    #[test]
+    fn ui_names_the_model_not_the_event_loop() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        for entry in std::fs::read_dir(&dir).expect("src/ui is readable") {
+            let path = entry.expect("a readable entry").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a readable source file");
+            let forbidden = concat!("crate", "::app");
+            assert!(
+                !source.contains(forbidden),
+                "{} names `{forbidden}`; the model it wants lives in `crate::state`",
+                path.display()
+            );
+        }
+    }
+
     use std::collections::VecDeque;
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::app::{ChannelPane, test_support};
     use crate::config::Channel;
+    use crate::state::{ChannelPane, test_support};
     use tui_input::Input;
 
     /// A 30x10 terminal splits into a 6-tall output pane (4 content rows
@@ -2813,7 +2838,7 @@ mod tests {
     /// rather than a layout one.
     #[test]
     fn moving_the_map_column_does_not_reuse_the_old_picture() {
-        let mut state = crate::app::test_support::app(&["tank"]);
+        let mut state = crate::state::test_support::app(&["tank"]);
         state.channels.push(ChannelPane {
             config: test_support::channel("chat"),
             lines: VecDeque::new(),
@@ -2842,7 +2867,7 @@ mod tests {
     /// index lookups would produce.
     #[test]
     fn the_map_and_comms_columns_swap_on_request() {
-        let mut state = crate::app::test_support::app(&["tank"]);
+        let mut state = crate::state::test_support::app(&["tank"]);
         state.channels.push(ChannelPane {
             config: test_support::channel("chat"),
             lines: VecDeque::new(),
@@ -2885,7 +2910,7 @@ mod tests {
     /// the order must not leave a hole where the missing one would be.
     #[test]
     fn swapping_with_only_one_column_shown_still_fills_the_space() {
-        let mut state = crate::app::test_support::app(&["tank"]);
+        let mut state = crate::state::test_support::app(&["tank"]);
         state.show_channels = false;
         state.show_map = true;
         state.map_first = true;
@@ -4037,7 +4062,7 @@ mod tests {
     #[test]
     fn the_mark_menus_typing_prompt_is_not_clipped() {
         let mut state = state();
-        state.mark_menu = Some(crate::app::MarkMenu {
+        state.mark_menu = Some(crate::state::MarkMenu {
             at: crate::map::RoomId(1),
             selected: 0,
             existing: None,
