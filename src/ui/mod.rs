@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 
 use ansi_to_tui::IntoText;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -67,6 +67,17 @@ pub(crate) fn clamp_map_width(width: u16, area_width: u16) -> u16 {
     let max = area_width.saturating_sub(MIN_MAIN_WIDTH).max(MIN_MAP_WIDTH);
     width.clamp(MIN_MAP_WIDTH, max)
 }
+
+/// The smallest terminal the client will draw its layout into; below this it
+/// says so instead (#122). The panes collapse toward zero width, titles
+/// truncate, and the map and comms columns compete for space that is not
+/// there — a screen the player is left to diagnose. 80x24 is the conventional
+/// floor and what a default terminal still opens at. That it is *enough* is
+/// asserted from the layout rather than assumed: see
+/// `the_minimum_width_holds_the_help_listing` and
+/// `the_minimum_height_leaves_a_usable_session_pane`.
+pub(crate) const MIN_COLS: u16 = 80;
+pub(crate) const MIN_ROWS: u16 = 24;
 
 /// Column the descriptions start at in the help listing.
 const HELP_KEY_WIDTH: usize = 14;
@@ -308,6 +319,7 @@ pub fn session_pane_sizes(area: Rect, state: &AppState) -> Vec<(usize, (u16, u16
 /// around it (§16), and the map pane's own area — real screen coordinates,
 /// not a guess — so `--map-debug` can read back exactly what this frame
 /// showed instead of re-rendering a separate approximation of it.
+#[derive(Default)]
 pub struct DrawnFrame {
     /// The map's picture this frame — present whenever one occupies the
     /// pane, whether freshly rasterised or reused from `MapImageCache`, so
@@ -433,6 +445,73 @@ struct MapImageCacheKey {
     /// is a different picture, and leaving this out of the key is how the
     /// map would appear frozen after a character switch (#58).
     pan: (i32, i32),
+}
+
+/// Whether `area` can host the layout at all (#122).
+///
+/// Kept apart from [`draw`] rather than folded into it because `draw` is the
+/// layout renderer and this is a policy about the terminal: the tests drive
+/// `draw` at deliberately small sizes to exercise narrow panes, and a floor
+/// inside it would make those sizes unreachable rather than merely unsupported.
+/// The caller that owns a real terminal asks this first.
+pub fn fits(area: Rect) -> bool {
+    area.width >= MIN_COLS && area.height >= MIN_ROWS
+}
+
+/// One legible notice in place of a layout that cannot fit (#122).
+///
+/// No border and no vertical centring by `Layout`: at this size every row is
+/// scarce, and a border would spend two of them saying nothing. The size it
+/// reports is the live one, so a player dragging a window edge can watch the
+/// numbers approach what is needed rather than guess how much further to go.
+pub fn draw_too_small(frame: &mut Frame, no_color: bool) {
+    let area = frame.area();
+    let lines = vec![
+        Line::from("Terminal too small".bold()),
+        Line::from(format!(
+            "{}x{} - need {MIN_COLS}x{MIN_ROWS}",
+            area.width, area.height
+        )),
+    ];
+    // Top-left rather than centred when there is no room to centre: the
+    // arithmetic for centring is what would clip the first line away.
+    let top = area.height.saturating_sub(lines.len() as u16) / 2;
+    let where_to = Rect {
+        y: area.y + top,
+        height: area.height - top,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        where_to,
+    );
+    // The same last word the full frame gets: a notice the player cannot read
+    // in monochrome is no better than the broken layout it replaced (#120).
+    if no_color {
+        strip_colour(frame.buffer_mut());
+    }
+}
+
+/// What a real terminal shows: the layout, or a notice that it does not fit
+/// (#122).
+///
+/// The split from [`draw`] is deliberate. `draw` renders the layout at
+/// whatever size it is handed, which is what lets the tests exercise narrow
+/// panes directly; the floor is a policy about the terminal, and belongs at
+/// the one place that owns one. Callers driving a terminal want this.
+pub fn draw_screen(
+    frame: &mut Frame,
+    state: &AppState,
+    map_cache: &mut MapImageCache,
+) -> DrawnFrame {
+    if fits(frame.area()) {
+        draw(frame, state, map_cache)
+    } else {
+        draw_too_small(frame, state.no_color);
+        DrawnFrame::default()
+    }
 }
 
 pub fn draw(frame: &mut Frame, state: &AppState, map_cache: &mut MapImageCache) -> DrawnFrame {
@@ -1910,6 +1989,19 @@ mod tests {
         render_sized(state, 30, 10)
     }
 
+    /// As `render_sized`, but through the entry a real terminal uses — so the
+    /// size floor applies (#122).
+    fn screen_sized(state: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut cache = MapImageCache::default();
+        terminal
+            .draw(|frame| {
+                draw_screen(frame, state, &mut cache);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     fn render_sized(state: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut cache = MapImageCache::default();
@@ -2871,6 +2963,112 @@ mod tests {
         let lines = help_lines(keybinds);
         let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
         (widest as u16 + 4 + 10, lines.len() as u16 + 2 + 6)
+    }
+
+    /// The declared floor has to hold the help listing, which is the widest
+    /// thing the client draws. Derived from the listing rather than restated:
+    /// a row long enough to need more than `MIN_COLS` fails here, instead of
+    /// silently truncating every row for anyone at the floor.
+    #[test]
+    fn the_minimum_width_holds_the_help_listing() {
+        let lines = help_lines(&Keybinds::default());
+        let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        // +4 for a border column and a space either side, as `draw_help` adds.
+        assert!(
+            (widest + 4) as u16 <= MIN_COLS,
+            "the help listing needs {} columns but the floor is {MIN_COLS}",
+            widest + 4
+        );
+    }
+
+    /// A floor that leaves no scrollback would be a floor in name only. What
+    /// the chrome costs is asked of `layout` rather than counted here — the
+    /// prompt row and the status bar each changed that answer once already,
+    /// and a hand-counted height would have gone quietly wrong both times.
+    #[test]
+    fn the_minimum_height_leaves_a_usable_session_pane() {
+        /// Rows of scrollback the floor promises. Not a layout constant: it is
+        /// the bar `MIN_ROWS` is chosen to clear, so a new row of chrome fails
+        /// this test rather than eating the player's view unannounced.
+        const PROMISED_ROWS: u16 = 16;
+
+        let state = state();
+        let needed = terminal_height_for(&state, MIN_COLS, PROMISED_ROWS);
+        assert!(
+            needed <= MIN_ROWS,
+            "a {PROMISED_ROWS}-row pane needs a {needed}-row terminal, over the {MIN_ROWS} floor"
+        );
+    }
+
+    /// Below the floor the player gets one legible sentence, not a layout
+    /// squeezed into a space it cannot occupy (#122).
+    #[test]
+    fn a_terminal_under_the_floor_is_told_so_instead_of_drawn_into() {
+        let drawn = rows(&screen_sized(&state(), MIN_COLS - 1, MIN_ROWS - 1));
+
+        assert!(
+            drawn.contains("too small"),
+            "the notice should say what is wrong:\n{drawn}"
+        );
+        assert!(
+            drawn.contains(&format!("{MIN_COLS}x{MIN_ROWS}")),
+            "the notice should say what size is needed:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("kestrel"),
+            "no pane should be drawn under the notice:\n{drawn}"
+        );
+    }
+
+    /// And gets its client back when the window grows, with no state to
+    /// reset: the check is per frame, so recovery is simply the next one.
+    #[test]
+    fn a_terminal_grown_back_over_the_floor_draws_the_client_again() {
+        let state = state();
+        // Under the floor first, so this is recovery rather than a fresh start.
+        let _ = screen_sized(&state, MIN_COLS - 1, MIN_ROWS - 1);
+        let drawn = rows(&screen_sized(&state, MIN_COLS, MIN_ROWS));
+
+        assert!(
+            !drawn.contains("too small"),
+            "the notice should be gone once there is room:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("kestrel"),
+            "the character pane should be back:\n{drawn}"
+        );
+    }
+
+    /// A notice that panics is worse than the layout it replaced. Every size
+    /// down to 1x1 has to render, including ones too small for the text.
+    #[test]
+    fn the_too_small_notice_survives_any_terminal_it_can_be_shown_on() {
+        let state = state();
+        for (w, h) in [(1, 1), (2, 1), (1, 40), (40, 1), (9, 2), (79, 23), (20, 5)] {
+            let drawn = rows(&screen_sized(&state, w, h));
+            assert_eq!(
+                drawn.lines().count(),
+                h as usize,
+                "a {w}x{h} terminal should still produce {h} rows"
+            );
+        }
+    }
+
+    /// The notice obeys `--no-color` like every other frame (#120).
+    #[test]
+    fn the_too_small_notice_is_stripped_under_no_color() {
+        let mut state = state();
+        state.no_color = true;
+        let buffer = screen_sized(&state, MIN_COLS - 1, MIN_ROWS - 1);
+        // Colour only: bold is emphasis, not colour, and NO_COLOR does not
+        // ask for it to go.
+        assert!(
+            buffer
+                .content
+                .iter()
+                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
+            "no cell should carry colour under no_color"
+        );
     }
 
     /// The overlay is as wide as its longest row, capped at the terminal —
