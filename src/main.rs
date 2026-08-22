@@ -6,6 +6,7 @@ mod map;
 mod net;
 mod scrollback;
 mod session;
+mod state;
 mod ui;
 mod update;
 mod vitals;
@@ -182,7 +183,7 @@ async fn main() -> Result<()> {
         });
         // No profile, so only the global layer applies.
         let layers = config::load_rules(&dir, None, &channels)?;
-        targets.push(app::ConnectTarget {
+        targets.push(state::ConnectTarget {
             // An ad-hoc `--host` session has no profile to name a world,
             // so its host and port are the whole answer.
             world: None,
@@ -192,7 +193,7 @@ async fn main() -> Result<()> {
             tls,
             record: cli.record.clone(),
             charset: cli.charset,
-            rules: app::Rules {
+            rules: state::Rules {
                 engine: engine::Engine::compile(&layers)?,
                 config_dir: dir.clone(),
                 profile: None,

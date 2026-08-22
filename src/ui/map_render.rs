@@ -240,7 +240,7 @@ fn ink_for(background: Color) -> Color {
 pub(super) fn marked_style(label: &str) -> (Style, Option<char>) {
     let label = label.trim();
     let folded = label.to_ascii_lowercase();
-    let background = match crate::app::MARK_SUGGESTIONS
+    let background = match crate::state::MARK_SUGGESTIONS
         .iter()
         .position(|known| *known == folded)
     {
@@ -355,7 +355,7 @@ pub(super) fn legend(width: u16) -> Vec<Line<'static>> {
     }
     entries.push((ground, Some('·'), "more exits", 1));
 
-    for label in crate::app::MARK_SUGGESTIONS {
+    for label in crate::state::MARK_SUGGESTIONS {
         let (style, letter) = marked_style(label);
         entries.push((style, letter, label, 2));
     }
@@ -588,7 +588,7 @@ mod tests {
     /// whole palette. Hashing alone put three of the nine on one colour.
     #[test]
     fn the_offered_labels_spread_across_the_palette() {
-        let used: std::collections::HashSet<Option<Color>> = crate::app::MARK_SUGGESTIONS
+        let used: std::collections::HashSet<Option<Color>> = crate::state::MARK_SUGGESTIONS
             .iter()
             .map(|label| marked_style(label).0.bg)
             .collect();
@@ -608,7 +608,7 @@ mod tests {
     fn labels_sharing_a_colour_do_not_share_a_letter() {
         let mut seen: std::collections::HashMap<(Option<Color>, Option<char>), &str> =
             std::collections::HashMap::new();
-        for label in crate::app::MARK_SUGGESTIONS {
+        for label in crate::state::MARK_SUGGESTIONS {
             let (style, letter) = marked_style(label);
             if let Some(other) = seen.insert((style.bg, letter), label) {
                 panic!("`{label}` and `{other}` are indistinguishable");
@@ -770,7 +770,7 @@ mod tests {
     /// never mistaken for "a shop" or for "me".
     #[test]
     fn the_party_colour_is_its_own() {
-        for label in crate::app::MARK_SUGGESTIONS {
+        for label in crate::state::MARK_SUGGESTIONS {
             assert_ne!(marked_style(label).0.bg, Some(palette::PARTY), "{label}");
         }
         assert_ne!(palette::PARTY, palette::HERE);
@@ -782,7 +782,7 @@ mod tests {
     /// something else in this pane.
     #[test]
     fn no_label_colour_collides_with_a_role_colour() {
-        for label in crate::app::MARK_SUGGESTIONS
+        for label in crate::state::MARK_SUGGESTIONS
             .iter()
             .chain(["anything"].iter())
         {

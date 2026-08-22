@@ -177,6 +177,8 @@ times ever demand it.
 src/
   main.rs        CLI entry (clap), tracing init, runtime setup
   app.rs         UI event loop: terminal setup, select! over input + sessions
+  state.rs       AppState and the session/pane model — what the client *is*,
+                 so `ui` can render it without importing the loop
   ui/            ratatui widgets: pane layout, status bar, input line, tabs,
                  help overlay, config_editor.rs (in-client profile editor)
   scrollback.rs  RetainedLine: what a pane keeps (text + arrival + origin)
@@ -196,7 +198,8 @@ src/
 
 Dependency rule (enforced by review): `proto` and `engine` depend on
 nothing above them and do no I/O; `session` composes them; `ui` knows
-nothing about sockets; `app` wires everything.
+nothing about sockets and reads the model from `state`, never from `app`
+(guarded by a test, not by review); `app` wires everything.
 
 ---
 
