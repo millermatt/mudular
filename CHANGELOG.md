@@ -8,6 +8,16 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0](https://github.com/millermatt/mudular/compare/v0.12.0...v0.13.0) - 2026-08-22
+
+### Added
+
+- *(ui)* respect NO_COLOR, and say the notice level in words ([#132](https://github.com/millermatt/mudular/pull/132))
+
+### Other
+
+- give each release-plz job the concurrency it needs ([#135](https://github.com/millermatt/mudular/pull/135))
+
 ## [0.12.0](https://github.com/millermatt/mudular/compare/v0.11.1...v0.12.0) - 2026-08-21
 
 ### Added
