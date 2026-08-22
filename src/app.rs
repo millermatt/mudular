@@ -1023,7 +1023,6 @@ impl AppState {
     /// binding are carried by id, so they need no fixing up — but if the
     /// session they named is the one that just went, they have to land on a
     /// survivor rather than on a position that now holds a stranger.
-    #[allow(dead_code)] // `/disconnect` is its own change; this is the seam.
     pub fn remove_session(&mut self, id: SessionId) {
         let Some(index) = self.index_of(id) else {
             return;
