@@ -57,14 +57,19 @@ needs a complete explanation, and gets a clipped fragment instead.
 > tabs intact, which ratatui writes to the terminal as real cursor
 > commands. Every retained line is now sanitised (§13), and a tab becomes a
 > space rather than vanishing. The stray leading `s` on
-> `[string "bad.lua"]:3` is not explained by this and has not been
-> reproduced; it is still open — #13.
+> `[string "bad.lua"]:3` was the same mechanism on a surface the tab fix
+> did not cover: the warnings panel and the empty client's notices draw
+> their rows straight into cells, with no `ansi-to-tui` between them and
+> the terminal, so a traceback's tabs stayed real cursor jumps and the
+> cells they skipped kept the previous frame's characters. The `s` was
+> debris rather than output, which is why it never reproduced twice the
+> same way. Both surfaces now flatten a row before drawing it (#13).
 
 **4. Power-user scripter — Lua runtime-error tracebacks render garbled.**
 The headline error is clear and has file/line; the traceback underneath is
 not (tabs collapse into `inC?:`/`inCfunction 'error'`, and
-`[string "bad.lua"]:3` gets a stray leading `s`). Tab half fixed above;
-the stray-`s` half is #13.
+`[string "bad.lua"]:3` gets a stray leading `s`). Both halves fixed
+above; the stray-`s` half was #13.
 
 ### Low
 

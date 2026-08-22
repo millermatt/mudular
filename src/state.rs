@@ -1585,8 +1585,8 @@ impl AppState {
     /// put it in front of the player themselves, usually because they know
     /// which pane it belongs in.
     pub fn record_warning(&mut self, text: impl Into<String>) {
-        let text = text.into();
-        self.errors.push_back(text);
+        self.errors
+            .push_back(crate::scrollback::plain_row(&text.into()));
         while self.errors.len() > ERRORS_KEPT {
             self.errors.pop_front();
         }
@@ -1601,7 +1601,7 @@ impl AppState {
         match self.bound_mut() {
             Some(session) => session.push_line(RetainedLine::client(text)),
             None => {
-                self.shell_notices.push(text);
+                self.shell_notices.push(crate::scrollback::plain_row(&text));
                 // Oldest first out: the reply to what was just typed is
                 // the one worth keeping.
                 while self.shell_notices.len() > SHELL_NOTICES {

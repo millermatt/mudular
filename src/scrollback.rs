@@ -155,6 +155,32 @@ pub fn strip_unsafe_controls(text: &str) -> String {
         .collect()
 }
 
+/// Text safe to hand a widget that draws it straight into cells: the
+/// warnings panel (#18) and the empty client's notices.
+///
+/// Scrollback can afford to keep `\n` and `ESC` because every retained line
+/// goes through `ansi-to-tui`, which splits the rows and consumes the escape
+/// sequences before a cell ever sees them. A panel row has neither, so
+/// anything the terminal would obey has to be gone by the time it arrives —
+/// a tab written into a cell is a real cursor jump, and the cells it skips
+/// keep whatever the previous frame drew there. That is how a Lua traceback
+/// came to render with a stray `s` in front of `[string "bad.lua"]:3`
+/// (#13): not a character the client wrote, but one it failed to overwrite.
+///
+/// The row is flattened rather than split. A warning is one entry and the
+/// panel counts entries, so a four-line traceback that became four warnings
+/// would say four things went wrong when one did.
+pub fn plain_row(text: &str) -> String {
+    strip_ansi(text)
+        .chars()
+        .map(|c| match c {
+            '\t' | '\n' => ' ',
+            c => c,
+        })
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
 /// The same bytes, shown rather than removed — for the raw GMCP inspector
 /// (§14 M6), whose whole purpose is to reveal what the server actually sent.
 /// Stripping there would hide the one thing a player opened it to see, so a

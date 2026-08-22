@@ -7530,6 +7530,55 @@ mod tests {
         }
     }
 
+    /// A real `mlua` runtime traceback, captured from `LuaHost` (a tab
+    /// before each frame, a newline between them). The exact bytes matter:
+    /// this is what a script failing in front of a player actually says.
+    const LUA_TRACEBACK: &str = "** `line` hook failed: runtime error: \
+[string \"bad.lua\"]:1: oops\nstack traceback:\n\t[C]: in ?\n\t[C]: in \
+function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
+\"bad.lua\"]:1>";
+
+    /// The warnings panel draws each entry straight into cells — no
+    /// `ansi-to-tui` between it and the terminal, unlike scrollback. So a
+    /// tab in a traceback is not a tab on screen: it is a real cursor jump,
+    /// and the cells it skips keep whatever the last frame left there. That
+    /// is the stray `s` in front of `[string "bad.lua"]` that #13 recorded
+    /// and could never reproduce — debris, so it was never the same
+    /// character twice.
+    #[test]
+    fn a_kept_warning_is_safe_to_draw_straight_into_cells() {
+        let mut state = test_support::app(&["tank"]);
+        state.record_warning(LUA_TRACEBACK);
+
+        let kept = state.errors.back().expect("the warning is kept");
+        assert!(
+            !kept.contains(['\t', '\n', '\x1b']),
+            "nothing the terminal obeys survives: {}",
+            kept.escape_debug()
+        );
+        assert!(
+            kept.contains("[string \"bad.lua\"]:1"),
+            "and the script location still reads: {}",
+            kept.escape_debug()
+        );
+    }
+
+    /// The same for the empty client's notices, which are drawn the same
+    /// way — `/reload` failing before any character is connected is exactly
+    /// when a traceback lands here.
+    #[test]
+    fn a_shell_notice_is_safe_to_draw_straight_into_cells() {
+        let mut state = test_support::app(&[]);
+        state.tell_player(LUA_TRACEBACK);
+
+        let notice = state.shell_notices.last().expect("the notice is kept");
+        assert!(
+            !notice.contains(['\t', '\n', '\x1b']),
+            "nothing the terminal obeys survives: {}",
+            notice.escape_debug()
+        );
+    }
+
     /// And the refusal has to say what to do instead, rather than looking
     /// like the client ignored it.
     #[tokio::test]
