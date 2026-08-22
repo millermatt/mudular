@@ -85,6 +85,45 @@ fn quits_on_the_key_even_while_output_is_flooding_in() {
     app.expect_exit("the quit key should work under a flood of output");
 }
 
+/// The harness must drain the pty unconditionally, not only while an
+/// `App::wait_for` happens to be on the stack (#130).
+///
+/// `FakeMud::wait_for_command` and `saw` poll the socket for ten seconds and
+/// hold no `App`, so they cannot pump. If the client is already blocked
+/// mid-`draw` on a full pty when one of them starts, it stays blocked for the
+/// whole deadline, never polls for the `\r`, and the command never leaves the
+/// input — which reads from the socket as a routing failure.
+///
+/// On macOS that state is reached by typing a 23-character command, because
+/// its tty buffer is about 1 KB against Linux's ~19 KB; this test forces the
+/// same state everywhere by overrunning the larger buffer first, so the
+/// regression is caught on every platform rather than only on the one where
+/// it happened to be cheap to trigger.
+#[test]
+fn a_command_still_reaches_the_server_after_the_pty_buffer_has_filled() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the screen");
+
+    // Enough to overrun the pty's buffer several times over, and deliberately
+    // not drained afterwards — filling it is the precondition under test.
+    for i in 0..20_000 {
+        mud.send_line(&format!("flood line {i} ................................"));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // No `app.wait_for` between the flood and the assertion. The wait below is
+    // on the socket, which is precisely the path that cannot drain the pty.
+    app.type_line("look");
+    mud.wait_for_command(
+        "look",
+        "a command typed after the pty buffer filled should still reach the server",
+    );
+}
+
 /// Completion changes what reaches the server, so the assembly worth
 /// proving end to end is exactly that: what the MUD printed, through the
 /// vocabulary, onto the input line, and back out as a different command
@@ -660,7 +699,9 @@ fn strip_telnet(bytes: &[u8]) -> Vec<u8> {
 struct App {
     child: Child,
     master: OwnedFd,
-    output: String,
+    /// Everything the client has written, appended by the reader thread
+    /// below rather than by whoever happens to be waiting.
+    output: Arc<Mutex<String>>,
 }
 
 impl App {
@@ -696,17 +737,40 @@ impl App {
         let child = command.spawn().expect("the binary should start");
         drop(slave);
 
-        // Non-blocking, so reads can poll instead of hanging on a child
-        // that has nothing to say.
-        unsafe {
-            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
-            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+        // Drain the pty for as long as the client lives, in a thread of its
+        // own. This is the invariant the rest of the harness rests on, and it
+        // is not an optimisation: a client writing frames into a pty nobody is
+        // reading blocks mid-`draw`, where it never polls for the key it is
+        // being asked to react to (#130). Draining only inside `wait_for` left
+        // every socket-side wait — `FakeMud::wait_for_command`, `saw` — able to
+        // deadlock the client for its whole deadline, because those hold no
+        // `App` and so cannot pump. A real terminal is always reading; so is
+        // this now, which removes the requirement to remember rather than
+        // adding a fifth place that has to.
+        let output = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&output);
+        let read_fd = unsafe { libc::dup(master.as_raw_fd()) };
+        std::thread::spawn(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+            let mut buf = [0u8; 8192];
+            loop {
+                // A blocking read, so this thread costs nothing while the
+                // client is quiet. It ends at EOF, or at the EIO the master
+                // returns once the last slave is closed.
+                match file.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        });
 
         App {
             child,
             master,
-            output: String::new(),
+            output,
         }
     }
 
@@ -737,22 +801,10 @@ impl App {
         }
     }
 
-    fn pump(&mut self) {
-        let mut file = unsafe { std::fs::File::from_raw_fd(libc::dup(self.master.as_raw_fd())) };
-        let mut buf = [0u8; 8192];
-        while let Ok(n) = file.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            self.output.push_str(&String::from_utf8_lossy(&buf[..n]));
-        }
-    }
-
     fn wait_for(&mut self, needle: &str, why: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            self.pump();
-            if self.output.contains(needle) {
+            if self.output.lock().unwrap().contains(needle) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -771,20 +823,16 @@ impl App {
     /// the client answered with. Stripping is what makes a byte budget mean
     /// approximately what it says.
     fn tail(&mut self, bytes: usize) -> String {
-        self.pump();
-        let drawn = visible_text(&self.output);
+        let drawn = visible_text(&self.output.lock().unwrap());
         last_bytes(&drawn, bytes).to_string()
     }
 
     fn still_running(&mut self) -> bool {
-        // Give a quit that should not happen time to happen anyway, and keep
-        // draining while waiting — see `expect_exit`. A client wedged on a
-        // full pty is "still running" for the wrong reason, which would let
-        // this assertion pass over a client that had actually stopped
-        // responding.
+        // Give a quit that should not happen time to happen anyway. The
+        // reader thread is draining throughout, so a client that is still
+        // running here is responsive rather than merely wedged on a full pty.
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
-            self.pump();
             std::thread::sleep(Duration::from_millis(50));
         }
         matches!(self.child.try_wait(), Ok(None))
@@ -793,13 +841,6 @@ impl App {
     fn expect_exit(&mut self, why: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            // Drain while waiting. The client is writing frames to this pty
-            // the whole time; a test that stops reading fills the buffer and
-            // blocks the client mid-`draw`, where it never polls for the key
-            // it is being asked to react to. That reads as "the process was
-            // still running" — a harness deadlock wearing a product bug's
-            // clothes.
-            self.pump();
             if let Ok(Some(status)) = self.child.try_wait() {
                 assert!(status.success(), "{why}: exited with {status}");
                 return;
@@ -813,14 +854,12 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        // Reap it, but keep draining while we do, and give up rather than wait
-        // forever — for the reason `expect_exit` documents at length: a client
-        // blocked writing into a full pty is not going anywhere, and a bare
-        // `wait()` here hung a macOS CI job for 36 minutes on the one test
-        // that leaves teardown to this rather than quitting explicitly.
+        // Reap it, but give up rather than wait forever. The reader thread
+        // keeps draining until the pty closes, so the client is free to finish
+        // writing; a bare `wait()` here still risks hanging teardown on a child
+        // that will not exit, and once hung a macOS CI job for 36 minutes.
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            self.pump();
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
             }
