@@ -8,6 +8,16 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0](https://github.com/millermatt/mudular/compare/v0.13.0...v0.14.0) - 2026-08-22
+
+### Added
+
+- *(ui)* say the terminal is too small instead of drawing into it ([#137](https://github.com/millermatt/mudular/pull/137))
+
+### Other
+
+- drain the pty continuously instead of only while waiting ([#136](https://github.com/millermatt/mudular/pull/136))
+
 ## [0.13.0](https://github.com/millermatt/mudular/compare/v0.12.0...v0.13.0) - 2026-08-22
 
 ### Added
