@@ -8,6 +8,23 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0](https://github.com/millermatt/mudular/compare/v0.14.0...v0.15.0) - 2026-08-23
+
+### Added
+
+- *(ui)* let the palette find a setting, not just a command ([#146](https://github.com/millermatt/mudular/pull/146))
+
+### Fixed
+
+- *(ui)* flatten a warning before drawing it straight into cells ([#141](https://github.com/millermatt/mudular/pull/141))
+
+### Other
+
+- put the editor's model below `ui`, ending the last cycle ([#147](https://github.com/millermatt/mudular/pull/147))
+- record the front-end seam, and that it is internal ([#144](https://github.com/millermatt/mudular/pull/144))
+- move the client's model out of the event loop into `state` ([#140](https://github.com/millermatt/mudular/pull/140))
+- *(app)* drop the stale dead_code allow on remove_session ([#139](https://github.com/millermatt/mudular/pull/139))
+
 ## [0.14.0](https://github.com/millermatt/mudular/compare/v0.13.0...v0.14.0) - 2026-08-22
 
 ### Added
