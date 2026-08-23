@@ -529,8 +529,18 @@ markup at all.
   onto their `Alt+Shift+T`. The categories are built; they are currently
   rendered as a drawn column instead of bound to keys.
 
-  This also revises §6.7: line mode's answer to "channel panes are
-  unavailable" should be keyed recall, not a spoken refusal.
+  **Split out as [#149](https://github.com/millermatt/mudular/issues/149),
+  deliberately not in branch 2.** Recall is not line-mode-specific — by
+  §5.2's own criterion it is a shared intent both front ends can realise, so
+  building it inside the line front end would make it line-mode-only, which
+  is the mistake the intent layer exists to prevent. It also collides with
+  `Alt+1..9`, which §5.4 records is not yet a real binding, and that is worth
+  resolving deliberately rather than under the weight of a larger branch.
+
+  Branch 2 therefore ships only the minimum that is not a hole: routed lines
+  print inline with a channel tag, so nothing vanishes (§6.2). That is
+  strictly worse than recall — it pushes tells into the queue §2 names as
+  the dominant failure — and it is the honest interim, not the answer.
 
 - **A first-party review cursor.** §3 refuses this, and keyed recall is why
   the refusal survives: it is the capability, reached another way.
