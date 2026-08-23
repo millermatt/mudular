@@ -2117,31 +2117,8 @@ fn handle_key(
         }
         return true;
     }
-    if keybinds.toggle_timestamps.matches(code, modifiers) {
-        state.show_timestamps = !state.show_timestamps;
-        return true;
-    }
-    if keybinds.toggle_hud.matches(code, modifiers) {
-        state.show_hud = !state.show_hud;
-        return true;
-    }
-    if keybinds.who_needs_me.matches(code, modifiers) {
-        match state.neediest() {
-            Some(index) => {
-                if let Some(id) = state.id_at(index) {
-                    state.focus_pane(Focus::Session(id));
-                }
-            }
-            // Said rather than ignored, the same way the map cursor says
-            // why it did nothing: a key that silently does nothing is a
-            // key the player assumes is broken.
-            None => {
-                if let Some(session) = state.bound_mut() {
-                    session.push_line(RetainedLine::client("** nobody is in trouble"));
-                }
-            }
-        }
-        return true;
+    if let Some(action) = Action::for_key_before_modes(keybinds, code, modifiers) {
+        return apply_action(state, channels, action);
     }
     if keybinds.map_cursor.matches(code, modifiers) {
         // The same place `Alt+<map>` and `focus_next` arrive at — one key
@@ -2394,6 +2371,48 @@ fn handle_key(
         }
     }
     false
+}
+
+/// Carries out a named intent. Sync, and returns what `handle_key` returns:
+/// whether the arrangement of panes changed, so the caller re-reports NAWS
+/// (§6.2, §11.4). Actions that need async work set a deferred flag for the
+/// event loop to service, exactly as the inline arms did
+/// (docs/LINE_MODE.md §5.4).
+fn apply_action(state: &mut AppState, channels: &[Channel], action: Action) -> bool {
+    let _ = channels;
+    match action {
+        Action::ToggleTimestamps => {
+            state.show_timestamps = !state.show_timestamps;
+            true
+        }
+        Action::ToggleHud => {
+            state.show_hud = !state.show_hud;
+            true
+        }
+        Action::WhoNeedsMe => {
+            match state.neediest() {
+                Some(index) => {
+                    if let Some(id) = state.id_at(index) {
+                        state.focus_pane(Focus::Session(id));
+                    }
+                }
+                // Said rather than ignored, the same way the map cursor says
+                // why it did nothing: a key that silently does nothing is a
+                // key the player assumes is broken.
+                None => {
+                    if let Some(session) = state.bound_mut() {
+                        session.push_line(RetainedLine::client("** nobody is in trouble"));
+                    }
+                }
+            }
+            true
+        }
+        // Genuinely unreachable at this point: only the three group-A
+        // variants are constructed until Task 5 wires the second resolver.
+        // `unreachable!` rather than `todo!` says that, and Task 5 deletes
+        // the arm entirely.
+        _ => unreachable!("group B arms land in Task 5"),
+    }
 }
 
 /// Acts on the answer to the save-password offer: `y` stores the held
