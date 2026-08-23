@@ -440,11 +440,52 @@ Stated plainly so the gaps are arguable rather than discovered.
 requested capability across twenty years of blind MUD players. §2 answers
 half of it: the player's own flush works and lands on the newest line. It
 does not establish that their review cursor lets them go *back* over arriving
-text. That remains the question to put to a blind developer:
+text. That remains the question to put to a blind developer — now two
+questions, the second of which (§8.1a) may matter more:
 
-> Over a normal scrolling terminal with no repaint, does your own screen
-> reader's review cursor already give you "skip a few boring lines, or
-> re-read that line"?
+> 1. Over a normal scrolling terminal with no repaint, does your own screen
+>    reader's review cursor already give you "skip a few boring lines, or
+>    re-read that line"?
+> 2. Is there any way for a terminal application to tell your screen reader
+>    that a group of lines is one unit — a room description, a combat round
+>    — so that review moves by chunk rather than by line? Do blank lines
+>    achieve this in practice?
+
+**8.1a Chunking — telling the reader that lines belong together.** Review
+moves a line at a time, but a MUD's output is not a sequence of independent
+lines: a room description is one thing, a combat round is one thing, a tell
+is one thing. Being able to step over a chunk, or back into one, is a
+different and probably more valuable capability than stepping over a line,
+and nothing in this design offers it.
+
+No standard mechanism carries that to a screen reader. Three avenues, and
+the ordering is by what is known to work rather than by elegance:
+
+- **Blank lines.** NVDA has paragraph navigation with a configurable
+  paragraph style, one option of which treats a blank line as the boundary.
+  This needs no protocol, degrades to something a sighted player already
+  expects — MUDs conventionally separate room descriptions this way — and
+  costs one line of code. **Unverified**: whether NVDA's paragraph
+  navigation reaches console text rather than only browse mode and
+  documents, and whether Orca has any equivalent over a terminal, where flat
+  review sees the whole grid as a single object. Cheap enough that branch 2
+  may as well emit them and find out.
+- **`OSC 133`.** The FinalTerm shell-integration sequences mark prompt,
+  command and output boundaries, and Ghostty, iTerm2, kitty, WezTerm and VS
+  Code already implement block-jumping on them. It is a real chunking
+  protocol and it is nearly free to emit. But it drives the *terminal's* own
+  navigation, and no evidence was found that any screen reader consumes it,
+  so it must not be described as an accessibility feature.
+- **A first-party review cursor.** §3 refuses this. If neither of the above
+  reaches a reader, that refusal has a measurable ceiling, and this is where
+  it would be paid for.
+
+The part that is already done: **mudular knows where the chunks are.** GMCP
+`Room.Info` says which lines are a room description, channel routing says
+which are a tell, `Origin` separates server text from a trigger's echo and a
+client notice, and any trigger marks whatever a player taught it to
+recognise. The semantics are in the model; only the expression channel is
+missing. Whichever mechanism turns out to work, the expensive half exists.
 
 **8.2 Bounding the speech queue.** §2 identifies the backlog as the dominant
 failure mode and this design does nothing about it beyond preserving the
