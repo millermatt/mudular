@@ -1,6 +1,7 @@
 mod app;
 mod complete;
 mod config;
+mod config_editor;
 mod engine;
 mod map;
 mod net;

@@ -21,6 +21,7 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, Channel, CrossSession, Keybinds};
+use crate::config_editor;
 use crate::engine::{self, Engine, PeerSnapshot};
 use crate::proto::charset::Charset;
 use crate::scrollback::{Origin, RetainedLine};
@@ -392,7 +393,7 @@ fn open_config_editor(state: &mut AppState, channels: &[Channel], setting: &str)
     match config::load_profile_file(&path) {
         Ok(file) => {
             let known_modules = known_module_names(&dir);
-            let mut editor = ui::config_editor::ConfigEditorState::open(
+            let mut editor = config_editor::ConfigEditorState::open(
                 file,
                 dir,
                 name,
@@ -479,16 +480,15 @@ fn open_new_trigger_from_line(state: &mut AppState, channels: &[Channel], back_o
     match config::load_profile_file(&path) {
         Ok(file) => {
             let known_modules = known_module_names(&dir);
-            state.config_editor =
-                Some(ui::config_editor::ConfigEditorState::open_with_new_trigger(
-                    file,
-                    dir,
-                    name,
-                    channels,
-                    known_modules,
-                    had_comments,
-                    pattern,
-                ));
+            state.config_editor = Some(config_editor::ConfigEditorState::open_with_new_trigger(
+                file,
+                dir,
+                name,
+                channels,
+                known_modules,
+                had_comments,
+                pattern,
+            ));
         }
         Err(err) => {
             if let Some(session) = state.bound_mut() {
@@ -1728,7 +1728,7 @@ async fn event_loop(
         // Decided once per frame, from the grid the last frame reported,
         // rather than hooked onto every event that could move a character
         // or change who is bound (#58).
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         // A palette choice that was complete is sent as if the player had
         // pressed Enter on it (#43) — `handle_key` filled the line but is
         // not async, so it cannot submit.
@@ -2030,9 +2030,9 @@ fn handle_key(
     // rather than closing on any key (§10.2).
     if let Some(editor) = state.config_editor.as_mut() {
         match editor.handle_key(code, modifiers) {
-            ui::config_editor::EditorAction::Consumed => {}
-            ui::config_editor::EditorAction::Close => state.config_editor = None,
-            ui::config_editor::EditorAction::Save { force } => {
+            config_editor::EditorAction::Consumed => {}
+            config_editor::EditorAction::Close => state.config_editor = None,
+            config_editor::EditorAction::Save { force } => {
                 state.config_editor_save = Some(if force {
                     config::SaveMode::Overwrite
                 } else {
@@ -7881,12 +7881,12 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
 
         let cleric = state.sessions[1].id;
         state.focus_pane(Focus::Session(cleric));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         assert_eq!(state.map_pan, (0, 0), "the first character centres");
 
         let tank = state.sessions[0].id;
         state.focus_pane(Focus::Session(tank));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
 
         assert_eq!(
             state.map_pan,
@@ -7911,11 +7911,11 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
 
         let cleric = state.sessions[1].id;
         state.focus_pane(Focus::Session(cleric));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
 
         let tank = state.sessions[0].id;
         state.focus_pane(Focus::Session(tank));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
 
         assert_eq!(
             state.map_pan,
@@ -7937,12 +7937,12 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
         map_grid(&mut state);
 
         walk_east_to(&mut state, 0, 2);
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         assert_eq!(state.map_pan, (0, 0));
 
         for id in 3..=8 {
             apply_session_event(&mut state, 0, room(id, Some("e")));
-            state.update_map_pan();
+            state.update_map_pan(ui::map_shows_room);
             assert_eq!(
                 state.map_pan,
                 (0, 0),
@@ -7966,15 +7966,15 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
 
         let cleric = state.sessions[1].id;
         state.focus_pane(Focus::Session(cleric));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         let tank = state.sessions[0].id;
         state.focus_pane(Focus::Session(tank));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         assert_eq!(state.map_pan, (2, 0), "held still on the switch");
 
         // Tank walks back west, towards where cleric is standing.
         apply_session_event(&mut state, 0, room(2, Some("w")));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         assert_eq!(
             state.map_pan,
             (2, 0),
@@ -7993,7 +7993,7 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
         walk_east_to(&mut state, 0, 9);
         // Back to the west end, so the corridor runs away east of them.
         apply_session_event(&mut state, 0, room(1, None));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         assert_eq!(state.map_pan, (0, 0));
 
         // Arrow east until the cursor leaves what a 40-column pane shows.
@@ -8007,7 +8007,7 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
                 80,
                 &[],
             );
-            state.update_map_pan();
+            state.update_map_pan(ui::map_shows_room);
         }
 
         let cursor = state.map_cursor.expect("the cursor is still up");
@@ -8034,7 +8034,7 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
         map_grid(&mut state);
         walk_east_to(&mut state, 0, 9);
         apply_session_event(&mut state, 0, room(1, None));
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
 
         state.map_cursor = Some(crate::map::RoomId(1));
         for _ in 0..8 {
@@ -8046,7 +8046,7 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
                 80,
                 &[],
             );
-            state.update_map_pan();
+            state.update_map_pan(ui::map_shows_room);
         }
         let while_browsing = state.map_pan;
         assert_ne!(
@@ -8056,7 +8056,7 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
         );
 
         // Another frame with nothing touched must not undo it.
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         assert_eq!(
             state.map_pan, while_browsing,
             "the character being off-pane is expected while browsing"
@@ -8071,7 +8071,7 @@ function 'error'\n\t[string \"bad.lua\"]:1: in function <[string \
             80,
             &[],
         );
-        state.update_map_pan();
+        state.update_map_pan(ui::map_shows_room);
         assert_eq!(
             state.map_pan,
             (0, 0),
