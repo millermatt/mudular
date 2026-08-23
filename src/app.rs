@@ -4467,6 +4467,55 @@ mod tests {
         assert!(!state.show_help);
     }
 
+    /// `Alt+T` is checked before the help overlay's block, so timestamps
+    /// toggle while the overlay is up. That ordering is behaviour, not an
+    /// accident of layout: the intent layer resolves bindings at two
+    /// positions precisely to keep it (docs/LINE_MODE.md §5.5).
+    #[test]
+    fn a_pre_mode_binding_still_works_while_the_help_overlay_is_up() {
+        assert!(
+            Keybinds::default()
+                .toggle_timestamps
+                .matches(KeyCode::Char('t'), KeyModifiers::ALT),
+            "this test presses the default; update it with the default"
+        );
+        let (mut state, _rx) = app(&["tank"]);
+        state.show_help = true;
+        let before = state.show_timestamps;
+
+        assert!(press(&mut state, KeyCode::Char('t'), KeyModifiers::ALT));
+
+        assert_ne!(
+            state.show_timestamps, before,
+            "a binding checked before the overlay's block must still act"
+        );
+        assert!(state.show_help, "and must not dismiss the overlay");
+    }
+
+    /// `Ctrl+P` is checked *after* the overlay's block, so while the overlay
+    /// is up it is just another key: the overlay eats it and closes.
+    /// Resolving every binding in one pass at the top would open the palette
+    /// instead (docs/LINE_MODE.md §5.5).
+    #[test]
+    fn a_post_mode_binding_is_eaten_by_the_help_overlay() {
+        assert!(
+            Keybinds::default()
+                .palette
+                .matches(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            "this test presses the default; update it with the default"
+        );
+        let (mut state, _rx) = app(&["tank"]);
+        state.show_help = true;
+
+        assert!(press(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert!(!state.show_help, "the overlay consumes the key and closes");
+        assert!(
+            state.palette.is_none(),
+            "and the palette must not have opened behind it"
+        );
+    }
+
     /// The overlay must never become a second, stale copy of the bindings
     /// (§11.2) — the listing is generated from the ones in force.
     #[test]
