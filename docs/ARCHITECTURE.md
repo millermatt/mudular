@@ -179,8 +179,10 @@ src/
   app.rs         UI event loop: terminal setup, select! over input + sessions
   state.rs       AppState and the session/pane model — what the client *is*,
                  so `ui` can render it without importing the loop
+  config_editor.rs  The in-client profile editor's model: modes, cursor,
+                 draft edits (§10.2). Below `ui`, so it draws nothing
   ui/            ratatui widgets: pane layout, status bar, input line, tabs,
-                 help overlay, config_editor.rs (in-client profile editor)
+                 help overlay, config_editor.rs (the editor's drawing half)
   scrollback.rs  RetainedLine: what a pane keeps (text + arrival + origin)
   session/       Session task: pipeline assembly, SessionEvent/Command types
   net/           Transport: TCP / TLS connect, unified AsyncRead+Write
@@ -198,8 +200,16 @@ src/
 
 Dependency rule (enforced by review): `proto` and `engine` depend on
 nothing above them and do no I/O; `session` composes them; `ui` knows
-nothing about sockets and reads the model from `state`, never from `app`
-(guarded by a test, not by review); `app` wires everything.
+nothing about sockets and reads the model from `state`, never from `app`;
+`state` names nothing in `ui`, so the model sits below every front end
+rather than beside one; `app` wires everything. The last two are guarded
+by tests rather than by review — `ui_names_the_model_not_the_event_loop`
+and `the_model_does_not_name_the_front_end`.
+
+Where a model needs an answer only a renderer can give — the map's
+re-centring policy needs to know whether a room would be drawn, which is
+the renderer's own geometry — `app` passes the question in rather than
+`state` reaching up for it.
 
 ### 4.1 The front-end seam, and why it is internal
 

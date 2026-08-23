@@ -16,11 +16,11 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, Channel, CrossSession, Keybinds};
+use crate::config_editor;
 use crate::engine::Engine;
 use crate::proto::charset::Charset;
 use crate::scrollback::{Origin, RetainedLine};
 use crate::session::{self, SessionCommand, SessionEvent};
-use crate::ui;
 
 /// Same rationale as `scrollback_size` (§8), for the raw server-data
 /// inspector log (GMCP and/or MSDP, §6.3): bounded so a chatty MUD can't
@@ -1177,7 +1177,7 @@ pub struct AppState {
     /// The profile editor, when it is open (§10.2). `Some` means it owns
     /// the keyboard and paints over every pane, like the help overlay —
     /// but sessions keep running behind it.
-    pub config_editor: Option<ui::config_editor::ConfigEditorState>,
+    pub config_editor: Option<config_editor::ConfigEditorState>,
     /// A save the editor asked for on the last keypress, drained by
     /// `event_loop` right after `handle_key` returns — saving needs async
     /// IO that `handle_key` itself, being sync, cannot do.
@@ -1452,7 +1452,16 @@ impl AppState {
     /// a group it cannot reach, where `layout_area` gives them no
     /// coordinate). In each, centring on them is the only thing that puts
     /// them in front of the player.
-    pub fn update_map_pan(&mut self) {
+    /// `shows_room` answers whether the map pane would draw a room at a
+    /// given scene coordinate. That is geometry only the renderer can
+    /// answer — it lays the scene out — while *when to re-centre* is
+    /// policy, and policy belongs with the model. So the caller hands the
+    /// question in (`app` passes `ui::map_shows_room`) rather than the
+    /// model reaching up into `ui` for it (#6).
+    pub fn update_map_pan(
+        &mut self,
+        shows_room: impl Fn(ratatui::layout::Rect, (i32, i32)) -> bool,
+    ) {
         let (Some(id), Some(current)) = (
             self.bound_index().and_then(|i| self.id_at(i)),
             self.bound().and_then(|session| session.view.current_room),
@@ -1499,8 +1508,7 @@ impl AppState {
         });
         match (cursor_at, self.map_grid) {
             (Some(at), Some(grid)) => {
-                let drawn =
-                    crate::ui::map_shows_room(grid, (self.map_pan.0 + at.0, self.map_pan.1 + at.1));
+                let drawn = shows_room(grid, (self.map_pan.0 + at.0, self.map_pan.1 + at.1));
                 if !drawn {
                     // Centred rather than nudged to the edge: the cursor is
                     // being steered, and the next arrow press should have
@@ -1516,7 +1524,7 @@ impl AppState {
             _ => {
                 if !self
                     .map_grid
-                    .is_some_and(|grid| crate::ui::map_shows_room(grid, self.map_pan))
+                    .is_some_and(|grid| shows_room(grid, self.map_pan))
                 {
                     self.map_pan = (0, 0);
                 }
@@ -1926,6 +1934,30 @@ impl AppState {
 
 /// Panes and app state without live session tasks behind them, so both the
 /// hub's own tests and the widget tests can build a realistic app.
+#[cfg(test)]
+mod boundary {
+    /// The model is below the front end, not beside it: `ui` reads `state`
+    /// and `state` names nothing in `ui`. That edge ran both ways until
+    /// #6 — the codebase's only dependency cycle — and it is what a second
+    /// front end needs gone, since a line-oriented mode has to read this
+    /// model without pulling in ratatui's widgets (§4.1).
+    ///
+    /// Source text rather than a type, because a cycle is a fact about
+    /// what a module *names*, and by the time it is a type the edge is
+    /// already back.
+    #[test]
+    fn the_model_does_not_name_the_front_end() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/state.rs");
+        let source = std::fs::read_to_string(&path).expect("a readable source file");
+        let forbidden = concat!("crate", "::ui");
+        assert!(
+            !source.contains(forbidden),
+            "src/state.rs names `{forbidden}`; what it wants either belongs \
+             below `ui` or should be handed in by `app`, which knows both"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
