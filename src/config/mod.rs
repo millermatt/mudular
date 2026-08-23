@@ -3755,4 +3755,24 @@ triggers:
         assert!(!yaml.contains("gag"));
         assert!(!yaml.contains("when"));
     }
+
+    /// `Keybinds` lives here and the model lives in `state`, which names
+    /// `config` — so an edge the other way is a cycle, and #6 closed the
+    /// last one. It would not fail to compile: an inherent
+    /// `impl Keybinds { fn resolve(..) -> Option<Action> }` written inside
+    /// `src/state.rs` is legal and passes both other boundary tests, which
+    /// only look at `ui`. Hence a test rather than a note
+    /// (docs/LINE_MODE.md §5.3).
+    #[test]
+    fn config_does_not_name_the_model() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/mod.rs");
+        let source = std::fs::read_to_string(&path).expect("a readable source file");
+        let forbidden = concat!("crate", "::state");
+        assert!(
+            !source.contains(forbidden),
+            "src/config/mod.rs names `{forbidden}`; `state` names `config`, \
+             so this edge is a cycle — put the type in `state` and resolve \
+             from there"
+        );
+    }
 }
