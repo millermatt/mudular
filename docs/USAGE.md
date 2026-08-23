@@ -1060,7 +1060,9 @@ Note that this reloads *rules and scripts* only. Changing a profile's
 
 `F5`, or typing `/config`, opens a full-screen editor over the profile
 you're connected with — no hand-editing YAML required for day-to-day
-changes. It has a tab per thing a profile holds: **Connection**,
+changes. `/config <setting>` opens it standing on one connection setting
+(`/config charset`), which is what the command palette hands over when you
+pick a setting out of it. It has a tab per thing a profile holds: **Connection**,
 **Variables**, **Aliases**, **Triggers**, **Timers**, **Modules**.
 `Tab`/`Shift+Tab` (or `1`-`6`) switch tabs, `↑`/`↓` move the selection,
 `a` adds, `e`/`Enter` edits, `d` deletes (with a yes/no confirmation —
@@ -1318,7 +1320,7 @@ fallback.
 | `Alt+,` / `Alt+.` | Widen / narrow the map column | `map_wider` / `map_narrower` |
 | `Alt+S` | Swap the map and comms columns | `swap_columns` |
 | `/errors` | Show the client's own warnings, and clear the badge | — |
-| `Ctrl+P` | Command palette: type a few letters, find any command or profile | `palette` |
+| `Ctrl+P` | Command palette: type a few letters, find any command, profile, or connection setting | `palette` |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 | `Alt+T` | Show or hide the clock down the character panes | `toggle_timestamps` |
 | `/comms` | Show or hide the comms column — the same thing `F4` does | — (a command) |

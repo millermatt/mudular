@@ -300,6 +300,39 @@ pub fn save_comms(
     Ok(())
 }
 
+/// The connection settings the palette offers by name (#43), each with
+/// what it does in the words a player would search for rather than the
+/// ones the schema uses.
+///
+/// Here rather than beside the editor's own `ConnField`, which is the
+/// other list of these fields: the palette is built in `state`, and
+/// `state` must not depend on `ui` (#6). The two are held in step by
+/// `every_connection_field_is_offered_in_the_palette`.
+pub const CONNECTION_SETTINGS: [(&str, &str); 10] = [
+    ("host", "the address this character connects to"),
+    ("port", "the port this character connects to"),
+    ("tls.enabled", "connect over TLS"),
+    (
+        "tls.verify",
+        "how strictly the server's certificate is checked",
+    ),
+    ("charset", "the character set this MUD sends"),
+    (
+        "color",
+        "the colour of this character's pane border and tab",
+    ),
+    ("login.name", "the name to send at the login prompt"),
+    (
+        "login.name_prompt",
+        "the text that means the MUD is asking for a name",
+    ),
+    (
+        "login.password_prompt",
+        "the text that means the MUD is asking for a password",
+    ),
+    ("log", "write this character's scrollback to a file"),
+];
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {

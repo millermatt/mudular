@@ -368,7 +368,9 @@ async fn reload_rules(state: &AppState, channels: &[Channel]) -> String {
 /// file to edit — and a profile that at least parses; a broken file is
 /// reported rather than edited from a blank default, which would risk
 /// overwriting whatever is actually wrong with it.
-fn open_config_editor(state: &mut AppState, channels: &[Channel]) {
+/// Opens the profile editor, optionally standing on one named setting —
+/// `/config charset`, which is what the palette emits for a setting (#43).
+fn open_config_editor(state: &mut AppState, channels: &[Channel], setting: &str) {
     let Some(session) = state.bound() else {
         return;
     };
@@ -390,14 +392,25 @@ fn open_config_editor(state: &mut AppState, channels: &[Channel]) {
     match config::load_profile_file(&path) {
         Ok(file) => {
             let known_modules = known_module_names(&dir);
-            state.config_editor = Some(ui::config_editor::ConfigEditorState::open(
+            let mut editor = ui::config_editor::ConfigEditorState::open(
                 file,
                 dir,
                 name,
                 channels,
                 known_modules,
                 had_comments,
-            ));
+            );
+            // A name nothing answers to is refused rather than opening at
+            // the top, which would look exactly like a typo that worked.
+            if !setting.is_empty() && !editor.focus_setting(setting) {
+                if let Some(session) = state.bound_mut() {
+                    session.push_line(RetainedLine::client(format!(
+                        "** /config: no setting called `{setting}`"
+                    )));
+                }
+                return;
+            }
+            state.config_editor = Some(editor);
         }
         Err(err) => {
             if let Some(session) = state.bound_mut() {
@@ -2278,7 +2291,7 @@ fn handle_key(
         return true;
     }
     if keybinds.config_editor.matches(code, modifiers) {
-        open_config_editor(state, channels);
+        open_config_editor(state, channels, "");
         return true;
     }
     if keybinds.swap_columns.matches(code, modifiers) {
@@ -2475,6 +2488,8 @@ fn run_palette_entry(state: &mut AppState, entry: PaletteEntry) -> bool {
         }
         // A profile is already the argument, so this one is complete.
         PaletteEntry::Profile(name) => format!("{CONNECT_COMMAND} {name}"),
+        // So is a setting: `/config charset` opens the editor on it.
+        PaletteEntry::Setting(name) => format!("{CONFIG_COMMAND} {name}"),
         PaletteEntry::Command(command) => command.name().to_string(),
     };
     let ready = !matches!(&entry, PaletteEntry::Command(command) if command.takes_an_argument());
@@ -2525,7 +2540,7 @@ async fn run_client_command(state: &mut AppState, channels: &[Channel], command:
                 state.tell_player(text);
             }
         }
-        ClientCommand::Config => open_config_editor(state, channels),
+        ClientCommand::Config(setting) => open_config_editor(state, channels, &setting),
         ClientCommand::NewProfile => {
             state.new_profile_wizard = Some(NewProfileWizard::new(state.config_dir.clone()));
         }
@@ -7416,6 +7431,78 @@ mod tests {
             "the player is left to say where"
         );
         assert!(!state.palette_submit, "and it is not sent for them");
+    }
+
+    /// #43's last third: a *setting* is findable too, by its name and by
+    /// what it does, exactly like a command.
+    #[tokio::test]
+    async fn the_palette_finds_a_setting() {
+        let (state, _rx) = app(&["tank"]);
+        let first = |query: &str| {
+            state
+                .palette_entries(query)
+                .first()
+                .map(|entry| entry.label())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(first("charset"), "charset");
+        assert_eq!(first("tls.v"), "tls.verify", "initials find one too");
+        assert_eq!(
+            first("certificate"),
+            "tls.verify",
+            "and the description is searchable, as it is for a command"
+        );
+    }
+
+    /// The point of listing settings at all: choosing one opens the editor
+    /// already standing on that field. Naming the setting and leaving the
+    /// player to go find it would be a list that tells you to type
+    /// something else.
+    #[tokio::test]
+    async fn choosing_a_setting_opens_the_editor_standing_on_it() {
+        let dir = config_with_alias("old");
+        let (mut state, _rx) = app_with_rules(dir.path());
+
+        run_palette_entry(&mut state, PaletteEntry::Setting("charset"));
+        assert_eq!(
+            state.bound().unwrap().view.input.value(),
+            "/config charset",
+            "a setting is emitted as a real command line, like a profile is"
+        );
+        assert!(state.palette_submit, "and it is complete, so it is sent");
+
+        submit(&mut state, "/config charset").await;
+        let editor = state.config_editor.as_ref().expect("the editor opened");
+        assert_eq!(editor.selected_setting(), Some("charset"));
+    }
+
+    /// The argument is optional: `/config` on its own still opens the
+    /// editor where it always did, and a name nothing answers to is
+    /// refused rather than silently opening at the top — which would look
+    /// exactly like a typo that worked.
+    #[tokio::test]
+    async fn config_without_a_setting_opens_at_the_top_and_a_bad_one_is_refused() {
+        let dir = config_with_alias("old");
+        let (mut state, _rx) = app_with_rules(dir.path());
+
+        submit(&mut state, "/config").await;
+        let editor = state.config_editor.as_ref().expect("the editor opened");
+        assert_eq!(editor.selected_setting(), Some("host"), "the first field");
+
+        state.config_editor = None;
+        submit(&mut state, "/config nosuch").await;
+        assert!(state.config_editor.is_none(), "it does not open");
+        let notice = state.sessions[0]
+            .view
+            .scrollback
+            .back()
+            .expect("a notice")
+            .plain();
+        assert!(
+            notice.contains("nosuch"),
+            "and it says which name it did not know: {notice:?}"
+        );
     }
 
     /// #18. A warning shown as one more scrollback line is
