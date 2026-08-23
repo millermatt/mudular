@@ -405,6 +405,103 @@ impl ClientCommand {
     }
 }
 
+/// A named player intention.
+///
+/// `handle_key` used to turn a keypress straight into an effect, which made
+/// the keybind the one entry point that never met `ClientCommand` — typing
+/// `/map` and pressing the map key ran two implementations of one idea. A
+/// second front end would have made that three (docs/LINE_MODE.md §5).
+///
+/// Wrapping `ClientCommand` rather than growing it: `ClientCommand` means
+/// "a thing you can type with a slash and find in the palette", and `parse`
+/// deliberately leaves an unknown `/word` to the MUD. Intents that are
+/// neither typable nor listable would need a hidden-entry concept to keep
+/// them out of the palette again.
+///
+/// Nothing constructs this yet — Task 5 routes `handle_key` through it and
+/// every variant becomes reachable.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// The three intents a key and a slash-command both express.
+    Command(ClientCommand),
+    ToggleTimestamps,
+    ToggleHud,
+    WhoNeedsMe,
+    OpenPalette,
+    /// The overlay, which is *not* `ClientCommand::Help` — that prints the
+    /// same listing into the pane instead.
+    HelpOverlay,
+    /// Sets the deferred flag the event loop services, which is *not*
+    /// `ClientCommand::Reload`'s awaited path (docs/LINE_MODE.md §5.4).
+    RequestReload,
+    LinePicker,
+    ServerDataInspector,
+    FocusNext,
+}
+
+// Nothing calls these resolvers yet — Task 5 routes `handle_key` through
+// them and the allow comes off.
+#[allow(dead_code)]
+impl Action {
+    /// Bindings checked *before* the modal blocks, and so still live while
+    /// an overlay is up. One resolver for both groups would move these
+    /// behind the overlay and change behaviour (docs/LINE_MODE.md §5.5).
+    pub(crate) fn for_key_before_modes(
+        keybinds: &Keybinds,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<Self> {
+        if keybinds.toggle_timestamps.matches(code, modifiers) {
+            return Some(Self::ToggleTimestamps);
+        }
+        if keybinds.toggle_hud.matches(code, modifiers) {
+            return Some(Self::ToggleHud);
+        }
+        if keybinds.who_needs_me.matches(code, modifiers) {
+            return Some(Self::WhoNeedsMe);
+        }
+        None
+    }
+
+    /// Bindings checked *after* the modal blocks, so an open overlay or
+    /// palette eats them first.
+    pub(crate) fn for_key_after_modes(
+        keybinds: &Keybinds,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<Self> {
+        if keybinds.palette.matches(code, modifiers) {
+            return Some(Self::OpenPalette);
+        }
+        if keybinds.help.matches(code, modifiers) {
+            return Some(Self::HelpOverlay);
+        }
+        if keybinds.config_editor.matches(code, modifiers) {
+            return Some(Self::Command(ClientCommand::Config(String::new())));
+        }
+        if keybinds.toggle_map.matches(code, modifiers) {
+            return Some(Self::Command(ClientCommand::Map));
+        }
+        if keybinds.reload.matches(code, modifiers) {
+            return Some(Self::RequestReload);
+        }
+        if keybinds.line_picker.matches(code, modifiers) {
+            return Some(Self::LinePicker);
+        }
+        if keybinds.server_data_inspector.matches(code, modifiers) {
+            return Some(Self::ServerDataInspector);
+        }
+        if keybinds.focus_next.matches(code, modifiers) {
+            return Some(Self::FocusNext);
+        }
+        if keybinds.toggle_channels.matches(code, modifiers) {
+            return Some(Self::Command(ClientCommand::Comms));
+        }
+        None
+    }
+}
+
 /// What the palette can act on (#43).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteEntry {
@@ -2102,6 +2199,91 @@ pub(crate) mod test_support {
             // the real config dir, and a test that means to exercise
             // persistence sets it and points at a temp dir.
             persist: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+
+    /// A key and the slash-command that means the same thing resolve to one
+    /// `Action`, so a second front end reaches one implementation rather
+    /// than two (docs/LINE_MODE.md §5.1). Only the three genuine duplicates
+    /// are listed: `help` opens an overlay where `/help` prints a listing,
+    /// and `reload` defers through a flag where `/reload` awaits, so those
+    /// two are different intents that happen to share a name.
+    #[test]
+    fn a_key_and_its_slash_command_mean_the_same_action() {
+        let keybinds = crate::config::Keybinds::default();
+        let cases = [
+            (keybinds.toggle_map, "/map"),
+            (keybinds.toggle_channels, "/comms"),
+            (keybinds.config_editor, "/config"),
+        ];
+        for (binding, typed) in cases {
+            let (code, mods) = binding.parts();
+            let from_key = Action::for_key_after_modes(&keybinds, code, mods)
+                .unwrap_or_else(|| panic!("{typed}'s key resolves to an action"));
+            let from_text = ClientCommand::parse(typed)
+                .map(Action::Command)
+                .unwrap_or_else(|| panic!("{typed} parses"));
+            assert_eq!(from_key, from_text, "{typed} disagrees with its key");
+        }
+    }
+
+    /// The split exists because the modal blocks sit between the two groups
+    /// (docs/LINE_MODE.md §5.5); a binding must resolve in exactly one.
+    #[test]
+    fn each_shared_binding_resolves_in_exactly_one_group() {
+        let k = crate::config::Keybinds::default();
+        let all = [
+            &k.toggle_timestamps,
+            &k.toggle_hud,
+            &k.who_needs_me,
+            &k.palette,
+            &k.help,
+            &k.config_editor,
+            &k.toggle_map,
+            &k.reload,
+            &k.line_picker,
+            &k.server_data_inspector,
+            &k.focus_next,
+            &k.toggle_channels,
+        ];
+        for binding in all {
+            let (code, mods) = binding.parts();
+            let early = Action::for_key_before_modes(&k, code, mods);
+            let late = Action::for_key_after_modes(&k, code, mods);
+            assert_ne!(
+                early.is_some(),
+                late.is_some(),
+                "a shared binding resolves in one group, never both or neither"
+            );
+        }
+    }
+
+    /// A binding whose subject is the geometry stays inline in `ui`
+    /// (docs/LINE_MODE.md §5.2), so the layer must not claim it.
+    #[test]
+    fn geometry_bindings_do_not_resolve_to_an_action() {
+        let k = crate::config::Keybinds::default();
+        let private = [
+            &k.map_cursor,
+            &k.swap_columns,
+            &k.cycle_layout,
+            &k.channel_wider,
+            &k.channel_narrower,
+            &k.map_wider,
+            &k.map_narrower,
+        ];
+        for binding in private {
+            let (code, mods) = binding.parts();
+            assert!(
+                Action::for_key_before_modes(&k, code, mods).is_none()
+                    && Action::for_key_after_modes(&k, code, mods).is_none(),
+                "a geometry binding must stay private to the front end"
+            );
         }
     }
 }

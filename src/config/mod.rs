@@ -1029,6 +1029,17 @@ impl KeyBinding {
     pub fn matches(&self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         self.code == code && self.modifiers == modifiers
     }
+
+    /// The pair a resolver matches on. `matches` answers "is this you?",
+    /// which is no help to a caller that has a binding and needs the key it
+    /// stands for (docs/LINE_MODE.md §5.3).
+    ///
+    /// Only tests call this so far; the allow comes off in Task 5 once
+    /// `Action`'s resolvers are reachable from production code too.
+    #[allow(dead_code)]
+    pub(crate) fn parts(&self) -> (KeyCode, KeyModifiers) {
+        (self.code, self.modifiers)
+    }
 }
 
 impl std::fmt::Display for KeyBinding {
