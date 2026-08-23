@@ -79,7 +79,26 @@ interruption; braille, sound cues, stereo panning; a first-party reading
 cursor; making the existing panes readable; a runtime toggle between front
 ends. Each is a separate decision with its own evidence, and none is blocked
 by this work. The MTTS screen-reader bit is
-[#145](https://github.com/millermatt/mudular/issues/145) and stays there.
+[#145](https://github.com/millermatt/mudular/issues/145) and stays there —
+but see the objection below before building it.
+
+**#145 may be the wrong thing to build, and all three plans agreed on it
+without examining it.** MTTS bit 64 advertises "a screen reader is in use"
+to the server, unprompted. Mudlet's accessibility manual calls exactly this
+out as bad practice:
+
+> "Auto-detection of visually impaired players is frowned upon, as it could
+> lead to 'fingerprinting' certain users without their consent. Instead, the
+> best practice is to provide a command for the players that enables a
+> screenreader-friendly mode."
+
+Disclosing a disability to every server you connect to, by default, is a
+privacy decision made on the player's behalf. It is also §13's kind of
+question rather than a protocol detail. #145 was ranked "cheapest, ships
+first" by all three plans in #39; none of them weighed this. At minimum it
+is off by default and opt-in per profile; possibly it should not exist, and
+the player should type the MUD's own screen-reader command instead. Recorded
+here because #145's issue does not know it yet.
 
 Interruption is left to the player's screen reader because the measurement in
 §2 shows it already works: any keypress flushes the backlog and, in this
@@ -151,7 +170,11 @@ because they are contested or were previously filed wrongly:
   (`input_session`) is not geometry and §6.5 requires it. Which *pane* has
   focus is. The intent splits, and only the character half is shared.
 - **`toggle_hud` is shared.** Its subject is every character's vitals, not
-  geometry; a line front end prints a table. Filing it private while
+  geometry; a line front end prints it as lines. **Not as a table** —
+  Mudlet's accessibility manual is explicit that tabular layout "can often
+  appear as streams of indecipherable data" because screen readers need
+  markup to walk cells and plain text has none, and advises breaking the
+  information into lines separated by commas or colons. Filing it private while
   `who_needs_me` — which reads the same data — is shared, is not a
   distinction this criterion supports, and the blind multi-boxer wants the
   table most.
@@ -351,9 +374,19 @@ Blightmud's third option is better than either branch and is adopted:
 **suppressed from the live stream, retained in scrollback**, so it is there
 on review without being spoken on arrival.
 
-Both branches ship implemented and tested. The default is the weakest-founded
-choice in this document: the evidence supports *a setting*, and neither
-branch has two independent confirmations behind it.
+Both branches ship implemented and tested, but the default is no longer
+unfounded. Mudlet's accessibility manual instructs screen-reader users to
+configure exactly this, in the client blind testers signed off on:
+
+> "Auto clear the input line after you sent text", should be checked.
+> "Show the text you sent", should be unchecked.
+
+Two independent clients, then, arriving at the same default — which is what
+§10 asks for before a default is chosen.
+
+The auto-clear half is worth adopting too: mudular keeps the sent command
+selected in the input line, and Mudlet names that as a sighted-user
+convenience that costs a screen-reader user. Line mode clears on send.
 
 ### 6.5 Several characters, one printed
 
@@ -458,27 +491,68 @@ is one thing. Being able to step over a chunk, or back into one, is a
 different and probably more valuable capability than stepping over a line,
 and nothing in this design offers it.
 
-No standard mechanism carries that to a screen reader. Three avenues, and
-the ordering is by what is known to work rather than by elegance:
+No standard mechanism carries chunk boundaries to a screen reader, and the
+obvious workaround is contraindicated. What the field does instead is not
+markup at all.
 
-- **Blank lines.** NVDA has paragraph navigation with a configurable
-  paragraph style, one option of which treats a blank line as the boundary.
-  This needs no protocol, degrades to something a sighted player already
-  expects — MUDs conventionally separate room descriptions this way — and
-  costs one line of code. **Unverified**: whether NVDA's paragraph
-  navigation reaches console text rather than only browse mode and
-  documents, and whether Orca has any equivalent over a terminal, where flat
-  review sees the whole grid as a single object. Cheap enough that branch 2
-  may as well emit them and find out.
+- **Blank lines do not work, and are actively avoided.** The natural idea is
+  to separate chunks with a blank line and let paragraph navigation find
+  them. Mudlet ships a *Blank Lines* setting whose options are show, hide,
+  or replace with a space, and its accessibility manual recommends one of
+  the latter two, because "having blank lines can be problematic on Windows
+  specifically." A client written for these users offers to remove them.
+  Line mode should not add them, and this document previously said it
+  should.
 - **`OSC 133`.** The FinalTerm shell-integration sequences mark prompt,
   command and output boundaries, and Ghostty, iTerm2, kitty, WezTerm and VS
   Code already implement block-jumping on them. It is a real chunking
-  protocol and it is nearly free to emit. But it drives the *terminal's* own
+  protocol and nearly free to emit. But it drives the *terminal's* own
   navigation, and no evidence was found that any screen reader consumes it,
   so it must not be described as an accessibility feature.
-- **A first-party review cursor.** §3 refuses this. If neither of the above
-  reaches a reader, that refusal has a measurable ceiling, and this is where
-  it would be paid for.
+- **Keyed recall of categorised chunks — this is what actually ships.**
+  Two Mudlet packages and a MushClient plugin independently implement the
+  same model, described as "virtual buffering for screen reader users",
+  and its stated premise is blunt: *traditional scrollback is inaccessible*.
+  Rather than teach the reader what a chunk is, the client keeps chunks in
+  named categories and gives each a key.
+
+  `ChannelHistory` assigns every stored message a category and reviews them
+  with `Alt+Left`/`Alt+Right` between categories, `Alt+Up`/`Alt+Down` within
+  one, `Alt+Home`/`Alt+End` for first and last, `Alt+1`–`Alt+0` for the ten
+  most recent, and `Alt+Shift+T` for timestamps. `QuickOutput` does the
+  simpler half: read the ten most recent lines from the MUD. MushClient's
+  `channel_history` is the same idea again.
+
+  **Mudular is unusually close to this.** Channel routing (§11.1) already
+  does what ChannelHistory asks trigger authors to write by hand, `Origin`
+  already tags provenance, and `toggle_timestamps` already exists and maps
+  onto their `Alt+Shift+T`. The categories are built; they are currently
+  rendered as a drawn column instead of bound to keys.
+
+  This also revises §6.7: line mode's answer to "channel panes are
+  unavailable" should be keyed recall, not a spoken refusal.
+
+- **A first-party review cursor.** §3 refuses this, and keyed recall is why
+  the refusal survives: it is the capability, reached another way.
+
+**What a terminal cannot copy, and should admit.** Mudlet's own answer to
+re-reading is to make the output pane focusable — `Ctrl+Tab` or `F6` moves
+focus off the input line and into the buffer, where ordinary cursor keys
+review by character, word and line, `Ctrl+Home`/`Ctrl+End` jump to the start
+of the buffer or the latest content, and the screen reader announces
+"Jumped to latest content" as it lands. That works because Mudlet is a GUI
+application with a real accessible text widget to hand focus to. A terminal
+application has no such object; the terminal emulator owns the only one. So
+this specific solution is unavailable here, and it is the clearest
+disadvantage of a terminal client for this player. Keyed recall is the
+compensating mechanism, not a preference.
+
+**On the client pushing text rather than being read.** Mudlet's "Announce
+incoming text in screen reader" is on by default, and turning it *off* is
+what its manual recommends on macOS and Linux. That is the delegated-push
+path — the client calling the screen reader's own API — which is #39's
+later layer and not what this design does. Worth knowing that the most
+accessible MUD client does not rely on the reader noticing changed text.
 
 The part that is already done: **mudular knows where the chunks are.** GMCP
 `Room.Info` says which lines are a room description, channel routing says
@@ -492,6 +566,13 @@ failure mode and this design does nothing about it beyond preserving the
 player's own flush. That may be enough — the flush is one keypress and blind
 players use it constantly — but it is untested at realistic burst rates, and
 "you are forty lines behind" has no expression here.
+
+That the queue is a real and known problem, rather than an artefact of the
+§2 measurement, is corroborated by the Mudlet Reader package existing: its
+stated purpose includes fixing "some VoiceOver issues regarding queuing
+things". It is written by Tyler Spivey, who also wrote `tdsr` — one of the
+three developers #39 proposes putting §8.1's questions to, and therefore the
+person most likely to already know the answer to this one.
 
 **8.3 Appending on arrival is itself contested.** The one braille user on
 record in #39 said the auto-scroll on new text "messes with my ability to
