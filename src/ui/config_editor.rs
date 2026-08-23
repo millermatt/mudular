@@ -253,6 +253,29 @@ impl ConfigEditorState {
         }
     }
 
+    /// Moves the cursor to the named connection setting, so the palette
+    /// can land on it rather than at the top of the section (#43).
+    ///
+    /// Returns whether the name is one of them: `app.rs` checks before
+    /// opening, so a typo is refused rather than opening somewhere the
+    /// player did not ask for.
+    pub fn focus_setting(&mut self, name: &str) -> bool {
+        let Some(index) = CONN_FIELDS.iter().position(|field| field.label() == name) else {
+            return false;
+        };
+        self.section = Section::Connection;
+        self.cursor[Section::Connection.index()] = index;
+        true
+    }
+
+    /// Which connection setting the cursor is on, for the tests that pin
+    /// where opening lands.
+    #[cfg(test)]
+    pub fn selected_setting(&self) -> Option<&'static str> {
+        (self.section == Section::Connection)
+            .then(|| CONN_FIELDS[self.cursor[Section::Connection.index()]].label())
+    }
+
     /// Opens straight into a brand-new trigger with `pattern` prefilled —
     /// the scrollback line-cursor's entry point (§11.5).
     pub fn open_with_new_trigger(
@@ -1530,6 +1553,27 @@ fn tabs_line(current: Section) -> Line<'static> {
 mod tests {
     use super::*;
     use ::test_support::TempDir;
+
+    /// The palette offers these settings by name (#43), and its list lives
+    /// in `config` rather than beside `ConnField` — the palette is built in
+    /// `state`, which must not depend on `ui` (#6). Two lists of the same
+    /// fields, so this is what keeps them from drifting apart: a field
+    /// added here and not there is a setting the palette cannot find, and
+    /// one named there and not here is a setting `/config` would refuse.
+    #[test]
+    fn every_connection_field_is_offered_in_the_palette() {
+        let offered: Vec<&str> = crate::config::CONNECTION_SETTINGS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let edited: Vec<&str> = CONN_FIELDS.iter().map(|field| field.label()).collect();
+
+        assert_eq!(
+            offered, edited,
+            "the palette's settings and the editor's fields are the same \
+             fields, in the same order"
+        );
+    }
 
     fn minimal(name: &str) -> Profile {
         Profile {

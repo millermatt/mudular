@@ -1317,7 +1317,9 @@ command is behind a key.
   focus, layout, views, quit), the built-in ones (`Alt+1..9`, `Up`/`Down`
   history, `PgUp`/`PgDn`/`Home`/`End` scrollback, §11.5), and the client-side commands
   (`/reload`, `/help`, `/config`) — which are otherwise just as invisible
-  as the keys.
+  as the keys. The command palette (`Ctrl+P`) searches the same commands
+  by name and by what they do, alongside the profiles on disk and the
+  connection settings `/config <setting>` opens on.
 - **`/help` prints the same content** into the focused pane, so the
   overlay is reachable without already knowing a key. Client commands are
   matched before the line is sent (§7.1), as `/reload` already is.

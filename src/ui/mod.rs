@@ -149,7 +149,10 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         "Commands you can type".to_string(),
         row("/help", "print this help into the pane"),
         row("/reload", "recompile rules and scripts from disk"),
-        row("/config", "edit this character's profile"),
+        row(
+            "/config",
+            "edit this profile — `/config charset` opens on a setting",
+        ),
         row("/update", "install a newer Mudular, if one was announced"),
         row("/newprofile", "create another character's profile"),
         row("/connect", "add a character to this running instance"),

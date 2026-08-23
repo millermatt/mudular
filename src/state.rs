@@ -254,7 +254,10 @@ pub(crate) enum ClientCommand {
     Help,
     Reload,
     Update,
-    Config,
+    /// Optionally names one connection setting to open standing on, so the
+    /// palette can hand over `/config charset` rather than `/config` and a
+    /// hunt (#43). Empty means the editor as it always opened.
+    Config(String),
     NewProfile,
     Connect(String),
     Disconnect,
@@ -283,7 +286,7 @@ impl ClientCommand {
             HELP_COMMAND => Self::Help,
             RELOAD_COMMAND => Self::Reload,
             UPDATE_COMMAND => Self::Update,
-            CONFIG_COMMAND => Self::Config,
+            CONFIG_COMMAND => Self::Config(rest),
             NEWPROFILE_COMMAND => Self::NewProfile,
             CONNECT_COMMAND => Self::Connect(rest),
             DISCONNECT_COMMAND => Self::Disconnect,
@@ -318,7 +321,7 @@ impl ClientCommand {
             Self::Corpse,
             Self::Mark(String::new()),
             Self::Send(String::new()),
-            Self::Config,
+            Self::Config(String::new()),
             Self::Reload,
             Self::Update,
         ]
@@ -330,7 +333,7 @@ impl ClientCommand {
             Self::Help => HELP_COMMAND,
             Self::Reload => RELOAD_COMMAND,
             Self::Update => UPDATE_COMMAND,
-            Self::Config => CONFIG_COMMAND,
+            Self::Config(_) => CONFIG_COMMAND,
             Self::NewProfile => NEWPROFILE_COMMAND,
             Self::Connect(_) => CONNECT_COMMAND,
             Self::Disconnect => DISCONNECT_COMMAND,
@@ -353,7 +356,7 @@ impl ClientCommand {
             Self::Help => "show every keybinding",
             Self::Reload => "reload rules and modules from disk",
             Self::Update => "install a newer release",
-            Self::Config => "edit this profile",
+            Self::Config(_) => "edit this profile",
             Self::NewProfile => "make a new character profile",
             Self::Connect(_) => "open another character",
             Self::Disconnect => "close the character you are typing at",
@@ -390,7 +393,7 @@ impl ClientCommand {
             Self::Connect(_) | Self::NewProfile | Self::Help | Self::Errors => false,
             Self::Reload
             | Self::Update
-            | Self::Config
+            | Self::Config(_)
             | Self::Disconnect
             | Self::Map
             | Self::Comms
@@ -409,6 +412,10 @@ pub enum PaletteEntry {
     /// A profile on disk, offered as "connect this character" — the
     /// commonest thing a multi-boxer wants that is not a command at all.
     Profile(String),
+    /// One of the profile's connection settings, offered by its own name:
+    /// a player hunting for `charset` is hunting for `charset`, not for
+    /// the editor it happens to live in.
+    Setting(&'static str),
 }
 
 impl PaletteEntry {
@@ -416,6 +423,7 @@ impl PaletteEntry {
         match self {
             Self::Command(command) => command.name().to_string(),
             Self::Profile(name) => format!("{CONNECT_COMMAND} {name}"),
+            Self::Setting(name) => (*name).to_string(),
         }
     }
 
@@ -423,6 +431,11 @@ impl PaletteEntry {
         match self {
             Self::Command(command) => command.describes().to_string(),
             Self::Profile(name) => format!("open {name}"),
+            Self::Setting(name) => config::CONNECTION_SETTINGS
+                .iter()
+                .find(|(setting, _)| setting == name)
+                .map(|(_, describes)| (*describes).to_string())
+                .unwrap_or_default(),
         }
     }
 }
@@ -1539,6 +1552,16 @@ impl AppState {
                 .into_iter()
                 .map(PaletteEntry::Profile),
         );
+        // Settings go through `/config`, so they are on offer exactly when
+        // it is — including for a `--host` session, which `/config` itself
+        // refuses on its own terms rather than being hidden.
+        if bound {
+            entries.extend(
+                config::CONNECTION_SETTINGS
+                    .iter()
+                    .map(|(name, _)| PaletteEntry::Setting(name)),
+            );
+        }
 
         let mut scored: Vec<(i32, PaletteEntry)> = entries
             .into_iter()
