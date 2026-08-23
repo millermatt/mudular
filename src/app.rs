@@ -2239,12 +2239,8 @@ fn handle_key(
         }
         return true;
     }
-    if keybinds.palette.matches(code, modifiers) {
-        state.palette = Some(Palette {
-            input: Input::default(),
-            selected: 0,
-        });
-        return true;
+    if let Some(action) = Action::for_key_after_modes(keybinds, code, modifiers) {
+        return apply_action(state, channels, action);
     }
     // The warnings panel closes the way every other overlay here does —
     // Esc, or any key that is not steering it. A panel that could only be
@@ -2260,53 +2256,8 @@ fn handle_key(
         }
         return handle_key(state, keybinds, code, modifiers, area_width, channels);
     }
-    if keybinds.help.matches(code, modifiers) {
-        state.show_help = true;
-        // Always from the top: reopening to wherever it was left reads as
-        // the overlay having lost its place.
-        state.help_scroll = 0;
-        return true;
-    }
-    if keybinds.config_editor.matches(code, modifiers) {
-        open_config_editor(state, channels, "");
-        return true;
-    }
     if keybinds.swap_columns.matches(code, modifiers) {
         state.map_first = !state.map_first;
-        return true;
-    }
-    if keybinds.toggle_map.matches(code, modifiers) {
-        state.show_map = !state.show_map;
-        describe_current_room(state);
-        return true;
-    }
-    if keybinds.reload.matches(code, modifiers) {
-        state.reload_requested = true;
-        return true;
-    }
-    if keybinds.line_picker.matches(code, modifiers) {
-        if let Some(session) = state.bound()
-            && !session.view.scrollback.is_empty()
-        {
-            // Starts wherever the pane is already scrolled to, rather than
-            // always jumping to the newest line — if you scrolled up to
-            // look at something before reaching for this, that's the line
-            // you meant to pick.
-            state.line_cursor = Some(
-                session
-                    .view
-                    .back_offset
-                    .min(session.view.scrollback.len().saturating_sub(1)),
-            );
-        }
-        return true;
-    }
-    if keybinds.server_data_inspector.matches(code, modifiers) {
-        state.show_inspector = !state.show_inspector;
-        return true;
-    }
-    if keybinds.focus_next.matches(code, modifiers) {
-        state.focus_next();
         return true;
     }
     if keybinds.cycle_layout.matches(code, modifiers) {
@@ -2314,10 +2265,6 @@ fn handle_key(
             LayoutMode::Tabs => LayoutMode::Splits,
             LayoutMode::Splits => LayoutMode::Tabs,
         };
-        return true;
-    }
-    if keybinds.toggle_channels.matches(code, modifiers) {
-        toggle_comms(state);
         return true;
     }
     // Resizing the column resizes the session panes beside it, so both keys
@@ -2379,7 +2326,6 @@ fn handle_key(
 /// event loop to service, exactly as the inline arms did
 /// (docs/LINE_MODE.md §5.4).
 fn apply_action(state: &mut AppState, channels: &[Channel], action: Action) -> bool {
-    let _ = channels;
     match action {
         Action::ToggleTimestamps => {
             state.show_timestamps = !state.show_timestamps;
@@ -2407,11 +2353,68 @@ fn apply_action(state: &mut AppState, channels: &[Channel], action: Action) -> b
             }
             true
         }
-        // Genuinely unreachable at this point: only the three group-A
-        // variants are constructed until Task 5 wires the second resolver.
-        // `unreachable!` rather than `todo!` says that, and Task 5 deletes
-        // the arm entirely.
-        _ => unreachable!("group B arms land in Task 5"),
+        Action::OpenPalette => {
+            state.palette = Some(Palette {
+                input: Input::default(),
+                selected: 0,
+            });
+            true
+        }
+        Action::HelpOverlay => {
+            state.show_help = true;
+            // Always from the top: reopening to wherever it was left reads
+            // as the overlay having lost its place.
+            state.help_scroll = 0;
+            true
+        }
+        Action::RequestReload => {
+            state.reload_requested = true;
+            true
+        }
+        Action::LinePicker => {
+            if let Some(session) = state.bound()
+                && !session.view.scrollback.is_empty()
+            {
+                // Starts wherever the pane is already scrolled to, rather
+                // than always jumping to the newest line — if you scrolled
+                // up to look at something before reaching for this, that's
+                // the line you meant to pick.
+                state.line_cursor = Some(
+                    session
+                        .view
+                        .back_offset
+                        .min(session.view.scrollback.len().saturating_sub(1)),
+                );
+            }
+            true
+        }
+        Action::ServerDataInspector => {
+            state.show_inspector = !state.show_inspector;
+            true
+        }
+        Action::FocusNext => {
+            state.focus_next();
+            true
+        }
+        Action::Command(ClientCommand::Map) => {
+            toggle_map(state);
+            true
+        }
+        Action::Command(ClientCommand::Comms) => {
+            toggle_comms(state);
+            true
+        }
+        Action::Command(ClientCommand::Config(setting)) => {
+            open_config_editor(state, channels, &setting);
+            true
+        }
+        // No key resolves to any other command today. A second front end
+        // may route typed commands here later; until one does, an arm that
+        // cannot be reached is a lie about what this handles.
+        Action::Command(other) => {
+            debug_assert!(false, "no key resolves to {other:?}");
+            false
+        }
     }
 }
 
@@ -2579,10 +2582,7 @@ async fn run_client_command(state: &mut AppState, channels: &[Channel], command:
                 state.errors_unread = 0;
             }
         }
-        ClientCommand::Map => {
-            state.show_map = !state.show_map;
-            describe_current_room(state);
-        }
+        ClientCommand::Map => toggle_map(state),
         ClientCommand::Comms => toggle_comms(state),
         ClientCommand::Goto(target) => start_goto(state, &target).await,
         ClientCommand::Corpse => start_corpse_run(state).await,
@@ -2652,6 +2652,14 @@ async fn send_as_other_session(state: &mut AppState, args: &str) {
 /// block has no comms pane to reveal, and a command — or a key — that
 /// silently does nothing is how a player concludes the client is broken;
 /// the map cursor already answers the same way for the same reason.
+/// Shows or hides the map column, and says the room either way — the same
+/// thing `/map` does, because it is now literally the same code
+/// (docs/LINE_MODE.md §5.1).
+fn toggle_map(state: &mut AppState) {
+    state.show_map = !state.show_map;
+    describe_current_room(state);
+}
+
 fn toggle_comms(state: &mut AppState) {
     if state.channels.is_empty() {
         if let Some(session) = state.bound_mut() {

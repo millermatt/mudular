@@ -418,9 +418,6 @@ impl ClientCommand {
 /// neither typable nor listable would need a hidden-entry concept to keep
 /// them out of the palette again.
 ///
-/// Nothing constructs this yet — Task 5 routes `handle_key` through it and
-/// every variant becomes reachable.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     /// The three intents a key and a slash-command both express.
@@ -440,9 +437,6 @@ pub(crate) enum Action {
     FocusNext,
 }
 
-// Nothing calls these resolvers yet — Task 5 routes `handle_key` through
-// them and the allow comes off.
-#[allow(dead_code)]
 impl Action {
     /// Bindings checked *before* the modal blocks, and so still live while
     /// an overlay is up. One resolver for both groups would move these
