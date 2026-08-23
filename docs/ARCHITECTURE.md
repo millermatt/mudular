@@ -201,6 +201,38 @@ nothing above them and do no I/O; `session` composes them; `ui` knows
 nothing about sockets and reads the model from `state`, never from `app`
 (guarded by a test, not by review); `app` wires everything.
 
+### 4.1 The front-end seam, and why it is internal
+
+`ui` is one way to present a session, not the only possible one. A
+line-oriented mode that leaves the alternate screen — which is what serves
+the player using a screen reader (§ACTORS, #39) — is a second consumer of
+the same model and the same events, sharing the pipeline, the rules and
+the sessions, and sharing none of the drawing.
+
+Two consumers is the point. One consumer cannot tell a model from a
+convenience: every field `ui` happens to want looks like part of the
+model when `ui` is the only thing reading it. A second consumer that is
+*different in kind* — no ratatui, no alternate screen, no raw mode, no
+keybinds — is what makes the answer falsifiable.
+
+**The seam is internal, unversioned, and free to change.** Nothing here is
+published for third parties, no event name is stable, and there is no
+plugin ABI. A rename that moves every consumer in the same commit is an
+ordinary refactor and stays one. This is a deliberate limit rather than an
+omission: a stable surface is a permanent commitment, and the project
+takes it on when someone outside it has a reason to depend on the surface,
+not before.
+
+Consequently the seam is a means and not an end. It exists because it is
+how the screen-reader player gets served at all; the better factoring is a
+side effect worth having. "More modular" is not a reason to widen it,
+because it names no one it is for (docs/ACTORS.md).
+
+What the seam does **not** license, until something needs it: injectable
+protocol stacks. §6.5's ordering is load-bearing — compression wraps
+Telnet wraps charset — and making the composition configurable mostly buys
+the ability to compose an invalid one.
+
 ---
 
 ## 5. Networking Layer (`net`)
