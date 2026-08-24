@@ -162,9 +162,33 @@ exactly this reason). Same intent, two realisations, one name.
 A binding fails when its subject *is* the geometry: a width, a layout, which
 pane has focus, or a cursor moving over drawn content.
 
-Classification is to be done against the code while implementing; the
-criterion above is normative, not any list. Four cases are settled here
-because they are contested or were previously filed wrongly:
+Classification is against the code, not any list — the criterion above is
+normative. Applied to every binding, it gives **13 shared, 7 private**:
+
+| Binding | | Binding |
+| --- | --- | --- |
+| `quit` (shared, deferred to branch 2 — §5.3) | | `swap_columns` (private) |
+| `server_data_inspector` | | `cycle_layout` (private) |
+| `focus_next` (shared, in part) | | `channel_wider` (private) |
+| `toggle_channels` | | `channel_narrower` (private) |
+| `palette` | | `map_wider` (private) |
+| `help` | | `map_narrower` (private) |
+| `config_editor` | | `map_cursor` (private) |
+| `line_picker` | | |
+| `reload` | | |
+| `toggle_map` | | |
+| `toggle_hud` | | |
+| `toggle_timestamps` | | |
+| `who_needs_me` | | |
+
+The right column is exactly the bindings whose subject is a width, a layout,
+or a cursor over drawn content — geometry the criterion excludes by
+construction. Everything else is shared. `quit` is shared by the criterion
+(any front end can quit) but is matched in `event_loop`, not `handle_key`,
+and stays there until branch 2 gives line mode a loop to join.
+
+Four cases are worth recording because they are contested or were previously
+filed wrongly:
 
 - **`focus_next` is shared**, in part. Which character the input is bound to
   (`input_session`) is not geometry and §6.5 requires it. Which *pane* has
@@ -248,7 +272,7 @@ branch 2 most needs. Either it becomes a real binding or the character-switch
 intent gets its own name; the former is preferable and is a small,
 independently sensible fix.
 
-### 5.5 Order is behaviour, and one lookup will break it
+### 5.5 Order is behaviour, and a single lookup will break it
 
 The shared bindings are **not contiguous**. In `handle_key` they interleave
 with the modal blocks, and that ordering is load-bearing: `toggle_timestamps`
@@ -256,18 +280,38 @@ is checked *before* the help overlay's block, so it works while the overlay
 is up, and the palette key while the overlay is up dismisses the overlay
 rather than opening the palette.
 
-A single `Action::for_key` call at the top of the binding section inverts
-both, and no test covers either. The layer is therefore **two lookups at two
-positions**, not one, and the split point is where the modal blocks begin.
+The general rule: **a shared binding resolves in the gap it already
+occupied, and every modal block between gaps is a divider.** A single
+`Action::for_key` call at the top of the binding section collapses every gap
+into one and inverts every ordering `handle_key` currently depends on, so the
+layer needs one resolver per gap, not one for the whole function.
+
+The help overlay is the divider that motivates the rule; the errors panel is
+the one that proves it needs to be general rather than "the help overlay and
+everything else." `show_errors` does not just gate a block the way the
+overlay does — it clears the errors panel and then recursively re-dispatches
+the same key, so a binding resolved *after* that block closes the panel as a
+side effect of running, while a binding resolved *before* it leaves the panel
+up. `palette` is on the "leaves it up" side; the other eight shared bindings
+are not. That difference is invisible unless the block that causes it is
+named as a divider on its own terms, which is why treating dividers as "the
+overlay, plus a residual second lookup" would have missed it.
+
+Three resolvers follow the three gaps: `Action::for_key_before_modes`, for
+bindings that must see the key before any modal block including the errors
+panel; `Action::for_key_before_errors`, for bindings that must run before the
+errors panel clears but after the earlier modal blocks; and
+`Action::for_key_after_errors`, for bindings — `palette` among them — for
+which running after the errors panel's side effect is correct.
 
 ### 5.6 Done when
 
-- Every shared binding reaches its effect through `Action::for_key` and one
-  dispatch, at the two positions §5.5 requires.
+- Every shared binding reaches its effect through one of the three resolvers
+  §5.5 names, at the gap it occupied.
 - The three genuine duplicates have one implementation.
 - A test asserts that resolving a key and parsing the equivalent
   slash-command produce the same `Action`, for those three.
-- A test asserts the two orderings §5.5 names, which are currently unguarded.
+- A test asserts the orderings §5.5 names, which are currently unguarded.
 - Behaviour is unchanged. Tests may be edited only where they name a
   mechanism that moved; `the_reload_keybind_requests_a_reload` is expected to
   be one, since it asserts the deferred flag by name.
