@@ -1323,6 +1323,7 @@ fallback.
 | `Ctrl+P` | Command palette: type a few letters, find any command, profile, or connection setting | `palette` |
 | `Alt+V` | Pick a scrollback line for a new trigger | `line_picker` |
 | `Alt+T` | Show or hide the clock down the character panes | `toggle_timestamps` |
+| `Alt+A` | Turn the input completion off or on — the same thing `/autocomplete` does | `toggle_autocomplete` |
 | `/comms` | Show or hide the comms column — the same thing `F4` does | — (a command) |
 
 `F1` shows this same list inside the client, built from your actual
@@ -1397,7 +1398,9 @@ Two things it deliberately will not do:
 It needs three characters before it will guess, only completes the last
 word, and only when the cursor is at the end of the line. `Escape` drops
 the suggestion for that line — press it and `Enter` sends exactly what you
-typed. To turn it off entirely:
+typed. `Alt+A`, or `/autocomplete`, turns it off and on for every character
+at once while you play — and for any you open afterwards. To have it start
+off instead:
 
 ```yaml
 autocomplete: false

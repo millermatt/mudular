@@ -2412,6 +2412,11 @@ fn apply_action(state: &mut AppState, channels: &[Channel], action: Action) -> b
             toggle_comms(state);
             true
         }
+        Action::Command(ClientCommand::Autocomplete) => {
+            toggle_autocomplete(state);
+            // Nothing about the pane layout moved, so no NAWS re-report.
+            false
+        }
         Action::Command(ClientCommand::Config(setting)) => {
             open_config_editor(state, channels, &setting);
             true
@@ -2592,6 +2597,7 @@ async fn run_client_command(state: &mut AppState, channels: &[Channel], command:
         }
         ClientCommand::Map => toggle_map(state),
         ClientCommand::Comms => toggle_comms(state),
+        ClientCommand::Autocomplete => toggle_autocomplete(state),
         ClientCommand::Goto(target) => start_goto(state, &target).await,
         ClientCommand::Corpse => start_corpse_run(state).await,
         ClientCommand::Mark(label) => mark_current_room(state, &label),
@@ -2664,6 +2670,31 @@ fn toggle_map(state: &mut AppState) {
 /// Shows or hides the comms column, from either the key or `/comms`
 /// (§11.1).
 ///
+/// Turns the input completion off or on for every character at once, and
+/// for any opened later — the flag lives on each `SessionPane`, with
+/// `AppState`'s copy as the value `connect` hands a new one, so a toggle
+/// that moved one and not the other would leave them disagreeing.
+///
+/// Says which way it went, because otherwise the only evidence is what
+/// happens the next time the player types (UX_REVIEW.md I).
+fn toggle_autocomplete(state: &mut AppState) {
+    let on = !state.autocomplete;
+    state.autocomplete = on;
+    for session in &mut state.sessions {
+        session.autocomplete = on;
+        if !on {
+            // The ghost is only recomputed on the next keystroke, so a
+            // stale one would sit there looking like nothing happened.
+            session.view.suggestion = None;
+        }
+    }
+    state.tell_player(if on {
+        "autocomplete on"
+    } else {
+        "autocomplete off"
+    });
+}
+
 /// Says so when there is nothing to show. An install with no `channels:`
 /// block has no comms pane to reveal, and a command — or a key — that
 /// silently does nothing is how a player concludes the client is broken;
@@ -6221,6 +6252,68 @@ mod tests {
         );
     }
 
+    /// `autocomplete:` is per-session — every `SessionPane` carries its own
+    /// copy, and `connect` hands a new one whatever `AppState` holds. A
+    /// toggle that moved only one of those would leave a multi-boxer's
+    /// characters disagreeing about it, and a `/connect` afterwards
+    /// disagreeing with all of them.
+    #[tokio::test]
+    async fn toggling_autocomplete_reaches_every_character_and_the_default() {
+        let (mut state, _rx) = app(&["tank", "cleric"]);
+        assert!(state.autocomplete, "the fixture starts with it on");
+
+        run_client_command(&mut state, &[], ClientCommand::Autocomplete).await;
+
+        assert!(
+            !state.autocomplete,
+            "the default a later /connect would inherit"
+        );
+        assert!(
+            state.sessions.iter().all(|session| !session.autocomplete),
+            "and every character already open"
+        );
+
+        run_client_command(&mut state, &[], ClientCommand::Autocomplete).await;
+
+        assert!(state.autocomplete);
+        assert!(state.sessions.iter().all(|session| session.autocomplete));
+    }
+
+    /// The ghost text is drawn from `suggestion`, which is only recomputed
+    /// on the next keystroke. Left in place it sits there after the toggle,
+    /// which reads as the toggle having done nothing at all.
+    #[tokio::test]
+    async fn turning_autocomplete_off_clears_the_suggestion_already_showing() {
+        let (mut state, _rx) = app(&["tank"]);
+        state.sessions[0].view.suggestion = Some("ilbasher".to_string());
+
+        run_client_command(&mut state, &[], ClientCommand::Autocomplete).await;
+
+        assert!(
+            state.sessions[0].view.suggestion.is_none(),
+            "a stale ghost outlives the setting that produced it"
+        );
+    }
+
+    /// Success is silent otherwise: the only evidence of this toggle is
+    /// what happens the *next* time you type (UX_REVIEW.md I).
+    #[tokio::test]
+    async fn toggling_autocomplete_says_which_way_it_went() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        run_client_command(&mut state, &[], ClientCommand::Autocomplete).await;
+        assert!(
+            scrollback(&state.sessions[0]).contains("autocomplete off"),
+            "turning it off says so"
+        );
+
+        run_client_command(&mut state, &[], ClientCommand::Autocomplete).await;
+        assert!(
+            scrollback(&state.sessions[0]).contains("autocomplete on"),
+            "and turning it back on says so"
+        );
+    }
+
     /// The map has nothing to say before the server has placed you, and
     /// saying nothing at all reads as a broken command (§16's plain-report
     /// rule, as `/goto` already follows).
@@ -7437,7 +7530,7 @@ mod tests {
     #[test]
     fn every_command_is_in_the_palette() {
         let listed: Vec<&str> = ClientCommand::all().iter().map(|c| c.name()).collect();
-        for name in [
+        let names = [
             HELP_COMMAND,
             RELOAD_COMMAND,
             UPDATE_COMMAND,
@@ -7452,14 +7545,19 @@ mod tests {
             CORPSE_COMMAND,
             MARK_COMMAND,
             SEND_COMMAND,
-        ] {
+            AUTOCOMPLETE_COMMAND,
+        ];
+        for name in names {
             assert!(
                 ClientCommand::parse(name).is_some(),
                 "{name} is not a command the parser knows"
             );
             assert!(listed.contains(&name), "{name} is missing from the palette");
         }
-        assert_eq!(listed.len(), 14, "and nothing is listed twice");
+        // Derived, not counted by hand: a literal here goes stale the next
+        // time a command is added and fails as an arithmetic puzzle rather
+        // than as the duplicate it is meant to catch.
+        assert_eq!(listed.len(), names.len(), "and nothing is listed twice");
     }
 
     /// Typing a few letters has to find the thing meant, not merely

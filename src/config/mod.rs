@@ -869,6 +869,12 @@ pub struct Keybinds {
     /// (docs/ARCHITECTURE.md §11.3).
     #[serde(default = "default_toggle_timestamps")]
     pub toggle_timestamps: KeyBinding,
+    /// Turns the input line's completion off and on without a restart —
+    /// the same thing `/autocomplete` does. A MUD whose syntax the
+    /// completion keeps guessing wrong at is not worth editing a file and
+    /// relaunching over (§11.3).
+    #[serde(default = "default_toggle_autocomplete")]
+    pub toggle_autocomplete: KeyBinding,
     /// Jumps to whichever character is in the most trouble
     /// (docs/ARCHITECTURE.md §11.7).
     #[serde(default = "default_who_needs_me")]
@@ -897,6 +903,7 @@ impl Default for Keybinds {
             map_cursor: default_map_cursor(),
             toggle_hud: default_toggle_hud(),
             toggle_timestamps: default_toggle_timestamps(),
+            toggle_autocomplete: default_toggle_autocomplete(),
             who_needs_me: default_who_needs_me(),
         }
     }
@@ -1000,6 +1007,12 @@ fn default_map_cursor() -> KeyBinding {
 fn default_toggle_hud() -> KeyBinding {
     // Next free after F8, continuing the same row.
     "f9".parse().expect("built-in default keybinding")
+}
+
+fn default_toggle_autocomplete() -> KeyBinding {
+    // `a` for autocomplete, and Alt because the F-row is full — the same
+    // reason `line_picker` and `toggle_timestamps` take theirs.
+    "alt+a".parse().expect("built-in default keybinding")
 }
 
 fn default_toggle_timestamps() -> KeyBinding {
@@ -1183,7 +1196,8 @@ const STARTER_APP_CONFIG: &str = r#"# Mudular's own settings — the ones that b
 #map_width: 24
 #channel_width: 28
 
-# Complete what you type from words the MUD just printed.
+# Complete what you type from words the MUD just printed. This is only the
+# starting value: Alt+A or /autocomplete turns it off and on while you play.
 #autocomplete: true
 
 # Ask GitHub at startup whether a newer Mudular exists, and say so if one
