@@ -213,17 +213,28 @@ the renderer's own geometry — `app` passes the question in rather than
 
 ### 4.1 The front-end seam, and why it is internal
 
-`ui` is one way to present a session, not the only possible one. A
-line-oriented mode that leaves the alternate screen — which is what serves
-the player using a screen reader (§ACTORS, #39) — is a second consumer of
-the same model and the same events, sharing the pipeline, the rules and
-the sessions, and sharing none of the drawing.
+`ui` is one way to present a session, not the only one. `line` is the
+other: started with `--line`, it appends output to an ordinary terminal
+that keeps its own scrollback, which is what serves the player using a
+screen reader (§ACTORS, #39). It consumes the same model and the same
+events, shares the pipeline, the rules and the sessions, and shares none
+of the drawing (docs/LINE_MODE.md).
 
 Two consumers is the point. One consumer cannot tell a model from a
 convenience: every field `ui` happens to want looks like part of the
-model when `ui` is the only thing reading it. A second consumer that is
-*different in kind* — no ratatui, no alternate screen, no raw mode, no
-keybinds — is what makes the answer falsifiable.
+model when `ui` is the only thing reading it. The second consumer is
+*different in kind* — no ratatui, no alternate screen, no panes, no
+cursor addressing — which is what makes the answer falsifiable.
+
+It keeps raw mode and it keeps the keybinds, and both are deliberate. Raw
+mode is what lets a configured keypress reach the shared intent layer at
+all, and measurement against Orca found no cost to it: the failure a
+screen-reader user actually hits is that a flush after an interruption
+lands a screenful behind the newest line, which is a property of the
+alternate screen and the repaint, not of raw mode. What the two front
+ends share is therefore `Action`, a named intent a keypress resolves to,
+which each realises its own way — or declines by name, since a surface
+that cannot degrade must say so rather than do nothing.
 
 **The seam is internal, unversioned, and free to change.** Nothing here is
 published for third parties, no event name is stable, and there is no
@@ -2163,8 +2174,12 @@ lives in `ui`, and neither is visible from inside it.
   does its ordinary job: swallowing it meant `Alt+<n>` did nothing the
   first time it was pressed with the cursor up. Deliberately keyboard-only: hover would need mouse capture,
   which takes over selection terminal-wide, and OSC 8 cannot carry it since
-  `ratatui`'s `Cell` has nowhere to hang a URI. A cursor is also the only
-  form of this a screen reader can follow.
+  `ratatui`'s `Cell` has nowhere to hang a URI. The cursor is a TUI
+  affordance and stays one: stepping between *drawn* rooms needs the
+  renderer's geometry, so it is not an intent a front end without a map
+  column could realise. The line front end's answer to the same question is
+  `Map::describe` and, in time, "describe the room north" — words rather
+  than a cursor (docs/LINE_MODE.md §5.2).
 - **`/mark <label>` is the player's own note on a room**, and the only
   source of one. No protocol carries what a place is *for*: a
   Diku-derived server's MSDP variable table is `ROOM`, `ROOM_VNUM`,

@@ -1,6 +1,9 @@
 # The line-oriented output path — design
 
-Status: approved, not yet built. Tracks [#39](https://github.com/millermatt/mudular/issues/39).
+Status: built. Tracks [#39](https://github.com/millermatt/mudular/issues/39);
+§8 is what it does not achieve, and keyed recall
+([#149](https://github.com/millermatt/mudular/issues/149)) is the next
+thing it owes.
 Design authority remains `docs/ARCHITECTURE.md`; this records one decision in
 enough detail to implement, and folds into the TAD once it is built.
 
