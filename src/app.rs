@@ -2263,6 +2263,15 @@ fn handle_key(
         state.map_first = !state.map_first;
         return true;
     }
+    // Cycling panes is geometry: the list it walks is sessions, then any
+    // visible channel panes, then the map column, and what it moves is which
+    // pane the scroll and arrow keys act on. A front end with no panes has
+    // nothing for it to do — and it does not change which character the input
+    // line is bound to, which is `input_session` and belongs to Alt+1..9.
+    if keybinds.focus_next.matches(code, modifiers) {
+        state.focus_next();
+        return true;
+    }
     if keybinds.cycle_layout.matches(code, modifiers) {
         state.layout = match state.layout {
             LayoutMode::Tabs => LayoutMode::Splits,
@@ -2393,10 +2402,6 @@ fn apply_action(state: &mut AppState, channels: &[Channel], action: Action) -> b
         }
         Action::ServerDataInspector => {
             state.show_inspector = !state.show_inspector;
-            true
-        }
-        Action::FocusNext => {
-            state.focus_next();
             true
         }
         Action::Command(ClientCommand::Map) => {

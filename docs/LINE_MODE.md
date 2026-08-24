@@ -163,19 +163,18 @@ A binding fails when its subject *is* the geometry: a width, a layout, which
 pane has focus, or a cursor moving over drawn content.
 
 Classification is against the code, not any list — the criterion above is
-normative. Applied to every binding, it gives **13 shared, 7 private**:
+normative. Applied to every binding, it gives **12 shared, 8 private**:
 
 | Binding | | Binding |
 | --- | --- | --- |
 | `quit` (shared, deferred to branch 2 — §5.3) | | `swap_columns` (private) |
 | `server_data_inspector` | | `cycle_layout` (private) |
-| `focus_next` (shared, whole, for now) | | `channel_wider` (private) |
-| `toggle_channels` | | `channel_narrower` (private) |
-| `palette` | | `map_wider` (private) |
-| `help` | | `map_narrower` (private) |
-| `config_editor` | | `map_cursor` (private) |
-| `line_picker` | | |
-| `reload` | | |
+| `toggle_channels` | | `channel_wider` (private) |
+| `palette` | | `channel_narrower` (private) |
+| `help` | | `map_wider` (private) |
+| `config_editor` | | `map_narrower` (private) |
+| `line_picker` | | `map_cursor` (private) |
+| `reload` | | `focus_next` (private) |
 | `toggle_map` | | |
 | `toggle_hud` | | |
 | `toggle_timestamps` | | |
@@ -190,16 +189,15 @@ and stays there until branch 2 gives line mode a loop to join.
 Four cases are worth recording because they are contested or were previously
 filed wrongly:
 
-- **`focus_next` is shared whole**, for now. Which character the input is
-  bound to (`input_session`) is not geometry and §6.5 requires it; which
-  *pane* has focus is. The intent does split along that line in principle,
-  but splitting it here would change behaviour, and this branch moves
-  bindings without changing what they do. `Action::FocusNext` therefore
-  wraps the whole binding, and `AppState::focus_next` cycles onto
-  `Focus::Map` and `Focus::Channel` as it always has. The split — giving the
-  character half its own `Action` and leaving the pane half private — is
-  deferred to the branch that adds the second front end, which is the first
-  branch that needs the two to disagree.
+- **`focus_next` is private.** Its name suggests a character switch and it
+  is not one. `AppState::focus_next` walks sessions, then any visible
+  channel panes, then the map column, and what it moves is which pane the
+  scroll and arrow keys act on — `self.focus`, not `input_session`. Focus
+  and input binding are separate in this model: which character the input
+  line is bound to is `input_session`, driven by `Alt+1..9`, which is not a
+  binding at all yet (§5.4). So a front end with no panes has nothing for
+  `focus_next` to walk, and the intent that line mode actually needs from
+  this area is the one `Alt+1..9` carries.
 - **`toggle_hud` is shared.** Its subject is every character's vitals, not
   geometry; a line front end prints it as lines. **Not as a table** —
   Mudlet's accessibility manual is explicit that tabular layout "can often
@@ -314,9 +312,9 @@ open, but before the help overlay and the errors panel; `Action::for_key_before_
 which holds only `palette`, checked after the earlier modal blocks but before
 the errors panel's own block, so the palette key while the panel is up opens
 the palette and leaves the panel exactly as it was, with no clear-and-re-dispatch
-in between; and `Action::for_key_after_errors`, for the remaining eight —
+in between; and `Action::for_key_after_errors`, for the remaining seven —
 `help`, `config_editor`, `toggle_map`, `reload`, `line_picker`,
-`server_data_inspector`, `focus_next` and `toggle_channels` — each of which
+`server_data_inspector` and `toggle_channels` — each of which
 only runs after the errors panel has already cleared and re-dispatched the
 key, so an open panel takes their key first.
 

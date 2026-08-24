@@ -434,12 +434,6 @@ pub(crate) enum Action {
     RequestReload,
     LinePicker,
     ServerDataInspector,
-    /// Wraps the whole binding, not just the character half. `focus_next`
-    /// also cycles which pane has focus, which is geometry a second front
-    /// end cannot share — splitting the character half out is deferred to
-    /// the branch that adds it, because splitting changes behaviour and
-    /// this branch may not (docs/LINE_MODE.md §5.2).
-    FocusNext,
 }
 
 impl Action {
@@ -505,9 +499,6 @@ impl Action {
         }
         if keybinds.server_data_inspector.matches(code, modifiers) {
             return Some(Self::ServerDataInspector);
-        }
-        if keybinds.focus_next.matches(code, modifiers) {
-            return Some(Self::FocusNext);
         }
         if keybinds.toggle_channels.matches(code, modifiers) {
             return Some(Self::Command(ClientCommand::Comms));
@@ -2264,7 +2255,6 @@ mod action_tests {
             &k.reload,
             &k.line_picker,
             &k.server_data_inspector,
-            &k.focus_next,
             &k.toggle_channels,
         ];
         for binding in all {
@@ -2290,6 +2280,7 @@ mod action_tests {
         let private = [
             &k.map_cursor,
             &k.swap_columns,
+            &k.focus_next,
             &k.cycle_layout,
             &k.channel_wider,
             &k.channel_narrower,
