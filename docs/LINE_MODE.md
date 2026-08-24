@@ -260,6 +260,16 @@ comms panes before leaving the loop.
 `Declined` is what makes a gap visible: a front end that cannot do something
 says so in words (§8.4) rather than doing nothing.
 
+**What was built is the behaviour without the enum.** Both front ends match
+`quit` in their own loop, so nothing needed `Exit` to carry it; and a refusal
+is a named reason printed into the session, so nothing needed `Declined` to
+carry that either. Refusing a *typed* command is the part that did need
+shared code, and it is `FrontEnd::refuses` — consulted by the command
+dispatch, since `/config` reaches it without passing through `Action` at all
+(§6.7). An `Outcome` enum with one producer and one consumer would have been
+a shape rather than a mechanism; it becomes worth having at the third front
+end, or the first one that cannot print its own refusal.
+
 ### 5.4 What the layer does not touch
 
 **Modal owners stay in `ui`.** Roughly half of `handle_key` is the password
