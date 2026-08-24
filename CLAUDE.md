@@ -78,13 +78,17 @@ Corollary: when a fix turns up mid-branch and is not what the branch is about,
 finish the branch, then do the fix in its own. Two small PRs beat one whose
 history has to be read to work out what it did.
 
-**Write every commit as if a stranger will read it in the changelog, because
-they will.** Subjects are the release notes. Intermediate commits are welcome
-— a branch that shows its working is easier to review than one squashed flat
-— but a commit that fixes a bug an earlier commit in the same branch
-introduced writes a changelog line for a bug no release ever had. Either fold
-it into the commit it fixes before opening the PR, or word it so it reads
-sensibly to someone who never saw the branch.
+**The PR title is the release note, and the release trigger.** A merge commit
+takes the PR title as its subject, and that subject is what release-plz reads
+and matches against `release_commits` in `release-plz.toml`. So a PR titled
+`refactor:` or `docs:` ships no release however many `feat:` commits it
+contains, and a PR titled `feat:` ships one however small it is. Title the PR
+for what the whole branch does, in Conventional Commits form.
+
+Commits inside the branch are for the reviewer and for whoever is bisecting
+later. They land on `main` and they are worth writing well, but they are not
+what the changelog is built from — do not count on one of them reaching a
+release note, and do not assume a `fix:` among them will trigger a release.
 
 **This checkout is habitually behind `origin/main`.** PRs — including
 release-plz's release PRs — are merged on GitHub, which never touches the local
@@ -94,7 +98,10 @@ repo. So:
   branch**, every time. A branch cut from a stale tip cannot fast-forward, and
   the failure surfaces later as a rejected push or a PR that needs a rebase.
 - Rebase onto `main` rather than merging it back in, and force-push with
-  `--force-with-lease`.
+  `--force-with-lease`. **Rebase again if `main` moved while the PR was
+  open.** A branch merged while it is behind the base can have its commits
+  dropped from the changelog entirely — silently, exit code 0 — so this is
+  load-bearing for releases and not only for tidy history.
 - Never `git pull` without `--ff-only`: an accidental merge commit on `main`
   clutters the changelog release-plz generates from these commits.
 
