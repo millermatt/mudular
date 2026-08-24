@@ -787,7 +787,7 @@ async fn handle_line_key(
     let action = Action::for_key_before_modes(keybinds, code, modifiers)
         .or_else(|| Action::for_key_before_errors(keybinds, code, modifiers))
         .or_else(|| Action::for_key_after_errors(keybinds, code, modifiers))
-        .or_else(|| Action::for_key_last(code, modifiers));
+        .or_else(|| Action::for_key_last(keybinds, code, modifiers));
     if let Some(action) = action {
         apply_line_action(state, channels, action).await;
         return;
@@ -2614,7 +2614,9 @@ fn handle_key(
     // Alt+1..9 jumps straight to a session (§11), and to the map column on
     // the number after the last one — the sessions keep the numbers they
     // always had, so nothing anybody has learned moves.
-    if let Some(action @ Action::SelectCharacter(index)) = Action::for_key_last(code, modifiers) {
+    if let Some(action @ Action::SelectCharacter(index)) =
+        Action::for_key_last(keybinds, code, modifiers)
+    {
         if index < state.sessions.len() {
             return apply_action(state, channels, action);
         }

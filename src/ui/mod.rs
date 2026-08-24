@@ -105,7 +105,10 @@ pub fn help_lines(keybinds: &Keybinds) -> Vec<String> {
         row("Home / End", "jump to the oldest / newest line"),
         String::new(),
         "Characters".to_string(),
-        row("Alt+1 … Alt+9", "jump to character 1-9, then the map"),
+        row(
+            format!("{m}1 … {m}9", m = keybinds.character_jump_modifier),
+            "jump to character 1-9, then the map",
+        ),
         row(keybinds.focus_next, "cycle focus, comms included"),
         String::new(),
         "Views".to_string(),
@@ -2986,6 +2989,26 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.contains("F6")),
             "the reload keybind must be listed in the help overlay: {lines:?}"
+        );
+    }
+
+    /// M9's criterion is that every binding is discoverable from inside the
+    /// client *including remapped ones*, and the character jump was the one
+    /// row that named its key rather than reading it.
+    #[test]
+    fn the_help_listing_names_the_character_jump_the_profile_configured() {
+        let keybinds = Keybinds {
+            character_jump_modifier: "ctrl".parse().expect("a modifier"),
+            ..Keybinds::default()
+        };
+        let lines = help_lines(&keybinds);
+        assert!(
+            lines.iter().any(|line| line.contains("Ctrl+1")),
+            "the help overlay must name the configured modifier: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("Alt+1")),
+            "and must not still name the one it replaced: {lines:?}"
         );
     }
 

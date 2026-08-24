@@ -1367,8 +1367,9 @@ command is behind a key.
   feature worth having; a static list of defaults would be worse than
   nothing for the user who remapped something.
 - **Contents:** the configurable bindings grouped by purpose (session
-  focus, layout, views, quit), the built-in ones (`Alt+1..9`, `Up`/`Down`
-  history, `PgUp`/`PgDn`/`Home`/`End` scrollback, §11.5), and the client-side commands
+  focus, layout, views, quit, and the modifier the character digits wear),
+  the built-in ones (`Up`/`Down` history, `PgUp`/`PgDn`/`Home`/`End`
+  scrollback, §11.5), and the client-side commands
   (`/reload`, `/help`, `/config`) — which are otherwise just as invisible
   as the keys. The command palette (`Ctrl+P`) searches the same commands
   by name and by what they do, alongside the profiles on disk and the
@@ -1394,7 +1395,7 @@ a burst of short repeated commands, and the alternative to history is the
 player mashing the same six characters all evening.
 
 - **`Up`/`Down` walk the focused session's history**, replacing the input
-  line. Built-in and not remappable, like `Alt+1..9` — the arrows have no
+  line. Built-in and not remappable — the arrows have no
   other meaning on a single-line input, and a client that made them
   configurable would be inviting users to break the one binding everyone
   arrives already knowing. Scrollback keeps `PgUp`/`PgDn`/`Home`/`End`
@@ -1577,7 +1578,7 @@ already defers) stays a later addition on top of it.
   re-clamped on `Resize`, unlike the channel column's width (§11.4).
 - **Keys: `PgUp`/`PgDn` move a fixed page (`SCROLL_PAGE`, 10 rows);
   `Home`/`End` jump to the oldest and newest line.** Built-in and
-  unremappable, like `Alt+1..9` and `Up`/`Down` (§11.3) — none of them
+  unremappable, like `Up`/`Down` (§11.3) — none of them
   have a competing
   meaning on a scrollback pane, and making them configurable would
   invite someone to break the one behaviour every pager and terminal has
