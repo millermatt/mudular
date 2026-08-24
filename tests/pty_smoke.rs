@@ -518,6 +518,68 @@ fn write_two_profiles(dir: &Path, tank_port: u16, cleric_port: u16) {
 }
 
 /// A config dir with a shared module the profile pulls in and overrides.
+/// The line front end's first acceptance criterion (docs/LINE_MODE.md
+/// §6.8): a player reading the terminal with a screen reader must never
+/// have the client repaint under them, and the two ways it could are the
+/// alternate screen and an absolute cursor move. Asserted against the raw
+/// byte stream, because both are invisible in the stripped view every
+/// other test here reads.
+#[test]
+fn line_mode_appends_and_never_repaints() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--line", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the terminal");
+
+    mud.send_line("A rat scurries by.");
+    app.wait_for("scurries", "the server's line should be printed");
+
+    // The rules still apply — this front end shares the pipeline, not just
+    // the socket.
+    app.type_line("k");
+    mud.wait_for_command("kill dragon", "the profile's rules should apply");
+
+    let raw = app.raw();
+    for sequence in ALTERNATE_SCREEN {
+        assert!(
+            !raw.contains(sequence),
+            "line mode must never enter the alternate screen"
+        );
+    }
+    assert!(
+        !addresses_the_cursor(&raw),
+        "line mode must never address the cursor: the input line is redrawn \
+         with \\r and ESC[K only (§6.2)"
+    );
+    assert_eq!(
+        raw.matches("A rat scurries by.").count(),
+        1,
+        "an output line must be written exactly once"
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// The three ways a terminal is asked for its alternate screen.
+const ALTERNATE_SCREEN: [&str; 3] = ["\x1b[?1049h", "\x1b[?1047h", "\x1b[?47h"];
+
+/// Whether the stream contains a `CUP`/`HVP` — `ESC[<row>;<col>H` or the
+/// `f` spelling. Both move the cursor somewhere absolute, which is what
+/// rewriting a line already read requires.
+fn addresses_the_cursor(raw: &str) -> bool {
+    raw.split('\x1b')
+        .filter_map(|part| part.strip_prefix('['))
+        .any(|part| {
+            let end = part
+                .find(|c: char| !c.is_ascii_digit() && c != ';')
+                .unwrap_or(part.len());
+            matches!(part.as_bytes().get(end), Some(b'H') | Some(b'f'))
+        })
+}
+
 fn write_config(dir: &Path, port: u16, quit: Option<&str>) {
     std::fs::create_dir_all(dir.join("profiles")).unwrap();
     std::fs::create_dir_all(dir.join("modules")).unwrap();
@@ -825,6 +887,13 @@ impl App {
     fn tail(&mut self, bytes: usize) -> String {
         let drawn = visible_text(&self.output.lock().unwrap());
         last_bytes(&drawn, bytes).to_string()
+    }
+
+    /// Everything the client has written, escape codes and all. The
+    /// stripped view above is what most assertions want; this is for the
+    /// ones about the escapes themselves (docs/LINE_MODE.md §6.8).
+    fn raw(&self) -> String {
+        self.output.lock().unwrap().clone()
     }
 
     fn still_running(&mut self) -> bool {

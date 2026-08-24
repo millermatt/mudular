@@ -2852,6 +2852,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         state.show_map = true;
@@ -2881,6 +2882,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         state.show_map = true;
@@ -3332,6 +3334,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         state.focus_pane(Focus::Session(state.id_at(1).unwrap()));
@@ -3353,6 +3356,7 @@ mod tests {
             unread: 2,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         };
         channel
             .lines
@@ -3428,6 +3432,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         };
         channel.lines.push_back(RetainedLine::from_session(
             state.sessions[0].view.name.clone(),
@@ -3468,6 +3473,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         };
         channel.lines.push_back(RetainedLine::from_session(
             state.sessions[0].view.name.clone(),
@@ -3494,6 +3500,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         };
         channel.lines.push_back(RetainedLine::with_origin(
             "Bob gossips hi",
@@ -3587,6 +3594,7 @@ mod tests {
                 unread: 0,
                 scrollback_limit: 10_000,
                 back_offset: 0,
+                pushed: 0,
             };
             channel.lines.push_back(line.clone());
             state.channels.push(channel);
@@ -3614,6 +3622,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         };
         channel
             .lines
@@ -3638,6 +3647,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         let area = Rect::new(0, 0, 80, 12);
@@ -3679,6 +3689,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         state.channel_width = MIN_CHANNEL_WIDTH;
@@ -3729,6 +3740,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         state.channel_width = MIN_CHANNEL_WIDTH;

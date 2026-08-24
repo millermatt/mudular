@@ -659,6 +659,286 @@ pub async fn run(
     result
 }
 
+/// The line-oriented front end (docs/LINE_MODE.md §6): raw mode, no
+/// alternate screen, output appended to the terminal the player already
+/// has — and reads with whatever their screen reader already does.
+///
+/// Raw mode and the alternate screen are separate switches, and this takes
+/// only the first. Raw mode is what lets a configured keypress reach the
+/// intent layer at all (§6.3); the alternate screen is what would cost the
+/// terminal its own scrollback and put a flush a screenful behind the
+/// newest line (§2).
+pub async fn run_line(
+    startup: Startup,
+    update_check: Option<tokio::sync::oneshot::Receiver<Option<crate::update::Available>>>,
+) -> Result<()> {
+    crossterm::terminal::enable_raw_mode().context("switching the terminal to raw mode")?;
+    let result = line_event_loop(startup, update_check).await;
+    // Best-effort, and after the loop's own error is in hand: leaving the
+    // terminal in raw mode is worse than any error this could add.
+    let _ = crossterm::terminal::disable_raw_mode();
+    println!();
+    result
+}
+
+async fn line_event_loop(
+    startup: Startup,
+    mut update_check: Option<tokio::sync::oneshot::Receiver<Option<crate::update::Available>>>,
+) -> Result<()> {
+    let keybinds = startup.keybinds.clone();
+    let channels = startup.channels.clone();
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut state = startup.connect_all(cols);
+    state.front_end = FrontEnd::Lines;
+    // None of these has a surface here, and a saved layout that says
+    // otherwise would only make `session_pane_sizes` answer for columns
+    // nobody can see.
+    state.show_channels = false;
+    state.show_map = false;
+    state.show_inspector = false;
+    state.show_hud = false;
+
+    let mut screen = crate::line::Screen::new(false, true);
+    report_terminal_size(&mut state, cols, rows).await;
+
+    let mut term_events = EventStream::new();
+    let mut map_saves = tokio::time::interval(MAP_SAVE_INTERVAL);
+    map_saves.tick().await;
+
+    loop {
+        screen.refresh(&state)?;
+
+        let wake = tokio::select! {
+            ev = term_events.next() => Wake::Terminal(ev),
+            (index, ev) = next_session_event(&mut state.sessions) => Wake::Session(index, ev),
+            _ = map_saves.tick() => Wake::SaveMaps,
+            found = async { update_check.as_mut().expect("guarded").await },
+                if update_check.is_some() =>
+            {
+                update_check = None;
+                Wake::Update(found.ok().flatten())
+            }
+        };
+
+        match wake {
+            Wake::Terminal(Some(Ok(Event::Key(key)))) if key.kind == KeyEventKind::Press => {
+                if keybinds.quit.matches(key.code, key.modifiers) {
+                    save_all_maps(&mut state);
+                    save_comms_panes(&state);
+                    // The last thing printed, and it cannot go through the
+                    // model: the session it would be said into is about to
+                    // stop being drawn at all.
+                    let _ = screen.say("** goodbye");
+                    return Ok(());
+                }
+                handle_line_key(&mut state, &keybinds, &channels, key).await;
+            }
+            // The terminal's own size is what the MUD is told here: there
+            // are no panes to divide it between (§6.2).
+            Wake::Terminal(Some(Ok(Event::Resize(cols, rows)))) => {
+                report_terminal_size(&mut state, cols, rows).await;
+            }
+            Wake::Terminal(Some(Ok(_))) => {}
+            Wake::Terminal(Some(Err(err))) => return Err(err.into()),
+            Wake::Terminal(None) => return Ok(()),
+            Wake::Update(Some(available)) => {
+                let version = available.version;
+                state.tell_player(format!(
+                    "** Mudular {version} is available — type /update to install it"
+                ));
+            }
+            Wake::Update(None) => {}
+            Wake::SaveMaps => save_dirty_maps(&mut state),
+            Wake::Session(index, ev) => drain_session(&mut state, index, ev).await,
+        }
+    }
+}
+
+/// Tells every session the size of the terminal. The TUI reports each
+/// pane's own size instead (§6.2); here the pane *is* the terminal.
+async fn report_terminal_size(state: &mut AppState, cols: u16, rows: u16) {
+    for session in &mut state.sessions {
+        if session.last_size == Some((cols, rows)) {
+            continue;
+        }
+        session.last_size = Some((cols, rows));
+        let _ = session
+            .commands
+            .send(SessionCommand::Resize { cols, rows })
+            .await;
+    }
+}
+
+/// A keypress in line mode.
+///
+/// The three resolvers collapse into one chain here, which is safe for
+/// exactly the reason §5.5 says it is not safe in `ui`: the gaps between
+/// them are modal blocks — the help overlay, the errors panel, the palette
+/// — and this front end has none of them. Their relative order is kept.
+async fn handle_line_key(
+    state: &mut AppState,
+    keybinds: &Keybinds,
+    channels: &[Channel],
+    key: crossterm::event::KeyEvent,
+) {
+    let (code, modifiers) = (key.code, key.modifiers);
+    let action = Action::for_key_before_modes(keybinds, code, modifiers)
+        .or_else(|| Action::for_key_before_errors(keybinds, code, modifiers))
+        .or_else(|| Action::for_key_after_errors(keybinds, code, modifiers))
+        .or_else(|| Action::for_key_last(code, modifiers));
+    if let Some(action) = action {
+        apply_line_action(state, channels, action).await;
+        return;
+    }
+    if code == KeyCode::Enter {
+        submit_input(state, channels).await;
+        return;
+    }
+    if is_scroll_key(code, modifiers) {
+        // Refused rather than ignored, and the refusal is also the answer:
+        // the terminal kept every line this front end printed, so its own
+        // scrollback is the one to use (§6.8, §8.1).
+        state.tell_player("** scrollback here is the terminal's own — use its scroll keys");
+        return;
+    }
+    type_anywhere(state, key);
+}
+
+/// Carries out a named intent, or says why it cannot (§6.7).
+async fn apply_line_action(state: &mut AppState, channels: &[Channel], action: Action) {
+    match action {
+        // A command may still be refused — by the dispatch, which is where
+        // a *typed* one is refused too.
+        Action::Command(command) => run_client_command(state, channels, command).await,
+        // The overlay's listing is the same listing `/help` prints into the
+        // pane, so the intent survives without the overlay.
+        Action::HelpOverlay => run_client_command(state, channels, ClientCommand::Help).await,
+        Action::RequestReload => {
+            let notice = reload_rules(state, channels).await;
+            state.tell_player(notice);
+        }
+        Action::SelectCharacter(index) => match state.id_at(index) {
+            Some(id) => {
+                state.focus_pane(Focus::Session(id));
+                // The marker names the character and is the only sign a
+                // switch happened, since nothing on screen is redrawn to
+                // show it (§6.5).
+                let name = state
+                    .bound()
+                    .map(|session| session.view.name.clone())
+                    .unwrap_or_default();
+                state.tell_player(format!("** now typing to {name}"));
+            }
+            None => state.tell_player(format!("** there is no character {}", index + 1)),
+        },
+        Action::WhoNeedsMe => match state.neediest() {
+            Some(index) => {
+                if let Some(id) = state.id_at(index) {
+                    state.focus_pane(Focus::Session(id));
+                    let name = state
+                        .bound()
+                        .map(|session| session.view.name.clone())
+                        .unwrap_or_default();
+                    state.tell_player(format!("** {name} needs help — now typing to them"));
+                }
+            }
+            None => state.tell_player("** nobody is in trouble"),
+        },
+        // A strip redrawn on every change would be a line spoken on every
+        // change, so the key prints the numbers once instead — and as
+        // lines, never as a table: a screen reader has no markup to walk a
+        // table's cells with (§5.2).
+        Action::ToggleHud => {
+            for line in vitals_lines(state) {
+                state.tell_player(line);
+            }
+        }
+        Action::ToggleTimestamps => {
+            state.show_timestamps = !state.show_timestamps;
+            let notice = match state.show_timestamps {
+                true => "** timestamps on",
+                false => "** timestamps off",
+            };
+            state.tell_player(notice);
+        }
+        Action::OpenPalette => state.tell_player(
+            "** the command palette is a list this mode cannot draw — type the \
+             command, or /help for the list",
+        ),
+        Action::LinePicker => state.tell_player(
+            "** picking a line needs a scrollback this mode does not draw — \
+             /config adds a trigger by hand",
+        ),
+        Action::ServerDataInspector => {
+            state.tell_player("** the server-data inspector is a pane this mode does not draw")
+        }
+    }
+}
+
+/// Every character's vitals, one line each, as `Action::ToggleHud` prints
+/// them. Read from the peer snapshots, which is where the strip reads them
+/// (§7.5).
+fn vitals_lines(state: &AppState) -> Vec<String> {
+    state
+        .sessions
+        .iter()
+        .map(|session| {
+            let vitals = state
+                .peer_registry
+                .get(&session.view.name)
+                .map(|peer| crate::vitals::from_server_data(&peer.borrow().data))
+                .unwrap_or_default();
+            let mut parts = Vec::new();
+            for (name, gauge) in [
+                ("health", &vitals.health),
+                ("mana", &vitals.mana),
+                ("movement", &vitals.movement),
+                ("experience", &vitals.experience),
+            ] {
+                if let Some(gauge) = gauge {
+                    parts.push(format!("{name} {}/{}", gauge.now, gauge.max));
+                }
+            }
+            match parts.is_empty() {
+                // A MUD that reports nothing is said to report nothing,
+                // rather than read out as a character at zero health.
+                true => format!("** {}: nothing reported", session.view.name),
+                false => format!("** {}: {}", session.view.name, parts.join(", ")),
+            }
+        })
+        .collect()
+}
+
+/// Applies a session event and everything already buffered behind it, then
+/// delivers whatever it injected — the same drain the TUI's loop does, for
+/// the same reason: a burst of output should cost one refresh, not one per
+/// event.
+async fn drain_session(state: &mut AppState, index: usize, ev: Option<SessionEvent>) {
+    let mut injections = Vec::new();
+    match ev {
+        Some(ev) => {
+            let (ended, out) = apply_session_event(state, index, ev);
+            injections.extend(out);
+            if ended {
+                state.sessions[index].events = None;
+            } else {
+                while let Some(ev) = try_recv(state, index) {
+                    let (ended, out) = apply_session_event(state, index, ev);
+                    injections.extend(out);
+                    if ended {
+                        state.sessions[index].events = None;
+                        break;
+                    }
+                }
+            }
+        }
+        None => state.sessions[index].events = None,
+    }
+    for (target, command) in injections {
+        let _ = state.sessions[target].commands.send(command).await;
+    }
+}
+
 /// Builds everything one profile needs to connect, shared by the CLI
 /// startup path and `/connect <profile>` (§7.5, ARCH_REVIEW.md "Features
 /// that would break the architecture") — the same construction either way,
@@ -799,6 +1079,7 @@ fn connect(
         view: SessionView {
             name: target.name,
             scrollback: VecDeque::new(),
+            pushed: 0,
             prompt: String::new(),
             input: Input::default(),
             status,
@@ -1604,6 +1885,10 @@ impl Startup {
                     unread: 0,
                     scrollback_limit: scrollback_size,
                     back_offset: 0,
+                    // Restored history is not new output: a front end that
+                    // prints what it has not printed yet must not replay
+                    // last night's tells on launch.
+                    pushed: 0,
                 })
                 .collect(),
             focus: Focus::Session(first_id),
@@ -1655,6 +1940,8 @@ impl Startup {
             autocomplete,
             cross_session_default,
             no_color: no_color_requested(std::env::var("NO_COLOR").ok().as_deref()),
+            // Set by whichever front end is about to drive this state.
+            front_end: FrontEnd::default(),
         };
         // Each world read off disk once, by whichever character reaches it
         // first — the rest join the entry that is already there (§16).
@@ -2556,6 +2843,12 @@ fn run_palette_entry(state: &mut AppState, entry: PaletteEntry) -> bool {
 /// Runs a parsed command. One match, so every command's body has exactly
 /// one home whichever dispatcher reached it.
 async fn run_client_command(state: &mut AppState, channels: &[Channel], command: ClientCommand) {
+    // Before the match, and here rather than at the keypress, because a
+    // typed `/config` arrives straight from the input line (§6.7).
+    if let Some(reason) = state.front_end.refuses(&command) {
+        state.tell_player(reason);
+        return;
+    }
     match command {
         ClientCommand::Help => {
             let lines = ui::help_lines(&state.keybinds);
@@ -3852,6 +4145,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
 
@@ -3874,6 +4168,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
 
@@ -3901,6 +4196,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
     }
@@ -5483,6 +5779,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         state.focus_pane(Focus::Channel(0));
@@ -5650,6 +5947,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 2,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         for line in ["one", "two", "three"] {
@@ -5698,6 +5996,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         state.focus_pane(Focus::Channel(0));
@@ -5725,6 +6024,7 @@ mod tests {
             unread: 0,
             scrollback_limit: 10_000,
             back_offset: 0,
+            pushed: 0,
         });
         state.show_channels = true;
         // Bind input to "tank" (index 0), then focus the channel pane.
