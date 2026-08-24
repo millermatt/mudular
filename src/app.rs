@@ -1944,6 +1944,7 @@ impl Startup {
             no_color: no_color_requested(std::env::var("NO_COLOR").ok().as_deref()),
             // Set by whichever front end is about to drive this state.
             front_end: FrontEnd::default(),
+            notices_pushed: 0,
         };
         // Each world read off disk once, by whichever character reaches it
         // first — the rest join the entry that is already there (§16).

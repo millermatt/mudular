@@ -1347,6 +1347,11 @@ pub struct AppState {
     /// Which front end is driving, so shared code can refuse a surface the
     /// caller has no way to show (docs/LINE_MODE.md §6.7).
     pub front_end: FrontEnd,
+    /// Notices ever added to `shell_notices`, on the same terms as
+    /// `SessionView::pushed`: a launch with no session still says things,
+    /// and a front end that prints rather than draws needs to know which
+    /// of them it has not printed (docs/LINE_MODE.md §6.2).
+    pub notices_pushed: u64,
     pub sessions: Vec<SessionPane>,
     pub channels: Vec<ChannelPane>,
     pub focus: Focus,
@@ -1845,6 +1850,7 @@ impl AppState {
             Some(session) => session.push_line(RetainedLine::client(text)),
             None => {
                 self.shell_notices.push(crate::scrollback::plain_row(&text));
+                self.notices_pushed += 1;
                 // Oldest first out: the reply to what was just typed is
                 // the one worth keeping.
                 while self.shell_notices.len() > SHELL_NOTICES {
@@ -2251,6 +2257,7 @@ pub(crate) mod test_support {
                 // every colour assertion in this module vacuous.
                 no_color: false,
                 front_end: FrontEnd::Panes,
+                notices_pushed: 0,
                 sessions,
                 maps: HashMap::new(),
                 channels: Vec::new(),

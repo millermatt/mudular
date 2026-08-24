@@ -35,6 +35,7 @@ pub(crate) struct Screen {
     /// character's next line rather than replaying what it missed (§6.5).
     sessions: HashMap<SessionId, u64>,
     channels: Vec<u64>,
+    notices: u64,
     /// The prompt as last printed. A prompt that changed while output was
     /// arriving is printed at the next quiet moment instead, which is what
     /// keeps a prompt-per-line MUD out of the speech queue (§6.2).
@@ -54,6 +55,7 @@ impl Screen {
             out: io::stdout(),
             sessions: HashMap::new(),
             channels: Vec::new(),
+            notices: 0,
             prompt: String::new(),
             echo_sent,
             prompts,
@@ -78,6 +80,7 @@ impl Screen {
         let mut printed = false;
         printed |= self.take_session_lines(state, &mut out);
         printed |= self.take_routed_lines(state, &mut out);
+        printed |= self.take_notices(state, &mut out);
         if !printed {
             self.take_prompt(state, &mut out);
         }
@@ -159,6 +162,24 @@ impl Screen {
             }
         }
         printed
+    }
+
+    /// Client notices said while no session was bound. A launch that
+    /// connected nothing still answers what is typed at it, and those
+    /// answers never reach a scrollback — they are the third source of
+    /// output that does not pass through `push_line` (§6.2).
+    fn take_notices(&mut self, state: &AppState, out: &mut String) -> bool {
+        let fresh = fresh_count(
+            state.notices_pushed,
+            self.notices,
+            state.shell_notices.len(),
+        );
+        self.notices = state.notices_pushed;
+        let start = state.shell_notices.len() - fresh;
+        for notice in state.shell_notices.iter().skip(start) {
+            append(out, notice);
+        }
+        fresh > 0
     }
 
     /// The MUD's prompt, when it changed and nothing else has been printed
@@ -316,6 +337,17 @@ mod tests {
             !after.contains("cleric sees a rat"),
             "switching should start at the next line, not replay a backlog: {after:?}"
         );
+    }
+
+    /// A launch that connected nothing still answers what is typed at it,
+    /// and those answers have no scrollback to go into (§6.2).
+    #[test]
+    fn a_notice_with_no_session_is_still_printed() {
+        let (mut state, _rx) = app_with_receivers(&[]);
+        state.tell_player("** no such profile: warlock");
+
+        let out = Screen::new(false, true).compose(&state);
+        assert!(out.contains("no such profile"), "{out:?}");
     }
 
     #[test]
