@@ -221,17 +221,19 @@ palette" — `parse` deliberately leaves an unknown `/word` to the MUD, and
 `name`/`describes` feed the palette listing and `every_command_is_in_the_palette`.
 Widening it would need a hidden-entry concept to suppress the additions again.
 
-**`Action` lives in `state`, beside `ClientCommand`, and so does the
-resolution function.** It must not be spelled as a method on `Keybinds`:
-`Keybinds` lives in `config`, `state` names `config`, and `config` does not
-name `state`. A `Keybinds::resolve -> Option<Action>` therefore adds a
-`config` → `state` edge and reopens the module cycle that #6 closed. Rust
-permits the inherent `impl` to be written inside `src/state.rs`, where it
-compiles and passes both boundary tests — neither guards `config` ↔ `state` —
-so the cycle would return silently. Spell it:
+**`Action` lives in `state`, beside `ClientCommand`, and so do its
+resolvers.** They must not be spelled as methods on `Keybinds`: `Keybinds`
+lives in `config`, `state` names `config`, and `config` does not name
+`state`. A `Keybinds::resolve -> Option<Action>` therefore adds a `config` →
+`state` edge and reopens the module cycle that #6 closed. Rust permits the
+inherent `impl` to be written inside `src/state.rs`, where it compiles and
+passes both boundary tests — neither guards `config` ↔ `state` — so the cycle
+would return silently. Spell them, one per gap §5.5 names:
 
 ```
-Action::for_key(&Keybinds, code, modifiers) -> Option<Action>
+Action::for_key_before_modes(&Keybinds, code, modifiers) -> Option<Action>
+Action::for_key_before_errors(&Keybinds, code, modifiers) -> Option<Action>
+Action::for_key_after_errors(&Keybinds, code, modifiers) -> Option<Action>
 ```
 
 `crossterm`'s `KeyCode`/`KeyModifiers` are already imported in both modules,
@@ -267,7 +269,7 @@ dispatch, and §7.1 extracts it rather than copying it.
 
 **`Alt+1..9` is not reachable and must be made so.** The session jump is
 hardcoded in `handle_key` and is not a `KeyBinding` at all, so it is not
-remappable and `Action::for_key` cannot see it. It is also the one intent
+remappable and none of the resolvers can see it. It is also the one intent
 branch 2 most needs. Either it becomes a real binding or the character-switch
 intent gets its own name; the former is preferable and is a small,
 independently sensible fix.
@@ -298,11 +300,16 @@ named as a divider on its own terms, which is why treating dividers as "the
 overlay, plus a residual second lookup" would have missed it.
 
 Three resolvers follow the three gaps: `Action::for_key_before_modes`, for
-bindings that must see the key before any modal block including the errors
-panel; `Action::for_key_before_errors`, for bindings that must run before the
-errors panel clears but after the earlier modal blocks; and
-`Action::for_key_after_errors`, for bindings — `palette` among them — for
-which running after the errors panel's side effect is correct.
+`toggle_timestamps`, `toggle_hud` and `who_needs_me`, which must see the key
+before any modal block including the errors panel; `Action::for_key_before_errors`,
+which holds only `palette`, checked after the earlier modal blocks but before
+the errors panel's own block, so the palette key while the panel is up opens
+the palette and leaves the panel exactly as it was, with no clear-and-re-dispatch
+in between; and `Action::for_key_after_errors`, for the remaining eight —
+`help`, `config_editor`, `toggle_map`, `reload`, `line_picker`,
+`server_data_inspector`, `focus_next` and `toggle_channels` — each of which
+only runs after the errors panel has already cleared and re-dispatched the
+key, so an open panel takes their key first.
 
 ### 5.6 Done when
 
