@@ -90,6 +90,10 @@ pub(crate) const MAP_COMMAND: &str = "/map";
 /// `toggle_channels` does, for players who reach for a command before a
 /// function key.
 pub(crate) const COMMS_COMMAND: &str = "/comms";
+
+/// Turns the input line's completion off and on for every character at
+/// once, without a restart (§11.3).
+pub(crate) const AUTOCOMPLETE_COMMAND: &str = "/autocomplete";
 /// Runs a command as another character without switching to their pane
 /// (§7.5) — a character name, or `*`, then the command. The ad-hoc form of a
 /// rule's `send_to:`, for the times the player did not decide in advance that
@@ -264,6 +268,7 @@ pub(crate) enum ClientCommand {
     Errors,
     Map,
     Comms,
+    Autocomplete,
     Goto(String),
     Corpse,
     Mark(String),
@@ -293,6 +298,7 @@ impl ClientCommand {
             ERRORS_COMMAND => Self::Errors,
             MAP_COMMAND => Self::Map,
             COMMS_COMMAND => Self::Comms,
+            AUTOCOMPLETE_COMMAND => Self::Autocomplete,
             GOTO_COMMAND => Self::Goto(rest),
             CORPSE_COMMAND => Self::Corpse,
             MARK_COMMAND => Self::Mark(rest),
@@ -317,6 +323,7 @@ impl ClientCommand {
             Self::NewProfile,
             Self::Map,
             Self::Comms,
+            Self::Autocomplete,
             Self::Goto(String::new()),
             Self::Corpse,
             Self::Mark(String::new()),
@@ -340,6 +347,7 @@ impl ClientCommand {
             Self::Errors => ERRORS_COMMAND,
             Self::Map => MAP_COMMAND,
             Self::Comms => COMMS_COMMAND,
+            Self::Autocomplete => AUTOCOMPLETE_COMMAND,
             Self::Goto(_) => GOTO_COMMAND,
             Self::Corpse => CORPSE_COMMAND,
             Self::Mark(_) => MARK_COMMAND,
@@ -363,6 +371,7 @@ impl ClientCommand {
             Self::Errors => "show warnings the client kept",
             Self::Map => "show or hide the map column",
             Self::Comms => "show or hide the comms column",
+            Self::Autocomplete => "turn the input completion off or on",
             Self::Goto(_) => "walk to a room you have been to",
             Self::Corpse => "walk back to your corpse",
             Self::Mark(_) => "label this room on the map",
@@ -391,6 +400,9 @@ impl ClientCommand {
             // Warnings outlive the character they were about, and the
             // ones from startup never had one (#18).
             Self::Connect(_) | Self::NewProfile | Self::Help | Self::Errors => false,
+            // Sets the value a later `/connect` inherits, so it is worth
+            // something before there is anything to type at.
+            Self::Autocomplete => false,
             Self::Reload
             | Self::Update
             | Self::Config(_)
@@ -502,6 +514,9 @@ impl Action {
         }
         if keybinds.toggle_channels.matches(code, modifiers) {
             return Some(Self::Command(ClientCommand::Comms));
+        }
+        if keybinds.toggle_autocomplete.matches(code, modifiers) {
+            return Some(Self::Command(ClientCommand::Autocomplete));
         }
         None
     }
@@ -2225,6 +2240,7 @@ mod action_tests {
             (keybinds.toggle_map, "/map"),
             (keybinds.toggle_channels, "/comms"),
             (keybinds.config_editor, "/config"),
+            (keybinds.toggle_autocomplete, "/autocomplete"),
         ];
         for (binding, typed) in cases {
             let (code, mods) = binding.parts();
@@ -2256,6 +2272,7 @@ mod action_tests {
             &k.line_picker,
             &k.server_data_inspector,
             &k.toggle_channels,
+            &k.toggle_autocomplete,
         ];
         for binding in all {
             let (code, mods) = binding.parts();
