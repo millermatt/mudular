@@ -2324,17 +2324,13 @@ fn handle_key(
     // Alt+1..9 jumps straight to a session (§11), and to the map column on
     // the number after the last one — the sessions keep the numbers they
     // always had, so nothing anybody has learned moves.
-    if modifiers.contains(KeyModifiers::ALT)
-        && let KeyCode::Char(c) = code
-        && let Some(n) = c.to_digit(10).filter(|&n| n >= 1)
-    {
-        let index = n as usize - 1;
+    if let Some(action @ Action::SelectCharacter(index)) = Action::for_key_last(code, modifiers) {
         if index < state.sessions.len() {
-            if let Some(id) = state.id_at(index) {
-                state.focus_pane(Focus::Session(id));
-            }
-            return true;
+            return apply_action(state, channels, action);
         }
+        // The map column answering to the number after the last session is
+        // this front end's own arrangement, not an intent a front end with
+        // no columns could realise, so it stays here (§5.2).
         if index == state.sessions.len() && state.show_map {
             state.focus_pane(Focus::Map);
             return true;
@@ -2350,6 +2346,12 @@ fn handle_key(
 /// (docs/LINE_MODE.md §5.4).
 fn apply_action(state: &mut AppState, channels: &[Channel], action: Action) -> bool {
     match action {
+        Action::SelectCharacter(index) => {
+            if let Some(id) = state.id_at(index) {
+                state.focus_pane(Focus::Session(id));
+            }
+            true
+        }
         Action::ToggleTimestamps => {
             state.show_timestamps = !state.show_timestamps;
             true

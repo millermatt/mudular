@@ -446,6 +446,11 @@ pub(crate) enum Action {
     RequestReload,
     LinePicker,
     ServerDataInspector,
+    /// Bind the input line to the nth connected character, zero-based.
+    /// Carries the index rather than naming a key, because the digit is
+    /// the intent: "the third character", not "Alt+3"
+    /// (docs/LINE_MODE.md §5.4).
+    SelectCharacter(usize),
 }
 
 impl Action {
@@ -519,6 +524,27 @@ impl Action {
             return Some(Self::Command(ClientCommand::Autocomplete));
         }
         None
+    }
+
+    /// The last gap, after every private binding. `Alt+1..9` has always
+    /// been resolved here and stays here: a player who has remapped a
+    /// geometry binding onto an `Alt`+digit still gets the remapped one,
+    /// which is what resolving it any earlier would take away
+    /// (docs/LINE_MODE.md §5.5).
+    ///
+    /// Not remappable, and so it does not consult `keybinds` — the digits
+    /// are the vocabulary. Making them configurable collides with the keyed
+    /// recall of [#149], which wants the same range, and is left to be
+    /// decided there rather than under this branch (§8.1a).
+    ///
+    /// [#149]: https://github.com/millermatt/mudular/issues/149
+    pub(crate) fn for_key_last(code: KeyCode, modifiers: KeyModifiers) -> Option<Self> {
+        if !modifiers.contains(KeyModifiers::ALT) {
+            return None;
+        }
+        let KeyCode::Char(c) = code else { return None };
+        let n = c.to_digit(10).filter(|&n| n >= 1)?;
+        Some(Self::SelectCharacter(n as usize - 1))
     }
 }
 
@@ -2313,5 +2339,28 @@ mod action_tests {
                 "a geometry binding must stay private to the front end"
             );
         }
+    }
+    /// The character switch is the one intent a second front end cannot do
+    /// without, and it was hardcoded in `ui` rather than named
+    /// (docs/LINE_MODE.md §5.4).
+    #[test]
+    fn alt_digit_names_the_character_it_selects() {
+        assert_eq!(
+            Action::for_key_last(KeyCode::Char('1'), KeyModifiers::ALT),
+            Some(Action::SelectCharacter(0))
+        );
+        assert_eq!(
+            Action::for_key_last(KeyCode::Char('9'), KeyModifiers::ALT),
+            Some(Action::SelectCharacter(8))
+        );
+        // `Alt+0` was never a session and does not become one here.
+        assert_eq!(
+            Action::for_key_last(KeyCode::Char('0'), KeyModifiers::ALT),
+            None
+        );
+        assert_eq!(
+            Action::for_key_last(KeyCode::Char('1'), KeyModifiers::NONE),
+            None
+        );
     }
 }
