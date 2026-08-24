@@ -63,6 +63,17 @@ impl Screen {
     /// Prints everything the model has gained since the last call, then
     /// redraws the input line under it.
     pub(crate) fn refresh(&mut self, state: &AppState) -> io::Result<()> {
+        let out = self.compose(state);
+        self.out.write_all(out.as_bytes())?;
+        self.out.flush()
+    }
+
+    /// What the next write to the terminal is, and the whole of what this
+    /// front end decides. Separate from writing it so the decisions —
+    /// which lines are new, whether an echo is printed, whether a prompt
+    /// has earned a line, whether the input is masked — are testable
+    /// without a terminal to read back.
+    fn compose(&mut self, state: &AppState) -> String {
         let mut out = String::from(ERASE_LINE);
         let mut printed = false;
         printed |= self.take_session_lines(state, &mut out);
@@ -77,8 +88,7 @@ impl Screen {
         if back > 0 {
             out.push_str(&format!("\x1b[{back}D"));
         }
-        self.out.write_all(out.as_bytes())?;
-        self.out.flush()
+        out
     }
 
     /// Says something in the client's own voice, outside the model — used
@@ -214,6 +224,99 @@ fn append(out: &mut String, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrollback::RetainedLine;
+    use crate::state::test_support::app_with_receivers;
+
+    /// §6.4 — sent-command echo, both branches. Off by default: the
+    /// command is kept in scrollback for review without being spoken back
+    /// on arrival, which is what Blightmud ships and what Mudlet's
+    /// accessibility manual tells its users to configure.
+    #[test]
+    fn a_sent_command_is_kept_but_not_printed_by_default() {
+        let (mut state, _rx) = app_with_receivers(&["tank"]);
+        state.sessions[0].push_line(RetainedLine::echo("> kill dragon"));
+        state.sessions[0].push_line(RetainedLine::server("The dragon dies."));
+
+        let quiet = Screen::new(false, true).compose(&state);
+        assert!(!quiet.contains("kill dragon"), "{quiet:?}");
+        assert!(quiet.contains("The dragon dies."), "{quiet:?}");
+
+        let (mut state, _rx) = app_with_receivers(&["tank"]);
+        state.sessions[0].push_line(RetainedLine::echo("> kill dragon"));
+        let echoing = Screen::new(true, true).compose(&state);
+        assert!(echoing.contains("kill dragon"), "{echoing:?}");
+    }
+
+    /// §6.2 — a prompt that changed is worth a line only when nothing else
+    /// has been printed since. A prompt printed on every update is the
+    /// speech backlog §2 names as the dominant failure.
+    #[test]
+    fn the_prompt_waits_for_a_quiet_moment() {
+        let (mut state, _rx) = app_with_receivers(&["tank"]);
+        state.sessions[0].view.prompt = "100hp 50m>".to_string();
+        state.sessions[0].push_line(RetainedLine::server("A rat scurries by."));
+
+        let busy = {
+            let mut screen = Screen::new(false, true);
+            let busy = screen.compose(&state);
+            assert!(!busy.contains("100hp"), "{busy:?}");
+            // Nothing new arrived this time, so the prompt gets its line.
+            screen.compose(&state)
+        };
+        assert!(busy.contains("100hp 50m>"), "{busy:?}");
+    }
+
+    /// The same prompt, suppressed outright — the setting §6.4 asks for.
+    #[test]
+    fn the_prompt_can_be_turned_off() {
+        let (mut state, _rx) = app_with_receivers(&["tank"]);
+        state.sessions[0].view.prompt = "100hp 50m>".to_string();
+        let mut screen = Screen::new(false, false);
+        screen.compose(&state);
+        let out = screen.compose(&state);
+        assert!(!out.contains("100hp"), "{out:?}");
+    }
+
+    /// §6.6 — keystroke echo is the client's job here, and it stops at a
+    /// masked prompt. Nothing inherits this: `push_line` does not keep a
+    /// password out of scrollback either.
+    #[test]
+    fn a_masked_prompt_is_not_echoed() {
+        let (mut state, _rx) = app_with_receivers(&["tank"]);
+        state.sessions[0].view.input = state.sessions[0]
+            .view
+            .input
+            .clone()
+            .with_value("hunter2".to_string());
+
+        let visible = Screen::new(false, true).compose(&state);
+        assert!(visible.contains("hunter2"), "{visible:?}");
+
+        state.sessions[0].view.masked = true;
+        let masked = Screen::new(false, true).compose(&state);
+        assert!(!masked.contains("hunter2"), "{masked:?}");
+    }
+
+    /// Only the bound character prints, and switching does not replay what
+    /// the other one said while it was unbound (§6.5).
+    #[test]
+    fn an_unbound_character_neither_prints_nor_accumulates() {
+        let (mut state, _rx) = app_with_receivers(&["tank", "cleric"]);
+        let mut screen = Screen::new(false, true);
+        screen.compose(&state);
+
+        state.sessions[1].push_line(RetainedLine::server("cleric sees a rat"));
+        let out = screen.compose(&state);
+        assert!(!out.contains("cleric sees a rat"), "{out:?}");
+
+        let cleric = state.sessions[1].id;
+        state.input_session = cleric;
+        let after = screen.compose(&state);
+        assert!(
+            !after.contains("cleric sees a rat"),
+            "switching should start at the next line, not replay a backlog: {after:?}"
+        );
+    }
 
     #[test]
     fn a_burst_longer_than_the_buffer_prints_what_survived() {

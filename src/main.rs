@@ -269,7 +269,7 @@ async fn main() -> Result<()> {
     };
 
     match cli.line {
-        true => app::run_line(startup, update_check).await,
+        true => app::run_line(startup, app_config.line, update_check).await,
         false => app::run(startup, cli.map_debug, update_check).await,
     }
 }

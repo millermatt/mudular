@@ -670,10 +670,11 @@ pub async fn run(
 /// newest line (§2).
 pub async fn run_line(
     startup: Startup,
+    options: crate::config::LineOptions,
     update_check: Option<tokio::sync::oneshot::Receiver<Option<crate::update::Available>>>,
 ) -> Result<()> {
     crossterm::terminal::enable_raw_mode().context("switching the terminal to raw mode")?;
-    let result = line_event_loop(startup, update_check).await;
+    let result = line_event_loop(startup, options, update_check).await;
     // Best-effort, and after the loop's own error is in hand: leaving the
     // terminal in raw mode is worse than any error this could add.
     let _ = crossterm::terminal::disable_raw_mode();
@@ -683,6 +684,7 @@ pub async fn run_line(
 
 async fn line_event_loop(
     startup: Startup,
+    options: crate::config::LineOptions,
     mut update_check: Option<tokio::sync::oneshot::Receiver<Option<crate::update::Available>>>,
 ) -> Result<()> {
     let keybinds = startup.keybinds.clone();
@@ -698,7 +700,7 @@ async fn line_event_loop(
     state.show_inspector = false;
     state.show_hud = false;
 
-    let mut screen = crate::line::Screen::new(false, true);
+    let mut screen = crate::line::Screen::new(options.echo_sent, options.prompt);
     report_terminal_size(&mut state, cols, rows).await;
 
     let mut term_events = EventStream::new();
