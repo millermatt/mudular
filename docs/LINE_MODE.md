@@ -441,10 +441,28 @@ they intercept above the application rather than above the terminal. The
 practical conclusion is the same and the §2 measurement confirms it on Orca;
 the mechanism differs, and an earlier draft conflated them.
 
-**Caveat worth carrying:** the Orca path depends on the terminal emulator's
-own accessibility, and that is not uniform. GTK4/VTE and out-of-tree text
-widgets are incompletely covered. "Delegate to the platform" is right, and it
-is not free everywhere.
+**Caveat worth carrying, and measured:** the Orca path depends on the
+terminal emulator's own accessibility, and that is not uniform — the spread
+is wider than "incompletely covered". Measured on Wayland against Orca 50.2
+and AT-SPI2 2.60.4 in August 2026, with a 24-row window printing 300
+numbered lines:
+
+- **GNOME Terminal (VTE)** exposes a `terminal` node implementing the `Text`
+  interface, and what it holds is the *viewport*, not the buffer: 24 lines
+  of the 300, exactly what is on screen. The exposed window follows the
+  emulator's own scroll, so scrollback is reachable one screenful at a time
+  — through keys the client neither owns nor observes.
+- **WezTerm** (20260817-232108-e7024497) does not appear on the
+  accessibility bus at all: no application, no window, no text node. Its
+  binary carries no AT-SPI markers and no AccessKit, and no setting enables
+  one; the work is unimplemented upstream and tracked as
+  [wezterm/wezterm#913][wez913], open since 2021.
+
+[wez913]: https://github.com/wezterm/wezterm/issues/913
+
+"Delegate to the platform" is right, and on one of those two emulators there
+is no platform to delegate to. Both halves are dated rather than permanent:
+#913 can close, and what VTE exposes can widen.
 
 ### 6.4 Echo, and not moving the reader
 
@@ -462,7 +480,9 @@ other about being moved by new text.
 
 Blightmud's third option is better than either branch and is adopted:
 **suppressed from the live stream, retained in scrollback**, so it is there
-on review without being spoken on arrival.
+on review without being spoken on arrival. *Review* here means the player
+scrolling their own emulator; §6.3 measures where that reaches and where it
+does not.
 
 Both branches ship implemented and tested, but the default is no longer
 unfounded. Mudlet's accessibility manual instructs screen-reader users to
@@ -642,10 +662,15 @@ review by character, word and line, `Ctrl+Home`/`Ctrl+End` jump to the start
 of the buffer or the latest content, and the screen reader announces
 "Jumped to latest content" as it lands. That works because Mudlet is a GUI
 application with a real accessible text widget to hand focus to. A terminal
-application has no such object; the terminal emulator owns the only one. So
-this specific solution is unavailable here, and it is the clearest
-disadvantage of a terminal client for this player. Keyed recall is the
-compensating mechanism, not a preference.
+application has no such object of its own; the emulator owns the only one,
+and §6.3 measures what that holds — on VTE the visible screen, moving with
+the emulator's scroll; on WezTerm nothing at all. So where the emulator
+cooperates the player can reach a missed line one screenful at a time, with
+no announcement and no way to search, and where it does not they cannot
+reach it by any means. This specific solution is unavailable either way, and
+it is the clearest disadvantage of a terminal client for this player. Keyed
+recall is what puts the wanted line back under the reader's position, which
+is the capability, not a preference.
 
 **On the client pushing text rather than being read.** Mudlet's "Announce
 incoming text in screen reader" is on by default, and turning it *off* is
