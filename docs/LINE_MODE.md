@@ -169,7 +169,7 @@ normative. Applied to every binding, it gives **13 shared, 7 private**:
 | --- | --- | --- |
 | `quit` (shared, deferred to branch 2 — §5.3) | | `swap_columns` (private) |
 | `server_data_inspector` | | `cycle_layout` (private) |
-| `focus_next` (shared, in part) | | `channel_wider` (private) |
+| `focus_next` (shared, whole, for now) | | `channel_wider` (private) |
 | `toggle_channels` | | `channel_narrower` (private) |
 | `palette` | | `map_wider` (private) |
 | `help` | | `map_narrower` (private) |
@@ -190,9 +190,16 @@ and stays there until branch 2 gives line mode a loop to join.
 Four cases are worth recording because they are contested or were previously
 filed wrongly:
 
-- **`focus_next` is shared**, in part. Which character the input is bound to
-  (`input_session`) is not geometry and §6.5 requires it. Which *pane* has
-  focus is. The intent splits, and only the character half is shared.
+- **`focus_next` is shared whole**, for now. Which character the input is
+  bound to (`input_session`) is not geometry and §6.5 requires it; which
+  *pane* has focus is. The intent does split along that line in principle,
+  but splitting it here would change behaviour, and this branch moves
+  bindings without changing what they do. `Action::FocusNext` therefore
+  wraps the whole binding, and `AppState::focus_next` cycles onto
+  `Focus::Map` and `Focus::Channel` as it always has. The split — giving the
+  character half its own `Action` and leaving the pane half private — is
+  deferred to the branch that adds the second front end, which is the first
+  branch that needs the two to disagree.
 - **`toggle_hud` is shared.** Its subject is every character's vitals, not
   geometry; a line front end prints it as lines. **Not as a table** —
   Mudlet's accessibility manual is explicit that tabular layout "can often
@@ -300,8 +307,10 @@ named as a divider on its own terms, which is why treating dividers as "the
 overlay, plus a residual second lookup" would have missed it.
 
 Three resolvers follow the three gaps: `Action::for_key_before_modes`, for
-`toggle_timestamps`, `toggle_hud` and `who_needs_me`, which must see the key
-before any modal block including the errors panel; `Action::for_key_before_errors`,
+`toggle_timestamps`, `toggle_hud` and `who_needs_me`, which is checked first
+among the overlay blocks — after the mark menu, the config editor and the
+new-profile wizard, each of which already owns the keyboard outright while
+open, but before the help overlay and the errors panel; `Action::for_key_before_errors`,
 which holds only `palette`, checked after the earlier modal blocks but before
 the errors panel's own block, so the palette key while the panel is up opens
 the palette and leaves the panel exactly as it was, with no clear-and-re-dispatch
@@ -310,6 +319,25 @@ in between; and `Action::for_key_after_errors`, for the remaining eight —
 `server_data_inspector`, `focus_next` and `toggle_channels` — each of which
 only runs after the errors panel has already cleared and re-dispatched the
 key, so an open panel takes their key first.
+
+The rule above — a shared binding resolves in the gap it already
+occupied — governs *shared* bindings; it says nothing about the seven
+geometry bindings, because they are not in the layer at all. In `handle_key`
+they are checked after all three resolvers, `swap_columns` and `cycle_layout`
+where `for_key_after_errors` used to be interleaved with them at the branch's
+base, the four resize keys and `map_cursor` where they already were. A
+geometry binding therefore now loses to any shared binding it happens to
+collide with, where at the base it could win one of two gaps depending on
+which shared binding it was interleaved with. With the default binds nothing
+collides, so no default keypress resolves differently than before. The only
+configuration this is observable in is one binding a single key to both a
+shared action and a geometry action — `Keybinds` validates neither collisions
+nor duplicates, so nothing stops it — and that binding has no defined winner
+in either arrangement: the base ordering only happened to pick one because
+of where in `handle_key` each arm was written, not because either arm's
+intent should win. Restoring the old interleaving would need a resolver
+seam for the geometry bindings too, to serve a misconfiguration that was
+never a supported case. It stays unrestored.
 
 ### 5.6 Done when
 

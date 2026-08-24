@@ -3775,6 +3775,12 @@ triggers:
     /// `src/state.rs` is legal and passes both other boundary tests, which
     /// only look at `ui`. Hence a test rather than a note
     /// (docs/LINE_MODE.md §5.3).
+    ///
+    /// This greps for one spelling of the edge — `crate` followed directly
+    /// by `::state` — and is a tripwire for that obvious case rather than a
+    /// proof: a brace-grouped `use` naming `state` alongside other items, or
+    /// a `super::state` path from a submodule, would name it without
+    /// matching this string and slip past.
     #[test]
     fn config_does_not_name_the_model() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/mod.rs");

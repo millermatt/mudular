@@ -2648,13 +2648,6 @@ async fn send_as_other_session(state: &mut AppState, args: &str) {
     }
 }
 
-/// Shows or hides the comms column, from either the key or `/comms`
-/// (§11.1).
-///
-/// Says so when there is nothing to show. An install with no `channels:`
-/// block has no comms pane to reveal, and a command — or a key — that
-/// silently does nothing is how a player concludes the client is broken;
-/// the map cursor already answers the same way for the same reason.
 /// Shows or hides the map column, and says the room either way — the same
 /// thing `/map` does, because it is now literally the same code
 /// (docs/LINE_MODE.md §5.1).
@@ -2663,6 +2656,13 @@ fn toggle_map(state: &mut AppState) {
     describe_current_room(state);
 }
 
+/// Shows or hides the comms column, from either the key or `/comms`
+/// (§11.1).
+///
+/// Says so when there is nothing to show. An install with no `channels:`
+/// block has no comms pane to reveal, and a command — or a key — that
+/// silently does nothing is how a player concludes the client is broken;
+/// the map cursor already answers the same way for the same reason.
 fn toggle_comms(state: &mut AppState) {
     if state.channels.is_empty() {
         if let Some(session) = state.bound_mut() {
@@ -4499,7 +4499,7 @@ mod tests {
 
     /// `Alt+T` is checked before the help overlay's block, so timestamps
     /// toggle while the overlay is up. That ordering is behaviour, not an
-    /// accident of layout: the intent layer resolves bindings at two
+    /// accident of layout: the intent layer resolves bindings at three
     /// positions precisely to keep it (docs/LINE_MODE.md §5.5).
     #[test]
     fn a_pre_mode_binding_still_works_while_the_help_overlay_is_up() {

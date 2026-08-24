@@ -434,13 +434,19 @@ pub(crate) enum Action {
     RequestReload,
     LinePicker,
     ServerDataInspector,
+    /// Wraps the whole binding, not just the character half. `focus_next`
+    /// also cycles which pane has focus, which is geometry a second front
+    /// end cannot share — splitting the character half out is deferred to
+    /// the branch that adds it, because splitting changes behaviour and
+    /// this branch may not (docs/LINE_MODE.md §5.2).
     FocusNext,
 }
 
 impl Action {
     /// Bindings checked *before* the modal blocks, and so still live while
-    /// an overlay is up. One resolver for both groups would move these
-    /// behind the overlay and change behaviour (docs/LINE_MODE.md §5.5).
+    /// an overlay is up. Folding this into either of the other two
+    /// resolvers would move these behind the overlay and change behaviour
+    /// (docs/LINE_MODE.md §5.5).
     pub(crate) fn for_key_before_modes(
         keybinds: &Keybinds,
         code: KeyCode,
