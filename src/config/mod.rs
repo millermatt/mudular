@@ -1037,7 +1037,7 @@ impl KeyBinding {
     /// Only tests call this — the bin target never resolves a binding back
     /// to a key/modifier pair, it only asks `matches` whether a keypress is
     /// this one.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn parts(&self) -> (KeyCode, KeyModifiers) {
         (self.code, self.modifiers)
     }

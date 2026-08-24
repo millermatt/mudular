@@ -2239,7 +2239,7 @@ fn handle_key(
         }
         return true;
     }
-    if let Some(action) = Action::for_key_after_modes(keybinds, code, modifiers) {
+    if let Some(action) = Action::for_key_before_errors(keybinds, code, modifiers) {
         return apply_action(state, channels, action);
     }
     // The warnings panel closes the way every other overlay here does —
@@ -2255,6 +2255,9 @@ fn handle_key(
             return true;
         }
         return handle_key(state, keybinds, code, modifiers, area_width, channels);
+    }
+    if let Some(action) = Action::for_key_after_errors(keybinds, code, modifiers) {
+        return apply_action(state, channels, action);
     }
     if keybinds.swap_columns.matches(code, modifiers) {
         state.map_first = !state.map_first;
@@ -4541,6 +4544,33 @@ mod tests {
             state.palette.is_none(),
             "and the palette must not have opened behind it"
         );
+    }
+
+    /// The errors panel dismisses itself and re-dispatches the key, so a
+    /// binding resolved after it closes the panel as a side effect while
+    /// one resolved before it leaves the panel up. `palette` is before,
+    /// `help` is after, and hoisting either across the block changes what
+    /// the player sees (docs/LINE_MODE.md §5.5).
+    #[test]
+    fn the_errors_panel_closes_for_a_late_binding_but_not_for_the_palette() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        state.show_errors = true;
+        assert!(press(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(
+            state.show_errors,
+            "the palette resolves before the panel's block"
+        );
+        assert!(state.palette.is_some());
+
+        let (mut state, _rx) = app(&["tank"]);
+        state.show_errors = true;
+        assert!(press(&mut state, KeyCode::F(1), KeyModifiers::NONE));
+        assert!(
+            !state.show_errors,
+            "a late binding closes the panel on its way through"
+        );
+        assert!(state.show_help, "and still does its own job");
     }
 
     /// The overlay must never become a second, stale copy of the bindings

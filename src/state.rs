@@ -458,9 +458,13 @@ impl Action {
         None
     }
 
-    /// Bindings checked *after* the modal blocks, so an open overlay or
-    /// palette eats them first.
-    pub(crate) fn for_key_after_modes(
+    /// Checked after the palette's block but *before* the errors panel's,
+    /// which is where this binding has always sat. The panel dismisses
+    /// itself and re-dispatches the key, so a binding resolved after it
+    /// closes the panel as a side effect and one resolved before it does
+    /// not. `palette` is on the "does not" side and stays there
+    /// (docs/LINE_MODE.md §5.5).
+    pub(crate) fn for_key_before_errors(
         keybinds: &Keybinds,
         code: KeyCode,
         modifiers: KeyModifiers,
@@ -468,6 +472,16 @@ impl Action {
         if keybinds.palette.matches(code, modifiers) {
             return Some(Self::OpenPalette);
         }
+        None
+    }
+
+    /// Bindings checked *after* the errors panel's block, so an open panel,
+    /// overlay, or palette eats them first.
+    pub(crate) fn for_key_after_errors(
+        keybinds: &Keybinds,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<Self> {
         if keybinds.help.matches(code, modifiers) {
             return Some(Self::HelpOverlay);
         }
@@ -2217,7 +2231,7 @@ mod action_tests {
         ];
         for (binding, typed) in cases {
             let (code, mods) = binding.parts();
-            let from_key = Action::for_key_after_modes(&keybinds, code, mods)
+            let from_key = Action::for_key_after_errors(&keybinds, code, mods)
                 .unwrap_or_else(|| panic!("{typed}'s key resolves to an action"));
             let from_text = ClientCommand::parse(typed)
                 .map(Action::Command)
@@ -2226,8 +2240,10 @@ mod action_tests {
         }
     }
 
-    /// The split exists because the modal blocks sit between the two groups
-    /// (docs/LINE_MODE.md §5.5); a binding must resolve in exactly one.
+    /// The split exists because the errors panel's block — and, before
+    /// Task 5's fix round, the modal blocks generally — sits between
+    /// resolvers (docs/LINE_MODE.md §5.5); a binding must resolve in
+    /// exactly one of the three.
     #[test]
     fn each_shared_binding_resolves_in_exactly_one_group() {
         let k = crate::config::Keybinds::default();
@@ -2247,12 +2263,15 @@ mod action_tests {
         ];
         for binding in all {
             let (code, mods) = binding.parts();
-            let early = Action::for_key_before_modes(&k, code, mods);
-            let late = Action::for_key_after_modes(&k, code, mods);
-            assert_ne!(
-                early.is_some(),
-                late.is_some(),
-                "a shared binding resolves in one group, never both or neither"
+            let resolutions = [
+                Action::for_key_before_modes(&k, code, mods),
+                Action::for_key_before_errors(&k, code, mods),
+                Action::for_key_after_errors(&k, code, mods),
+            ];
+            let count = resolutions.iter().filter(|r| r.is_some()).count();
+            assert_eq!(
+                count, 1,
+                "a shared binding resolves in exactly one of the three resolvers"
             );
         }
     }
@@ -2275,7 +2294,8 @@ mod action_tests {
             let (code, mods) = binding.parts();
             assert!(
                 Action::for_key_before_modes(&k, code, mods).is_none()
-                    && Action::for_key_after_modes(&k, code, mods).is_none(),
+                    && Action::for_key_before_errors(&k, code, mods).is_none()
+                    && Action::for_key_after_errors(&k, code, mods).is_none(),
                 "a geometry binding must stay private to the front end"
             );
         }
