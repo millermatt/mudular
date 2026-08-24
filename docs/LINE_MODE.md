@@ -162,13 +162,42 @@ exactly this reason). Same intent, two realisations, one name.
 A binding fails when its subject *is* the geometry: a width, a layout, which
 pane has focus, or a cursor moving over drawn content.
 
-Classification is to be done against the code while implementing; the
-criterion above is normative, not any list. Four cases are settled here
-because they are contested or were previously filed wrongly:
+Classification is against the code, not any list — the criterion above is
+normative. Applied to every binding, it gives **12 shared, 8 private**:
 
-- **`focus_next` is shared**, in part. Which character the input is bound to
-  (`input_session`) is not geometry and §6.5 requires it. Which *pane* has
-  focus is. The intent splits, and only the character half is shared.
+| Binding | | Binding |
+| --- | --- | --- |
+| `quit` (shared, deferred to branch 2 — §5.3) | | `swap_columns` (private) |
+| `server_data_inspector` | | `cycle_layout` (private) |
+| `toggle_channels` | | `channel_wider` (private) |
+| `palette` | | `channel_narrower` (private) |
+| `help` | | `map_wider` (private) |
+| `config_editor` | | `map_narrower` (private) |
+| `line_picker` | | `map_cursor` (private) |
+| `reload` | | `focus_next` (private) |
+| `toggle_map` | | |
+| `toggle_hud` | | |
+| `toggle_timestamps` | | |
+| `who_needs_me` | | |
+
+The right column is exactly the bindings whose subject is a width, a layout,
+or a cursor over drawn content — geometry the criterion excludes by
+construction. Everything else is shared. `quit` is shared by the criterion
+(any front end can quit) but is matched in `event_loop`, not `handle_key`,
+and stays there until branch 2 gives line mode a loop to join.
+
+Four cases are worth recording because they are contested or were previously
+filed wrongly:
+
+- **`focus_next` is private.** Its name suggests a character switch and it
+  is not one. `AppState::focus_next` walks sessions, then any visible
+  channel panes, then the map column, and what it moves is which pane the
+  scroll and arrow keys act on — `self.focus`, not `input_session`. Focus
+  and input binding are separate in this model: which character the input
+  line is bound to is `input_session`, driven by `Alt+1..9`, which is not a
+  binding at all yet (§5.4). So a front end with no panes has nothing for
+  `focus_next` to walk, and the intent that line mode actually needs from
+  this area is the one `Alt+1..9` carries.
 - **`toggle_hud` is shared.** Its subject is every character's vitals, not
   geometry; a line front end prints it as lines. **Not as a table** —
   Mudlet's accessibility manual is explicit that tabular layout "can often
@@ -197,17 +226,19 @@ palette" — `parse` deliberately leaves an unknown `/word` to the MUD, and
 `name`/`describes` feed the palette listing and `every_command_is_in_the_palette`.
 Widening it would need a hidden-entry concept to suppress the additions again.
 
-**`Action` lives in `state`, beside `ClientCommand`, and so does the
-resolution function.** It must not be spelled as a method on `Keybinds`:
-`Keybinds` lives in `config`, `state` names `config`, and `config` does not
-name `state`. A `Keybinds::resolve -> Option<Action>` therefore adds a
-`config` → `state` edge and reopens the module cycle that #6 closed. Rust
-permits the inherent `impl` to be written inside `src/state.rs`, where it
-compiles and passes both boundary tests — neither guards `config` ↔ `state` —
-so the cycle would return silently. Spell it:
+**`Action` lives in `state`, beside `ClientCommand`, and so do its
+resolvers.** They must not be spelled as methods on `Keybinds`: `Keybinds`
+lives in `config`, `state` names `config`, and `config` does not name
+`state`. A `Keybinds::resolve -> Option<Action>` therefore adds a `config` →
+`state` edge and reopens the module cycle that #6 closed. Rust permits the
+inherent `impl` to be written inside `src/state.rs`, where it compiles and
+passes both boundary tests — neither guards `config` ↔ `state` — so the cycle
+would return silently. Spell them, one per gap §5.5 names:
 
 ```
-Action::for_key(&Keybinds, code, modifiers) -> Option<Action>
+Action::for_key_before_modes(&Keybinds, code, modifiers) -> Option<Action>
+Action::for_key_before_errors(&Keybinds, code, modifiers) -> Option<Action>
+Action::for_key_after_errors(&Keybinds, code, modifiers) -> Option<Action>
 ```
 
 `crossterm`'s `KeyCode`/`KeyModifiers` are already imported in both modules,
@@ -243,12 +274,12 @@ dispatch, and §7.1 extracts it rather than copying it.
 
 **`Alt+1..9` is not reachable and must be made so.** The session jump is
 hardcoded in `handle_key` and is not a `KeyBinding` at all, so it is not
-remappable and `Action::for_key` cannot see it. It is also the one intent
+remappable and none of the resolvers can see it. It is also the one intent
 branch 2 most needs. Either it becomes a real binding or the character-switch
 intent gets its own name; the former is preferable and is a small,
 independently sensible fix.
 
-### 5.5 Order is behaviour, and one lookup will break it
+### 5.5 Order is behaviour, and a single lookup will break it
 
 The shared bindings are **not contiguous**. In `handle_key` they interleave
 with the modal blocks, and that ordering is load-bearing: `toggle_timestamps`
@@ -256,18 +287,64 @@ is checked *before* the help overlay's block, so it works while the overlay
 is up, and the palette key while the overlay is up dismisses the overlay
 rather than opening the palette.
 
-A single `Action::for_key` call at the top of the binding section inverts
-both, and no test covers either. The layer is therefore **two lookups at two
-positions**, not one, and the split point is where the modal blocks begin.
+The general rule: **a shared binding resolves in the gap it already
+occupied, and every modal block between gaps is a divider.** A single
+`Action::for_key` call at the top of the binding section collapses every gap
+into one and inverts every ordering `handle_key` currently depends on, so the
+layer needs one resolver per gap, not one for the whole function.
+
+The help overlay is the divider that motivates the rule; the errors panel is
+the one that proves it needs to be general rather than "the help overlay and
+everything else." `show_errors` does not just gate a block the way the
+overlay does — it clears the errors panel and then recursively re-dispatches
+the same key, so a binding resolved *after* that block closes the panel as a
+side effect of running, while a binding resolved *before* it leaves the panel
+up. `palette` is on the "leaves it up" side; the other eight shared bindings
+are not. That difference is invisible unless the block that causes it is
+named as a divider on its own terms, which is why treating dividers as "the
+overlay, plus a residual second lookup" would have missed it.
+
+Three resolvers follow the three gaps: `Action::for_key_before_modes`, for
+`toggle_timestamps`, `toggle_hud` and `who_needs_me`, which is checked first
+among the overlay blocks — after the mark menu, the config editor and the
+new-profile wizard, each of which already owns the keyboard outright while
+open, but before the help overlay and the errors panel; `Action::for_key_before_errors`,
+which holds only `palette`, checked after the earlier modal blocks but before
+the errors panel's own block, so the palette key while the panel is up opens
+the palette and leaves the panel exactly as it was, with no clear-and-re-dispatch
+in between; and `Action::for_key_after_errors`, for the remaining seven —
+`help`, `config_editor`, `toggle_map`, `reload`, `line_picker`,
+`server_data_inspector` and `toggle_channels` — each of which
+only runs after the errors panel has already cleared and re-dispatched the
+key, so an open panel takes their key first.
+
+The rule above — a shared binding resolves in the gap it already
+occupied — governs *shared* bindings; it says nothing about the seven
+geometry bindings, because they are not in the layer at all. In `handle_key`
+they are checked after all three resolvers, `swap_columns` and `cycle_layout`
+where `for_key_after_errors` used to be interleaved with them at the branch's
+base, the four resize keys and `map_cursor` where they already were. A
+geometry binding therefore now loses to any shared binding it happens to
+collide with, where at the base it could win one of two gaps depending on
+which shared binding it was interleaved with. With the default binds nothing
+collides, so no default keypress resolves differently than before. The only
+configuration this is observable in is one binding a single key to both a
+shared action and a geometry action — `Keybinds` validates neither collisions
+nor duplicates, so nothing stops it — and that binding has no defined winner
+in either arrangement: the base ordering only happened to pick one because
+of where in `handle_key` each arm was written, not because either arm's
+intent should win. Restoring the old interleaving would need a resolver
+seam for the geometry bindings too, to serve a misconfiguration that was
+never a supported case. It stays unrestored.
 
 ### 5.6 Done when
 
-- Every shared binding reaches its effect through `Action::for_key` and one
-  dispatch, at the two positions §5.5 requires.
+- Every shared binding reaches its effect through one of the three resolvers
+  §5.5 names, at the gap it occupied.
 - The three genuine duplicates have one implementation.
 - A test asserts that resolving a key and parsing the equivalent
   slash-command produce the same `Action`, for those three.
-- A test asserts the two orderings §5.5 names, which are currently unguarded.
+- A test asserts the orderings §5.5 names, which are currently unguarded.
 - Behaviour is unchanged. Tests may be edited only where they name a
   mechanism that moved; `the_reload_keybind_requests_a_reload` is expected to
   be one, since it asserts the deferred flag by name.

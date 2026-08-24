@@ -1029,6 +1029,18 @@ impl KeyBinding {
     pub fn matches(&self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         self.code == code && self.modifiers == modifiers
     }
+
+    /// The pair a resolver matches on. `matches` answers "is this you?",
+    /// which is no help to a caller that has a binding and needs the key it
+    /// stands for (docs/LINE_MODE.md §5.3).
+    ///
+    /// Only tests call this — the bin target never resolves a binding back
+    /// to a key/modifier pair, it only asks `matches` whether a keypress is
+    /// this one.
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> (KeyCode, KeyModifiers) {
+        (self.code, self.modifiers)
+    }
 }
 
 impl std::fmt::Display for KeyBinding {
@@ -3754,5 +3766,31 @@ triggers:
         assert!(yaml.contains("enabled: false"), "{yaml}");
         assert!(!yaml.contains("gag"));
         assert!(!yaml.contains("when"));
+    }
+
+    /// `Keybinds` lives here and the model lives in `state`, which names
+    /// `config` — so an edge the other way is a cycle, and #6 closed the
+    /// last one. It would not fail to compile: an inherent
+    /// `impl Keybinds { fn resolve(..) -> Option<Action> }` written inside
+    /// `src/state.rs` is legal and passes both other boundary tests, which
+    /// only look at `ui`. Hence a test rather than a note
+    /// (docs/LINE_MODE.md §5.3).
+    ///
+    /// This greps for one spelling of the edge — `crate` followed directly
+    /// by `::state` — and is a tripwire for that obvious case rather than a
+    /// proof: a brace-grouped `use` naming `state` alongside other items, or
+    /// a `super::state` path from a submodule, would name it without
+    /// matching this string and slip past.
+    #[test]
+    fn config_does_not_name_the_model() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/mod.rs");
+        let source = std::fs::read_to_string(&path).expect("a readable source file");
+        let forbidden = concat!("crate", "::state");
+        assert!(
+            !source.contains(forbidden),
+            "src/config/mod.rs names `{forbidden}`; `state` names `config`, \
+             so this edge is a cycle — put the type in `state` and resolve \
+             from there"
+        );
     }
 }

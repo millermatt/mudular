@@ -2117,31 +2117,8 @@ fn handle_key(
         }
         return true;
     }
-    if keybinds.toggle_timestamps.matches(code, modifiers) {
-        state.show_timestamps = !state.show_timestamps;
-        return true;
-    }
-    if keybinds.toggle_hud.matches(code, modifiers) {
-        state.show_hud = !state.show_hud;
-        return true;
-    }
-    if keybinds.who_needs_me.matches(code, modifiers) {
-        match state.neediest() {
-            Some(index) => {
-                if let Some(id) = state.id_at(index) {
-                    state.focus_pane(Focus::Session(id));
-                }
-            }
-            // Said rather than ignored, the same way the map cursor says
-            // why it did nothing: a key that silently does nothing is a
-            // key the player assumes is broken.
-            None => {
-                if let Some(session) = state.bound_mut() {
-                    session.push_line(RetainedLine::client("** nobody is in trouble"));
-                }
-            }
-        }
-        return true;
+    if let Some(action) = Action::for_key_before_modes(keybinds, code, modifiers) {
+        return apply_action(state, channels, action);
     }
     if keybinds.map_cursor.matches(code, modifiers) {
         // The same place `Alt+<map>` and `focus_next` arrive at — one key
@@ -2262,12 +2239,8 @@ fn handle_key(
         }
         return true;
     }
-    if keybinds.palette.matches(code, modifiers) {
-        state.palette = Some(Palette {
-            input: Input::default(),
-            selected: 0,
-        });
-        return true;
+    if let Some(action) = Action::for_key_before_errors(keybinds, code, modifiers) {
+        return apply_action(state, channels, action);
     }
     // The warnings panel closes the way every other overlay here does —
     // Esc, or any key that is not steering it. A panel that could only be
@@ -2283,51 +2256,18 @@ fn handle_key(
         }
         return handle_key(state, keybinds, code, modifiers, area_width, channels);
     }
-    if keybinds.help.matches(code, modifiers) {
-        state.show_help = true;
-        // Always from the top: reopening to wherever it was left reads as
-        // the overlay having lost its place.
-        state.help_scroll = 0;
-        return true;
-    }
-    if keybinds.config_editor.matches(code, modifiers) {
-        open_config_editor(state, channels, "");
-        return true;
+    if let Some(action) = Action::for_key_after_errors(keybinds, code, modifiers) {
+        return apply_action(state, channels, action);
     }
     if keybinds.swap_columns.matches(code, modifiers) {
         state.map_first = !state.map_first;
         return true;
     }
-    if keybinds.toggle_map.matches(code, modifiers) {
-        state.show_map = !state.show_map;
-        describe_current_room(state);
-        return true;
-    }
-    if keybinds.reload.matches(code, modifiers) {
-        state.reload_requested = true;
-        return true;
-    }
-    if keybinds.line_picker.matches(code, modifiers) {
-        if let Some(session) = state.bound()
-            && !session.view.scrollback.is_empty()
-        {
-            // Starts wherever the pane is already scrolled to, rather than
-            // always jumping to the newest line — if you scrolled up to
-            // look at something before reaching for this, that's the line
-            // you meant to pick.
-            state.line_cursor = Some(
-                session
-                    .view
-                    .back_offset
-                    .min(session.view.scrollback.len().saturating_sub(1)),
-            );
-        }
-        return true;
-    }
-    if keybinds.server_data_inspector.matches(code, modifiers) {
-        state.show_inspector = !state.show_inspector;
-        return true;
-    }
+    // Cycling panes is geometry: the list it walks is sessions, then any
+    // visible channel panes, then the map column, and what it moves is which
+    // pane the scroll and arrow keys act on. A front end with no panes has
+    // nothing for it to do — and it does not change which character the input
+    // line is bound to, which is `input_session` and belongs to Alt+1..9.
     if keybinds.focus_next.matches(code, modifiers) {
         state.focus_next();
         return true;
@@ -2337,10 +2277,6 @@ fn handle_key(
             LayoutMode::Tabs => LayoutMode::Splits,
             LayoutMode::Splits => LayoutMode::Tabs,
         };
-        return true;
-    }
-    if keybinds.toggle_channels.matches(code, modifiers) {
-        toggle_comms(state);
         return true;
     }
     // Resizing the column resizes the session panes beside it, so both keys
@@ -2394,6 +2330,100 @@ fn handle_key(
         }
     }
     false
+}
+
+/// Carries out a named intent. Sync, and returns what `handle_key` returns:
+/// whether the arrangement of panes changed, so the caller re-reports NAWS
+/// (§6.2, §11.4). Actions that need async work set a deferred flag for the
+/// event loop to service, exactly as the inline arms did
+/// (docs/LINE_MODE.md §5.4).
+fn apply_action(state: &mut AppState, channels: &[Channel], action: Action) -> bool {
+    match action {
+        Action::ToggleTimestamps => {
+            state.show_timestamps = !state.show_timestamps;
+            true
+        }
+        Action::ToggleHud => {
+            state.show_hud = !state.show_hud;
+            true
+        }
+        Action::WhoNeedsMe => {
+            match state.neediest() {
+                Some(index) => {
+                    if let Some(id) = state.id_at(index) {
+                        state.focus_pane(Focus::Session(id));
+                    }
+                }
+                // Said rather than ignored, the same way the map cursor says
+                // why it did nothing: a key that silently does nothing is a
+                // key the player assumes is broken.
+                None => {
+                    if let Some(session) = state.bound_mut() {
+                        session.push_line(RetainedLine::client("** nobody is in trouble"));
+                    }
+                }
+            }
+            true
+        }
+        Action::OpenPalette => {
+            state.palette = Some(Palette {
+                input: Input::default(),
+                selected: 0,
+            });
+            true
+        }
+        Action::HelpOverlay => {
+            state.show_help = true;
+            // Always from the top: reopening to wherever it was left reads
+            // as the overlay having lost its place.
+            state.help_scroll = 0;
+            true
+        }
+        Action::RequestReload => {
+            state.reload_requested = true;
+            true
+        }
+        Action::LinePicker => {
+            if let Some(session) = state.bound()
+                && !session.view.scrollback.is_empty()
+            {
+                // Starts wherever the pane is already scrolled to, rather
+                // than always jumping to the newest line — if you scrolled
+                // up to look at something before reaching for this, that's
+                // the line you meant to pick.
+                state.line_cursor = Some(
+                    session
+                        .view
+                        .back_offset
+                        .min(session.view.scrollback.len().saturating_sub(1)),
+                );
+            }
+            true
+        }
+        Action::ServerDataInspector => {
+            state.show_inspector = !state.show_inspector;
+            true
+        }
+        Action::Command(ClientCommand::Map) => {
+            toggle_map(state);
+            true
+        }
+        Action::Command(ClientCommand::Comms) => {
+            toggle_comms(state);
+            true
+        }
+        Action::Command(ClientCommand::Config(setting)) => {
+            open_config_editor(state, channels, &setting);
+            true
+        }
+        // No key resolves to any other command today. A second front end
+        // may route typed commands here later; until one does, an arm that
+        // cannot be reached is a lie about what this handles.
+        Action::Command(other) => {
+            debug_assert!(false, "no key resolves to {other:?}");
+            false
+        }
+    }
 }
 
 /// Acts on the answer to the save-password offer: `y` stores the held
@@ -2560,10 +2590,7 @@ async fn run_client_command(state: &mut AppState, channels: &[Channel], command:
                 state.errors_unread = 0;
             }
         }
-        ClientCommand::Map => {
-            state.show_map = !state.show_map;
-            describe_current_room(state);
-        }
+        ClientCommand::Map => toggle_map(state),
         ClientCommand::Comms => toggle_comms(state),
         ClientCommand::Goto(target) => start_goto(state, &target).await,
         ClientCommand::Corpse => start_corpse_run(state).await,
@@ -2624,6 +2651,14 @@ async fn send_as_other_session(state: &mut AppState, args: &str) {
     for (index, command) in injections {
         let _ = state.sessions[index].commands.send(command).await;
     }
+}
+
+/// Shows or hides the map column, and says the room either way — the same
+/// thing `/map` does, because it is now literally the same code
+/// (docs/LINE_MODE.md §5.1).
+fn toggle_map(state: &mut AppState) {
+    state.show_map = !state.show_map;
+    describe_current_room(state);
 }
 
 /// Shows or hides the comms column, from either the key or `/comms`
@@ -4465,6 +4500,82 @@ mod tests {
         // typed into an input line hidden behind the overlay.
         assert!(press(&mut state, KeyCode::Char('k'), KeyModifiers::NONE));
         assert!(!state.show_help);
+    }
+
+    /// `Alt+T` is checked before the help overlay's block, so timestamps
+    /// toggle while the overlay is up. That ordering is behaviour, not an
+    /// accident of layout: the intent layer resolves bindings at three
+    /// positions precisely to keep it (docs/LINE_MODE.md §5.5).
+    #[test]
+    fn a_pre_mode_binding_still_works_while_the_help_overlay_is_up() {
+        assert!(
+            Keybinds::default()
+                .toggle_timestamps
+                .matches(KeyCode::Char('t'), KeyModifiers::ALT),
+            "this test presses the default; update it with the default"
+        );
+        let (mut state, _rx) = app(&["tank"]);
+        state.show_help = true;
+        let before = state.show_timestamps;
+
+        assert!(press(&mut state, KeyCode::Char('t'), KeyModifiers::ALT));
+
+        assert_ne!(
+            state.show_timestamps, before,
+            "a binding checked before the overlay's block must still act"
+        );
+        assert!(state.show_help, "and must not dismiss the overlay");
+    }
+
+    /// `Ctrl+P` is checked *after* the overlay's block, so while the overlay
+    /// is up it is just another key: the overlay eats it and closes.
+    /// Resolving every binding in one pass at the top would open the palette
+    /// instead (docs/LINE_MODE.md §5.5).
+    #[test]
+    fn a_post_mode_binding_is_eaten_by_the_help_overlay() {
+        assert!(
+            Keybinds::default()
+                .palette
+                .matches(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            "this test presses the default; update it with the default"
+        );
+        let (mut state, _rx) = app(&["tank"]);
+        state.show_help = true;
+
+        assert!(press(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert!(!state.show_help, "the overlay consumes the key and closes");
+        assert!(
+            state.palette.is_none(),
+            "and the palette must not have opened behind it"
+        );
+    }
+
+    /// The errors panel dismisses itself and re-dispatches the key, so a
+    /// binding resolved after it closes the panel as a side effect while
+    /// one resolved before it leaves the panel up. `palette` is before,
+    /// `help` is after, and hoisting either across the block changes what
+    /// the player sees (docs/LINE_MODE.md §5.5).
+    #[test]
+    fn the_errors_panel_closes_for_a_late_binding_but_not_for_the_palette() {
+        let (mut state, _rx) = app(&["tank"]);
+
+        state.show_errors = true;
+        assert!(press(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(
+            state.show_errors,
+            "the palette resolves before the panel's block"
+        );
+        assert!(state.palette.is_some());
+
+        let (mut state, _rx) = app(&["tank"]);
+        state.show_errors = true;
+        assert!(press(&mut state, KeyCode::F(1), KeyModifiers::NONE));
+        assert!(
+            !state.show_errors,
+            "a late binding closes the panel on its way through"
+        );
+        assert!(state.show_help, "and still does its own job");
     }
 
     /// The overlay must never become a second, stale copy of the bindings
