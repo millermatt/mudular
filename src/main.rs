@@ -233,23 +233,22 @@ async fn main() -> Result<()> {
         rx
     });
 
-    app::run(
-        dir,
+    let startup = app::Startup {
+        config_dir: dir,
         targets,
-        app_config.keybinds,
+        keybinds: app_config.keybinds,
         channels,
-        app_config.history_size,
-        app_config.scrollback_size,
-        app_config.channel_width,
-        app_config.map_width,
-        app_config.map_graphics,
-        app_config.autocomplete,
-        app_config.cross_session,
+        history_size: app_config.history_size,
+        scrollback_size: app_config.scrollback_size,
+        channel_width: app_config.channel_width,
+        map_width: app_config.map_width,
+        map_graphics: app_config.map_graphics,
+        autocomplete: app_config.autocomplete,
+        cross_session_default: app_config.cross_session,
         first_run_hint,
-        cli.map_debug,
-        update_check,
-    )
-    .await
+    };
+
+    app::run(startup, cli.map_debug, update_check).await
 }
 
 /// Stores a profile's password in the OS keyring. Reads it with the

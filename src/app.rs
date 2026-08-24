@@ -648,42 +648,13 @@ async fn new_profile_event_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
-    config_dir: PathBuf,
-    targets: Vec<ConnectTarget>,
-    keybinds: Keybinds,
-    channels: Vec<Channel>,
-    history_size: usize,
-    scrollback_size: usize,
-    channel_width: u16,
-    map_width: u16,
-    map_graphics: bool,
-    autocomplete: bool,
-    cross_session_default: CrossSession,
-    first_run_hint: bool,
+    startup: Startup,
     map_debug: Option<PathBuf>,
     update_check: Option<tokio::sync::oneshot::Receiver<Option<crate::update::Available>>>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(
-        &mut terminal,
-        config_dir,
-        targets,
-        keybinds,
-        channels,
-        history_size,
-        scrollback_size,
-        channel_width,
-        map_width,
-        map_graphics,
-        autocomplete,
-        cross_session_default,
-        first_run_hint,
-        map_debug,
-        update_check,
-    )
-    .await;
+    let result = event_loop(&mut terminal, startup, map_debug, update_check).await;
     ratatui::restore();
     result
 }
@@ -1530,180 +1501,220 @@ enum Wake {
     Update(Option<crate::update::Available>),
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Everything a front end needs before it has a loop: the peer mesh, the
+/// connected sessions, and the `AppState` both front ends drive.
+///
+/// A struct rather than arguments because there are twelve of them, and
+/// extracted rather than copied because a second front end that built its
+/// own `AppState` literal would leave the next field added initialised in
+/// one of them and not the other (docs/LINE_MODE.md §7.1).
+pub(crate) struct Startup {
+    pub(crate) config_dir: PathBuf,
+    pub(crate) targets: Vec<ConnectTarget>,
+    pub(crate) keybinds: Keybinds,
+    pub(crate) channels: Vec<Channel>,
+    pub(crate) history_size: usize,
+    pub(crate) scrollback_size: usize,
+    pub(crate) channel_width: u16,
+    pub(crate) map_width: u16,
+    pub(crate) map_graphics: bool,
+    pub(crate) autocomplete: bool,
+    pub(crate) cross_session_default: CrossSession,
+    pub(crate) first_run_hint: bool,
+}
+
+impl Startup {
+    /// Connects every target and builds the state. `width` is the terminal's
+    /// width, which the saved layout is clamped against — a config value or
+    /// a remembered one wider than this terminal is brought in before the
+    /// first frame, the same as a `Resize` does later (§11.4).
+    pub(crate) fn connect_all(self, width: u16) -> AppState {
+        let Startup {
+            config_dir,
+            targets,
+            keybinds,
+            channels,
+            history_size,
+            scrollback_size,
+            channel_width,
+            map_width,
+            map_graphics,
+            autocomplete,
+            cross_session_default,
+            first_run_hint,
+        } = self;
+
+        // Every session publishes a snapshot of its state and reads every
+        // other session's (§7.5). The channels are made up front, so a session
+        // can watch a peer that has not finished connecting yet — it simply
+        // sees that peer's empty snapshot until it has something to say.
+        let published: Vec<(
+            String,
+            watch::Sender<PeerSnapshot>,
+            watch::Receiver<PeerSnapshot>,
+        )> = targets
+            .iter()
+            .map(|target| {
+                let (tx, rx) = watch::channel(PeerSnapshot::default());
+                (target.name.clone(), tx, rx)
+            })
+            .collect();
+        let receivers: Vec<(String, watch::Receiver<PeerSnapshot>)> = published
+            .iter()
+            .map(|(name, _, rx)| (name.clone(), rx.clone()))
+            .collect();
+
+        let multiple_characters = targets.len() > 1;
+        let sessions: Vec<SessionPane> = targets
+            .into_iter()
+            .zip(published)
+            .map(|(target, (_, publish, _))| {
+                // `*` in a rule means "every other session", and so does this:
+                // a session never watches itself, where its own variables are
+                // already the live ones.
+                let others = receivers
+                    .iter()
+                    .filter(|(name, _)| *name != target.name)
+                    .map(|(name, rx)| (name.clone(), rx.clone()))
+                    .collect();
+                let links = PeerLinks {
+                    publish: Some(publish),
+                    others,
+                };
+                connect(target, history_size, scrollback_size, autocomplete, links)
+            })
+            .collect();
+        let has_sessions = !sessions.is_empty();
+        // Something has to be bound before the first frame. A launch with no
+        // sessions still needs a value here; it is replaced the moment one is
+        // connected, and `bound()` answers `None` until then.
+        let first_id = sessions
+            .first()
+            .map(|session: &SessionPane| session.id)
+            .unwrap_or_else(SessionId::next);
+
+        let mut state = AppState {
+            sessions,
+            maps: HashMap::new(),
+            channels: channels
+                .iter()
+                .map(|config| ChannelPane {
+                    lines: restored_comms(&config_dir, config, scrollback_size),
+                    config: config.clone(),
+                    unread: 0,
+                    scrollback_limit: scrollback_size,
+                    back_offset: 0,
+                })
+                .collect(),
+            focus: Focus::Session(first_id),
+            input_session: first_id,
+            layout: LayoutMode::Tabs,
+            show_channels: !channels.is_empty(),
+            channel_width,
+            // Off until asked for: on a MUD that sends no room data it would
+            // be a permanently empty column, and the player has not said yet
+            // whether they want it.
+            show_map: false,
+            map_width,
+            show_inspector: false,
+            // One character has nothing to compare, and the strip would be a
+            // row spent restating the prompt. Two or more is the case it exists
+            // for — the numbers a multiboxer was holding in their head.
+            show_hud: multiple_characters,
+            // Off until asked for: a MUD's own output is dense enough, and a
+            // clock down every line is a cost paid on every line by someone
+            // who wanted it on one.
+            show_timestamps: false,
+            map_cell_px: map_graphics.then(cell_pixels).flatten(),
+            show_help: false,
+            help_scroll: 0,
+            keybinds,
+            config_editor: None,
+            config_editor_save: None,
+            reload_requested: false,
+            line_cursor: None,
+            map_cursor: None,
+            map_first: false,
+            shell_input: Input::default(),
+            shell_notices: Vec::new(),
+            errors: VecDeque::new(),
+            errors_unread: 0,
+            show_errors: false,
+            palette: None,
+            palette_submit: false,
+            map_pan: (0, 0),
+            map_pan_for: None,
+            map_grid: None,
+            walk_requested: None,
+            config_dir,
+            mark_menu: None,
+            new_profile_wizard: None,
+            peer_registry: receivers.into_iter().collect(),
+            history_size,
+            scrollback_size,
+            autocomplete,
+            cross_session_default,
+            no_color: no_color_requested(std::env::var("NO_COLOR").ok().as_deref()),
+        };
+        // Each world read off disk once, by whichever character reaches it
+        // first — the rest join the entry that is already there (§16).
+        for index in 0..state.sessions.len() {
+            let key = state.sessions[index].map_key.clone();
+            open_world(&mut state.maps, &state.config_dir, &key);
+        }
+
+        // A config value wider than this terminal is clamped before the first
+        // frame, the same as a `Resize` clamps it later (§11.4).
+        state.channel_width = ui::clamp_channel_width(state.channel_width, width);
+        state.map_width = ui::clamp_map_width(state.map_width, width);
+        // Config says where a fresh install starts; this says where the player
+        // left off, so it goes on top (§11.4). Widths are re-clamped because
+        // the terminal may be narrower than it was last time.
+        if let Some(saved) = config::load_ui_state(&state.config_dir) {
+            state.show_channels = saved.show_channels;
+            state.show_map = saved.show_map;
+            state.show_inspector = saved.show_inspector;
+            state.show_timestamps = saved.show_timestamps;
+            // Only where the player has actually said. A saved layout that
+            // predates the strip, or one from before they ever touched it,
+            // leaves the count to decide.
+            if let Some(shown) = saved.show_hud {
+                state.show_hud = shown;
+            }
+            state.channel_width = ui::clamp_channel_width(saved.channel_width, width);
+            state.map_width = ui::clamp_map_width(saved.map_width, width);
+            state.map_first = saved.map_first;
+        }
+
+        if !has_sessions {
+            // Nothing to drive the loop but the terminal; the empty-state help
+            // lives in the UI, which has no pane to draw it in otherwise.
+            state.show_channels = false;
+        }
+
+        // The wizard always connects exactly one character, so it's this one
+        // (UX_REVIEW.md C) — a newcomer who just answered it has no other way
+        // to know F1 exists.
+        if first_run_hint && let Some(session) = state.sessions.first_mut() {
+            session.push_line(RetainedLine::client("press F1 for the full key list"));
+        }
+
+        state
+    }
+}
+
 async fn event_loop(
     terminal: &mut DefaultTerminal,
-    config_dir: PathBuf,
-    targets: Vec<ConnectTarget>,
-    keybinds: Keybinds,
-    channels: Vec<Channel>,
-    history_size: usize,
-    scrollback_size: usize,
-    channel_width: u16,
-    map_width: u16,
-    map_graphics: bool,
-    autocomplete: bool,
-    cross_session_default: CrossSession,
-    first_run_hint: bool,
+    startup: Startup,
     map_debug: Option<PathBuf>,
     mut update_check: Option<tokio::sync::oneshot::Receiver<Option<crate::update::Available>>>,
 ) -> Result<()> {
-    // Every session publishes a snapshot of its state and reads every
-    // other session's (§7.5). The channels are made up front, so a session
-    // can watch a peer that has not finished connecting yet — it simply
-    // sees that peer's empty snapshot until it has something to say.
-    let published: Vec<(
-        String,
-        watch::Sender<PeerSnapshot>,
-        watch::Receiver<PeerSnapshot>,
-    )> = targets
-        .iter()
-        .map(|target| {
-            let (tx, rx) = watch::channel(PeerSnapshot::default());
-            (target.name.clone(), tx, rx)
-        })
-        .collect();
-    let receivers: Vec<(String, watch::Receiver<PeerSnapshot>)> = published
-        .iter()
-        .map(|(name, _, rx)| (name.clone(), rx.clone()))
-        .collect();
-
-    let multiple_characters = targets.len() > 1;
-    let sessions: Vec<SessionPane> = targets
-        .into_iter()
-        .zip(published)
-        .map(|(target, (_, publish, _))| {
-            // `*` in a rule means "every other session", and so does this:
-            // a session never watches itself, where its own variables are
-            // already the live ones.
-            let others = receivers
-                .iter()
-                .filter(|(name, _)| *name != target.name)
-                .map(|(name, rx)| (name.clone(), rx.clone()))
-                .collect();
-            let links = PeerLinks {
-                publish: Some(publish),
-                others,
-            };
-            connect(target, history_size, scrollback_size, autocomplete, links)
-        })
-        .collect();
-    let has_sessions = !sessions.is_empty();
-    // Something has to be bound before the first frame. A launch with no
-    // sessions still needs a value here; it is replaced the moment one is
-    // connected, and `bound()` answers `None` until then.
-    let first_id = sessions
-        .first()
-        .map(|session: &SessionPane| session.id)
-        .unwrap_or_else(SessionId::next);
-
-    let mut state = AppState {
-        sessions,
-        maps: HashMap::new(),
-        channels: channels
-            .iter()
-            .map(|config| ChannelPane {
-                lines: restored_comms(&config_dir, config, scrollback_size),
-                config: config.clone(),
-                unread: 0,
-                scrollback_limit: scrollback_size,
-                back_offset: 0,
-            })
-            .collect(),
-        focus: Focus::Session(first_id),
-        input_session: first_id,
-        layout: LayoutMode::Tabs,
-        show_channels: !channels.is_empty(),
-        channel_width,
-        // Off until asked for: on a MUD that sends no room data it would
-        // be a permanently empty column, and the player has not said yet
-        // whether they want it.
-        show_map: false,
-        map_width,
-        show_inspector: false,
-        // One character has nothing to compare, and the strip would be a
-        // row spent restating the prompt. Two or more is the case it exists
-        // for — the numbers a multiboxer was holding in their head.
-        show_hud: multiple_characters,
-        // Off until asked for: a MUD's own output is dense enough, and a
-        // clock down every line is a cost paid on every line by someone
-        // who wanted it on one.
-        show_timestamps: false,
-        map_cell_px: map_graphics.then(cell_pixels).flatten(),
-        show_help: false,
-        help_scroll: 0,
-        keybinds: keybinds.clone(),
-        config_editor: None,
-        config_editor_save: None,
-        reload_requested: false,
-        line_cursor: None,
-        map_cursor: None,
-        map_first: false,
-        shell_input: Input::default(),
-        shell_notices: Vec::new(),
-        errors: VecDeque::new(),
-        errors_unread: 0,
-        show_errors: false,
-        palette: None,
-        palette_submit: false,
-        map_pan: (0, 0),
-        map_pan_for: None,
-        map_grid: None,
-        walk_requested: None,
-        config_dir,
-        mark_menu: None,
-        new_profile_wizard: None,
-        peer_registry: receivers.into_iter().collect(),
-        history_size,
-        scrollback_size,
-        autocomplete,
-        cross_session_default,
-        no_color: no_color_requested(std::env::var("NO_COLOR").ok().as_deref()),
-    };
-    // Each world read off disk once, by whichever character reaches it
-    // first — the rest join the entry that is already there (§16).
-    for index in 0..state.sessions.len() {
-        let key = state.sessions[index].map_key.clone();
-        open_world(&mut state.maps, &state.config_dir, &key);
-    }
-
-    // A config value wider than this terminal is clamped before the first
-    // frame, the same as a `Resize` clamps it later (§11.4).
-    state.channel_width =
-        ui::clamp_channel_width(state.channel_width, terminal.get_frame().area().width);
-    state.map_width = ui::clamp_map_width(state.map_width, terminal.get_frame().area().width);
-    // Config says where a fresh install starts; this says where the player
-    // left off, so it goes on top (§11.4). Widths are re-clamped because
-    // the terminal may be narrower than it was last time.
-    if let Some(saved) = config::load_ui_state(&state.config_dir) {
-        let width = terminal.get_frame().area().width;
-        state.show_channels = saved.show_channels;
-        state.show_map = saved.show_map;
-        state.show_inspector = saved.show_inspector;
-        state.show_timestamps = saved.show_timestamps;
-        // Only where the player has actually said. A saved layout that
-        // predates the strip, or one from before they ever touched it,
-        // leaves the count to decide.
-        if let Some(shown) = saved.show_hud {
-            state.show_hud = shown;
-        }
-        state.channel_width = ui::clamp_channel_width(saved.channel_width, width);
-        state.map_width = ui::clamp_map_width(saved.map_width, width);
-        state.map_first = saved.map_first;
-    }
-
-    if !has_sessions {
-        // Nothing to drive the loop but the terminal; the empty-state help
-        // lives in the UI, which has no pane to draw it in otherwise.
-        state.show_channels = false;
-    }
-
-    // The wizard always connects exactly one character, so it's this one
-    // (UX_REVIEW.md C) — a newcomer who just answered it has no other way
-    // to know F1 exists.
-    if first_run_hint && let Some(session) = state.sessions.first_mut() {
-        session.push_line(RetainedLine::client("press F1 for the full key list"));
-    }
+    // Both outlive the state they were built into: `keybinds` because
+    // `quit` is matched here rather than in `handle_key` (§5.3), and
+    // `channels` because routing consults it on every line sent.
+    let keybinds = startup.keybinds.clone();
+    let channels = startup.channels.clone();
+    let mut state = startup.connect_all(terminal.get_frame().area().width);
 
     report_pane_sizes(&mut state, terminal.get_frame().area()).await;
 
