@@ -3,6 +3,7 @@ mod complete;
 mod config;
 mod config_editor;
 mod engine;
+mod line;
 mod map;
 mod net;
 mod scrollback;
@@ -52,6 +53,12 @@ struct Cli {
     /// utf-8, latin1, or cp437.
     #[arg(long, default_value = "utf-8")]
     charset: Charset,
+
+    /// Print output as a stream of lines instead of drawing panes: no
+    /// alternate screen, and the terminal keeps its own scrollback. The
+    /// mode a screen reader reads best (docs/LINE_MODE.md).
+    #[arg(long, visible_alias = "screen-reader")]
+    line: bool,
 
     /// Configuration directory (default: the platform config directory).
     #[arg(long)]
@@ -147,6 +154,19 @@ async fn main() -> Result<()> {
     // line and no profile saved yet, so there is nothing this launch could
     // possibly connect to without either a form or a text editor.
     if cli.profiles.is_empty() && cli.host.is_none() && !config::has_profiles(&dir) {
+        // The wizard is a drawn form, and it runs *before* the front end
+        // this flag chooses — so `--line` on a fresh config directory would
+        // enter the alternate screen before anything else happened. Refusing
+        // with an instruction is acceptable; silently entering it is not
+        // (docs/LINE_MODE.md §6.1).
+        if cli.line {
+            anyhow::bail!(
+                "there is no profile to connect with yet, and the new-profile form \
+                 is a screen --line does not draw.\n\
+                 Run `mudular` once without --line to fill it in, or write \
+                 profiles/<name>.yaml by hand."
+            );
+        }
         // Esc backs out of the form without saving or connecting
         // (docs/USAGE.md) — not out of the whole client. `cli.profiles`
         // stays empty on `None`, so this falls through to the same
@@ -233,23 +253,25 @@ async fn main() -> Result<()> {
         rx
     });
 
-    app::run(
-        dir,
+    let startup = app::Startup {
+        config_dir: dir,
         targets,
-        app_config.keybinds,
+        keybinds: app_config.keybinds,
         channels,
-        app_config.history_size,
-        app_config.scrollback_size,
-        app_config.channel_width,
-        app_config.map_width,
-        app_config.map_graphics,
-        app_config.autocomplete,
-        app_config.cross_session,
+        history_size: app_config.history_size,
+        scrollback_size: app_config.scrollback_size,
+        channel_width: app_config.channel_width,
+        map_width: app_config.map_width,
+        map_graphics: app_config.map_graphics,
+        autocomplete: app_config.autocomplete,
+        cross_session_default: app_config.cross_session,
         first_run_hint,
-        cli.map_debug,
-        update_check,
-    )
-    .await
+    };
+
+    match cli.line {
+        true => app::run_line(startup, app_config.line, update_check).await,
+        false => app::run(startup, cli.map_debug, update_check).await,
+    }
 }
 
 /// Stores a profile's password in the OS keyring. Reads it with the

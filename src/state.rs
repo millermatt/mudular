@@ -446,6 +446,66 @@ pub(crate) enum Action {
     RequestReload,
     LinePicker,
     ServerDataInspector,
+    /// Bind the input line to the nth connected character, zero-based.
+    /// Carries the index rather than naming a key, because the digit is
+    /// the intent: "the third character", not "Alt+3"
+    /// (docs/LINE_MODE.md §5.4).
+    SelectCharacter(usize),
+}
+
+/// Which front end is driving the model.
+///
+/// `ui` can put a pane, an overlay or a column on the screen. The line
+/// front end cannot, and a surface that cannot degrade prints a named
+/// refusal rather than doing nothing — silence is what teaches a blind
+/// player the client is broken (docs/LINE_MODE.md §6.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrontEnd {
+    /// The ratatui front end: panes, columns, overlays.
+    #[default]
+    Panes,
+    /// The line-oriented front end (`--line`).
+    Lines,
+}
+
+impl FrontEnd {
+    /// Why this front end cannot carry out a command, if it cannot.
+    ///
+    /// Consulted by the command dispatch rather than by a keypress, because
+    /// a typed `/config` reaches `run_client_command` straight from the
+    /// input line and never passes through [`Action`] — so the refusal a
+    /// keypress gets would not cover the same command typed (§6.7).
+    pub(crate) fn refuses(self, command: &ClientCommand) -> Option<&'static str> {
+        if self == Self::Panes {
+            return None;
+        }
+        // Each of these *is* a drawn surface, rather than a command that
+        // happens to draw one: there is nothing to degrade to. §8.4 records
+        // them as a known, ranked gap.
+        match command {
+            ClientCommand::Config(_) => Some(
+                "** the settings editor is a screen this mode does not draw — \
+                 edit the profile file, or start without --line",
+            ),
+            ClientCommand::NewProfile => Some(
+                "** the new-profile form is a screen this mode does not draw — \
+                 start without --line to fill it in",
+            ),
+            ClientCommand::Errors => Some(
+                "** there is no errors panel here; client warnings are printed \
+                 where they happen",
+            ),
+            ClientCommand::Map => Some(
+                "** there is no map column here; /goto still walks, and /mark \
+                 still marks",
+            ),
+            ClientCommand::Comms => Some(
+                "** there are no channel panes here; routed lines are printed \
+                 inline, tagged with their channel",
+            ),
+            _ => None,
+        }
+    }
 }
 
 impl Action {
@@ -519,6 +579,27 @@ impl Action {
             return Some(Self::Command(ClientCommand::Autocomplete));
         }
         None
+    }
+
+    /// The last gap, after every private binding. `Alt+1..9` has always
+    /// been resolved here and stays here: a player who has remapped a
+    /// geometry binding onto an `Alt`+digit still gets the remapped one,
+    /// which is what resolving it any earlier would take away
+    /// (docs/LINE_MODE.md §5.5).
+    ///
+    /// Not remappable, and so it does not consult `keybinds` — the digits
+    /// are the vocabulary. Making them configurable collides with the keyed
+    /// recall of [#149], which wants the same range, and is left to be
+    /// decided there rather than under this branch (§8.1a).
+    ///
+    /// [#149]: https://github.com/millermatt/mudular/issues/149
+    pub(crate) fn for_key_last(code: KeyCode, modifiers: KeyModifiers) -> Option<Self> {
+        if !modifiers.contains(KeyModifiers::ALT) {
+            return None;
+        }
+        let KeyCode::Char(c) = code else { return None };
+        let n = c.to_digit(10).filter(|&n| n >= 1)?;
+        Some(Self::SelectCharacter(n as usize - 1))
     }
 }
 
@@ -678,6 +759,11 @@ pub struct Rules {
 pub struct SessionView {
     pub name: String,
     pub scrollback: VecDeque<RetainedLine>,
+    /// How many lines have ever been appended to `scrollback`, which is
+    /// not `scrollback.len()`: the buffer drops its oldest at the limit,
+    /// so a front end that prints what it has not printed yet needs a
+    /// count that never goes backwards (docs/LINE_MODE.md §6.2).
+    pub pushed: u64,
     /// Text pinned above the input line; empty means no prompt.
     pub prompt: String,
     pub input: Input,
@@ -1041,6 +1127,7 @@ impl SessionPane {
             }
         }
         self.view.scrollback.push_back(line);
+        self.view.pushed += 1;
         if self.view.scrollback.len() > self.scrollback_limit {
             self.view.scrollback.pop_front();
         }
@@ -1158,6 +1245,10 @@ pub struct ChannelPane {
     /// Same "distance from the tail" scroll state as `SessionPane`, and the
     /// same sticky-bottom behaviour (§11.5).
     pub back_offset: usize,
+    /// Lines ever appended, on the same terms as `SessionView::pushed` —
+    /// a routed line is one a line front end must print itself, since
+    /// routing it took it out of the session's own scrollback (§6.2).
+    pub pushed: u64,
 }
 
 /// How far back a copy of a broadcast may lag its siblings and still be
@@ -1169,6 +1260,7 @@ pub(crate) const HEARD_TOGETHER: chrono::TimeDelta = chrono::TimeDelta::seconds(
 impl ChannelPane {
     fn push(&mut self, line: RetainedLine) {
         self.lines.push_back(line);
+        self.pushed += 1;
         if self.lines.len() > self.scrollback_limit {
             self.lines.pop_front();
         }
@@ -1252,6 +1344,14 @@ pub struct AppState {
     /// an env lookup per cell would be absurd, and a test that had to set a
     /// process-wide variable could not run beside its neighbours.
     pub no_color: bool,
+    /// Which front end is driving, so shared code can refuse a surface the
+    /// caller has no way to show (docs/LINE_MODE.md §6.7).
+    pub front_end: FrontEnd,
+    /// Notices ever added to `shell_notices`, on the same terms as
+    /// `SessionView::pushed`: a launch with no session still says things,
+    /// and a front end that prints rather than draws needs to know which
+    /// of them it has not printed (docs/LINE_MODE.md §6.2).
+    pub notices_pushed: u64,
     pub sessions: Vec<SessionPane>,
     pub channels: Vec<ChannelPane>,
     pub focus: Focus,
@@ -1750,6 +1850,7 @@ impl AppState {
             Some(session) => session.push_line(RetainedLine::client(text)),
             None => {
                 self.shell_notices.push(crate::scrollback::plain_row(&text));
+                self.notices_pushed += 1;
                 // Oldest first out: the reply to what was just typed is
                 // the one worth keeping.
                 while self.shell_notices.len() > SHELL_NOTICES {
@@ -2087,6 +2188,7 @@ pub(crate) mod test_support {
                 view: SessionView {
                     name: name.to_string(),
                     scrollback: VecDeque::new(),
+                    pushed: 0,
                     prompt: String::new(),
                     input: Input::default(),
                     status: "connecting".to_string(),
@@ -2154,6 +2256,8 @@ pub(crate) mod test_support {
                 // Off in tests: a fixture that stripped colour would make
                 // every colour assertion in this module vacuous.
                 no_color: false,
+                front_end: FrontEnd::Panes,
+                notices_pushed: 0,
                 sessions,
                 maps: HashMap::new(),
                 channels: Vec::new(),
@@ -2313,5 +2417,28 @@ mod action_tests {
                 "a geometry binding must stay private to the front end"
             );
         }
+    }
+    /// The character switch is the one intent a second front end cannot do
+    /// without, and it was hardcoded in `ui` rather than named
+    /// (docs/LINE_MODE.md §5.4).
+    #[test]
+    fn alt_digit_names_the_character_it_selects() {
+        assert_eq!(
+            Action::for_key_last(KeyCode::Char('1'), KeyModifiers::ALT),
+            Some(Action::SelectCharacter(0))
+        );
+        assert_eq!(
+            Action::for_key_last(KeyCode::Char('9'), KeyModifiers::ALT),
+            Some(Action::SelectCharacter(8))
+        );
+        // `Alt+0` was never a session and does not become one here.
+        assert_eq!(
+            Action::for_key_last(KeyCode::Char('0'), KeyModifiers::ALT),
+            None
+        );
+        assert_eq!(
+            Action::for_key_last(KeyCode::Char('1'), KeyModifiers::NONE),
+            None
+        );
     }
 }

@@ -36,6 +36,7 @@ const BANNER: &str = "MUDULAR-SMOKE-BANNER";
 const CTRL_C: &[u8] = b"\x03";
 const CTRL_Q: &[u8] = b"\x11";
 const CTRL_S: &[u8] = b"\x13";
+const CTRL_P: &[u8] = b"\x10";
 const DOWN: &[u8] = b"\x1b[B";
 
 #[test]
@@ -518,6 +519,229 @@ fn write_two_profiles(dir: &Path, tank_port: u16, cleric_port: u16) {
 }
 
 /// A config dir with a shared module the profile pulls in and overrides.
+/// The line front end's first acceptance criterion (docs/LINE_MODE.md
+/// §6.8): a player reading the terminal with a screen reader must never
+/// have the client repaint under them, and the two ways it could are the
+/// alternate screen and an absolute cursor move. Asserted against the raw
+/// byte stream, because both are invisible in the stripped view every
+/// other test here reads.
+#[test]
+fn line_mode_appends_and_never_repaints() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--line", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the terminal");
+
+    mud.send_line("A rat scurries by.");
+    app.wait_for("scurries", "the server's line should be printed");
+
+    // The rules still apply — this front end shares the pipeline, not just
+    // the socket.
+    app.type_line("k");
+    mud.wait_for_command("kill dragon", "the profile's rules should apply");
+
+    let raw = app.raw();
+    for sequence in ALTERNATE_SCREEN {
+        assert!(
+            !raw.contains(sequence),
+            "line mode must never enter the alternate screen"
+        );
+    }
+    assert!(
+        !addresses_the_cursor(&raw),
+        "line mode must never address the cursor: the input line is redrawn \
+         with \\r and ESC[K only (§6.2)"
+    );
+    assert_eq!(
+        raw.matches("A rat scurries by.").count(),
+        1,
+        "an output line must be written exactly once"
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// §6.6 — the one place in this front end where getting it wrong prints a
+/// password to the terminal. `push_line` does not keep passwords out of
+/// scrollback; the guard is at the call site, and keystroke echo in line
+/// mode is the client's own job, so nothing is inherited here.
+#[test]
+fn line_mode_never_echoes_a_masked_password() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--line", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the terminal");
+
+    // IAC WILL ECHO: the server takes over echoing, which is how a MUD
+    // asks for a password. The prompt after it is the sync point — one
+    // socket, so the client has processed the negotiation by the time the
+    // prompt is on screen.
+    mud.send_bytes(&[0xff, 0xfb, 0x01]);
+    mud.send_line("Password:");
+    app.wait_for("Password:", "the masked prompt should be printed");
+
+    app.type_line("hunter2");
+    mud.wait_for_command("hunter2", "the password should still reach the server");
+
+    assert!(
+        !app.raw().contains("hunter2"),
+        "a masked password must never be printed to the terminal"
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// §6.2 — routing *moves* a line out of the session's scrollback, so a
+/// front end with no channel panes would lose every tell. Printed inline
+/// with its channel instead: strictly worse than keyed recall (#149), and
+/// the interim that is not a hole.
+#[test]
+fn line_mode_prints_a_routed_line_inline() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+    std::fs::write(
+        config.path().join("mudular.yaml"),
+        "channels:\n  - name: tells\n    pattern: ['tells you']\n",
+    )
+    .unwrap();
+
+    let mut app = App::launch(&["tank", "--line", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the terminal");
+
+    mud.send_line("Bob tells you hello");
+    app.wait_for(
+        "[tells] Bob tells you hello",
+        "a routed line should be printed inline, tagged with its channel",
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// §6.7 — a surface that cannot degrade prints a named refusal rather than
+/// doing nothing. Typed, because a typed command reaches the dispatch
+/// without passing through `Action` at all, and so cannot be refused by
+/// the keypress path.
+#[test]
+fn line_mode_says_why_a_drawn_surface_is_unavailable() {
+    let mud = FakeMud::start();
+    let config = TempDir::new();
+    write_config(config.path(), mud.port, None);
+
+    let mut app = App::launch(&["tank", "--line", "--config-dir", config.path_str()]);
+    app.wait_for(BANNER, "the server banner should reach the terminal");
+
+    app.type_line("/map");
+    app.wait_for(
+        "no map column",
+        "a refused surface should say so, by name: silence reads as a broken client",
+    );
+
+    app.type_line("/config");
+    app.wait_for(
+        "edit the profile file",
+        "a refusal should say what to do instead",
+    );
+
+    // And by keypress, which is the other half: `Declined` covers a
+    // keypress, and it is the dispatch above that it does not reach.
+    app.send(CTRL_P);
+    app.wait_for(
+        "type the command",
+        "a refused keypress should say so too, and say what to do instead",
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// §6.5 — every character connects and fills its scrollback; only the
+/// bound one prints, and switching says whose lines these now are. It is
+/// the only sign a switch happened, because nothing is redrawn to show it.
+#[test]
+fn line_mode_switches_character_and_says_so() {
+    let tank_mud = FakeMud::start();
+    let cleric_mud = FakeMud::start();
+    let config = TempDir::new();
+    write_two_profiles(config.path(), tank_mud.port, cleric_mud.port);
+
+    let mut app = App::launch(&[
+        "tank",
+        "cleric",
+        "--line",
+        "--config-dir",
+        config.path_str(),
+    ]);
+    app.wait_for(BANNER, "the first character's banner should be printed");
+    cleric_mud.wait_for_connection("cleric should have connected");
+
+    // Alt+2, through `press_esc`: an `Esc` byte in the same pty read as
+    // the bytes before it parses as one Alt-modified key.
+    app.press_esc(Some(b'2'));
+    app.wait_for(
+        "now typing to cleric",
+        "switching character should print a marker naming them",
+    );
+
+    cleric_mud.send_line("A rat scurries by.");
+    app.wait_for(
+        "scurries",
+        "the newly bound character's lines should be the ones printed",
+    );
+
+    app.send(CTRL_C);
+    app.expect_exit("the default quit key should quit");
+}
+
+/// §6.1 — the first-run wizard calls `ratatui::init()` before the front
+/// end is ever chosen, so `--line` on a fresh config directory would enter
+/// the alternate screen before anything else happened. Refusing with an
+/// instruction is acceptable for a first release; silently entering it is
+/// not, and §6.8 asks for the alternate screen to be absent on this path
+/// too.
+#[test]
+fn line_mode_refuses_the_first_run_form_rather_than_drawing_it() {
+    let config = TempDir::new();
+
+    let mut app = App::launch(&["--line", "--config-dir", config.path_str()]);
+    app.wait_for(
+        "without --line",
+        "the refusal should say how to get a profile",
+    );
+    app.expect_exit_with(false, "a launch with nothing to connect to should fail");
+
+    for sequence in ALTERNATE_SCREEN {
+        assert!(
+            !app.raw().contains(sequence),
+            "the first-run path must not enter the alternate screen under --line"
+        );
+    }
+}
+
+/// The three ways a terminal is asked for its alternate screen.
+const ALTERNATE_SCREEN: [&str; 3] = ["\x1b[?1049h", "\x1b[?1047h", "\x1b[?47h"];
+
+/// Whether the stream contains a `CUP`/`HVP` — `ESC[<row>;<col>H` or the
+/// `f` spelling. Both move the cursor somewhere absolute, which is what
+/// rewriting a line already read requires.
+fn addresses_the_cursor(raw: &str) -> bool {
+    raw.split('\x1b')
+        .filter_map(|part| part.strip_prefix('['))
+        .any(|part| {
+            let end = part
+                .find(|c: char| !c.is_ascii_digit() && c != ';')
+                .unwrap_or(part.len());
+            matches!(part.as_bytes().get(end), Some(b'H') | Some(b'f'))
+        })
+}
+
 fn write_config(dir: &Path, port: u16, quit: Option<&str>) {
     std::fs::create_dir_all(dir.join("profiles")).unwrap();
     std::fs::create_dir_all(dir.join("modules")).unwrap();
@@ -552,8 +776,10 @@ struct FakeMud {
     /// the name in the tab bar: the pane is drawn from the profile, before
     /// anything has been connected to.
     accepted: Arc<AtomicU32>,
-    /// Lines to push at the client once it has connected.
-    outbound: std::sync::mpsc::Sender<String>,
+    /// Bytes to push at the client once it has connected. Bytes rather
+    /// than lines because ECHO masking is negotiated in-band, and `IAC`
+    /// is not a character a `String` can hold.
+    outbound: std::sync::mpsc::Sender<Vec<u8>>,
 }
 
 impl FakeMud {
@@ -565,7 +791,7 @@ impl FakeMud {
         let sink = Arc::clone(&received);
         let accepted = Arc::new(AtomicU32::new(0));
         let count = Arc::clone(&accepted);
-        let (outbound, pending) = std::sync::mpsc::channel::<String>();
+        let (outbound, pending) = std::sync::mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
@@ -574,8 +800,8 @@ impl FakeMud {
             let _ = sock.write_all(format!("{BANNER}\r\n").as_bytes());
             if let Ok(mut writer) = sock.try_clone() {
                 std::thread::spawn(move || {
-                    while let Ok(line) = pending.recv() {
-                        let _ = writer.write_all(format!("{line}\r\n").as_bytes());
+                    while let Ok(bytes) = pending.recv() {
+                        let _ = writer.write_all(&bytes);
                     }
                 });
             }
@@ -600,7 +826,14 @@ impl FakeMud {
 
     /// Pushes a line to the connected client.
     fn send_line(&self, line: &str) {
-        self.outbound.send(line.to_string()).unwrap();
+        self.outbound
+            .send(format!("{line}\r\n").into_bytes())
+            .unwrap();
+    }
+
+    /// Pushes raw bytes — a telnet negotiation, say.
+    fn send_bytes(&self, bytes: &[u8]) {
+        self.outbound.send(bytes.to_vec()).unwrap();
     }
 
     /// Blocks until the client has opened a socket to this server.
@@ -827,6 +1060,13 @@ impl App {
         last_bytes(&drawn, bytes).to_string()
     }
 
+    /// Everything the client has written, escape codes and all. The
+    /// stripped view above is what most assertions want; this is for the
+    /// ones about the escapes themselves (docs/LINE_MODE.md §6.8).
+    fn raw(&self) -> String {
+        self.output.lock().unwrap().clone()
+    }
+
     fn still_running(&mut self) -> bool {
         // Give a quit that should not happen time to happen anyway. The
         // reader thread is draining throughout, so a client that is still
@@ -839,10 +1079,16 @@ impl App {
     }
 
     fn expect_exit(&mut self, why: &str) {
+        self.expect_exit_with(true, why);
+    }
+
+    /// The same, for a launch that is expected to refuse: `--line` with no
+    /// profile to connect to has nothing to do and says so.
+    fn expect_exit_with(&mut self, success: bool, why: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
-                assert!(status.success(), "{why}: exited with {status}");
+                assert_eq!(status.success(), success, "{why}: exited with {status}");
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));

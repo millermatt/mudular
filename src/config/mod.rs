@@ -743,6 +743,48 @@ pub struct AppConfig {
     /// is downloaded or changed without the player typing `/update`.
     #[serde(default = "default_check_for_updates")]
     pub check_for_updates: bool,
+    /// The line front end's own settings (`--line`, docs/LINE_MODE.md §6).
+    /// Inert without it, and deliberately not per-profile: which front end
+    /// is running is a property of the launch, not of a character.
+    #[serde(default)]
+    pub line: LineOptions,
+}
+
+/// What `--line` prints, beyond the MUD's own output.
+///
+/// Both settings ship with both branches implemented and tested, because
+/// #39's evidence has blind players contradicting each other about being
+/// moved by new text — the defaults are the ones two independent clients
+/// arrived at, not a preference (§6.4, §10).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LineOptions {
+    /// Print the player's own commands back into the stream.
+    ///
+    /// Off, following Blightmud, whose reader mode does not echo sent
+    /// commands, and Mudlet, whose accessibility manual instructs
+    /// screen-reader users to uncheck "show the text you sent". They stay
+    /// in scrollback and in the transcript either way: suppressed from the
+    /// live stream, retained for review.
+    #[serde(default)]
+    pub echo_sent: bool,
+    /// Print the MUD's prompt when it changes and nothing else has been
+    /// printed since (§6.2). On, because it is what a player reads most —
+    /// off for a MUD that sends one per line, where it is pure backlog.
+    #[serde(default = "default_line_prompt")]
+    pub prompt: bool,
+}
+
+impl Default for LineOptions {
+    fn default() -> Self {
+        Self {
+            echo_sent: false,
+            prompt: default_line_prompt(),
+        }
+    }
+}
+
+fn default_line_prompt() -> bool {
+    true
 }
 
 /// Where the docked columns start, in terminal columns. Defaults live with
@@ -772,6 +814,7 @@ impl Default for AppConfig {
             map_graphics: false,
             autocomplete: default_autocomplete(),
             check_for_updates: default_check_for_updates(),
+            line: LineOptions::default(),
         }
     }
 }
@@ -1206,6 +1249,12 @@ const STARTER_APP_CONFIG: &str = r#"# Mudular's own settings — the ones that b
 
 # Draw the map with pixel graphics where the terminal supports them.
 #map_graphics: false
+
+# Settings for --line, the line-oriented mode a screen reader reads best.
+# Ignored unless you start with --line (or --screen-reader).
+#line:
+#  echo_sent: false             # print your own commands back as you send them
+#  prompt: true                 # print the MUD's prompt when it changes
 "#;
 
 /// Writes the starter [`STARTER_APP_CONFIG`] if there is no `mudular.yaml`

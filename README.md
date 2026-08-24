@@ -90,6 +90,22 @@ mudular hercmud
 Type a line and press Enter to send it to the game, exactly as you would in any
 MUD client. Passwords are hidden as you type them.
 
+### If you use a screen reader
+
+```
+mudular hercmud --screen-reader
+```
+
+Mudular then prints output as plain lines into the terminal you are already
+in — no panes, no full-screen drawing, and nothing already printed is written
+over, so your terminal's own scrollback keeps it and your screen reader reads
+it the way it reads any other program. Everything else is the same client:
+the same profiles, aliases, triggers and scripts, and several characters at
+once. `--line` is the same flag, if that is what you would rather type.
+[docs/USAGE.md](docs/USAGE.md#reading-with-a-screen-reader---line) has the
+details, including what is unavailable in this mode and what it prints
+instead.
+
 ## The keys worth knowing
 
 **Press `F1` for help at any time** — it lists every key, so you don't have to

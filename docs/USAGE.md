@@ -1471,9 +1471,73 @@ mudular [PROFILE]... [OPTIONS]
   --forget-password <PROFILE>
                           Delete that profile's stored password from the
                           OS keyring, then exit
+  --line                  Print output as lines instead of drawing panes
+                          (alias: --screen-reader)
   --record <PATH>         Record raw inbound bytes to a file
   --log <PATH>            Write diagnostic logs to a file (filtered via RUST_LOG)
 ```
+
+## Reading with a screen reader: `--line`
+
+```
+mudular tank --line
+```
+
+`--line` — or `--screen-reader`, the same flag — starts Mudular without
+drawing anything. There is no alternate screen, there are no panes, and no
+line already printed is ever written over: output is appended to the
+terminal you are already in, and your terminal's own scrollback keeps it.
+What that buys is that reading, review, interruption, braille and echo
+policy all stay with the screen reader you already have and have
+configured, rather than being reinvented here badly.
+
+Everything below the presentation is the same client: the same profiles,
+the same aliases and triggers, the same scripts, several characters at
+once. What changes is what reaches the terminal.
+
+**Your own commands are not printed back** as you send them. They are
+still kept — in the scrollback and in a transcript log — so they are there
+on review; they are simply not spoken at you on the way out. Set
+`line: {echo_sent: true}` in `mudular.yaml` if you would rather hear them.
+
+**The MUD's prompt is printed when it changes**, and only when nothing
+else has been printed since. A MUD that sends a prompt on every line would
+otherwise fill your speech queue with prompts; `line: {prompt: false}`
+turns it off entirely.
+
+**Channel lines are printed where they happen**, tagged with the channel:
+
+```
+[tells Grunk] Bob tells you: meet me at the gate
+```
+
+There are no channel panes to put them in, and losing them silently would
+be worse than the tag.
+
+**Several characters** work as they always do: name them all, and each
+connects and keeps its own scrollback. Only the one you are typing to is
+printed. `Alt+1`…`Alt+9` switches, and the switch says who you are now
+typing to.
+
+**Keys work.** The bindings you have configured resolve to the same
+actions they do in the full client, and the ones that need a drawn surface
+say so instead of doing nothing:
+
+```
+** there is no map column here; /goto still walks, and /mark still marks
+```
+
+What is unavailable: the map column, channel panes, the party strip, the
+server-data inspector, the settings editor (`/config`) and the new-profile
+form. `F9` prints every character's vitals as lines instead of drawing the
+strip. Edit `profiles/<name>.yaml` in your own editor for anything the
+settings editor would have done, and start once without `--line` if you
+have no profile yet — the new-profile form is a screen this mode does not
+draw.
+
+**Scrolling back** is your terminal's, not the client's: `PgUp` and the
+rest go to the terminal you are in, and the client says so if you press
+the keys it would otherwise have used.
 
 ## Environment
 
