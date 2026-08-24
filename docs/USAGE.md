@@ -1306,7 +1306,7 @@ fallback.
 | `Up` / `Down` | Walk back and forward through the commands you've sent to the focused character. What you were part-way through typing comes back when you walk forward past the newest one. | — (built in) |
 | `F1` | Show the help overlay: every key and client command, including any you've remapped. Any key closes it. | `help` |
 | `Ctrl+C` | Quit | `quit` |
-| `Alt+1` … `Alt+9` | Jump straight to session 1–9 | — (built in) |
+| `Alt+1` … `Alt+9` | Jump straight to session 1–9 | `character_jump_modifier` (the modifier only; the digits stay digits) |
 | `Ctrl+Tab` | Cycle focus to the next pane, including comms panes | `focus_next` |
 | `F2` | Toggle the raw server-data inspector for the focused session — the GMCP and/or MSDP the server is sending behind the scenes, whichever it actually speaks | `server_data_inspector` |
 | `F3` | Switch between the tabbed and side-by-side layouts | `cycle_layout` |
@@ -1333,7 +1333,11 @@ into the pane if you'd rather not reach for a key.
 `Ctrl+Tab` is the one to watch: terminals differ in whether they send it
 at all, and some swallow it for their own tab switching. If it does
 nothing in yours, remap it (`alt+tab` is the usual second choice).
-`Alt+1..9` works everywhere and is unaffected.
+`Alt+1..9` works everywhere and is unaffected. If you would rather the
+digits wore a different modifier — because something else on your system
+takes `Alt`, or because you came from a client that used them for
+something else — set `character_jump_modifier` to `ctrl`, `shift` or a
+combination.
 
 ## App settings and keybinds
 

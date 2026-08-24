@@ -922,6 +922,10 @@ pub struct Keybinds {
     /// (docs/ARCHITECTURE.md §11.7).
     #[serde(default = "default_who_needs_me")]
     pub who_needs_me: KeyBinding,
+    /// The modifier the digits 1-9 wear to select a character (§11), and
+    /// the map column on the number after the last one.
+    #[serde(default = "default_character_jump_modifier")]
+    pub character_jump_modifier: Modifier,
 }
 
 impl Default for Keybinds {
@@ -948,8 +952,13 @@ impl Default for Keybinds {
             toggle_timestamps: default_toggle_timestamps(),
             toggle_autocomplete: default_toggle_autocomplete(),
             who_needs_me: default_who_needs_me(),
+            character_jump_modifier: default_character_jump_modifier(),
         }
     }
+}
+
+fn default_character_jump_modifier() -> Modifier {
+    "alt".parse().expect("built-in default modifier")
 }
 
 fn default_focus_next() -> KeyBinding {
@@ -1173,6 +1182,71 @@ impl<'de> Deserialize<'de> for KeyBinding {
     }
 }
 
+/// A modifier on its own, with no key attached — what the digits 1-9 wear
+/// to select a character (§11).
+///
+/// The digits are not nine bindings because they are positional: `3` is the
+/// third character because it is third on screen, and a player who moved
+/// them one at a time could make them disagree with what they are looking
+/// at. What a player needs to move is the modifier, so that is what the
+/// profile names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Modifier(KeyModifiers);
+
+impl Modifier {
+    /// An exact match, not a superset: with `alt` configured, `Alt+Shift+3`
+    /// is a different chord and belongs to whatever else claims it.
+    pub fn matches(&self, modifiers: KeyModifiers) -> bool {
+        self.0 == modifiers
+    }
+}
+
+impl std::fmt::Display for Modifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.contains(KeyModifiers::CONTROL) {
+            write!(f, "Ctrl+")?;
+        }
+        if self.0.contains(KeyModifiers::ALT) {
+            write!(f, "Alt+")?;
+        }
+        if self.0.contains(KeyModifiers::SHIFT) {
+            write!(f, "Shift+")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for Modifier {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let mut modifiers = KeyModifiers::NONE;
+        for part in s.split('+').map(str::trim) {
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
+                "alt" => modifiers |= KeyModifiers::ALT,
+                "shift" => modifiers |= KeyModifiers::SHIFT,
+                other => {
+                    return Err(format!(
+                        "`{other}` is not a modifier in `{s}` — expected ctrl, alt or shift"
+                    ));
+                }
+            }
+        }
+        Ok(Modifier(modifiers))
+    }
+}
+
+impl<'de> Deserialize<'de> for Modifier {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Loads `mudular.yaml` from the config dir, or the defaults if it (or the
 /// dir) doesn't exist yet — the common case before a first-run wizard
 /// exists (§15).
@@ -1211,7 +1285,9 @@ const STARTER_APP_CONFIG: &str = r#"# Mudular's own settings — the ones that b
 #  who_needs_me: f10            # jump to whoever is in the most trouble
 #  toggle_timestamps: alt+t     # a clock down the character panes
 #  line_picker: alt+v           # pick a scrollback line into a new trigger
-#  focus_next: ctrl+tab         # cycle characters (Alt+1..9 jumps directly)
+#  focus_next: ctrl+tab         # cycle characters (the digits jump directly)
+#  character_jump_modifier: alt # what 1-9 wear to select a character;
+#                               # ctrl, alt, shift, or a combination
 #  channel_wider: alt+-
 #  channel_narrower: alt+=
 #  map_wider: alt+,
@@ -1945,6 +2021,25 @@ fn apply_channel_defaults(layer: &mut RuleModule, channels: &[Channel]) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_modifier_parses_on_its_own_and_defaults_to_alt() {
+        assert_eq!(
+            Keybinds::default().character_jump_modifier,
+            "alt".parse::<Modifier>().expect("a modifier")
+        );
+        assert!("ctrl".parse::<Modifier>().is_ok());
+        assert!("alt+shift".parse::<Modifier>().is_ok());
+    }
+
+    /// A modifier is not a key: `ctrl+tab` names a chord, and accepting it
+    /// here would silently bind the digits to something nobody asked for.
+    #[test]
+    fn a_whole_chord_is_not_a_modifier() {
+        assert!("ctrl+tab".parse::<Modifier>().is_err());
+        assert!("".parse::<Modifier>().is_err());
+        assert!("meta".parse::<Modifier>().is_err());
+    }
+
     use super::*;
     use std::collections::HashSet;
 

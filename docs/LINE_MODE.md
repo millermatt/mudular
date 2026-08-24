@@ -197,10 +197,11 @@ filed wrongly:
   channel panes, then the map column, and what it moves is which pane the
   scroll and arrow keys act on — `self.focus`, not `input_session`. Focus
   and input binding are separate in this model: which character the input
-  line is bound to is `input_session`, driven by `Alt+1..9`, which is not a
-  binding at all yet (§5.4). So a front end with no panes has nothing for
+  line is bound to is `input_session`, driven by the character digits and
+  the modifier a profile gives them (§5.4). So a front end with no panes
+  has nothing for
   `focus_next` to walk, and the intent that line mode actually needs from
-  this area is the one `Alt+1..9` carries.
+  this area is the one those digits carry.
 - **`toggle_hud` is shared.** Its subject is every character's vitals, not
   geometry; a line front end prints it as lines. **Not as a table** —
   Mudlet's accessibility manual is explicit that tabular layout "can often
@@ -285,12 +286,15 @@ asynchronously afterwards, because `handle_key` is sync and the work is not.
 end therefore reproduces the post-key servicing block as well as the
 dispatch, and §7.1 extracts it rather than copying it.
 
-**`Alt+1..9` is not reachable and must be made so.** The session jump is
-hardcoded in `handle_key` and is not a `KeyBinding` at all, so it is not
-remappable and none of the resolvers can see it. It is also the one intent
-branch 2 most needs. Either it becomes a real binding or the character-switch
-intent gets its own name; the former is preferable and is a small,
-independently sensible fix.
+**The character jump is a named intent, resolved in the last gap.** It was
+hardcoded in `handle_key` and was not a binding at all, which left it
+invisible to every resolver while being the one intent branch 2 most needs.
+It resolves to `SelectCharacter` now, after every private binding, so a
+player who has remapped a geometry binding onto one of those chords still
+gets the remapped one. The digits stay digits — they are positional, and a
+player who moved them one at a time could make them disagree with the order
+on screen — so what a profile configures is the modifier they wear
+(`character_jump_modifier`, default `alt`).
 
 ### 5.5 Order is behaviour, and a single lookup will break it
 
@@ -643,9 +647,13 @@ markup at all.
   deliberately not in branch 2.** Recall is not line-mode-specific — by
   §5.2's own criterion it is a shared intent both front ends can realise, so
   building it inside the line front end would make it line-mode-only, which
-  is the mistake the intent layer exists to prevent. It also collides with
-  `Alt+1..9`, which §5.4 records is not yet a real binding, and that is worth
-  resolving deliberately rather than under the weight of a larger branch.
+  is the mistake the intent layer exists to prevent. Whether it wants the
+  character digits is a question for that issue and not a settled one:
+  `ChannelHistory`'s `Alt+1`–`Alt+0` is one client's answer under one
+  client's constraints, and a recall reached by command or by a leader key
+  spends no chord at all. §5.4 makes the modifier those digits wear
+  configurable, which is what that decision needed and is as far as it
+  goes.
 
   Branch 2 therefore ships only the minimum that is not a hole: routed lines
   print inline with a channel tag, so nothing vanishes (§6.2). That is

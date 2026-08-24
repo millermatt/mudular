@@ -587,14 +587,15 @@ impl Action {
     /// which is what resolving it any earlier would take away
     /// (docs/LINE_MODE.md §5.5).
     ///
-    /// Not remappable, and so it does not consult `keybinds` — the digits
-    /// are the vocabulary. Making them configurable collides with the keyed
-    /// recall of [#149], which wants the same range, and is left to be
-    /// decided there rather than under this branch (§8.1a).
-    ///
-    /// [#149]: https://github.com/millermatt/mudular/issues/149
-    pub(crate) fn for_key_last(code: KeyCode, modifiers: KeyModifiers) -> Option<Self> {
-        if !modifiers.contains(KeyModifiers::ALT) {
+    /// The digits stay digits — they are positional, matching the order the
+    /// characters sit in on screen — so the modifier they wear is what a
+    /// profile can move (`character_jump_modifier`, §11).
+    pub(crate) fn for_key_last(
+        keybinds: &Keybinds,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<Self> {
+        if !keybinds.character_jump_modifier.matches(modifiers) {
             return None;
         }
         let KeyCode::Char(c) = code else { return None };
@@ -2423,21 +2424,57 @@ mod action_tests {
     /// (docs/LINE_MODE.md §5.4).
     #[test]
     fn alt_digit_names_the_character_it_selects() {
+        let k = crate::config::Keybinds::default();
         assert_eq!(
-            Action::for_key_last(KeyCode::Char('1'), KeyModifiers::ALT),
+            Action::for_key_last(&k, KeyCode::Char('1'), KeyModifiers::ALT),
             Some(Action::SelectCharacter(0))
         );
         assert_eq!(
-            Action::for_key_last(KeyCode::Char('9'), KeyModifiers::ALT),
+            Action::for_key_last(&k, KeyCode::Char('9'), KeyModifiers::ALT),
             Some(Action::SelectCharacter(8))
         );
         // `Alt+0` was never a session and does not become one here.
         assert_eq!(
-            Action::for_key_last(KeyCode::Char('0'), KeyModifiers::ALT),
+            Action::for_key_last(&k, KeyCode::Char('0'), KeyModifiers::ALT),
             None
         );
         assert_eq!(
-            Action::for_key_last(KeyCode::Char('1'), KeyModifiers::NONE),
+            Action::for_key_last(&k, KeyCode::Char('1'), KeyModifiers::NONE),
+            None
+        );
+    }
+
+    /// The digits are positional and stay digits; what a player moves is
+    /// the modifier they wear (docs/ARCHITECTURE.md §11).
+    #[test]
+    fn the_character_jump_wears_the_modifier_the_profile_chose() {
+        let k = crate::config::Keybinds {
+            character_jump_modifier: "ctrl".parse().expect("a modifier"),
+            ..crate::config::Keybinds::default()
+        };
+        assert_eq!(
+            Action::for_key_last(&k, KeyCode::Char('3'), KeyModifiers::CONTROL),
+            Some(Action::SelectCharacter(2))
+        );
+        // And the modifier it replaced no longer selects anything, which is
+        // the half that frees the range for whatever the player moved it for.
+        assert_eq!(
+            Action::for_key_last(&k, KeyCode::Char('3'), KeyModifiers::ALT),
+            None
+        );
+    }
+
+    /// An exact match, not a superset: with `alt` configured, `Alt+Shift+3`
+    /// is a different chord and is left for whatever else wants it.
+    #[test]
+    fn a_further_modifier_is_not_the_character_jump() {
+        let k = crate::config::Keybinds::default();
+        assert_eq!(
+            Action::for_key_last(
+                &k,
+                KeyCode::Char('3'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            ),
             None
         );
     }
