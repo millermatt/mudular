@@ -8,6 +8,27 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0](https://github.com/millermatt/mudular/compare/v0.16.0...v0.17.0) - 2026-08-24
+
+### Added
+
+- let a profile choose the modifier the character digits wear
+- settle what --line prints, in config and in tests
+- add a line-oriented front end (--line)
+- name the character a keypress selects
+
+### Fixed
+
+- print the notices a launch with no session says
+
+### Other
+
+- measure what flat review actually reaches
+- record that the intent layer shipped without an Outcome enum
+- record the line front end where it is looked for
+- drive --line through a real pty against §6.8
+- extract the startup path both front ends need
+
 ## [0.16.0](https://github.com/millermatt/mudular/compare/v0.15.0...v0.16.0) - 2026-08-24
 
 ### Added
