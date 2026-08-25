@@ -22,6 +22,13 @@ irm https://github.com/millermatt/mudular/releases/latest/download/mudular-insta
 That's the whole install. It puts Mudular in `%USERPROFILE%\.cargo\bin` and
 adds that to your PATH.
 
+**It tells you what it's doing.** You should see it name a version, then
+`installing to C:\Users\you\.cargo\bin`, then `everything's installed!`. If
+you got none of that — a blank line and your prompt back — the installer
+never ran, and what to fix is why it couldn't start rather than anything
+about Mudular. A typo in the line, no network, or a policy that blocks
+scripts will all do it.
+
 **Don't run it as administrator.** Mudular installs into your own user folder,
 so an elevated window installs it for the wrong account and your normal prompt
 won't find it afterwards. A plain window is what you want.
@@ -228,7 +235,31 @@ it, with examples.
   missing the characters it draws with. Windows Terminal's default (Cascadia
   Mono) is fine; older fonts may not be.
 - **`mudular is not recognized`** — close the terminal and open a new one; the
-  installer changed your PATH and only a fresh window sees it.
+  installer changed your PATH and only a fresh window sees it. If a fresh
+  window still doesn't find it, paste this into PowerShell to see how far the
+  install got:
+
+  ```powershell
+  $bin = Join-Path $HOME ".cargo\bin"
+  "mudular.exe there: " + (Test-Path (Join-Path $bin 'mudular.exe'))
+  "in USER PATH     : " + ([Environment]::GetEnvironmentVariable('Path','User') -split ';' -contains $bin)
+  "in THIS session  : " + ($env:Path -split ';' -contains $bin)
+  ```
+
+  Three `True`s and it's installed — the problem is elsewhere, so open an
+  issue. Otherwise the first `False` is the one to fix:
+
+  - **No `mudular.exe`** — the install didn't finish. Run the installer again
+    and read what it prints; it says where it got to.
+  - **Not in USER PATH** — the exe is there but the PATH edit didn't stick.
+    Add `%USERPROFILE%\.cargo\bin` under Start → "Edit environment variables
+    for your account".
+  - **Not in THIS session** — the window is running with an older environment.
+    Signing out and back in fixes it for good; for right now,
+    `$env:Path = "$HOME\.cargo\bin;$env:Path"`.
+
+  Either way, `& "$HOME\.cargo\bin\mudular.exe"` runs Mudular regardless of
+  PATH, so you can play while you sort this out.
 - **Anything else** — open an issue on the repository with what you did and
   what you saw.
 
