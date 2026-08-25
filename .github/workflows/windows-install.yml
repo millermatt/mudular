@@ -33,31 +33,31 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      # Windows PowerShell 5.1, not pwsh 7. The whole of #158 is that 5.1
-      # defaults `$InformationPreference` to `SilentlyContinue` and 7 does
-      # not, so testing this in 7 would test the shell nobody hit the bug in.
-      - name: Run the installer the README tells people to run
+      # Windows PowerShell 5.1, not pwsh 7: 5.1 is the shell #158 was
+      # reported against, and the two differ in exactly the preference the
+      # report turns on.
+      #
+      # Both invocations, because they are the surviving difference between
+      # what the reporter ran and what reproduces. `irm | iex` is the README's
+      # line, running in the caller's own session; `-File` is a child process.
+      # Neither asserts anything yet - this run exists to find out which, if
+      # either, is silent.
+      - name: Run the installer both ways and report what each prints
         shell: powershell
         run: |
           $url = "https://github.com/millermatt/mudular/releases/latest/download/mudular-installer.ps1"
+
+          $iex = & powershell.exe -NoProfile -Command "irm $url | iex" 2>&1 | Out-String
+          Write-Host "===== irm | iex : $($iex.Trim().Length) chars ====="
+          Write-Host $iex
+          Write-Host "===== end irm | iex ====="
+
           $script = Join-Path $env:RUNNER_TEMP "mudular-installer.ps1"
           Invoke-WebRequest -Uri $url -OutFile $script
-
-          # A child process with no profile, so the preferences are the stock
-          # 5.1 ones a first-time player has rather than whatever this step
-          # has accumulated.
-          $out = & powershell.exe -NoProfile -File $script 2>&1 | Out-String
-
-          if ($out.Trim() -ne "") {
-            Write-Host "The installer produced output:"
-            Write-Host $out
-            Write-Host ""
-            Write-Host "That is not a broken installer - it is a README that"
-            Write-Host "now says the wrong thing. Its Windows section tells"
-            Write-Host "people to expect silence (#158). Update it to match."
-            exit 1
-          }
-          Write-Host "Installer finished silently, as the README says it will."
+          $file = & powershell.exe -NoProfile -File $script 2>&1 | Out-String
+          Write-Host "===== -File : $($file.Trim().Length) chars ====="
+          Write-Host $file
+          Write-Host "===== end -File ====="
 
       # The three checks the README hands a player whose `mudular` is not
       # recognized. If one of them is wrong there, it is wrong here first.
