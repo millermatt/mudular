@@ -33,31 +33,35 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      # Windows PowerShell 5.1, not pwsh 7: 5.1 is the shell #158 was
-      # reported against, and the two differ in exactly the preference the
-      # report turns on.
+      # Windows PowerShell 5.1, not pwsh 7, and `irm | iex` rather than a
+      # child process: this is the line the README gives, in the shell a
+      # Windows 10 or 11 player gets by default.
       #
-      # Both invocations, because they are the surviving difference between
-      # what the reporter ran and what reproduces. `irm | iex` is the README's
-      # line, running in the caller's own session; `-File` is a child process.
-      # Neither asserts anything yet - this run exists to find out which, if
-      # either, is silent.
-      - name: Run the installer both ways and report what each prints
+      # What it guards is the inversion #158 ended at. The installer names
+      # the directory it installed to, always - so the README can tell a
+      # player that a blank window means the installer never ran, rather
+      # than that it ran quietly. That advice is only safe while this is
+      # true of dist's script, which is not ours and changes without us.
+      - name: Run the line the README gives
         shell: powershell
         run: |
           $url = "https://github.com/millermatt/mudular/releases/latest/download/mudular-installer.ps1"
+          $out = & powershell.exe -NoProfile -Command "irm $url | iex" 2>&1 | Out-String
+          Write-Host $out
 
-          $iex = & powershell.exe -NoProfile -Command "irm $url | iex" 2>&1 | Out-String
-          Write-Host "===== irm | iex : $($iex.Trim().Length) chars ====="
-          Write-Host $iex
-          Write-Host "===== end irm | iex ====="
-
-          $script = Join-Path $env:RUNNER_TEMP "mudular-installer.ps1"
-          Invoke-WebRequest -Uri $url -OutFile $script
-          $file = & powershell.exe -NoProfile -File $script 2>&1 | Out-String
-          Write-Host "===== -File : $($file.Trim().Length) chars ====="
-          Write-Host $file
-          Write-Host "===== end -File ====="
+          if ($out.Trim() -eq "") {
+            Write-Host "The installer printed nothing."
+            Write-Host "The README tells players that silence means it never"
+            Write-Host "ran (#158). If dist has made it quiet, that advice is"
+            Write-Host "now wrong and has to change with it."
+            exit 1
+          }
+          if ($out -notmatch "installing to") {
+            Write-Host "The installer no longer says where it installed."
+            Write-Host "The README leans on that line to tell a player the"
+            Write-Host "install happened at all. Update it to match."
+            exit 1
+          }
 
       # The three checks the README hands a player whose `mudular` is not
       # recognized. If one of them is wrong there, it is wrong here first.
