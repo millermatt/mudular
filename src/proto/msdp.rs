@@ -67,9 +67,10 @@ pub fn encode_pair(name: &str, value: &str) -> Vec<u8> {
 /// does not speak MSDP at all.
 ///
 /// Hardcoded, unlike GMCP's `Core.Supports.Set` (`gmcp::supports_message`,
-/// declarable per §7.3 since #25): nothing has yet needed an MSDP variable
-/// the mapper does not already ask for, and the config layer the GMCP list
-/// now uses is there to extend the day something does.
+/// declarable per §7.3 since #25). The list is what the client itself can
+/// use plus what a script can read back through `mud.data`; the config
+/// layer the GMCP list uses is there for the day one profile needs a
+/// variable no other would ask for.
 pub fn report_requests() -> Vec<Vec<u8>> {
     // Everything the client can actually read: the room for the mapper
     // (§16) and the gauges for the party strip (§11.6). A server sends a
@@ -90,6 +91,18 @@ pub fn report_requests() -> Vec<Vec<u8>> {
         "MOVEMENT_MAX",
         "EXPERIENCE",
         "EXPERIENCE_MAX",
+        "LEVEL",
+        // Who the character is fighting, and how badly it is going. The
+        // server recomputes these every heartbeat whether anyone is
+        // listening or not, and blanks `OPPONENT_NAME` when the fight is
+        // over — which makes a non-empty one the answer to "am I in
+        // combat", a question MSDP has no variable of its own for. A
+        // script without them has to latch on combat messages and guess
+        // when the fight ended; the empty string is not a guess.
+        "OPPONENT_NAME",
+        "OPPONENT_HEALTH",
+        "OPPONENT_HEALTH_MAX",
+        "OPPONENT_LEVEL",
     ]
     .into_iter()
     // `REPORT` subscribes to *changes*, and a server that has already
@@ -435,6 +448,45 @@ mod tests {
             requests.len() % 2,
             0,
             "one REPORT and one SEND each: {requests:?}"
+        );
+    }
+
+    /// The server computes who you are fighting every heartbeat and, on a
+    /// stock tbaMUD, deliberately blanks `OPPONENT_NAME` when you are not —
+    /// its own comment calls a non-empty one "the de facto 'am I in combat'
+    /// signal". None of it reaches a script unless it is REPORTed, so a
+    /// module that wants to know whether a fight is on has to latch on
+    /// combat messages and guess when it ended.
+    #[test]
+    fn the_subscription_covers_who_the_character_is_fighting() {
+        let requests = report_requests();
+
+        for variable in [
+            "OPPONENT_NAME",
+            "OPPONENT_HEALTH",
+            "OPPONENT_HEALTH_MAX",
+            "OPPONENT_LEVEL",
+            "LEVEL",
+        ] {
+            assert!(
+                requests
+                    .contains(&[&[VAR][..], b"REPORT", &[VAL][..], variable.as_bytes()].concat()),
+                "{variable} is never sent unless it is asked for"
+            );
+        }
+    }
+
+    /// `OPPONENT_NAME` carries its meaning in the empty string, so the
+    /// empty value has to survive flattening: a script reading it back
+    /// tells "not fighting" (`""`) from "this server sends no MSDP"
+    /// (absent) only if the pair is stored rather than dropped.
+    #[test]
+    fn an_empty_scalar_is_a_value_not_an_absence() {
+        let mut out = Flattened::default();
+        flatten("OPPONENT_NAME", &MsdpValue::String(String::new()), &mut out);
+        assert_eq!(
+            out.pairs,
+            vec![("OPPONENT_NAME".to_string(), String::new())]
         );
     }
 
