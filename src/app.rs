@@ -341,23 +341,53 @@ fn apply_session_event(
     }
 }
 
+/// Recompiles one session's rules from disk, along with the
+/// `cross_session:` block from the same profile.
+///
+/// The block comes back with the rules because the two go stale together
+/// and only one of them used to be reloaded: `expand_aliases` is read in
+/// the session task and `max_hops` out here, both captured at connect, so
+/// editing either and pressing `/reload` printed "rules reloaded" over a
+/// setting that had not moved (§7.5). A session with no profile — `--host`
+/// — has no block to reread and keeps the one it has.
+fn recompile(
+    state: &AppState,
+    session: &SessionPane,
+    channels: &[Channel],
+) -> anyhow::Result<(Engine, CrossSession)> {
+    let (config_dir, profile) = &session.rules;
+    let layers = crate::config::load_rules(config_dir, profile.as_deref(), channels)?;
+    let engine = Engine::compile(&layers)?;
+    let cross = match profile {
+        Some(name) => {
+            let path = crate::config::profile_path(config_dir, name);
+            state
+                .cross_session_default
+                .with_override(crate::config::load_profile(&path)?.cross_session)
+        }
+        None => session.cross,
+    };
+    Ok((engine, cross))
+}
+
 /// Recompile the rule set from disk and hand it to the bound session.
 /// Returns the line to show the player either way — a broken rule file
 /// must report itself rather than silently leaving the old rules in place.
-async fn reload_rules(state: &AppState, channels: &[Channel]) -> String {
-    let Some(session) = state.bound() else {
+async fn reload_rules(state: &mut AppState, channels: &[Channel]) -> String {
+    let Some(index) = state.bound_index() else {
         return "** /reload needs a connected session".to_string();
     };
-    let (config_dir, profile) = &session.rules;
 
-    match crate::config::load_rules(config_dir, profile.as_deref(), channels)
-        .and_then(|layers| Ok(Engine::compile(&layers)?))
-    {
-        Ok(engine) => {
-            let _ = session
+    match recompile(state, &state.sessions[index], channels) {
+        Ok((engine, cross)) => {
+            let _ = state.sessions[index]
                 .commands
-                .send(SessionCommand::SetRules(Box::new(engine)))
+                .send(SessionCommand::SetRules {
+                    engine: Box::new(engine),
+                    expand_aliases: cross.expand_aliases,
+                })
                 .await;
+            state.sessions[index].cross = cross;
             "** rules reloaded".to_string()
         }
         Err(err) => format!("** reload failed, keeping the current rules: {err:#}"),
@@ -555,23 +585,22 @@ async fn service_config_save(state: &mut AppState, channels: &[Channel], mode: c
                     .iter()
                     .position(|s| s.view.name == target_name)
                 {
-                    let session = &state.sessions[index];
-                    let (config_dir, profile) = &session.rules;
-                    let text =
-                        match crate::config::load_rules(config_dir, profile.as_deref(), channels)
-                            .and_then(|layers| Ok(Engine::compile(&layers)?))
-                        {
-                            Ok(engine) => {
-                                let _ = session
-                                    .commands
-                                    .send(SessionCommand::SetRules(Box::new(engine)))
-                                    .await;
-                                "** config saved; rules reloaded".to_string()
-                            }
-                            Err(err) => {
-                                format!("** config saved, but rules failed to reload: {err:#}")
-                            }
-                        };
+                    let text = match recompile(state, &state.sessions[index], channels) {
+                        Ok((engine, cross)) => {
+                            let _ = state.sessions[index]
+                                .commands
+                                .send(SessionCommand::SetRules {
+                                    engine: Box::new(engine),
+                                    expand_aliases: cross.expand_aliases,
+                                })
+                                .await;
+                            state.sessions[index].cross = cross;
+                            "** config saved; rules reloaded".to_string()
+                        }
+                        Err(err) => {
+                            format!("** config saved, but rules failed to reload: {err:#}")
+                        }
+                    };
                     state.sessions[index].push_line(RetainedLine::client(text));
                 }
             }
@@ -2130,7 +2159,7 @@ async fn event_loop(
                     }
                     if state.reload_requested {
                         state.reload_requested = false;
-                        let notice = reload_rules(&state, &channels).await;
+                        let notice = reload_rules(&mut state, &channels).await;
                         if let Some(session) = state.bound_mut() {
                             session.push_line(RetainedLine::client(notice));
                         }
@@ -5871,7 +5900,7 @@ mod tests {
     #[tokio::test]
     async fn reload_picks_up_edited_rules() {
         let dir = config_with_alias("old");
-        let (state, mut receivers) = app_with_rules(dir.path());
+        let (mut state, mut receivers) = app_with_rules(dir.path());
 
         // Edit the module on disk, exactly as a player would.
         std::fs::write(
@@ -5880,15 +5909,48 @@ mod tests {
         )
         .unwrap();
 
-        let notice = reload_rules(&state, &[]).await;
+        let notice = reload_rules(&mut state, &[]).await;
         assert!(notice.contains("reloaded"), "{notice}");
 
         match receivers[0].try_recv().expect("a new rule set was sent") {
-            SessionCommand::SetRules(mut engine) => {
+            SessionCommand::SetRules { mut engine, .. } => {
                 assert_eq!(engine.expand_input("x").sends, vec!["new"]);
             }
             other => panic!("expected SetRules, got {other:?}"),
         }
+    }
+
+    /// `/reload` said "rules reloaded" and meant only the rules: the
+    /// session's `cross_session:` block was read once at connect and never
+    /// again, so turning `expand_aliases` on and reloading left injected
+    /// commands still going to the server verbatim — a success message over
+    /// a setting that had not taken. The player's only clue was the
+    /// behaviour not changing.
+    #[tokio::test]
+    async fn reload_picks_up_an_edited_cross_session_block() {
+        let dir = config_with_alias("old");
+        let (mut state, mut receivers) = app_with_rules(dir.path());
+        assert!(!state.sessions[0].cross.expand_aliases, "the default");
+
+        std::fs::write(
+            dir.path().join("profiles/tank.yaml"),
+            "name: tank\nhost: h\nport: 1\nmodules: [combat]\n\ncross_session:\n  expand_aliases: true\n  max_hops: 4\n",
+        )
+        .unwrap();
+
+        let notice = reload_rules(&mut state, &[]).await;
+        assert!(notice.contains("reloaded"), "{notice}");
+
+        match receivers[0].try_recv().expect("a new rule set was sent") {
+            SessionCommand::SetRules { expand_aliases, .. } => assert!(
+                expand_aliases,
+                "the session task decides this, so it has to be told"
+            ),
+            other => panic!("expected SetRules, got {other:?}"),
+        }
+        // `max_hops` is read on the routing side, out here, and goes stale
+        // in exactly the same way.
+        assert_eq!(state.sessions[0].cross.max_hops, 4);
     }
 
     /// A broken rule file must report itself and leave the running session
@@ -5896,7 +5958,7 @@ mod tests {
     #[tokio::test]
     async fn reload_reports_a_broken_file_and_sends_nothing() {
         let dir = config_with_alias("old");
-        let (state, mut receivers) = app_with_rules(dir.path());
+        let (mut state, mut receivers) = app_with_rules(dir.path());
 
         std::fs::write(
             dir.path().join("modules/combat.yaml"),
@@ -5904,7 +5966,7 @@ mod tests {
         )
         .unwrap();
 
-        let notice = reload_rules(&state, &[]).await;
+        let notice = reload_rules(&mut state, &[]).await;
         assert!(notice.contains("reload failed"), "{notice}");
         assert!(
             notice.contains("keeping the current rules"),
@@ -5918,8 +5980,8 @@ mod tests {
 
     #[tokio::test]
     async fn reload_without_a_session_explains_itself() {
-        let (state, _rx) = app(&[]);
-        let notice = reload_rules(&state, &[]).await;
+        let (mut state, _rx) = app(&[]);
+        let notice = reload_rules(&mut state, &[]).await;
         assert!(notice.contains("needs a connected session"), "{notice}");
     }
 

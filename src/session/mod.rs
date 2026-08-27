@@ -166,7 +166,16 @@ pub enum SessionCommand {
         hops: u8,
     },
     /// Replace the rule set without reconnecting (`/reload`).
-    SetRules(Box<Engine>),
+    ///
+    /// `expand_aliases` rides along because it is read here, in the session
+    /// task, and was captured at connect: a reload that swapped only the
+    /// engine reported success while leaving the old setting in force
+    /// (§7.5). It comes from the same profile block as the rules do, so it
+    /// is reloaded by the same command.
+    SetRules {
+        engine: Box<Engine>,
+        expand_aliases: bool,
+    },
     /// A session added to a running instance after this one, so this
     /// session's peer mesh — built once at spawn (§7.5) — has no other way
     /// to learn about it (`/connect`, docs/ARCH_REVIEW.md "One-way doors"
@@ -238,7 +247,7 @@ async fn run(
     record: Option<PathBuf>,
     charset: Charset,
     mut engine: Engine,
-    expand_injected: bool,
+    mut expand_injected: bool,
     mut login: Option<Autologin>,
     peers: PeerLinks,
     events: mpsc::Sender<SessionEvent>,
@@ -288,7 +297,7 @@ async fn run(
                     connection,
                     charset,
                     &mut engine,
-                    expand_injected,
+                    &mut expand_injected,
                     &mut login,
                     &mut watching,
                     &publish_to,
@@ -324,6 +333,7 @@ async fn run(
         if !wait_to_retry(
             delay,
             &mut engine,
+            &mut expand_injected,
             &mut window,
             &mut watching,
             &mut commands,
@@ -369,6 +379,7 @@ fn backoff_delay(attempt: u32) -> Duration {
 async fn wait_to_retry(
     delay: Duration,
     engine: &mut Engine,
+    expand_injected: &mut bool,
     window: &mut Option<(u16, u16)>,
     watching: &mut Vec<(String, watch::Receiver<PeerSnapshot>)>,
     commands: &mut mpsc::Receiver<SessionCommand>,
@@ -382,7 +393,13 @@ async fn wait_to_retry(
                 // `/reload` still lands: the reconnect runs the new rules'
                 // `on_connect` and starts their timers, as a reload against
                 // a live socket does (§7.4).
-                Some(SessionCommand::SetRules(rules)) => swap_rules(engine, rules),
+                Some(SessionCommand::SetRules {
+                    engine: rules,
+                    expand_aliases,
+                }) => {
+                    *expand_injected = expand_aliases;
+                    swap_rules(engine, rules)
+                }
                 Some(SessionCommand::Resize { cols, rows }) => *window = Some((cols, rows)),
                 // A peer added while this session is mid-backoff must not
                 // be lost by the time the connection comes back (§7.5).
@@ -424,7 +441,7 @@ async fn run_connection(
     connection: net::Connection,
     charset: Charset,
     engine: &mut Engine,
-    expand_injected: bool,
+    expand_injected: &mut bool,
     login: &mut Option<Autologin>,
     watching: &mut Vec<(String, watch::Receiver<PeerSnapshot>)>,
     publish_to: &Option<watch::Sender<PeerSnapshot>>,
@@ -969,7 +986,7 @@ async fn run_connection(
                                 return Outcome::Gone;
                             }
                         }
-                        let (sends, cross) = if expand_injected {
+                        let (sends, cross) = if *expand_injected {
                             let mut sends = Vec::new();
                             let mut cross = Vec::new();
                             for line in &lines {
@@ -996,7 +1013,11 @@ async fn run_connection(
                             return Outcome::Gone;
                         }
                     }
-                    Some(SessionCommand::SetRules(rules)) => {
+                    Some(SessionCommand::SetRules {
+                        engine: rules,
+                        expand_aliases,
+                    }) => {
+                        *expand_injected = expand_aliases;
                         swap_rules(engine, rules);
                         engine.start_timers(Instant::now());
                         // Freshly loaded scripts have not seen this
@@ -2268,14 +2289,17 @@ mod tests {
         assert_eq!(next_sent(&mut sent).await, "old");
 
         commands
-            .send(SessionCommand::SetRules(Box::new(rules(
-                r#"
+            .send(SessionCommand::SetRules {
+                engine: Box::new(rules(
+                    r#"
                 name: after
                 aliases:
                   - regex: '^x$'
                     send: ["new"]
                 "#,
-            ))))
+                )),
+                expand_aliases: false,
+            })
             .await
             .unwrap();
 
@@ -3414,6 +3438,53 @@ mod tests {
                 .expect("timed out")
                 .unwrap(),
             "cast 'major heal' me"
+        );
+    }
+
+    /// Whether injected commands expand was read once at connect, so
+    /// turning `expand_aliases` on and pressing `/reload` reported success
+    /// and changed nothing — the sender's `k` went on reaching the server
+    /// verbatim. The setting rides with the rules it belongs to.
+    #[tokio::test]
+    async fn reloading_can_turn_alias_expansion_on_for_injected_commands() {
+        let (tx, mut sent) = mpsc::channel(8);
+        let alias = r#"
+                name: test
+                aliases:
+                  - regex: '^hh$'
+                    send: ["cast 'major heal' me"]
+                "#;
+        let (_events, commands) = serve_with(
+            move |mut sock| async move {
+                tx.send(read_command(&mut sock).await).await.unwrap();
+            },
+            rules(alias),
+            false,
+        );
+
+        commands
+            .send(SessionCommand::SetRules {
+                engine: Box::new(rules(alias)),
+                expand_aliases: true,
+            })
+            .await
+            .unwrap();
+        commands
+            .send(SessionCommand::Inject {
+                from: "tank".to_string(),
+                lines: vec!["hh".to_string()],
+                hops: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), sent.recv())
+                .await
+                .expect("timed out")
+                .unwrap(),
+            "cast 'major heal' me",
+            "the reloaded setting has to reach the session task"
         );
     }
 

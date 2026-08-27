@@ -1053,8 +1053,10 @@ memory of the old one, and its `on_connect` hooks run, since as far as a
 just-loaded script is concerned the connection is only now up. Timers
 restart on the same reasoning.
 
-Note that this reloads *rules and scripts* only. Changing a profile's
-`host`, `port`, `tls`, or `charset` still needs a restart.
+Your profile's `cross_session:` block comes back with them, so a change to
+`expand_aliases` or `max_hops` takes effect on a reload like any rule.
+Changing a profile's `host`, `port`, `tls`, or `charset` still needs a
+restart.
 
 ## Editing your profile in the client
 
