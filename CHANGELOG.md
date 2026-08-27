@@ -8,6 +8,20 @@ from the same history.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0](https://github.com/millermatt/mudular/compare/v0.17.0...v0.18.0) - 2026-08-27
+
+### Added
+
+- subscribe to the opponent variables, so a script can tell it is fighting
+
+### Fixed
+
+- reload the cross_session block, not just the rules
+
+### Other
+
+- say what the Windows installer prints, and what silence means
+
 ## [0.17.0](https://github.com/millermatt/mudular/compare/v0.16.0...v0.17.0) - 2026-08-24
 
 ### Added
